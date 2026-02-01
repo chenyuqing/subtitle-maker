@@ -4,6 +4,7 @@
 
 ### Added
 - **Standalone SRT Upload Panel**: Separated SRT upload into a dedicated "Import SRT" panel (Step 4) to avoid confusion with video uploads.
+- **Player Subtitle Loader**: Added a "Load Subtitles" (📂) button in the video controls bar to instantly overlay local SRT files onto the video.
 - **Custom System Prompt**: Added a text area in the translation panel to allow users to provide custom system prompts for the translation model (e.g., "Translate to Cantonese").
 - **Local Model Integration**: Added support for `Sakura-14b` local model via `llama.cpp` using the `local_sakura` provider option.
 - **State Persistence**: Enhanced `localStorage` implementation to persist original and translated subtitles. Data now survives page refreshes even if the backend restarts.
@@ -18,6 +19,9 @@
 - **Non-Blocking Translation**: Moved translation logic to a threadpool to prevent blocking the main event loop.
 - **UI State**: Fixed issue where old subtitles persisted after uploading a new video.
 - **SRT Upload Workflow**: Fixed "Translate" and "Export" buttons remaining disabled after direct SRT upload.
+- **SRT Parsing**: Fixed an issue where multi-line subtitles were being joined into a single line during parsing.
+- **Subtitle Display**: Fixed line breaks not being rendered correctly in the video overlay.
+- **Player Controls**: Resolved unresponsive "Load Subtitles" button by implementing robust event handling.
 
 ### Changed
 - **UI Layout**: Split the "Upload" panel into "Upload Video" (Panel 1) and "Import SRT" (Panel 4).

@@ -229,18 +229,22 @@ if (videoPlayer) {
         const orig = findSub(originalSubtitlesData);
         const trans = findSub(translatedSubtitlesData);
 
+        const safeText = (t) => t ? t.replace(/\n/g, '<br>') : '';
+        const origText = orig ? safeText(orig.text) : '';
+        const transText = trans ? safeText(trans.text) : '';
+
         if (overlayMode === 'original') {
-            if (orig) textToShow = orig.text;
+            textToShow = origText;
         } else if (overlayMode === 'translated') {
-            if (trans) textToShow = trans.text;
+            textToShow = transText;
         } else if (overlayMode === 'bilingual_orig_trans') {
-            if (orig && trans) textToShow = `${orig.text}<br><span class="sub-secondary">${trans.text}</span>`;
-            else if (orig) textToShow = orig.text;
-            else if (trans) textToShow = trans.text;
+            if (orig && trans) textToShow = `${origText}<br><span class="sub-secondary">${transText}</span>`;
+            else if (orig) textToShow = origText;
+            else if (trans) textToShow = transText;
         } else if (overlayMode === 'bilingual_trans_orig') {
-            if (orig && trans) textToShow = `${trans.text}<br><span class="sub-secondary">${orig.text}</span>`;
-            else if (trans) textToShow = trans.text;
-            else if (orig) textToShow = orig.text;
+            if (orig && trans) textToShow = `${transText}<br><span class="sub-secondary">${origText}</span>`;
+            else if (trans) textToShow = transText;
+            else if (orig) textToShow = origText;
         }
 
         if (subtitleOverlay) {
@@ -708,6 +712,12 @@ async function handleSrtUpload(file) {
 
         if (uploadStatus) uploadStatus.textContent = "SRT Upload Complete";
 
+        // Enable buttons since we possess subtitles now
+        if (translateBtn) translateBtn.disabled = false;
+
+        const expBtn = document.getElementById('export-btn');
+        if (expBtn) expBtn.disabled = false;
+
         // Switch to Translate tab (since transcription is skipped)
         switchTab(2);
 
@@ -742,3 +752,45 @@ if (fullscreenBtn && videoWrapper) {
         }
     });
 }
+
+// --- Player Load Subtitles ---
+document.addEventListener('DOMContentLoaded', () => {
+    // Expose explicitly to window for inline onclick
+    window.triggerSrtLoad = function () {
+        console.log("Global triggerSrtLoad called");
+        const input = document.getElementById('player-srt-input');
+        if (input) {
+            input.click();
+        } else {
+            alert("Error: Input element not found!");
+        }
+    };
+
+    const playerSrtInput = document.getElementById('player-srt-input');
+    if (playerSrtInput) {
+        playerSrtInput.addEventListener('change', async (e) => {
+            if (e.target.files.length > 0) {
+                const file = e.target.files[0];
+                if (!file.name.toLowerCase().endsWith('.srt')) {
+                    alert("Please select a valid .srt file");
+                    return;
+                }
+                try {
+                    console.log("Loading SRT...", file.name);
+                    // Reuse existing upload handler
+                    await handleSrtUpload(file);
+
+                    const dispMode = document.getElementById('display-mode');
+                    if (dispMode && dispMode.value === 'translated') {
+                        dispMode.value = 'original';
+                    }
+                } catch (e) {
+                    console.error("Player SRT Load Error:", e);
+                    alert("Failed to load subtitles: " + e.message);
+                } finally {
+                    playerSrtInput.value = '';
+                }
+            }
+        });
+    }
+});

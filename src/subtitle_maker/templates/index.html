@@ -51,6 +51,10 @@
                 </div>
                 <!-- Video Controls -->
                 <div class="video-controls-bar">
+                    <!-- Hidden input for player-based subtitle upload -->
+                    <input type="file" id="player-srt-input" accept=".srt"
+                        style="visibility: hidden; position: absolute; width: 0; height: 0;">
+
                     <label for="display-mode">Overlay:</label>
                     <select id="display-mode">
                         <option value="original">Original Only</option>
@@ -58,7 +62,12 @@
                         <option value="bilingual_orig_trans">Original + Translation</option>
                         <option value="bilingual_trans_orig">Translation + Original</option>
                     </select>
-                    <button id="fullscreen-btn" class="secondary-btn" style="width: auto; padding: 5px 10px;">⛶</button>
+
+                    <button id="load-srt-btn" class="secondary-btn" type="button"
+                        onclick="if(window.triggerSrtLoad) window.triggerSrtLoad(); else alert('Wait for page load');"
+                        style="width: auto; padding: 5px 10px;" title="Load Local Subtitles">📂</button>
+                    <button id="fullscreen-btn" class="secondary-btn" style="width: auto; padding: 5px 10px;"
+                        title="Fullscreen">⛶</button>
                 </div>
             </div>
 

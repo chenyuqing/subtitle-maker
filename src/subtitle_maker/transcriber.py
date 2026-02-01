@@ -371,7 +371,7 @@ def parse_srt(srt_content: str):
         start_str, end_str = timecode.split('-->')
         
         # Line 3+: Text
-        text = " ".join(lines[2:])
+        text = "\n".join(lines[2:])
         
         try:
             start = _srt_time_to_seconds(start_str.strip())

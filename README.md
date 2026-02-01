@@ -96,7 +96,9 @@ subtitle-maker/
 2.  **开始转写**: 点击 Transcribe，等待本地模型处理。
 3.  **字幕预览**: 
     *   转写完成后，字幕会自动显示。
+    *   转写完成后，字幕会自动显示。
     *   使用视频下方的 **Overlay** 下拉菜单切换显示模式（如：`Original + Translation`）。
+    *   点击视频控制栏的 **📂 图标**，可直接加载本地 SRT 文件进行预览。
 4.  **翻译 (可选)**:
     *   输入 DeepSeek API Key。
     *   选择目标语言，点击 Translate。

@@ -186,7 +186,10 @@ body {
     display: flex;
     align-items: center;
     gap: 8px;
-    z-index: 20;
+    z-index: 30;
+    /* Higher than Z-20 overlay */
+    pointer-events: auto;
+    /* Force clickable */
 }
 
 .video-controls-bar label {
@@ -309,7 +312,6 @@ select:focus {
 .subtitle-overlay {
     position: absolute;
     bottom: 100px;
-    /* Moved even higher to avoid covering progress bar and overlay selector */
     left: 50%;
     transform: translateX(-50%);
     background: rgba(0, 0, 0, 0.75);
@@ -321,6 +323,8 @@ select:focus {
     max-width: 80%;
     pointer-events: none;
     line-height: 1.4;
+    z-index: 20;
+    /* Ensure above video */
 }
 
 .sub-secondary {
