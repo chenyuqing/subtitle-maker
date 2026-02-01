@@ -18,10 +18,15 @@
 - **Concurrency Safety**: Added server-side thread locking to prevent race conditions during model loading.
 - **Non-Blocking Translation**: Moved translation logic to a threadpool to prevent blocking the main event loop.
 - **UI State**: Fixed issue where old subtitles persisted after uploading a new video.
-- **SRT Upload Workflow**: Fixed "Translate" and "Export" buttons remaining disabled after direct SRT upload.
-- **SRT Parsing**: Fixed an issue where multi-line subtitles were being joined into a single line during parsing.
-- **Subtitle Display**: Fixed line breaks not being rendered correctly in the video overlay.
-- **Player Controls**: Resolved unresponsive "Load Subtitles" button by implementing robust event handling.
+- **Export Reliability**: Fixed "400 Bad Request" on export by allowing the frontend to send subtitle data directly if the backend session has expired or restarted.
+- **Translation Stability**: Implemented batch processing (chunk size 30) to prevent API timeouts or empty results on long videos.
+- **Filename Preservation**: Fixed issue where exported files used internal UUIDs instead of the original video filename.
+- **Subtitle Parsing**: Fixed issue where multi-line SRTs were parsed as single lines.
+- **UI Adjustments**: 
+    - Implemented dynamic subtitle positioning (20px -> 50px on hover).
+    - Added "Top/Bottom" position selector in video controls (10px from top).
+    - Changed "Fullscreen" button behavior to **Web Page Fullscreen** (expands player to window size) to ensure subtitles remain visible (fixes native fullscreen z-index issues).
+- **Player Controls**: Fixed unresponsive "Load Subtitles" button.
 
 ### Changed
 - **UI Layout**: Split the "Upload" panel into "Upload Video" (Panel 1) and "Import SRT" (Panel 4).

@@ -317,17 +317,36 @@ async def translate(
 @app.post("/export")
 async def export_subtitles(
     task_id: str = Form(...),
-    format: str = Form(...) # original, translated, bilingual_orig_trans, bilingual_trans_orig
+    format: str = Form(...), # original, translated, bilingual_orig_trans, bilingual_trans_orig
+    subtitles_json: Optional[str] = Form(None),
+    translated_subtitles_json: Optional[str] = Form(None)
 ):
+    import json
     task = tasks.get(task_id)
-    if not task or task["status"] != "completed":
-        raise HTTPException(status_code=400, detail="Task not ready or not found")
-        
-    subtitles = task.get("subtitles", [])
-    translated_subtitles = task.get("translated_subtitles", [])
     
-    subtitles = task.get("subtitles", [])
-    translated_subtitles = task.get("translated_subtitles", [])
+    subtitles = []
+    translated_subtitles = []
+    
+    # Priority 1: Task Memory
+    if task and task.get("status") == "completed":
+        subtitles = task.get("subtitles", [])
+        translated_subtitles = task.get("translated_subtitles", [])
+    
+    # Priority 2: Client provided JSON (Resilience for restarts)
+    if not subtitles and subtitles_json:
+        try:
+            subtitles = json.loads(subtitles_json)
+        except:
+            pass
+            
+    if not translated_subtitles and translated_subtitles_json:
+        try:
+            translated_subtitles = json.loads(translated_subtitles_json)
+        except:
+             pass
+
+    if not subtitles:
+        raise HTTPException(status_code=400, detail="Task not found or expired, and no subtitle data provided.")
     
     # gen = get_generator() # optimization: not needed anymore for export
     

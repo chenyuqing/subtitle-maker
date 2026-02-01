@@ -389,6 +389,9 @@ if (transcribeBtn) {
         formData.append('filename', currentFilename);
         formData.append('language', lang);
         formData.append('max_width', width);
+        if (currentOriginalFilename) {
+            formData.append('original_filename', currentOriginalFilename);
+        }
 
         transcribeBtn.disabled = true;
         progressContainer.style.display = 'block';
@@ -621,8 +624,16 @@ if (exportBtn) {
     exportBtn.addEventListener('click', async () => {
         const format = document.getElementById('export-format').value;
         const formData = new FormData();
-        formData.append('task_id', currentTaskId);
+        formData.append('task_id', currentTaskId || ""); // Send empty string if null, though backend handles fallback
         formData.append('format', format);
+
+        // Robustness: Send local data in case backend tasks got wiped (e.g. server restart)
+        if (originalSubtitlesData && originalSubtitlesData.length > 0) {
+            formData.append('subtitles_json', JSON.stringify(originalSubtitlesData));
+        }
+        if (translatedSubtitlesData && translatedSubtitlesData.length > 0) {
+            formData.append('translated_subtitles_json', JSON.stringify(translatedSubtitlesData));
+        }
 
         try {
             const res = await fetch('/export', { method: 'POST', body: formData });
@@ -743,12 +754,13 @@ const videoWrapper = document.querySelector('.video-wrapper');
 
 if (fullscreenBtn && videoWrapper) {
     fullscreenBtn.addEventListener('click', () => {
-        if (!document.fullscreenElement) {
-            videoWrapper.requestFullscreen().catch(err => {
-                alert(`Error attempting to enable fullscreen mode: ${err.message} (${err.name})`);
-            });
-        } else {
-            document.exitFullscreen();
+        videoWrapper.classList.toggle('web-fullscreen');
+    });
+
+    // Exit web fullscreen on ESC
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && videoWrapper.classList.contains('web-fullscreen')) {
+            videoWrapper.classList.remove('web-fullscreen');
         }
     });
 }
@@ -790,6 +802,19 @@ document.addEventListener('DOMContentLoaded', () => {
                 } finally {
                     playerSrtInput.value = '';
                 }
+            }
+        });
+    }
+
+    // --- Subtitle Position Toggle ---
+    const posSelect = document.getElementById('sub-position');
+    const overlay = document.getElementById('subtitle-overlay');
+    if (posSelect && overlay) {
+        posSelect.addEventListener('change', () => {
+            if (posSelect.value === 'top') {
+                overlay.classList.add('top-pos');
+            } else {
+                overlay.classList.remove('top-pos');
             }
         });
     }

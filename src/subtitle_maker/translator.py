@@ -47,21 +47,35 @@ Input:
                 translated_lines = translated_lines[:expected_len]
         return translated_lines
 
-    def translate_batch(self, subtitles, target_lang="Chinese", system_prompt=None):
+    def translate_batch(self, subtitles, target_lang="Chinese", system_prompt=None, chunk_size=30):
         if not subtitles:
             return []
 
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt if system_prompt and system_prompt.strip() else "You are a professional subtitle translator."},
-                    {"role": "user", "content": self._build_prompt(subtitles, target_lang)}
-                ],
-                stream=False
-            )
-            content = response.choices[0].message.content.strip()
-            return self._parse_translated_lines(content, len(subtitles))
-        except Exception as e:
-            logger.error("Translation failed: %s", e)
-            return [f"[Error: {e}] {s}" for s in subtitles]
+        all_translated = []
+        total = len(subtitles)
+        
+        for i in range(0, total, chunk_size):
+            batch = subtitles[i:i+chunk_size]
+            current_batch_texts = [sub if isinstance(sub, str) else sub['text'] for sub in batch] # Handle minimal strings or dicts
+            
+            logger.info(f"Translating batch {i//chunk_size + 1}/{(total + chunk_size - 1)//chunk_size} ({len(batch)} lines)...")
+            
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt if system_prompt and system_prompt.strip() else "You are a professional subtitle translator."},
+                        {"role": "user", "content": self._build_prompt(current_batch_texts, target_lang)}
+                    ],
+                    stream=False
+                )
+                content = response.choices[0].message.content.strip()
+                parsed = self._parse_translated_lines(content, len(batch))
+                all_translated.extend(parsed)
+                
+            except Exception as e:
+                logger.error(f"Batch translation failed: {e}")
+                # Fallback for this batch
+                all_translated.extend([f"[Error] {t}" for t in current_batch_texts])
+                
+        return all_translated

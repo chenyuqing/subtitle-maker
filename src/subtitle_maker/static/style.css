@@ -157,6 +157,25 @@ body {
     max-height: 100vh;
 }
 
+/* Web Fullscreen (Custom) */
+.video-wrapper.web-fullscreen {
+    position: fixed !important;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    z-index: 9999;
+    background: black;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.video-wrapper.web-fullscreen video {
+    max-width: 100%;
+    max-height: 100%;
+}
+
 /* Push overlay higher in fullscreen if needed, or keep relative */
 .video-wrapper:fullscreen .subtitle-overlay {
     bottom: 10%;
@@ -311,7 +330,8 @@ select:focus {
 
 .subtitle-overlay {
     position: absolute;
-    bottom: 100px;
+    bottom: 20px;
+    /* Default low position */
     left: 50%;
     transform: translateX(-50%);
     background: rgba(0, 0, 0, 0.75);
@@ -324,7 +344,20 @@ select:focus {
     pointer-events: none;
     line-height: 1.4;
     z-index: 20;
-    /* Ensure above video */
+    transition: bottom 0.3s ease;
+    /* Smooth movement */
+}
+
+/* Lift subtitles when controls (on hover) appear */
+.video-wrapper:hover .subtitle-overlay:not(.top-pos) {
+    bottom: 50px;
+}
+
+.subtitle-overlay.top-pos {
+    bottom: auto !important;
+    top: 10px;
+    transform: translateX(-50%);
+    /* Start from same X centering */
 }
 
 .sub-secondary {

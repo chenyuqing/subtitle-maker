@@ -63,6 +63,12 @@
                         <option value="bilingual_trans_orig">Translation + Original</option>
                     </select>
 
+                    <label for="sub-position">Pos:</label>
+                    <select id="sub-position" title="Subtitle Position">
+                        <option value="bottom">Bottom</option>
+                        <option value="top">Top</option>
+                    </select>
+
                     <button id="load-srt-btn" class="secondary-btn" type="button"
                         onclick="if(window.triggerSrtLoad) window.triggerSrtLoad(); else alert('Wait for page load');"
                         style="width: auto; padding: 5px 10px;" title="Load Local Subtitles">📂</button>
