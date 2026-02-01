@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Qwen3-ASR Subtitle Maker</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div class="app-layout">
+        <!-- Sidebar -->
+        <aside class="sidebar">
+            <div class="logo-area">
+                <h1>Subtitle Maker</h1>
+                <p>Qwen3-ASR & DeepSeek</p>
+            </div>
+
+            <nav class="nav-menu">
+                <button class="nav-item active" data-target="panel-upload">
+                    <span class="step-num">1</span> Upload Video
+                </button>
+                <button class="nav-item" data-target="panel-transcribe">
+                    <span class="step-num">2</span> Generate Subtitles
+                </button>
+                <button class="nav-item" data-target="panel-results">
+                    <span class="step-num">3</span> Subtitles & Translation
+                </button>
+                <button class="nav-item" data-target="panel-srt">
+                    <span class="step-num">4</span> Import SRT
+                </button>
+            </nav>
+
+            <div class="sidebar-footer">
+                <button id="new-project-btn" class="secondary-btn">New Project</button>
+            </div>
+        </aside>
+
+        <!-- Main Content (Right) -->
+        <main class="main-content">
+            <!-- Fixed Video Section (Top) -->
+            <div class="fixed-video-section">
+                <div class="video-wrapper">
+                    <div id="video-placeholder" class="placeholder">
+                        <span>Select a video to start</span>
+                    </div>
+                    <video id="video-player" controls style="display: none;"></video>
+                    <div id="subtitle-overlay" class="subtitle-overlay" style="display: none;"></div>
+                </div>
+                <!-- Video Controls -->
+                <div class="video-controls-bar">
+                    <label for="display-mode">Overlay:</label>
+                    <select id="display-mode">
+                        <option value="original">Original Only</option>
+                        <option value="translated">Translation Only</option>
+                        <option value="bilingual_orig_trans">Original + Translation</option>
+                        <option value="bilingual_trans_orig">Translation + Original</option>
+                    </select>
+                    <button id="fullscreen-btn" class="secondary-btn" style="width: auto; padding: 5px 10px;">⛶</button>
+                </div>
+            </div>
+
+            <!-- Scrollable Content Section (Bottom) -->
+            <div class="dynamic-content-section">
+                <!-- Panel 1: Upload Video -->
+                <div id="panel-upload" class="panel active">
+                    <div class="card" style="text-align: center; padding: 3rem;">
+                        <h2>Upload Media File</h2>
+                        <div id="upload-area" class="upload-area">
+                            <input type="file" id="file-input" accept="video/*,audio/*" style="display: none;">
+                            <div class="upload-icon">📁</div>
+                            <p class="upload-text">Click or Drag & Drop Video/Audio</p>
+                            <p class="upload-hint">Supported: MP4, MOV, MKV, MP3, WAV</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Panel 4: Import SRT -->
+                <div id="panel-srt" class="panel" style="display: none;">
+                    <div class="card" style="text-align: center; padding: 3rem;">
+                        <h2>Import SRT Subtitles</h2>
+                        <div id="srt-upload-area" class="upload-area">
+                            <input type="file" id="srt-file-input" accept=".srt" style="display: none;">
+                            <div class="upload-icon">📄</div>
+                            <p class="upload-text">Click or Drag & Drop SRT File</p>
+                            <p class="upload-hint">Directly upload .srt to edit & translate</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Panel 2: Transcribe -->
+                <div id="panel-transcribe" class="panel" style="display: none;">
+                    <div class="card">
+                        <h2>Configure & Generate</h2>
+                        <div class="form-row">
+                            <div class="input-group">
+                                <label>Source Language</label>
+                                <select id="source-lang">
+                                    <option value="auto">Auto Detect</option>
+                                    <option value="Chinese">Chinese (中文)</option>
+                                    <option value="English">English</option>
+                                    <option value="Cantonese">Cantonese (粤语)</option>
+                                    <option value="French">French (Français)</option>
+                                    <option value="German">German (Deutsch)</option>
+                                    <option value="Italian">Italian (Italiano)</option>
+                                    <option value="Japanese">Japanese (日本語)</option>
+                                    <option value="Korean">Korean (한국어)</option>
+                                    <option value="Portuguese">Portuguese (Português)</option>
+                                    <option value="Russian">Russian (Pусский)</option>
+                                    <option value="Spanish">Spanish (Español)</option>
+                                </select>
+                            </div>
+                            <div class="input-group">
+                                <label>Max Width (chars)</label>
+                                <input type="number" id="max-width" value="40" min="10" max="100">
+                            </div>
+                        </div>
+                        <button id="transcribe-btn" class="primary-btn" disabled>Generate Subtitles</button>
+
+                        <div id="progress-container" style="display: none;">
+                            <div class="progress-bar">
+                                <div class="progress-fill"></div>
+                            </div>
+                            <div
+                                style="display: flex; justify-content: space-between; margin-top: 5px; font-size: 0.9em;">
+                                <span id="progress-text">Processing...</span>
+                                <span id="runtime-timer" style="color: #666; font-family: monospace;">00:00</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Panel 3: Results -->
+                <div id="panel-results" class="panel" style="display: none;">
+                    <div class="card">
+                        <h2>Editor & Translation</h2>
+                        <div id="transcription-timer" style="color: #888; font-size: 0.9em; margin-bottom: 10px;"></div>
+                        <div class="subtitle-editor">
+                            <div class="subtitle-column">
+                                <h3>Original</h3>
+                                <div id="original-subtitles" class="subtitle-display"></div>
+                                <a id="download-original" class="download-link" style="display:none">Download SRT</a>
+                            </div>
+                            <div class="subtitle-column">
+                                <h3>Translation</h3>
+                                <div class="trans-controls-stack">
+                                    <select id="model-provider" style="flex: 1;">
+                                        <option value="deepseek" selected>DeepSeek Chat</option>
+                                    </select>
+                                    <select id="target-lang" style="flex: 1;">
+                                        <option value="Chinese" selected>Chinese</option>
+                                        <option value="English">English</option>
+                                        <option value="Japanese">Japanese</option>
+                                        <option value="French">French</option>
+                                        <option value="German">German</option>
+                                    </select>
+                                </div>
+                                <div class="row" style="margin-top: 10px;">
+                                    <input type="password" id="api-key"
+                                        placeholder="DeepSeek API Key (Required for DeepSeek)">
+                                </div>
+                                <div class="row" style="margin-top: 10px;">
+                                    <textarea id="system-prompt" class="system-prompt-input"
+                                        placeholder="Custom System Prompt (Optional)"></textarea>
+                                </div>
+                                <button id="translate-btn" class="secondary-btn" disabled>Translate</button>
+                            </div>
+                            <div id="translated-subtitles" class="subtitle-display"></div>
+
+                            <div class="export-section">
+                                <h3>Export Final</h3>
+                                <div class="row">
+                                    <select id="export-format">
+                                        <option value="original">Original Only</option>
+                                        <option value="translated">Translation Only</option>
+                                        <option value="bilingual_orig_trans">Original + Translation</option>
+                                        <option value="bilingual_trans_orig">Translation + Original</option>
+                                    </select>
+                                    <button id="export-btn" class="primary-btn" disabled>Download</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+    </div>
+    </main>
+    </div>
+    <script src="/static/app.js"></script>
+</body>
+
+</html>

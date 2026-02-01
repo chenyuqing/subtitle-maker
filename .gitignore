@@ -1,0 +1,27 @@
+# System
+.DS_Store
+*.log
+__pycache__/
+
+# Environments
+.venv/
+.python-version
+uv.lock
+
+# Data & Models
+models/
+uploads/
+outputs/
+*.mp4
+*.mkv
+*.mov
+*.mp3
+*.wav
+
+# User specific
+.idea/
+.vscode/
+
+# Temporary
+tmp/
+temp/
