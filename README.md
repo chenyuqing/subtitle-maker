@@ -63,11 +63,32 @@ uv sync
 ./stop.sh
 ```
 
-## 📂 模型文件
+## 📂 模型文件 (Model Setup)
 
-项目默认使用以下模型（需自行下载放置在 `models/` 目录）：
-*   `models/Qwen3-ASR-0.6B`
-*   `models/Qwen3-ForcedAligner-0.6B`
+本项目依赖 Qwen 系列语音识别模型。由于模型文件较大，需单独下载并按以下结构放置。
+
+**1. 下载地址:**
+> 请根据实际使用的 Qwen3/Qwen2-Audio 模型版本进行下载。
+*   **HuggingFace**: [https://huggingface.co/Qwen](https://huggingface.co/Qwen)
+*   **ModelScope**: [https://modelscope.cn/organization/qwen](https://modelscope.cn/organization/qwen)
+
+**2. 目录结构 (必须严格一致):**
+
+在项目根目录下创建 `models` 文件夹，并将解压后的模型放入其中：
+
+```text
+subtitle-maker/
+├── models/
+│   ├── Qwen3-ASR-0.6B/             # 核心 ASR 模型
+│   │   ├── config.json
+│   │   ├── model.safetensors
+│   │   ├── tokenizer.json
+│   │   └── ...
+│   └── Qwen3-ForcedAligner-0.6B/   # 强制对齐模型 (用于时间轴校准)
+│       ├── config.json
+│       ├── model.safetensors
+│       └── ...
+```
 
 ## 💡 使用指南
 
