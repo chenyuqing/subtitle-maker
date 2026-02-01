@@ -14,6 +14,8 @@ from typing import Dict, Optional
 import subprocess
 import time
 import socket
+from threading import Lock
+from starlette.concurrency import run_in_threadpool
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -37,6 +39,7 @@ templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
 # Global model instance (lazy loading)
 generator = None
+model_lock = Lock()
 
 def get_generator():
     global generator
@@ -93,73 +96,76 @@ async def stream_video(filename: str):
     return FileResponse(file_path)
 
 def transcribe_task(task_id: str, file_path: str, source_lang: str, max_width: int):
-    tasks[task_id]["status"] = "processing"
-    
-    try:
-        gen = get_generator()
-        logger.info(f"Task {task_id}: Loading ASR model (On Demand)...")
-        gen.load_model()
+    # Acquire lock to prevent other tasks from messing with the model
+    # Note: This means concurrent transcriptions are serial, but that's required for single GPU/memory.
+    with model_lock:
+        tasks[task_id]["status"] = "processing"
         
-        processed_audio = None
-        # Preprocess once to avoid repeated decoding for long files
-        tasks[task_id]["status"] = "preprocessing"
-        logger.info(f"Task {task_id}: Preprocessing {file_path}")
-        processed_audio = gen.preprocess_audio(file_path)
-        
-        # Chunked transcription keeps memory usage flat regardless of duration
-        tasks[task_id]["status"] = "transcribing"
-        tasks[task_id]["processed_chunks"] = 0
-        tasks[task_id]["generated_lines"] = 0
-        tasks[task_id]["subtitles"] = []
-        lang_arg = "auto" if source_lang == "auto" else source_lang
-        logger.info(f"Task {task_id}: Transcribing in chunks...")
-
-        for chunk_results in gen.transcribe_iter(
-            processed_audio,
-            language=lang_arg,
-            chunk_size=30,
-            preprocessed=True
-        ):
-            if tasks[task_id].get("status") == "cancelled":
-                logger.info(f"Task {task_id}: Cancelled mid-transcription")
-                return
-
-            chunk_subtitles = gen.generate_subtitles(chunk_results, max_len=max_width)
-            tasks[task_id]["subtitles"].extend(chunk_subtitles)
-            tasks[task_id]["processed_chunks"] += 1
-            tasks[task_id]["generated_lines"] = len(tasks[task_id]["subtitles"])
-
-            del chunk_results
-            del chunk_subtitles
-            import gc
-            gc.collect()
-        
-        subtitles = tasks[task_id]["subtitles"]
-        srt_content = format_srt(subtitles)
-        
-        # Save SRT
-        base_name = os.path.basename(file_path)
-        srt_filename = f"{os.path.splitext(base_name)[0]}.srt"
-        srt_path = os.path.join(OUTPUT_DIR, srt_filename)
-        
-        with open(srt_path, "w", encoding="utf-8") as f:
-            f.write(srt_content)
+        try:
+            gen = get_generator()
+            logger.info(f"Task {task_id}: Loading ASR model (On Demand)...")
+            gen.load_model()
             
-        tasks[task_id]["status"] = "completed"
-        tasks[task_id]["subtitles"] = subtitles # Store structured for UI
-        tasks[task_id]["srt_url"] = f"/download/{srt_filename}"
-        
-        # Cleanup audio
-    except Exception as e:
-        logger.error(f"Task failed: {e}", exc_info=True)
-        tasks[task_id]["status"] = "failed"
-        tasks[task_id]["error"] = str(e)
-    finally:
-        if 'processed_audio' in locals() and processed_audio and os.path.exists(processed_audio):
-            os.remove(processed_audio)
-        # Release memory after task (success or fail)
-        logger.info(f"Task {task_id}: Unloading ASR model...")
-        release_generator()
+            processed_audio = None
+            # Preprocess once to avoid repeated decoding for long files
+            tasks[task_id]["status"] = "preprocessing"
+            logger.info(f"Task {task_id}: Preprocessing {file_path}")
+            processed_audio = gen.preprocess_audio(file_path)
+            
+            # Chunked transcription keeps memory usage flat regardless of duration
+            tasks[task_id]["status"] = "transcribing"
+            tasks[task_id]["processed_chunks"] = 0
+            tasks[task_id]["generated_lines"] = 0
+            tasks[task_id]["subtitles"] = []
+            lang_arg = "auto" if source_lang == "auto" else source_lang
+            logger.info(f"Task {task_id}: Transcribing in chunks...")
+
+            for chunk_results in gen.transcribe_iter(
+                processed_audio,
+                language=lang_arg,
+                chunk_size=30,
+                preprocessed=True
+            ):
+                if tasks[task_id].get("status") == "cancelled":
+                    logger.info(f"Task {task_id}: Cancelled mid-transcription")
+                    return
+
+                chunk_subtitles = gen.generate_subtitles(chunk_results, max_len=max_width)
+                tasks[task_id]["subtitles"].extend(chunk_subtitles)
+                tasks[task_id]["processed_chunks"] += 1
+                tasks[task_id]["generated_lines"] = len(tasks[task_id]["subtitles"])
+
+                del chunk_results
+                del chunk_subtitles
+                import gc
+                gc.collect()
+            
+            subtitles = tasks[task_id]["subtitles"]
+            srt_content = format_srt(subtitles)
+            
+            # Save SRT
+            base_name = os.path.basename(file_path)
+            srt_filename = f"{os.path.splitext(base_name)[0]}.srt"
+            srt_path = os.path.join(OUTPUT_DIR, srt_filename)
+            
+            with open(srt_path, "w", encoding="utf-8") as f:
+                f.write(srt_content)
+                
+            tasks[task_id]["status"] = "completed"
+            tasks[task_id]["subtitles"] = subtitles # Store structured for UI
+            tasks[task_id]["srt_url"] = f"/download/{srt_filename}"
+            
+            # Cleanup audio
+        except Exception as e:
+            logger.error(f"Task failed: {e}", exc_info=True)
+            tasks[task_id]["status"] = "failed"
+            tasks[task_id]["error"] = str(e)
+        finally:
+            if 'processed_audio' in locals() and processed_audio and os.path.exists(processed_audio):
+                os.remove(processed_audio)
+            # Release memory after task (success or fail)
+            logger.info(f"Task {task_id}: Unloading ASR model...")
+            release_generator()
 
 @app.post("/upload_srt")
 async def upload_srt(file: UploadFile = File(...)):
@@ -272,7 +278,14 @@ async def translate(
         translator = Translator(api_key=api_key)
         
         original_texts = [sub['text'] for sub in subtitles]
-        translated_texts = translator.translate_batch(original_texts, target_lang=target_lang, system_prompt=system_prompt)
+        
+        # Run blocking translation in threadpool to enforce async non-blocking
+        translated_texts = await run_in_threadpool(
+            translator.translate_batch, 
+            original_texts, 
+            target_lang=target_lang, 
+            system_prompt=system_prompt
+        )
         
         translated_subtitles = []
         for sub, trans_text in zip(subtitles, translated_texts):
@@ -294,8 +307,11 @@ async def translate(
         }
         
     except Exception as e:
-        logger.error(f"Translation error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Translation failed: {e}", exc_info=True)
+        # Catch DeepSeek API errors specifically
+        if "Authentication Fails" in str(e):
+             raise HTTPException(status_code=401, detail=f"Authentication Failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
     # Finally block removed as we don't load model here anymore
 
 @app.post("/export")

@@ -323,6 +323,13 @@ async function handleMediaUpload(file) {
         currentTaskId = data.task_id;
         currentFilename = data.filename;
         currentOriginalFilename = file.name;
+
+        // Clear previous subtitles
+        originalSubtitlesData = [];
+        translatedSubtitlesData = [];
+        renderSubtitles([], document.getElementById('original-subtitles'));
+        renderSubtitles([], document.getElementById('translated-subtitles'));
+
         saveState();
 
         // Setup Video
