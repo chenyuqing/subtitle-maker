@@ -47,7 +47,7 @@ Input:
                 translated_lines = translated_lines[:expected_len]
         return translated_lines
 
-    def translate_batch(self, subtitles, target_lang="Chinese", system_prompt=None, chunk_size=30):
+    def translate_batch(self, subtitles, target_lang="Chinese", system_prompt=None, chunk_size=100):
         if not subtitles:
             return []
 

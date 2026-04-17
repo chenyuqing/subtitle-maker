@@ -15,6 +15,7 @@ def main():
     parser.add_argument("--aligner_path", default="./models/Qwen3-ForcedAligner-0.6B", help="Path to Aligner model (local or HF hub)")
     parser.add_argument("--translate_to", help="Target language for translation (e.g. 'English')")
     parser.add_argument("--api_key", help="DeepSeek API Key")
+    parser.add_argument("--chunk_size", type=int, default=30, help="Chunk size in seconds for long audio/video transcription")
 
     args = parser.parse_args()
 
@@ -35,7 +36,14 @@ def main():
         )
         print("Model loaded. Transcribing...")
         
-        results = generator.transcribe(args.input_path, language=args.language)
+        results = []
+        for chunk_results in generator.transcribe_iter(
+            args.input_path,
+            language=args.language,
+            chunk_size=max(1, int(args.chunk_size)),
+            preprocessed=False,
+        ):
+            results.extend(chunk_results)
         print("Transcription complete. Formatting subtitles...")
         
         # New API usage
