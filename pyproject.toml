@@ -4,11 +4,12 @@ version = "0.1.0"
 description = "Local subtitle generator using Qwen3-ASR"
 requires-python = ">=3.10"
 dependencies = [
-    "torch",
+    "torch==2.3.1",
+    "torchaudio==2.3.1",
     "transformers",
     "ffmpeg-python",
     "tiktoken",
-    "soundfile",
+    "soundfile>=0.12.1",
     "accelerate",
     "qwen-asr",
     "numba>=0.60.0",
@@ -18,7 +19,12 @@ dependencies = [
     "uvicorn",
     "python-multipart",
     "jinja2",
-    "aiofiles"
+    "aiofiles",
+    "demucs>=4.0.1",
+    "numpy>=2.2.6",
+    "scipy>=1.15.3",
+    "onnxruntime>=1.23.2",
+    "onnx>=1.20.1",
 ]
 
 [project.scripts]
