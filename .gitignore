@@ -25,3 +25,13 @@ outputs/
 # Temporary
 tmp/
 temp/
+
+# Local/private workflow files
+.claude/
+CLAUDE.md
+openclaw/
+align-deepsearch.md
+x-ArtemXTech-original.md
+x-arthem-zhutov-recall.md
+config/
+docs/
