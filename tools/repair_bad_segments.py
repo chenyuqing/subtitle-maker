@@ -202,6 +202,24 @@ def fit_audio_to_duration(
     )
 
 
+def compute_effective_target_duration(
+    *,
+    start_sec: float,
+    end_sec: float,
+    next_start_sec: float | None,
+    gap_guard_sec: float = 0.10,
+) -> Tuple[float, float]:
+    """根据下一句开始时间扩展可用时长，减少过度压缩。"""
+    base_target_sec = max(0.05, float(end_sec) - float(start_sec))
+    if next_start_sec is None:
+        return base_target_sec, 0.0
+    gap_sec = float(next_start_sec) - float(end_sec)
+    if gap_sec <= 0:
+        return base_target_sec, 0.0
+    borrow_sec = max(0.0, gap_sec - max(0.0, float(gap_guard_sec)))
+    return max(base_target_sec, base_target_sec + borrow_sec), borrow_sec
+
+
 def trim_silence_edges(
     *,
     input_path: Path,
@@ -276,7 +294,14 @@ def compose_vocals_master(
             raise RuntimeError("inconsistent segment sample rates")
 
         start_sample = int(float(segment["start_sec"]) * sr)
-        own_end_sec = float(segment.get("group_anchor_end_sec", segment["end_sec"]))
+        # 关键逻辑：若存在“借静音后”的有效目标时长，合成窗口也要同步扩展，
+        # 否则会在最终拼轨阶段把尾音二次截断。
+        if segment.get("effective_target_duration_sec") is not None:
+            own_end_sec = float(segment["start_sec"]) + max(
+                0.05, float(segment.get("effective_target_duration_sec", 0.0) or 0.0)
+            )
+        else:
+            own_end_sec = float(segment.get("group_anchor_end_sec", segment["end_sec"]))
         own_end_sample = max(start_sample + 1, int(own_end_sec * sr))
 
         if index + 1 < len(valid_segments):
@@ -551,6 +576,22 @@ def repair_segment_job(
             cjk_mode=cjk_mode,
         )
         group_target_duration = max(0.05, float(anchor_record.get("target_duration_sec", 0.05)))
+        group_start_sec = float(group_members[0][1].get("start_sec", 0.0) or 0.0)
+        group_end_sec = float(anchor_record.get("group_anchor_end_sec", anchor_record.get("end_sec", group_start_sec)) or group_start_sec)
+        next_start_sec: float | None = None
+        for candidate in segment_records:
+            candidate_start = float(candidate.get("start_sec", group_end_sec) or group_end_sec)
+            candidate_group = candidate.get("group_id")
+            if candidate_group == group_id:
+                continue
+            if candidate_start >= group_end_sec - 1e-6:
+                if next_start_sec is None or candidate_start < next_start_sec:
+                    next_start_sec = candidate_start
+        effective_target_duration, borrowed_gap_sec = compute_effective_target_duration(
+            start_sec=group_start_sec,
+            end_sec=group_end_sec,
+            next_start_sec=next_start_sec,
+        )
 
         raw_path = segment_audio_dir / f"{group_id}_raw.wav"
         trim_path = segment_audio_dir / f"{group_id}_trim.wav"
@@ -580,7 +621,7 @@ def repair_segment_job(
             fit_audio_to_duration(
                 input_path=use_path,
                 output_path=fit_path,
-                target_duration_sec=group_target_duration,
+                target_duration_sec=effective_target_duration,
             )
             use_path = fit_path
         else:
@@ -595,6 +636,7 @@ def repair_segment_job(
 
         actual = audio_duration(use_path)
         delta = actual - group_target_duration
+        effective_delta = actual - effective_target_duration
 
         for index, record in group_members:
             record["tts_audio_path"] = str(use_path.resolve())
@@ -602,6 +644,9 @@ def repair_segment_job(
                 record["group_text"] = group_text
                 record["actual_duration_sec"] = round(actual, 3)
                 record["delta_sec"] = round(delta, 3)
+                record["effective_target_duration_sec"] = round(effective_target_duration, 3)
+                record["borrowed_gap_sec"] = round(borrowed_gap_sec, 3)
+                record["effective_delta_sec"] = round(effective_delta, 3)
                 record["status"] = "done"
                 record["skip_compose"] = False
                 if "group_anchor_end_sec" not in record:

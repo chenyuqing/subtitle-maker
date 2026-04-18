@@ -142,14 +142,19 @@
                                 </div>
                             </div>
                         </div>
-                        <div class="row" style="margin-top: 10px;">
+                        <div class="row" style="margin-top: 10px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
                             <input type="file" id="auto-dub-subtitle-input" accept=".srt" style="display: none;">
                             <button id="auto-dub-subtitle-browse-btn" class="ghost-btn" type="button">选择字幕文件（可选）</button>
                             <span id="auto-dub-subtitle-name" class="auto-upload-filename">未选择字幕文件（默认自动识别）</span>
+                            <label for="auto-dub-subtitle-mode" style="margin-left: 6px; color: var(--text-secondary);">字幕类型</label>
+                            <select id="auto-dub-subtitle-mode" style="max-width: 220px; min-width: 200px;">
+                                <option value="source" selected>源字幕（需翻译）</option>
+                                <option value="translated">翻译字幕（跳过翻译）</option>
+                            </select>
                         </div>
 
-                        <div class="form-row" style="margin-top: 20px;">
-                            <div class="input-group">
+                        <div class="form-row" style="margin-top: 20px; display: flex; gap: 10px; flex-wrap: nowrap; align-items: flex-end;">
+                            <div class="input-group" style="flex: 1; min-width: 0;">
                                 <label for="auto-dub-source">Source Language</label>
                                 <select id="auto-dub-source">
                                     <option value="auto">Auto Detect</option>
@@ -166,7 +171,7 @@
                                     <option value="Spanish">Spanish (Español)</option>
                                 </select>
                             </div>
-                            <div class="input-group">
+                            <div class="input-group" style="flex: 1; min-width: 0;">
                                 <label for="auto-dub-target">Target Language</label>
                                 <select id="auto-dub-target">
                                     <option value="Chinese" selected>Chinese</option>
@@ -178,7 +183,7 @@
                                     <option value="Spanish">Spanish</option>
                                 </select>
                             </div>
-                            <div class="input-group">
+                            <div class="input-group" style="flex: 1; min-width: 0;">
                                 <label for="auto-dub-grouping-strategy">Sentence Grouping</label>
                                 <select id="auto-dub-grouping-strategy">
                                     <option value="legacy">Legacy</option>

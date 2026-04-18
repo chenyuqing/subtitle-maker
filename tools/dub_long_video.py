@@ -552,6 +552,7 @@ def run_segment_job(
     extra_args: List[str],
     segment_time_ranges: Optional[List[Tuple[float, float]]] = None,
     input_srt_path: Optional[Path] = None,
+    input_srt_kind: str = "source",
     resume_job_dir: Optional[Path] = None,
 ) -> Path:
     before = {item.name for item in list_job_dirs(segment_jobs_dir)}
@@ -582,6 +583,7 @@ def run_segment_job(
         cmd.extend(["--time-ranges-json", json.dumps(payload, ensure_ascii=False)])
     if input_srt_path is not None:
         cmd.extend(["--input-srt", str(input_srt_path)])
+        cmd.extend(["--input-srt-kind", (input_srt_kind or "source")])
     if extra_args:
         cmd.extend(extra_args)
 
@@ -744,6 +746,12 @@ def parse_args(argv: Optional[List[str]] = None) -> Tuple[argparse.Namespace, Li
     parser.add_argument("--target-lang", required=True, help="Target language")
     parser.add_argument("--out-dir", required=True, help="Output root directory for batch job")
     parser.add_argument("--input-srt", default=None, help="Optional external subtitle file to skip ASR")
+    parser.add_argument(
+        "--input-srt-kind",
+        default="source",
+        choices=["source", "translated"],
+        help="Type of input srt: source(need translation) or translated(skip translation)",
+    )
     parser.add_argument("--segment-minutes", type=float, default=8.0)
     parser.add_argument("--min-segment-minutes", type=float, default=4.0)
     parser.add_argument("--boundary-search-sec", type=float, default=45.0)
@@ -990,6 +998,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 extra_args=extra_args,
                 segment_time_ranges=segment_ranges,
                 input_srt_path=segment_input_srt,
+                input_srt_kind=args.input_srt_kind,
                 resume_job_dir=resume_job_dir,
             )
             manifest_path = job_dir / "manifest.json"

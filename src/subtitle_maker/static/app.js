@@ -147,6 +147,36 @@ function formatLineProgress(processed, total) {
     return `Segments ${processed}/${total}`;
 }
 
+function parseIsoUtcToMs(isoText) {
+    const value = Date.parse(String(isoText || ''));
+    return Number.isFinite(value) ? value : null;
+}
+
+function formatElapsedClock(elapsedSeconds) {
+    const safeSeconds = Math.max(0, Math.floor(Number(elapsedSeconds) || 0));
+    const hours = Math.floor(safeSeconds / 3600);
+    const mins = Math.floor((safeSeconds % 3600) / 60);
+    const secs = safeSeconds % 60;
+    if (hours > 0) {
+        return `${hours}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    }
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+}
+
+function buildAutoDubElapsedLabel(taskData, fallbackStartMs) {
+    // 优先使用后端任务时间戳，保证页面刷新后仍能得到准确耗时。
+    const createdMs = parseIsoUtcToMs(taskData?.created_at);
+    const finishedMs = parseIsoUtcToMs(taskData?.updated_at);
+    if (createdMs !== null && finishedMs !== null && finishedMs >= createdMs) {
+        return `用时 ${formatElapsedClock((finishedMs - createdMs) / 1000)}`;
+    }
+    // 兜底：若后端未返回可解析时间，使用前端本地启动时间。
+    if (Number.isFinite(fallbackStartMs) && fallbackStartMs > 0) {
+        return `用时 ${formatElapsedClock((Date.now() - fallbackStartMs) / 1000)}`;
+    }
+    return '';
+}
+
 function describeAutoStage(stage) {
     if (!stage) return 'Waiting';
     const mapping = {
@@ -1565,6 +1595,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const subtitleInput = document.getElementById('auto-dub-subtitle-input');
         const subtitleBrowseBtn = document.getElementById('auto-dub-subtitle-browse-btn');
         const subtitleNameDisplay = document.getElementById('auto-dub-subtitle-name');
+        const subtitleModeSelect = document.getElementById('auto-dub-subtitle-mode');
         const startBtn = document.getElementById('start-auto-dub-btn');
         const statusContainer = document.getElementById('auto-dub-status-container');
         const autoProgressFill = document.getElementById('auto-dub-progress-fill');
@@ -1591,6 +1622,7 @@ document.addEventListener('DOMContentLoaded', () => {
         let selectedSubtitleFile = null;
         let autoDubPreviewUrl = null;
         let autoDubTimeRanges = [];
+        let autoDubStartedAtMs = 0;
         const dubbedAudioPlayer = new Audio();
         dubbedAudioPlayer.preload = 'metadata';
         let dubbedAudioUrl = null;
@@ -1964,8 +1996,17 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
                 selectedSubtitleFile = file;
                 if (subtitleNameDisplay) {
-                    subtitleNameDisplay.textContent = `已选择：${file.name}（将跳过 ASR）`;
+                    const mode = subtitleModeSelect ? subtitleModeSelect.value : 'source';
+                    const modeHint = mode === 'translated' ? '将跳过 ASR 与翻译' : '将跳过 ASR';
+                    subtitleNameDisplay.textContent = `已选择：${file.name}（${modeHint}）`;
                 }
+            });
+        }
+        if (subtitleModeSelect) {
+            subtitleModeSelect.addEventListener('change', () => {
+                if (!selectedSubtitleFile || !subtitleNameDisplay) return;
+                const modeHint = subtitleModeSelect.value === 'translated' ? '将跳过 ASR 与翻译' : '将跳过 ASR';
+                subtitleNameDisplay.textContent = `已选择：${selectedSubtitleFile.name}（${modeHint}）`;
             });
         }
 
@@ -1975,6 +2016,7 @@ document.addEventListener('DOMContentLoaded', () => {
             selectedSubtitleFile = null;
             if (subtitleInput) subtitleInput.value = '';
             if (subtitleNameDisplay) subtitleNameDisplay.textContent = '未选择字幕文件（默认自动识别）';
+            if (subtitleModeSelect) subtitleModeSelect.value = 'source';
             // 切换新文件时清空旧区间，避免把上一个项目的配置误用于当前文件。
             autoDubTimeRanges = [];
             renderAutoDubTimeRanges();
@@ -2012,15 +2054,19 @@ document.addEventListener('DOMContentLoaded', () => {
                 const apiKey = document.getElementById('auto-dub-api-key').value;
                 const autoPickRangesEl = document.getElementById('auto-dub-auto-pick-ranges');
                 const autoPickRanges = autoPickRangesEl ? !!autoPickRangesEl.checked : true;
+                // 字幕模式：source=源字幕需翻译，translated=已翻译字幕直接跳过翻译。
+                const subtitleMode = subtitleModeSelect ? subtitleModeSelect.value : 'source';
+                const skipTranslationBySubtitle = !!selectedSubtitleFile && subtitleMode === 'translated';
 
                 if (!selectedFile) {
                     alert("Please select a video file first.");
                     return;
                 }
-                if (!apiKey) {
+                if (!apiKey && !skipTranslationBySubtitle) {
                     alert("Please enter your DeepSeek API Key.");
                     return;
                 }
+                autoDubStartedAtMs = Date.now();
 
                 // UI Reset
                 startBtn.disabled = true;
@@ -2029,7 +2075,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (autoProgressFill) {
                     autoProgressFill.style.width = '5%';
                 }
-                statusText.textContent = selectedSubtitleFile ? "Initializing... (Skip ASR with uploaded subtitles)" : "Initializing...";
+                if (selectedSubtitleFile) {
+                    statusText.textContent = subtitleMode === 'translated'
+                        ? "Initializing... (Skip ASR + Translation with uploaded translated subtitles)"
+                        : "Initializing... (Skip ASR with uploaded subtitles)";
+                } else {
+                    statusText.textContent = "Initializing...";
+                }
                 statusText.className = 'status-text';
 
                 // Reset steps
@@ -2046,6 +2098,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     formData.append('video', selectedFile);
                     if (selectedSubtitleFile) {
                         formData.append('subtitle_file', selectedSubtitleFile);
+                        formData.append('subtitle_mode', subtitleMode);
                     }
                     formData.append('source_lang', sourceLang);
                     formData.append('target_lang', targetLang);
@@ -2131,7 +2184,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     if (data.status === 'completed') {
                         clearInterval(interval);
                         startBtn.disabled = false;
-                        statusText.textContent = "Process Complete";
+                        const elapsedLabel = buildAutoDubElapsedLabel(data, autoDubStartedAtMs);
+                        statusText.textContent = elapsedLabel ? `Process Complete · ${elapsedLabel}` : "Process Complete";
                         statusText.className = 'status-text success';
                         renderResults(data);
                     } else if (data.status === 'failed') {
@@ -2248,6 +2302,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     : `Completed ${processed || total}/${total} segments.`;
             } else {
                 summary.textContent = 'Dub completed.';
+            }
+            const elapsedLabel = buildAutoDubElapsedLabel(data, autoDubStartedAtMs);
+            if (elapsedLabel) {
+                summary.textContent = `${summary.textContent} ${elapsedLabel}.`;
             }
             links.appendChild(summary);
         }

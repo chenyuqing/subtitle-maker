@@ -521,6 +521,7 @@ def _run_cli_task(task_id: str, cmd: List[str], env: Dict[str, str], out_root: P
 async def start_auto_dubbing(
     video: UploadFile = File(...),
     subtitle_file: UploadFile | None = File(None),
+    subtitle_mode: str = Form("source"),
     source_lang: str = Form("auto"),
     target_lang: str = Form(...),
     speaker_mode: str = Form("single-speaker"),
@@ -557,13 +558,18 @@ async def start_auto_dubbing(
         raise HTTPException(status_code=400, detail="Invalid auto_pick_min_silence_sec")
     if auto_pick_min_speech_sec < 0.1 or auto_pick_min_speech_sec > 30.0:
         raise HTTPException(status_code=400, detail="Invalid auto_pick_min_speech_sec")
+    subtitle_mode = (subtitle_mode or "").strip().lower() or "source"
+    if subtitle_mode not in {"source", "translated"}:
+        raise HTTPException(status_code=400, detail="Invalid subtitle_mode")
     auto_pick_ranges_enabled = _read_bool_form(auto_pick_ranges, field_name="auto_pick_ranges")
     parsed_time_ranges = _parse_time_ranges_form(time_ranges)
     translate_base_url = (translate_base_url or "").strip() or DEFAULT_TRANSLATE_BASE_URL
     translate_model = (translate_model or "").strip() or DEFAULT_TRANSLATE_MODEL
     index_tts_api_url = (index_tts_api_url or "").strip() or DEFAULT_INDEX_TTS_API_URL
     effective_api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
-    if not effective_api_key and translate_base_url == DEFAULT_TRANSLATE_BASE_URL:
+    # 当上传的是“已翻译字幕”时，自动跳过翻译环节，不强制要求翻译 API Key。
+    skip_translation_by_uploaded_subtitle = bool(subtitle_file is not None and subtitle_file.filename and subtitle_mode == "translated")
+    if (not skip_translation_by_uploaded_subtitle) and (not effective_api_key) and translate_base_url == DEFAULT_TRANSLATE_BASE_URL:
         raise HTTPException(
             status_code=400,
             detail="Translation API key is required. Provide api_key or configure a custom translate_base_url.",
@@ -650,6 +656,7 @@ async def start_auto_dubbing(
     ]
     if input_srt_path is not None:
         cmd.extend(["--input-srt", str(input_srt_path)])
+        cmd.extend(["--input-srt-kind", subtitle_mode])
     if parsed_time_ranges:
         cmd.extend(["--time-ranges-json", json.dumps(parsed_time_ranges, ensure_ascii=False)])
     if source_lang and source_lang != "auto":
@@ -677,6 +684,7 @@ async def start_auto_dubbing(
         "timing_mode": timing_mode,
         "grouping_strategy": grouping_strategy,
         "source_lang": source_lang,
+        "subtitle_mode": subtitle_mode,
         "translate_base_url": translate_base_url,
         "translate_model": translate_model,
         "index_tts_api_url": index_tts_api_url,

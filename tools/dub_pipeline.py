@@ -1908,7 +1908,14 @@ def compose_vocals_master(
             raise RuntimeError("E-MIX-001 inconsistent segment sample rates")
 
         start_sample = int(float(segment["start_sec"]) * sr)
-        own_end_sec = float(segment.get("group_anchor_end_sec", segment["end_sec"]))
+        # 关键逻辑：若存在“借静音后”的有效目标时长，合成窗口也要同步扩展，
+        # 否则会在最终拼轨阶段把前面保留下来的尾音再次截掉。
+        if segment.get("effective_target_duration_sec") is not None:
+            own_end_sec = float(segment["start_sec"]) + max(
+                0.05, float(segment.get("effective_target_duration_sec", 0.0) or 0.0)
+            )
+        else:
+            own_end_sec = float(segment.get("group_anchor_end_sec", segment["end_sec"]))
         own_end_sample = max(start_sample + 1, int(own_end_sec * sr))
 
         if index + 1 < len(valid_segments):
@@ -2607,6 +2614,33 @@ def allocate_balanced_durations(
     return allocated
 
 
+def compute_effective_target_duration(
+    *,
+    start_sec: float,
+    end_sec: float,
+    next_start_sec: Optional[float],
+    gap_guard_sec: float = 0.10,
+) -> Tuple[float, float]:
+    """计算“可借后续静音”后的有效目标时长。
+
+    设计目标：
+    1) 默认目标仍是字幕窗口 end-start；
+    2) 若下一句开始前存在空白，则允许借用空白（扣除 guard）；
+    3) 借用后得到 effective_target_sec，用于替代硬压到原窗口的目标。
+    """
+    base_target_sec = max(0.05, float(end_sec) - float(start_sec))
+    if next_start_sec is None:
+        return base_target_sec, 0.0
+
+    gap_sec = float(next_start_sec) - float(end_sec)
+    if gap_sec <= 0:
+        return base_target_sec, 0.0
+
+    borrow_sec = max(0.0, gap_sec - max(0.0, float(gap_guard_sec)))
+    effective_target_sec = max(base_target_sec, base_target_sec + borrow_sec)
+    return effective_target_sec, borrow_sec
+
+
 def apply_short_fade_edges(*, wav: np.ndarray, sample_rate: int, fade_ms: float = 10.0) -> np.ndarray:
     """为分割后的片段加短淡入淡出，减少切点爆音。"""
     audio = np.asarray(wav, dtype=np.float32).copy()
@@ -2634,6 +2668,7 @@ def synthesize_segments_grouped(
     tts_index: Optional[Any],
     ref_audio_path: Path,
     ref_audio_selector: Optional[Callable[[int], Path]],
+    source_media_duration_sec: Optional[float],
     index_emo_audio_prompt: Optional[Path],
     index_emo_alpha: float,
     index_use_emo_text: bool,
@@ -2678,6 +2713,19 @@ def synthesize_segments_grouped(
         group_start = float(subtitles[indices[0]]["start"])
         group_end = float(subtitles[indices[-1]]["end"])
         group_target_duration = max(0.05, group_end - group_start)
+        # 关键逻辑：允许借用“下一句开始前”的静音窗口，避免无谓的重压缩。
+        next_start_for_group: Optional[float] = None
+        next_index = indices[-1] + 1
+        if next_index < len(subtitles):
+            next_start_for_group = float(subtitles[next_index].get("start", group_end) or group_end)
+        elif source_media_duration_sec is not None:
+            # 关键边界：最后一句/最后一组可借用“到音频末尾”的静音，不应默认为 0。
+            next_start_for_group = float(source_media_duration_sec)
+        group_effective_target_duration, group_borrowed_gap_sec = compute_effective_target_duration(
+            start_sec=group_start,
+            end_sec=group_end,
+            next_start_sec=next_start_for_group,
+        )
         group_texts = [
             (translated_lines[index] if index < len(translated_lines) else subtitles[index]["text"]) or subtitles[index]["text"]
             for index in indices
@@ -2826,29 +2874,61 @@ def synthesize_segments_grouped(
                     if force_fit_timing:
                         raw_group_actual = audio_duration(use_path)
                         raw_group_delta = raw_group_actual - group_target_duration
-                        # sentence 策略：只限制“不超过时间窗上限”，不做强制时长拟合。
+                        raw_group_delta_effective = raw_group_actual - group_effective_target_duration
+                        # sentence 策略：优先做“整句时长拟合”（轻微变速），避免硬截断导致尾音/尾词丢失。
                         if grouping_strategy == "sentence":
-                            if raw_group_actual > group_target_duration:
-                                sentence_cap_path = segment_dir / f"{group_id}_sentence_cap.wav"
-                                trim_audio_to_max_duration(
-                                    input_path=use_path,
-                                    output_path=sentence_cap_path,
-                                    max_duration_sec=group_target_duration,
-                                )
-                                capped_actual = audio_duration(sentence_cap_path)
-                                attempts_base.append(
-                                    {
-                                        "attempt_no": 0,
-                                        "action": "group_sentence_cap_duration",
-                                        "input_text": group_text,
-                                        "actual_duration_sec": round(capped_actual, 3),
-                                        "delta_sec": round(capped_actual - group_target_duration, 3),
-                                        "result": "pass",
-                                        "error": None,
-                                        "ts": iso_now(),
-                                    }
-                                )
-                                use_path = sentence_cap_path
+                            if raw_group_actual > group_effective_target_duration:
+                                sentence_fit_path = segment_dir / f"{group_id}_sentence_fit.wav"
+                                try:
+                                    fit_audio_to_duration(
+                                        input_path=use_path,
+                                        output_path=sentence_fit_path,
+                                        target_duration_sec=group_effective_target_duration,
+                                    )
+                                    fitted_actual = audio_duration(sentence_fit_path)
+                                    attempts_base.append(
+                                        {
+                                            "attempt_no": 0,
+                                            "action": "group_sentence_fit_duration",
+                                            "input_text": group_text,
+                                            "actual_duration_sec": round(fitted_actual, 3),
+                                            "delta_sec": round(fitted_actual - group_target_duration, 3),
+                                            "result": "pass",
+                                            "error": None,
+                                            "data": {
+                                                "effective_target_sec": round(group_effective_target_duration, 3),
+                                                "borrowed_gap_sec": round(group_borrowed_gap_sec, 3),
+                                            },
+                                            "ts": iso_now(),
+                                        }
+                                    )
+                                    use_path = sentence_fit_path
+                                except Exception as fit_exc:
+                                    # 兜底：若变速拟合失败，再退回旧的硬裁剪，保证流水线不中断。
+                                    sentence_cap_path = segment_dir / f"{group_id}_sentence_cap.wav"
+                                    trim_audio_to_max_duration(
+                                        input_path=use_path,
+                                        output_path=sentence_cap_path,
+                                        max_duration_sec=group_effective_target_duration,
+                                    )
+                                    capped_actual = audio_duration(sentence_cap_path)
+                                    attempts_base.append(
+                                        {
+                                            "attempt_no": 0,
+                                            "action": "group_sentence_cap_duration_fallback",
+                                            "input_text": group_text,
+                                            "actual_duration_sec": round(capped_actual, 3),
+                                            "delta_sec": round(capped_actual - group_target_duration, 3),
+                                            "result": "pass",
+                                            "error": f"E-ALN-001 sentence fit failed: {fit_exc}",
+                                            "data": {
+                                                "effective_target_sec": round(group_effective_target_duration, 3),
+                                                "borrowed_gap_sec": round(group_borrowed_gap_sec, 3),
+                                            },
+                                            "ts": iso_now(),
+                                        }
+                                    )
+                                    use_path = sentence_cap_path
                             else:
                                 attempts_base.append(
                                     {
@@ -2859,6 +2939,11 @@ def synthesize_segments_grouped(
                                         "delta_sec": round(raw_group_delta, 3),
                                         "result": "pass",
                                         "error": None,
+                                        "data": {
+                                            "effective_target_sec": round(group_effective_target_duration, 3),
+                                            "borrowed_gap_sec": round(group_borrowed_gap_sec, 3),
+                                            "effective_delta_sec": round(raw_group_delta_effective, 3),
+                                        },
                                         "ts": iso_now(),
                                     }
                                 )
@@ -2867,7 +2952,7 @@ def synthesize_segments_grouped(
                             fit_audio_to_duration(
                                 input_path=use_path,
                                 output_path=fit_path,
-                                target_duration_sec=group_target_duration,
+                                target_duration_sec=group_effective_target_duration,
                             )
                             fit_actual = audio_duration(fit_path)
                             attempts_base.append(
@@ -2879,18 +2964,22 @@ def synthesize_segments_grouped(
                                     "delta_sec": round(fit_actual - group_target_duration, 3),
                                     "result": "pass",
                                     "error": None,
+                                    "data": {
+                                        "effective_target_sec": round(group_effective_target_duration, 3),
+                                        "borrowed_gap_sec": round(group_borrowed_gap_sec, 3),
+                                    },
                                     "ts": iso_now(),
                                 }
                             )
                             use_path = fit_path
                         else:
                             # balanced 模式优先保留自然节奏；仅超阈值时回退 strict 兜底。
-                            relative_shift = abs(raw_group_delta) / max(0.05, group_target_duration)
+                            relative_shift = abs(raw_group_delta_effective) / max(0.05, group_effective_target_duration)
                             if relative_shift > max(0.0, float(balanced_max_tempo_shift)):
                                 fit_audio_to_duration(
                                     input_path=use_path,
                                     output_path=fit_path,
-                                    target_duration_sec=group_target_duration,
+                                    target_duration_sec=group_effective_target_duration,
                                 )
                                 fit_actual = audio_duration(fit_path)
                                 attempts_base.append(
@@ -2902,6 +2991,10 @@ def synthesize_segments_grouped(
                                         "delta_sec": round(fit_actual - group_target_duration, 3),
                                         "result": "pass",
                                         "error": None,
+                                        "data": {
+                                            "effective_target_sec": round(group_effective_target_duration, 3),
+                                            "borrowed_gap_sec": round(group_borrowed_gap_sec, 3),
+                                        },
                                         "ts": iso_now(),
                                     }
                                 )
@@ -2916,6 +3009,11 @@ def synthesize_segments_grouped(
                                         "delta_sec": round(raw_group_delta, 3),
                                         "result": "pass",
                                         "error": None,
+                                        "data": {
+                                            "effective_target_sec": round(group_effective_target_duration, 3),
+                                            "borrowed_gap_sec": round(group_borrowed_gap_sec, 3),
+                                            "effective_delta_sec": round(raw_group_delta_effective, 3),
+                                        },
                                         "ts": iso_now(),
                                     }
                                 )
@@ -2979,28 +3077,38 @@ def synthesize_segments_grouped(
                 if force_fit_timing:
                     retry_actual = audio_duration(retry_use)
                     retry_delta = retry_actual - group_target_duration
+                    retry_delta_effective = retry_actual - group_effective_target_duration
                     if grouping_strategy == "sentence":
-                        if retry_actual > group_target_duration:
-                            trim_audio_to_max_duration(
-                                input_path=retry_use,
-                                output_path=retry_fit,
-                                max_duration_sec=group_target_duration,
-                            )
-                            retry_use = retry_fit
+                        if retry_actual > group_effective_target_duration:
+                            try:
+                                fit_audio_to_duration(
+                                    input_path=retry_use,
+                                    output_path=retry_fit,
+                                    target_duration_sec=group_effective_target_duration,
+                                )
+                                retry_use = retry_fit
+                            except Exception:
+                                # 兜底保持原行为，确保重试路径不因拟合失败直接中断。
+                                trim_audio_to_max_duration(
+                                    input_path=retry_use,
+                                    output_path=retry_fit,
+                                    max_duration_sec=group_effective_target_duration,
+                                )
+                                retry_use = retry_fit
                     elif timing_mode == "strict":
                         fit_audio_to_duration(
                             input_path=retry_use,
                             output_path=retry_fit,
-                            target_duration_sec=group_target_duration,
+                            target_duration_sec=group_effective_target_duration,
                         )
                         retry_use = retry_fit
                     else:
-                        relative_shift = abs(retry_delta) / max(0.05, group_target_duration)
+                        relative_shift = abs(retry_delta_effective) / max(0.05, group_effective_target_duration)
                         if relative_shift > max(0.0, float(balanced_max_tempo_shift)):
                             fit_audio_to_duration(
                                 input_path=retry_use,
                                 output_path=retry_fit,
-                                target_duration_sec=group_target_duration,
+                                target_duration_sec=group_effective_target_duration,
                             )
                             retry_use = retry_fit
 
@@ -3035,7 +3143,8 @@ def synthesize_segments_grouped(
 
             group_actual = audio_duration(use_path)
             group_delta = group_actual - group_target_duration
-            anchor_status = "done" if abs(group_delta) * 1000 <= delta_pass_ms else "manual_review"
+            group_delta_effective = group_actual - group_effective_target_duration
+            anchor_status = "done" if abs(group_delta_effective) * 1000 <= delta_pass_ms else "manual_review"
 
             # 统一按“整句组”落盘，不再把组内再次切成短片段。
             for local_index, global_index in enumerate(indices):
@@ -3075,6 +3184,9 @@ def synthesize_segments_grouped(
                     record["skip_compose"] = False
                     record["group_anchor_end_sec"] = round(group_end, 3)
                     record["group_text"] = group_text
+                    record["effective_target_duration_sec"] = round(group_effective_target_duration, 3)
+                    record["borrowed_gap_sec"] = round(group_borrowed_gap_sec, 3)
+                    record["effective_delta_sec"] = round(group_delta_effective, 3)
 
                 records_by_index[global_index] = record
 
@@ -3086,6 +3198,7 @@ def synthesize_segments_grouped(
                         "reason_code": "duration_exceeded_after_retries",
                         "reason_detail": "grouped synthesis anchor out of threshold",
                         "last_delta_sec": round(group_delta, 3),
+                        "last_effective_delta_sec": round(group_delta_effective, 3),
                         "last_attempt_no": 0,
                         "error_code": "E-ALN-001",
                         "error_stage": "duration_align",
@@ -3158,6 +3271,7 @@ def synthesize_segments(
     ref_audio_path: Path,
     ref_audio_selector: Optional[Callable[[int], Path]],
     source_vocals_audio: Path,
+    source_media_duration_sec: Optional[float],
     speaker_mode: str,
     index_emo_audio_prompt: Optional[Path],
     index_emo_alpha: float,
@@ -3190,6 +3304,18 @@ def synthesize_segments(
         start_sec = float(subtitle["start"])
         end_sec = float(subtitle["end"])
         target_duration = max(0.05, end_sec - start_sec)
+        # 关键逻辑：在单句模式也允许借用后续静音，减少无谓压缩。
+        next_start_sec: Optional[float] = None
+        if idx < len(subtitles):
+            next_start_sec = float(subtitles[idx].get("start", end_sec) or end_sec)
+        elif source_media_duration_sec is not None:
+            # 关键边界：最后一句可借用到媒体末尾的静音，避免被过度压缩。
+            next_start_sec = float(source_media_duration_sec)
+        effective_target_duration, borrowed_gap_sec = compute_effective_target_duration(
+            start_sec=start_sec,
+            end_sec=end_sec,
+            next_start_sec=next_start_sec,
+        )
         source_text = subtitle["text"]
         current_text = translated_text or source_text
         attempts: List[Dict[str, Any]] = []
@@ -3309,7 +3435,8 @@ def synthesize_segments(
                     continue
                 break
             delta = actual - target_duration
-            abs_delta = abs(delta)
+            delta_effective = actual - effective_target_duration
+            abs_delta = abs(delta_effective)
             attempts.append(
                 {
                     "attempt_no": attempt_no,
@@ -3319,6 +3446,11 @@ def synthesize_segments(
                     "delta_sec": round(delta, 3),
                     "result": "pass" if abs_delta * 1000 <= delta_pass_ms else "fail",
                     "error": None,
+                    "data": {
+                        "effective_target_sec": round(effective_target_duration, 3),
+                        "borrowed_gap_sec": round(borrowed_gap_sec, 3),
+                        "effective_delta_sec": round(delta_effective, 3),
+                    },
                     "ts": iso_now(),
                 }
             )
@@ -3329,10 +3461,11 @@ def synthesize_segments(
                     fit_audio_to_duration(
                         input_path=raw_path,
                         output_path=fit_path,
-                        target_duration_sec=target_duration,
+                        target_duration_sec=effective_target_duration,
                     )
                     actual_fit = audio_duration(fit_path)
                     delta_fit = actual_fit - target_duration
+                    delta_fit_effective = actual_fit - effective_target_duration
                     attempts.append(
                         {
                             "attempt_no": attempt_no,
@@ -3342,6 +3475,11 @@ def synthesize_segments(
                             "delta_sec": round(delta_fit, 3),
                             "result": "pass",
                             "error": None,
+                            "data": {
+                                "effective_target_sec": round(effective_target_duration, 3),
+                                "borrowed_gap_sec": round(borrowed_gap_sec, 3),
+                                "effective_delta_sec": round(delta_fit_effective, 3),
+                            },
                             "ts": iso_now(),
                         }
                     )
@@ -3359,11 +3497,16 @@ def synthesize_segments(
                             "delta_sec": round(delta, 3),
                             "result": "fail",
                             "error": f"E-ALN-001 {type(exc).__name__}: {exc}",
+                            "data": {
+                                "effective_target_sec": round(effective_target_duration, 3),
+                                "borrowed_gap_sec": round(borrowed_gap_sec, 3),
+                                "effective_delta_sec": round(delta_effective, 3),
+                            },
                             "ts": iso_now(),
                         }
                     )
 
-            if best is None or abs_delta < abs(best[2]):
+            if best is None or abs_delta < abs(best[1] - effective_target_duration):
                 best = (raw_path, actual, delta)
 
             if abs_delta * 1000 <= delta_pass_ms:
@@ -3372,12 +3515,13 @@ def synthesize_segments(
                 break
 
             if abs_delta * 1000 <= delta_rewrite_ms:
-                tempo = clamp(actual / target_duration, atempo_min, atempo_max)
+                tempo = clamp(actual / effective_target_duration, atempo_min, atempo_max)
                 adjusted_path = segment_dir / f"{seg_id}_a{attempt_no}_atempo.wav"
                 try:
                     apply_atempo(input_path=raw_path, output_path=adjusted_path, tempo=tempo)
                     actual2 = audio_duration(adjusted_path)
                     delta2 = actual2 - target_duration
+                    delta2_effective = actual2 - effective_target_duration
                     attempts.append(
                         {
                             "attempt_no": attempt_no,
@@ -3385,14 +3529,19 @@ def synthesize_segments(
                             "input_text": current_text,
                             "actual_duration_sec": round(actual2, 3),
                             "delta_sec": round(delta2, 3),
-                            "result": "pass" if abs(delta2) * 1000 <= delta_pass_ms else "fail",
+                            "result": "pass" if abs(delta2_effective) * 1000 <= delta_pass_ms else "fail",
                             "error": None,
+                            "data": {
+                                "effective_target_sec": round(effective_target_duration, 3),
+                                "borrowed_gap_sec": round(borrowed_gap_sec, 3),
+                                "effective_delta_sec": round(delta2_effective, 3),
+                            },
                             "ts": iso_now(),
                         }
                     )
-                    if best is None or abs(delta2) < abs(best[2]):
+                    if best is None or abs(delta2_effective) < abs(best[1] - effective_target_duration):
                         best = (adjusted_path, actual2, delta2)
-                    if abs(delta2) * 1000 <= delta_pass_ms:
+                    if abs(delta2_effective) * 1000 <= delta_pass_ms:
                         final_status = "done"
                         retry_count = attempt_no
                         break
@@ -3406,6 +3555,11 @@ def synthesize_segments(
                             "delta_sec": round(delta, 3),
                             "result": "fail",
                             "error": f"E-ALN-001 {type(exc).__name__}: {exc}",
+                            "data": {
+                                "effective_target_sec": round(effective_target_duration, 3),
+                                "borrowed_gap_sec": round(borrowed_gap_sec, 3),
+                                "effective_delta_sec": round(delta_effective, 3),
+                            },
                             "ts": iso_now(),
                         }
                     )
@@ -3462,6 +3616,7 @@ def synthesize_segments(
             shutil.copy2(best[0], output_path)
             actual_best = best[1]
             delta_best = best[2]
+        effective_delta_best = actual_best - effective_target_duration
 
         record: Dict[str, Any] = {
             "id": seg_id,
@@ -3474,6 +3629,9 @@ def synthesize_segments(
             "tts_audio_path": str(output_path),
             "actual_duration_sec": round(actual_best, 3),
             "delta_sec": round(delta_best, 3),
+            "effective_target_duration_sec": round(effective_target_duration, 3),
+            "borrowed_gap_sec": round(borrowed_gap_sec, 3),
+            "effective_delta_sec": round(effective_delta_best, 3),
             "status": final_status if final_status == "done" else "manual_review",
             "retry_count": retry_count,
             "attempt_history": attempts,
@@ -3487,6 +3645,7 @@ def synthesize_segments(
                     "reason_code": failure_reason_code,
                     "reason_detail": "segment not within pass threshold after retries",
                     "last_delta_sec": round(delta_best, 3),
+                    "last_effective_delta_sec": round(effective_delta_best, 3),
                     "last_attempt_no": max_retry,
                     "error_code": failure_error_code,
                     "error_stage": failure_stage,
@@ -3498,7 +3657,11 @@ def synthesize_segments(
                 "segment_manual_review_marked",
                 f"{seg_id} marked manual review",
                 segment_id=seg_id,
-                data={"error_code": failure_error_code, "delta_sec": round(delta_best, 3)},
+                data={
+                    "error_code": failure_error_code,
+                    "delta_sec": round(delta_best, 3),
+                    "effective_delta_sec": round(effective_delta_best, 3),
+                },
             )
 
     return records, manual_review
@@ -3695,6 +3858,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-lang", required=True, help="Target translation language")
     parser.add_argument("--out-dir", required=True, help="Output directory")
     parser.add_argument("--input-srt", help="Optional SRT path to skip ASR")
+    parser.add_argument(
+        "--input-srt-kind",
+        default="source",
+        choices=["source", "translated"],
+        help="Type of --input-srt: source(need translation) or translated(skip translation)",
+    )
 
     parser.add_argument("--speaker-mode", default="single-speaker", choices=["single-speaker", "per-speaker", "auto"])
     parser.add_argument("--diarization-provider", default="auto", choices=["auto", "pyannote", "simple"])
@@ -3907,6 +4076,8 @@ def main() -> int:
     manifest_path = job_dir / "manifest.json"
 
     separate_vocals = read_bool(args.separate_vocals)
+    input_srt_kind = (args.input_srt_kind or "source").strip().lower()
+    input_srt_is_translated = bool(args.input_srt) and input_srt_kind == "translated"
     bilingual_enabled = read_bool(args.bilingual_srt)
     export_vocals = read_bool(args.export_vocals)
     export_mix = read_bool(args.export_mix)
@@ -4102,7 +4273,18 @@ def main() -> int:
                 "subtitle range filtering applied",
                 data={"before": before_count, "after": len(subtitles)},
             )
-            translated_lines = []
+            if input_srt_is_translated:
+                # 上传的是翻译字幕：区间过滤后直接复用为配音文本，跳过翻译阶段。
+                translated_lines = [item["text"] for item in subtitles]
+                save_srt(
+                    [
+                        {"start": float(item["start"]), "end": float(item["end"]), "text": text}
+                        for item, text in zip(subtitles, translated_lines)
+                    ],
+                    translated_srt,
+                )
+            else:
+                translated_lines = []
 
         # 识别字幕完成后再做人声分离，避免“分离音频退化”影响字幕时间戳。
         if source_vocals.exists():
@@ -4169,6 +4351,24 @@ def main() -> int:
                 progress=60,
             )
             translated_lines = []
+        elif input_srt_is_translated:
+            # 关键逻辑：当输入字幕已是目标语言时，直接跳过翻译并复用文本。
+            translated_lines = [item["text"] for item in subtitles]
+            save_srt(
+                [
+                    {"start": float(item["start"]), "end": float(item["end"]), "text": text}
+                    for item, text in zip(subtitles, translated_lines)
+                ],
+                translated_srt,
+            )
+            logger.log(
+                "INFO",
+                "translate",
+                "translation_skipped_input_translated_srt",
+                "uploaded subtitles marked translated, skip translation step",
+                progress=60,
+                data={"count": len(translated_lines)},
+            )
         elif not translated_lines:
             api_key = args.api_key or os.environ.get(args.api_key_env)
             if not api_key:
@@ -4330,6 +4530,7 @@ def main() -> int:
                 tts_index=tts_index,
                 ref_audio_path=ref_audio_path,
                 ref_audio_selector=ref_audio_selector,
+                source_media_duration_sec=source_duration_sec,
                 index_emo_audio_prompt=index_emo_audio_prompt_path,
                 index_emo_alpha=args.index_emo_alpha,
                 index_use_emo_text=index_use_emo_text,
@@ -4366,6 +4567,7 @@ def main() -> int:
                 ref_audio_path=ref_audio_path,
                 ref_audio_selector=ref_audio_selector,
                 source_vocals_audio=separation.vocals_audio,
+                source_media_duration_sec=source_duration_sec,
                 speaker_mode=args.speaker_mode,
                 index_emo_audio_prompt=index_emo_audio_prompt_path,
                 index_emo_alpha=args.index_emo_alpha,
