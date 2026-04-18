@@ -43,6 +43,25 @@ DEFAULT_TRANSLATE_MODEL = "deepseek-chat"
 DEFAULT_INDEX_TTS_API_URL = "http://127.0.0.1:8010"
 
 
+def _index_tts_target_lang_supported(target_lang: str) -> bool:
+    """判断当前 index-tts 服务是否支持目标语种（本地部署版本仅稳定支持中/英）。"""
+    lowered = (target_lang or "").strip().lower()
+    if not lowered:
+        return False
+    # 兼容中英文常见写法；其余语种（如 Japanese）直接拦截，避免生成无效音。
+    supported_markers = [
+        "chinese",
+        "中文",
+        "mandarin",
+        "cantonese",
+        "english",
+        "英文",
+        "en",
+        "zh",
+    ]
+    return any(marker in lowered for marker in supported_markers)
+
+
 def _iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -544,6 +563,14 @@ async def start_auto_dubbing(
         raise HTTPException(status_code=400, detail="Invalid segment duration settings")
     if not target_lang.strip():
         raise HTTPException(status_code=400, detail="target_lang is required")
+    if not _index_tts_target_lang_supported(target_lang):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Current index-tts backend in this project only supports Chinese/English reliably. "
+                f"Unsupported target_lang: {target_lang}"
+            ),
+        )
     # 允许前端显式传入说话人模式；默认保持单人模式，确保兼容历史行为
     speaker_mode = (speaker_mode or "").strip() or "single-speaker"
     if speaker_mode not in {"single-speaker", "per-speaker", "auto"}:
@@ -602,6 +629,10 @@ async def start_auto_dubbing(
         input_srt_path = upload_dir / f"manual_{subtitle_name}"
         with input_srt_path.open("wb") as handle:
             shutil.copyfileobj(subtitle_file.file, handle)
+    # 上传字幕时，默认走“按字幕时间轴处理”的稳定链路，避免自动语音区间切成大量碎片段。
+    # 这能防止出现“用户未显式开启 auto-pick，但任务仍按 auto ranges 切 10 段”的误行为。
+    if input_srt_path is not None and auto_pick_ranges_enabled:
+        auto_pick_ranges_enabled = False
 
     cmd = [
         sys.executable,

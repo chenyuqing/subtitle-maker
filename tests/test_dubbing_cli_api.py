@@ -228,6 +228,31 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertIn("--input-srt", task["command"])
         self.assertTrue(task.get("input_srt"))
 
+    def test_start_auto_dubbing_forces_auto_pick_off_when_subtitle_uploaded(self):
+        with patch.object(dubbing_cli_api.threading, "Thread", FakeThread), patch.object(
+            dubbing_cli_api, "_check_index_tts_service", return_value=None
+        ):
+            response = self.client.post(
+                "/dubbing/auto/start",
+                files={
+                    "video": ("demo.mp4", b"video-data", "video/mp4"),
+                    "subtitle_file": ("manual.srt", b"1\n00:00:00,000 --> 00:00:01,000\nhi\n", "application/x-subrip"),
+                },
+                data={
+                    "target_lang": "Chinese",
+                    "api_key": "secret-key",
+                    "auto_pick_ranges": "true",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        task = self.client.get(f"/dubbing/auto/status/{payload['task_id']}").json()
+        self.assertEqual(task["auto_pick_ranges"], False)
+        self.assertIn("--auto-pick-ranges", task["command"])
+        auto_pick_index = task["command"].index("--auto-pick-ranges")
+        self.assertEqual(task["command"][auto_pick_index + 1], "false")
+
     def test_start_auto_dubbing_accepts_translated_subtitle_without_api_key(self):
         with patch.object(dubbing_cli_api.threading, "Thread", FakeThread), patch.object(
             dubbing_cli_api, "_check_index_tts_service", return_value=None

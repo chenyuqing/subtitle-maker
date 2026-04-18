@@ -570,11 +570,14 @@ def start():
     # 明确单 worker，保证基于内存的任务状态读写在同一进程内
     uvicorn.run("subtitle_maker.web:app", host="0.0.0.0", port=8000, reload=reload_enabled, workers=1)
 
-def clear_directory_contents(target_dir: str) -> int:
-    """Remove all files and folders inside the given directory."""
+def clear_directory_contents(target_dir: str, exclude_names: Optional[set[str]] = None) -> int:
+    """Remove files/folders inside directory, excluding specified entry names."""
     os.makedirs(target_dir, exist_ok=True)
+    excludes = set(exclude_names or set())
     removed = 0
     for entry in os.listdir(target_dir):
+        if entry in excludes:
+            continue
         path = os.path.join(target_dir, entry)
         try:
             if os.path.isfile(path) or os.path.islink(path):
@@ -643,10 +646,11 @@ async def stop_index_tts_model_service():
 
 @app.post("/project/reset")
 async def reset_project_storage():
-    """Clear uploads/outputs directories so the next project starts fresh."""
+    """Clear legacy uploads/outputs but keep auto-dubbing history directories."""
     cancelled_auto_tasks = cancel_active_dubbing("Cancelled via project reset")
+    # New Project 需要清理 uploads/dubbing，避免旧上传文件干扰后续任务。
     uploads_removed = clear_directory_contents(UPLOAD_DIR)
-    outputs_removed = clear_directory_contents(OUTPUT_DIR)
+    outputs_removed = clear_directory_contents(OUTPUT_DIR, exclude_names={"dub_jobs"})
     return {
         "status": "reset",
         "cancelled_auto_tasks": cancelled_auto_tasks,

@@ -169,3 +169,29 @@
 - 校验通过：`uv run python -m py_compile src/subtitle_maker/dubbing_cli_api.py tools/dub_long_video.py tools/dub_pipeline.py tests/test_dubbing_cli_api.py`。
 - 校验通过：`uv run python -m unittest tests/test_dubbing_cli_api.py`，`Ran 17 tests ... OK`。
 - 校验通过：`node --check src/subtitle_maker/static/app.js`。
+
+## 2026-04-18 Auto Dubbing 稳定性修复收口（翻译字幕链路）
+
+- [x] 修复 auto ranges 被隐式开启导致碎片分段
+- [x] New Project 禁止误触发 segment resume in-place
+- [x] 上传翻译字幕统一清洗 `<b>`、`[]`、`{}`
+- [x] 上传翻译字幕改为句级 start 对齐（end 自然收尾）
+- [x] 上传翻译字幕禁用重试改写，保留用户文本
+- [x] 清理逐句重试中间文件 `seg_xxxx_a*.wav`
+- [x] New Project 清理 `uploads/dubbing` 但保留 `outputs/dub_jobs`
+- [x] `longdub` 目录命名改为纯时间戳（无 `-001`）
+- [x] 增加“上传字幕时强制关闭 auto-pick”单测
+- [x] 完成 py_compile + unittest 回归验证
+
+## Review（2026-04-18 稳定性修复收口）
+- `src/subtitle_maker/static/app.js` 修复 `autoPickRanges` 缺省值为 `false`，并与模板默认取消勾选一致。
+- `src/subtitle_maker/dubbing_cli_api.py` 上传字幕时强制关闭 `auto_pick_ranges`，避免未显式开启却自动碎片分段。
+- `tools/dub_long_video.py` 修复 New Project 场景误打印/误使用 `resume in-place`，并保持 `segment_jobs/segment_xxxx` 一一对应。
+- `tools/dub_pipeline.py` 新增字幕清洗（HTML 标签、括号说明），并接入上传字幕/复用字幕/翻译字幕跳过翻译主链路。
+- `tools/dub_pipeline.py` 上传翻译字幕时强制逐句合成、关闭硬性 end 拟合、关闭改写重翻，保障“start 严格对齐 + 文案不改写”。
+- `tools/dub_pipeline.py` 增加逐句中间文件清理，消除 `seg_xxxx_a0/a1/a3.wav` 残留干扰。
+- `src/subtitle_maker/web.py` 调整 `/project/reset`：清理 `uploads/dubbing`，保留 `outputs/dub_jobs` 历史结果。
+- `tools/dub_long_video.py` 批次命名改为 `longdub_YYYYMMDD_HHMMSS`（无序号后缀）。
+- `tests/test_dubbing_cli_api.py` 新增上传字幕时 `auto_pick_ranges=true` 仍被强制关掉的回归测试。
+- 校验通过：`uv run python -m py_compile src/subtitle_maker/web.py src/subtitle_maker/dubbing_cli_api.py tools/dub_long_video.py tools/dub_pipeline.py`。
+- 校验通过：`uv run python -m unittest tests/test_dubbing_cli_api.py`，`Ran 20 tests ... OK`。

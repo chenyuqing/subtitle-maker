@@ -2053,7 +2053,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 const groupingStrategy = groupingStrategySelect ? groupingStrategySelect.value : 'sentence';
                 const apiKey = document.getElementById('auto-dub-api-key').value;
                 const autoPickRangesEl = document.getElementById('auto-dub-auto-pick-ranges');
-                const autoPickRanges = autoPickRangesEl ? !!autoPickRangesEl.checked : true;
+                // 兜底默认关闭：当页面未渲染该控件时，避免误开启自动区间切分导致碎片分段。
+                const autoPickRanges = autoPickRangesEl ? !!autoPickRangesEl.checked : false;
                 // 字幕模式：source=源字幕需翻译，translated=已翻译字幕直接跳过翻译。
                 const subtitleMode = subtitleModeSelect ? subtitleModeSelect.value : 'source';
                 const skipTranslationBySubtitle = !!selectedSubtitleFile && subtitleMode === 'translated';

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import html
 import json
 import os
 import re
@@ -554,13 +555,21 @@ def load_or_transcribe_subtitles(
     if input_srt is not None:
         text = input_srt.read_text(encoding="utf-8")
         subtitles = parse_srt(text)
+        # 上传字幕统一做文本清洗：去 HTML 标签与括号说明，避免生成无效音。
+        subtitles, changed_count = sanitize_subtitles_for_tts(subtitles)
         media_duration_sec = audio_duration(asr_audio)
         subtitles = enforce_subtitle_timestamps(
             subtitles=subtitles,
             media_duration_sec=media_duration_sec,
         )
         save_srt(subtitles, source_srt_path)
-        logger.log("INFO", "asr_align", "srt_loaded", "loaded existing srt input", data={"count": len(subtitles)})
+        logger.log(
+            "INFO",
+            "asr_align",
+            "srt_loaded",
+            "loaded existing srt input",
+            data={"count": len(subtitles), "sanitized_lines": int(changed_count)},
+        )
         return subtitles
 
     logger.log("INFO", "asr_align", "asr_started", "transcribing source audio")
@@ -600,6 +609,8 @@ def load_or_transcribe_subtitles(
             preprocessed=False,
         ):
             subtitles.extend(generator.generate_subtitles(chunk_results, max_len=max_width))
+        # ASR 结果也走相同清洗规则，统一后续 TTS 输入规范。
+        subtitles, changed_count = sanitize_subtitles_for_tts(subtitles)
         if asr_offset_sec > 0.0:
             for item in subtitles:
                 item["start"] = float(item.get("start", 0.0) or 0.0) + asr_offset_sec
@@ -622,7 +633,7 @@ def load_or_transcribe_subtitles(
             "asr_align",
             "asr_timestamp_health",
             "subtitle timestamp health checked",
-            data={"before": before_health, "after": after_health},
+            data={"before": before_health, "after": after_health, "sanitized_lines": int(changed_count)},
         )
         save_srt(subtitles, source_srt_path)
         logger.log("INFO", "asr_align", "asr_completed", "transcription completed", data={"count": len(subtitles)})
@@ -731,6 +742,50 @@ def is_punctuation_only_text(text: str) -> bool:
     if not compact:
         return False
     return bool(re.fullmatch(r"[,.;:!?，。！？、；：…\"'`~\-—_(){}\[\]<>/|\\]+", compact))
+
+
+def sanitize_subtitle_text(text: str) -> str:
+    """清洗字幕文本，移除 HTML 与括号内情绪/舞台说明。"""
+    # 先反转 HTML 实体，再去掉标签（如 <b>...</b>）。
+    cleaned = html.unescape(text or "")
+    cleaned = re.sub(r"<[^>]+>", "", cleaned)
+
+    # 递归移除常见括号内容（含中英文半角/全角），避免把情绪说明送入 TTS。
+    bracket_patterns = [
+        r"\[[^\[\]]*\]",
+        r"\{[^{}]*\}",
+        r"\([^()]*\)",
+        r"【[^【】]*】",
+        r"（[^（）]*）",
+        r"｛[^｛｝]*｝",
+    ]
+    changed = True
+    while changed:
+        changed = False
+        for pattern in bracket_patterns:
+            updated = re.sub(pattern, "", cleaned)
+            if updated != cleaned:
+                changed = True
+                cleaned = updated
+
+    # 统一空白，避免残留换行/多空格影响后续分组与合成。
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def sanitize_subtitles_for_tts(subtitles: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+    """批量清洗字幕文本，返回新字幕列表与发生变更的行数。"""
+    output: List[Dict[str, Any]] = []
+    changed_count = 0
+    for item in subtitles:
+        old_text = str(item.get("text", "") or "")
+        new_text = sanitize_subtitle_text(old_text)
+        if new_text != old_text:
+            changed_count += 1
+        updated = dict(item)
+        updated["text"] = new_text
+        output.append(updated)
+    return output, changed_count
 
 
 def merge_text_lines(lines: List[str], *, cjk_mode: bool) -> str:
@@ -3292,9 +3347,16 @@ def synthesize_segments(
     max_retry: int,
     translator: Translator,
     target_lang: str,
+    allow_rewrite_translation: bool,
     logger: JsonlLogger,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     segment_dir.mkdir(parents=True, exist_ok=True)
+    # 清理历史重试残留，避免 resume in-place 时出现 a0/a1/a3 混杂误导排查。
+    for stale_path in segment_dir.glob("seg_*_a*.wav"):
+        try:
+            stale_path.unlink(missing_ok=True)
+        except Exception:
+            pass
     records: List[Dict[str, Any]] = []
     manual_review: List[Dict[str, Any]] = []
 
@@ -3319,6 +3381,8 @@ def synthesize_segments(
         source_text = subtitle["text"]
         current_text = translated_text or source_text
         attempts: List[Dict[str, Any]] = []
+        # 记录本句产生的临时尝试音频，结束后统一清理，仅保留最终产物。
+        attempt_artifacts: List[Path] = []
         best: Optional[Tuple[Path, float, float]] = None
         final_status = "failed"
         retry_count = 0
@@ -3332,6 +3396,7 @@ def synthesize_segments(
 
         for attempt_no in range(0, max_retry + 1):
             raw_path = segment_dir / f"{seg_id}_a{attempt_no}.wav"
+            attempt_artifacts.append(raw_path)
             try:
                 if tts_backend == "qwen":
                     if tts_qwen is None or qwen_prompt_items is None:
@@ -3463,6 +3528,7 @@ def synthesize_segments(
                         output_path=fit_path,
                         target_duration_sec=effective_target_duration,
                     )
+                    attempt_artifacts.append(fit_path)
                     actual_fit = audio_duration(fit_path)
                     delta_fit = actual_fit - target_duration
                     delta_fit_effective = actual_fit - effective_target_duration
@@ -3519,6 +3585,7 @@ def synthesize_segments(
                 adjusted_path = segment_dir / f"{seg_id}_a{attempt_no}_atempo.wav"
                 try:
                     apply_atempo(input_path=raw_path, output_path=adjusted_path, tempo=tempo)
+                    attempt_artifacts.append(adjusted_path)
                     actual2 = audio_duration(adjusted_path)
                     delta2 = actual2 - target_duration
                     delta2_effective = actual2 - effective_target_duration
@@ -3564,7 +3631,8 @@ def synthesize_segments(
                         }
                     )
 
-            if attempt_no < max_retry:
+            # 上传翻译字幕场景可关闭改写：仅做语音合成重试，不再改动字幕文本本身。
+            if allow_rewrite_translation and attempt_no < max_retry:
                 need_shorter = delta > 0
                 try:
                     rewritten = retranslate_single_line(
@@ -3663,6 +3731,14 @@ def synthesize_segments(
                     "effective_delta_sec": round(effective_delta_best, 3),
                 },
             )
+
+        # 清理本句中间重试文件，目录中仅保留最终可消费结果，避免“命名一会一变”。
+        for artifact in attempt_artifacts:
+            try:
+                if artifact.exists():
+                    artifact.unlink(missing_ok=True)
+            except Exception:
+                pass
 
     return records, manual_review
 
@@ -4088,6 +4164,29 @@ def main() -> int:
     display_merge_fragments = read_bool(args.display_merge_fragments)
     force_fit_timing = read_bool(args.force_fit_timing)
     grouped_synthesis = read_bool(args.grouped_synthesis)
+    # 上传“已翻译字幕”时，优先遵循用户提供的句级时间轴：
+    # 1) 关闭 grouped 合成，改为逐句合成与逐句贴轨（严格对齐）；
+    # 2) 逐句流程仍保留“借后续静音”窗口，避免尾音被硬截断导致漏音。
+    if input_srt_is_translated:
+        if grouped_synthesis:
+            grouped_synthesis = False
+            logger.log(
+                "INFO",
+                "tts",
+                "grouped_synthesis_forced_off",
+                "uploaded translated subtitles force per-line synthesis for strict start-time alignment",
+                data={"input_srt_kind": "translated"},
+            )
+        # 上传翻译字幕时：只要求 start 严格对齐，end 允许自然收尾（可借后续静音，不强制 fit 到 end）。
+        if force_fit_timing:
+            force_fit_timing = False
+            logger.log(
+                "INFO",
+                "duration_align",
+                "force_fit_timing_forced_off",
+                "uploaded translated subtitles disable hard end fitting (start-aligned, natural ending)",
+                data={"input_srt_kind": "translated"},
+            )
     # 保留 grouped 开关：用于对比 legacy/sentence 两种切分策略。
     index_use_fp16 = read_bool(args.index_use_fp16)
     index_use_accel = read_bool(args.index_use_accel)
@@ -4183,6 +4282,17 @@ def main() -> int:
         ]
         if source_srt.exists():
             source_subtitles_loaded = parse_srt(source_srt.read_text(encoding="utf-8"))
+            # 兼容历史任务：复用旧字幕前先做文本清洗，避免旧文件中的标签/括号说明污染 TTS。
+            source_subtitles_loaded, source_sanitize_count = sanitize_subtitles_for_tts(source_subtitles_loaded)
+            if source_sanitize_count > 0:
+                save_srt(source_subtitles_loaded, source_srt)
+                logger.log(
+                    "INFO",
+                    "asr_align",
+                    "source_subtitle_sanitized",
+                    "sanitized existing source subtitles before reuse",
+                    data={"sanitized_lines": int(source_sanitize_count)},
+                )
             source_health = analyze_subtitle_timestamps(source_subtitles_loaded)
             bad_source_srt = (
                 source_health["zero_or_negative"] > 0
@@ -4215,6 +4325,16 @@ def main() -> int:
                 subtitles = source_subtitles_loaded
                 if translated_srt.exists():
                     translated_items = parse_srt(translated_srt.read_text(encoding="utf-8"))
+                    translated_items, translated_sanitize_count = sanitize_subtitles_for_tts(translated_items)
+                    if translated_sanitize_count > 0:
+                        save_srt(translated_items, translated_srt)
+                        logger.log(
+                            "INFO",
+                            "translate",
+                            "translated_subtitle_sanitized",
+                            "sanitized existing translated subtitles before reuse",
+                            data={"sanitized_lines": int(translated_sanitize_count)},
+                        )
                 else:
                     translated_items = []
                 if len(subtitles) == len(translated_items) and subtitles and translated_items:
@@ -4275,7 +4395,7 @@ def main() -> int:
             )
             if input_srt_is_translated:
                 # 上传的是翻译字幕：区间过滤后直接复用为配音文本，跳过翻译阶段。
-                translated_lines = [item["text"] for item in subtitles]
+                translated_lines = [sanitize_subtitle_text(item["text"]) for item in subtitles]
                 save_srt(
                     [
                         {"start": float(item["start"]), "end": float(item["end"]), "text": text}
@@ -4353,7 +4473,7 @@ def main() -> int:
             translated_lines = []
         elif input_srt_is_translated:
             # 关键逻辑：当输入字幕已是目标语言时，直接跳过翻译并复用文本。
-            translated_lines = [item["text"] for item in subtitles]
+            translated_lines = [sanitize_subtitle_text(item["text"]) for item in subtitles]
             save_srt(
                 [
                     {"start": float(item["start"]), "end": float(item["end"]), "text": text}
@@ -4368,6 +4488,13 @@ def main() -> int:
                 "uploaded subtitles marked translated, skip translation step",
                 progress=60,
                 data={"count": len(translated_lines)},
+            )
+            logger.log(
+                "INFO",
+                "translate",
+                "translation_rewrite_disabled",
+                "uploaded translated subtitles disable rewrite step to preserve provided wording",
+                data={"input_srt_kind": "translated"},
             )
         elif not translated_lines:
             api_key = args.api_key or os.environ.get(args.api_key_env)
@@ -4592,6 +4719,7 @@ def main() -> int:
                     model=args.translate_model,
                 ),
                 target_lang=args.target_lang,
+                allow_rewrite_translation=not input_srt_is_translated,
                 logger=logger,
             )
         manual_review.extend(segment_manual)

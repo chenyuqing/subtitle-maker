@@ -33,14 +33,9 @@ def iso_now() -> str:
 
 
 def build_readable_batch_id(*, out_root: Path, time_tag: str) -> str:
-    # 生成可读批次名：固定三位序号后缀，格式如 20260417_192311-001。
-    base = time_tag
-    index = 1
-    while True:
-        candidate = f"{base}-{index:03d}"
-        if not (out_root / f"longdub_{candidate}").exists():
-            return candidate
-        index += 1
+    # 批次名仅使用时间戳，不追加 -001/-002 后缀。
+    # 目录隔离由上层 web_<task_id> 保证（每次上传一个新 task 目录）。
+    return time_tag
 
 
 def run_cmd(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, str, str]:
@@ -373,6 +368,30 @@ def concat_wav_files(inputs: List[Path], output_wav: Path) -> None:
     )
 
 
+def mix_vocals_with_bgm(*, vocals_wav: Path, bgm_wav: Path, output_wav: Path) -> None:
+    # 全局只混一次，替代分段逐个混音，减少总耗时与中间文件体积。
+    output_wav.parent.mkdir(parents=True, exist_ok=True)
+    run_cmd_checked(
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(vocals_wav),
+            "-i",
+            str(bgm_wav),
+            "-filter_complex",
+            "[0:a]volume=1.0[v];[1:a]volume=1.0[b];[v][b]amix=inputs=2:duration=longest:dropout_transition=0[m]",
+            "-map",
+            "[m]",
+            "-ac",
+            "1",
+            "-ar",
+            "44100",
+            str(output_wav),
+        ]
+    )
+
+
 def _load_mono_audio(path: Path) -> Tuple[np.ndarray, int]:
     # 读取音频并统一为单声道 float32，便于后续时间轴替换。
     wav, sample_rate = sf.read(str(path))
@@ -584,10 +603,18 @@ def run_segment_job(
     if input_srt_path is not None:
         cmd.extend(["--input-srt", str(input_srt_path)])
         cmd.extend(["--input-srt-kind", (input_srt_kind or "source")])
+    # 性能优化：分段阶段默认不导出 mix，避免“每段混音 + 最终再拼接”重复开销。
+    if "--export-mix" not in extra_args:
+        cmd.extend(["--export-mix", "false"])
     if extra_args:
         cmd.extend(extra_args)
 
-    if resume_job_dir is not None and resume_job_dir.exists():
+    is_real_resume = bool(
+        resume_job_dir is not None
+        and resume_job_dir.exists()
+        and (resume_job_dir / "manifest.json").exists()
+    )
+    if is_real_resume:
         print(f"\n===== Segment {segment_index:02d} resume in-place: {resume_job_dir.name} =====")
     else:
         print(f"\n===== Segment {segment_index:02d} start =====")
@@ -986,6 +1013,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             job_dir, manifest = reusable_jobs[seg_index]
             print(f"===== Segment {seg_index:02d} reuse: {job_dir.name} =====")
         else:
+            # 统一使用固定段目录，保证 segment_xxxx 与 segment_jobs/segment_xxxx 一一对应。
+            # 注意：是否“真实续跑”由 run_segment_job 内部按 manifest 存在性判断。
             resume_job_dir = canonical_job_dir
             job_dir = run_segment_job(
                 segment_index=seg_index,
@@ -1025,7 +1054,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print("Step 5/5: merge outputs")
     all_vocals: List[Path] = []
-    all_mix: List[Path] = []
     all_bgm: List[Path] = []
     source_srt_inputs: List[Tuple[Path, float]] = []
     translated_srt_inputs: List[Tuple[Path, float]] = []
@@ -1034,7 +1062,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     for item in results:
         paths = item.manifest.get("paths", {})
         vocals_path = resolve_output_path(paths.get("dubbed_vocals"))
-        mix_path = resolve_output_path(paths.get("dubbed_mix"))
         bgm_path = resolve_output_path(paths.get("source_bgm"))
         source_srt = resolve_output_path(paths.get("source_srt"))
         translated_srt = resolve_output_path(paths.get("translated_srt"))
@@ -1052,8 +1079,6 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if vocals_path and vocals_path.exists():
             all_vocals.append(vocals_path)
-        if mix_path and mix_path.exists():
-            all_mix.append(mix_path)
         if bgm_path and bgm_path.exists():
             all_bgm.append(bgm_path)
         if source_srt and source_srt.exists():
@@ -1082,12 +1107,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         if all_vocals and len(all_vocals) == len(results):
             merged_vocals = final_dir / "dubbed_vocals_full.wav"
             concat_wav_files(all_vocals, merged_vocals)
-        if all_mix and len(all_mix) == len(results):
-            merged_mix = final_dir / "dubbed_mix_full.wav"
-            concat_wav_files(all_mix, merged_mix)
         if all_bgm and len(all_bgm) == len(results):
             merged_bgm = final_dir / "source_bgm_full.wav"
             concat_wav_files(all_bgm, merged_bgm)
+        # 全量模式改为“最终只混一次”：使用 full vocals + full bgm 生成 mix。
+        if merged_vocals is not None and merged_bgm is not None:
+            merged_mix = final_dir / "dubbed_mix_full.wav"
+            mix_vocals_with_bgm(vocals_wav=merged_vocals, bgm_wav=merged_bgm, output_wav=merged_mix)
 
     if source_srt_inputs:
         merge_srt_files(
