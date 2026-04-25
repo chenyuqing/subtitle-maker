@@ -12,31 +12,53 @@
 </head>
 
 <body>
-    <div class="app-layout">
-        <!-- Sidebar -->
-        <aside class="sidebar">
-            <div class="logo-area">
-                <h1>Subtitle Maker</h1>
-                <p>AI-Powered Subtitling</p>
-            </div>
+        <div class="app-layout">
+            <!-- Sidebar -->
+            <aside class="sidebar">
+                <div class="logo-area">
+                    <div class="logo-head">
+                        <div class="logo-copy">
+                            <h1>Subtitle Maker</h1>
+                            <p>AI-Powered Subtitling</p>
+                        </div>
+                        <button
+                            id="sidebar-toggle-btn"
+                            class="sidebar-toggle-btn"
+                            type="button"
+                            aria-expanded="true"
+                            aria-label="Collapse sidebar"
+                        >
+                            <span class="sidebar-toggle-icon" aria-hidden="true"></span>
+                        </button>
+                    </div>
+                </div>
 
-            <nav class="nav-menu">
-                <button class="nav-item active" data-target="panel-upload">
-                    <span class="step-num">1</span> Upload Video
-                </button>
-                <button class="nav-item" data-target="panel-transcribe">
-                    <span class="step-num">2</span> Generate Subtitles
-                </button>
-                <button class="nav-item" data-target="panel-results">
-                    <span class="step-num">3</span> Subtitles & Translation
-                </button>
-                <button class="nav-item" data-target="panel-srt">
-                    <span class="step-num">4</span> Import SRT
-                </button>
-                <button class="nav-item" data-target="panel-auto-dub">
-                    <span class="step-num">5</span> Auto Dubbing
-                </button>
-            </nav>
+                <nav class="nav-menu">
+                    <button class="nav-item active" data-target="panel-upload">
+                        <span class="step-num">1</span>
+                        <span class="nav-label">Upload Video</span>
+                    </button>
+                    <button class="nav-item" data-target="panel-transcribe">
+                        <span class="step-num">2</span>
+                        <span class="nav-label">Generate Subtitles</span>
+                    </button>
+                    <button class="nav-item" data-target="panel-results">
+                        <span class="step-num">3</span>
+                        <span class="nav-label">Subtitles & Translation</span>
+                    </button>
+                    <button class="nav-item" data-target="panel-srt">
+                        <span class="step-num">4</span>
+                        <span class="nav-label">Import SRT</span>
+                    </button>
+                    <button class="nav-item" data-target="panel-auto-dub">
+                        <span class="step-num">5</span>
+                        <span class="nav-label">Auto Dubbing</span>
+                    </button>
+                    <button class="nav-item" data-target="panel-auto-dub-v2">
+                        <span class="step-num">6</span>
+                        <span class="nav-label">Auto Dubbing V2</span>
+                    </button>
+                </nav>
 
             <div class="sidebar-footer">
                 <button id="theme-toggle-btn" class="secondary-btn">Light Theme</button>
@@ -126,126 +148,432 @@
 
                 <!-- Panel 5: Auto Dubbing -->
                 <div id="panel-auto-dub" class="panel" style="display: none;">
-                    <div class="card">
+                    <div class="card auto-dub-card">
                         <h2>🎙️ Auto Dubbing</h2>
-                        <div id="auto-dub-upload-area" class="auto-upload-card">
-                            <input type="file" id="auto-dub-file-input" accept="video/*,audio/*" style="display: none;">
-                            <div class="auto-upload-visual">
-                                <div class="auto-upload-icon">🎬</div>
-                                <div class="auto-upload-content">
-                                    <div class="auto-upload-title">Drop media for full CLI dubbing</div>
-                                    <div class="auto-upload-hint">Runs the isolated long-video CLI pipeline without touching the subtitle editor workflow.</div>
-                                    <div class="auto-upload-actions">
-                                        <button id="auto-dub-browse-btn" class="ghost-btn" type="button">Browse File</button>
-                                        <span id="auto-dub-filename" class="auto-upload-filename">No file selected</span>
+                        <div class="auto-dub-shell">
+                            <div class="auto-dub-top-grid">
+                                <div id="auto-dub-upload-area" class="auto-upload-card auto-dub-media-card">
+                                    <input type="file" id="auto-dub-file-input" accept="video/*,audio/*" style="display: none;">
+                                    <div class="auto-upload-visual">
+                                        <div class="auto-upload-icon">🎬</div>
+                                        <div class="auto-upload-content">
+                                            <div class="auto-upload-title">Drop media for full CLI dubbing</div>
+                                            <div class="auto-upload-hint">Runs the isolated long-video CLI pipeline without touching the subtitle editor workflow.</div>
+                                            <div class="auto-upload-actions">
+                                                <button id="auto-dub-browse-btn" class="ghost-btn" type="button">Browse File</button>
+                                                <span id="auto-dub-filename" class="auto-upload-filename">No file selected</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="auto-dub-section-card auto-dub-subtitle-card">
+                                    <div class="auto-dub-section-head">
+                                        <div>
+                                            <div class="auto-dub-section-kicker">Optional Subtitle</div>
+                                            <div class="auto-dub-section-title">Use your own timeline when ASR is not needed</div>
+                                        </div>
+                                        <span class="auto-dub-inline-hint">SRT / VTT / Markdown</span>
+                                    </div>
+                                    <input type="file" id="auto-dub-subtitle-input" accept=".srt,.vtt,.md" style="display: none;">
+                                    <div class="auto-dub-subtitle-row">
+                                        <button id="auto-dub-subtitle-browse-btn" class="ghost-btn" type="button">选择字幕文件（可选）</button>
+                                        <span id="auto-dub-subtitle-name" class="auto-upload-filename">未选择字幕文件（默认自动识别）</span>
+                                    </div>
+                                    <div class="auto-dub-subtitle-meta">
+                                        <label for="auto-dub-subtitle-mode">字幕类型</label>
+                                        <select id="auto-dub-subtitle-mode">
+                                            <option value="source" selected>源字幕（需翻译）</option>
+                                            <option value="translated">翻译字幕（跳过翻译）</option>
+                                        </select>
                                     </div>
                                 </div>
                             </div>
-                        </div>
-                        <div class="row" style="margin-top: 10px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
-                            <input type="file" id="auto-dub-subtitle-input" accept=".srt" style="display: none;">
-                            <button id="auto-dub-subtitle-browse-btn" class="ghost-btn" type="button">选择字幕文件（可选）</button>
-                            <span id="auto-dub-subtitle-name" class="auto-upload-filename">未选择字幕文件（默认自动识别）</span>
-                            <label for="auto-dub-subtitle-mode" style="margin-left: 6px; color: var(--text-secondary);">字幕类型</label>
-                            <select id="auto-dub-subtitle-mode" style="max-width: 220px; min-width: 200px;">
-                                <option value="source" selected>源字幕（需翻译）</option>
-                                <option value="translated">翻译字幕（跳过翻译）</option>
-                            </select>
-                        </div>
 
-                        <div class="form-row" style="margin-top: 20px; display: flex; gap: 10px; flex-wrap: nowrap; align-items: flex-end;">
-                            <div class="input-group" style="flex: 1; min-width: 0;">
-                                <label for="auto-dub-source">Source Language</label>
-                                <select id="auto-dub-source">
-                                    <option value="auto">Auto Detect</option>
-                                    <option value="Chinese">Chinese (中文)</option>
-                                    <option value="English">English</option>
-                                    <option value="Cantonese">Cantonese (粤语)</option>
-                                    <option value="French">French (Français)</option>
-                                    <option value="German">German (Deutsch)</option>
-                                    <option value="Italian">Italian (Italiano)</option>
-                                    <option value="Japanese">Japanese (日本語)</option>
-                                    <option value="Korean">Korean (한국어)</option>
-                                    <option value="Portuguese">Portuguese (Português)</option>
-                                    <option value="Russian">Russian (Pусский)</option>
-                                    <option value="Spanish">Spanish (Español)</option>
-                                </select>
-                            </div>
-                            <div class="input-group" style="flex: 1; min-width: 0;">
-                                <label for="auto-dub-target">Target Language</label>
-                                <select id="auto-dub-target">
-                                    <option value="Chinese" selected>Chinese</option>
-                                    <option value="English">English</option>
-                                    <option value="Japanese">Japanese</option>
-                                    <option value="French">French</option>
-                                    <option value="German">German</option>
-                                    <option value="Cantonese">Cantonese</option>
-                                    <option value="Spanish">Spanish</option>
-                                </select>
-                            </div>
-                            <div class="input-group" style="flex: 1; min-width: 0;">
-                                <label for="auto-dub-grouping-strategy">Sentence Grouping</label>
-                                <select id="auto-dub-grouping-strategy">
-                                    <option value="legacy">Legacy</option>
-                                    <option value="sentence" selected>Sentence</option>
-                                </select>
-                            </div>
-                        </div>
-                        <div class="row">
-                            <input type="password" id="auto-dub-api-key" placeholder="DeepSeek API Key">
-                        </div>
-                        <div class="checkbox-row" style="margin-top: 8px;">
-                            <input type="checkbox" id="auto-dub-save-key">
-                            <label for="auto-dub-save-key">Save key for next time</label>
-                        </div>
-                        <div class="checkbox-row" style="margin-top: 8px;">
-                            <input type="checkbox" id="auto-dub-auto-pick-ranges">
-                            <label for="auto-dub-auto-pick-ranges">Auto pick dubbing ranges (skip long silence)</label>
-                        </div>
-                        <div class="time-ranges-section" style="margin: 12px 0 0 0; padding: 12px; border: 1px solid var(--border); border-radius: 8px;">
-                            <label style="font-weight: 500; display: block; margin-bottom: 8px;">Dubbing Time Ranges (Optional)</label>
-                            <p style="font-size: 0.85em; color: var(--text-muted); margin-bottom: 10px;">If configured, only these ranges will be dubbed.</p>
-                            <div id="auto-dub-time-ranges-list" class="time-ranges-list"></div>
-                            <div class="time-range-inputs" style="display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-bottom: 8px;">
-                                <span style="color: var(--text-muted); font-size: 0.85em;">Start:</span>
-                                <input type="text" id="auto-dub-range-start-m" placeholder="MM" maxlength="2" pattern="[0-9]{1,2}" style="width: 60px; text-align: center; padding: 8px;">
-                                <span style="color: var(--text-secondary); font-weight: bold;">:</span>
-                                <input type="text" id="auto-dub-range-start-s" placeholder="SS" maxlength="2" pattern="[0-5][0-9]" style="width: 60px; text-align: center; padding: 8px;">
-                                <span style="color: var(--text-muted); font-size: 0.85em; margin-left: 16px;">End:</span>
-                                <input type="text" id="auto-dub-range-end-m" placeholder="MM" maxlength="2" pattern="[0-9]{1,2}" style="width: 60px; text-align: center; padding: 8px;">
-                                <span style="color: var(--text-secondary); font-weight: bold;">:</span>
-                                <input type="text" id="auto-dub-range-end-s" placeholder="SS" maxlength="2" pattern="[0-5][0-9]" style="width: 60px; text-align: center; padding: 8px;">
-                            </div>
-                            <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
-                                <button id="auto-dub-add-range-btn" class="secondary-btn" style="padding: 6px 12px; font-size: 0.9em;">Add Range</button>
-                                <button id="auto-dub-use-current-time-btn" class="ghost-btn" style="padding: 6px 12px; font-size: 0.9em;" title="Use current playback position as start time">⏱ Use Current</button>
-                                <button id="auto-dub-clear-ranges-btn" class="ghost-btn" style="padding: 6px 12px; font-size: 0.9em;">Clear All</button>
-                            </div>
-                            <div id="auto-dub-range-error" class="range-error" style="color: var(--danger); font-size: 0.85em; margin-top: 8px; display: none;"></div>
-                        </div>
-                        <div class="dub-step-list">
-                            <span id="step-transcribe">Prepare & ASR</span>
-                            <span id="step-translate">Translate</span>
-                            <span id="step-dub">Clone, align & mix</span>
-                        </div>
+                            <div class="auto-dub-main-grid">
+                                <div class="auto-dub-section-card auto-dub-config-card">
+                                    <div class="auto-dub-section-head">
+                                        <div>
+                                            <div class="auto-dub-section-kicker">Setup</div>
+                                            <div class="auto-dub-section-title">Core dubbing parameters</div>
+                                        </div>
+                                    </div>
+                                    <div class="auto-dub-config-grid">
+                                        <div class="input-group">
+                                            <label for="auto-dub-source">Source Language</label>
+                                            <select id="auto-dub-source">
+                                                <option value="auto">Auto Detect</option>
+                                                <option value="Chinese">Chinese (中文)</option>
+                                                <option value="English">English</option>
+                                                <option value="Cantonese">Cantonese (粤语)</option>
+                                                <option value="French">French (Français)</option>
+                                                <option value="German">German (Deutsch)</option>
+                                                <option value="Italian">Italian (Italiano)</option>
+                                                <option value="Japanese">Japanese (日本語)</option>
+                                                <option value="Korean">Korean (한국어)</option>
+                                                <option value="Portuguese">Portuguese (Português)</option>
+                                                <option value="Russian">Russian (Pусский)</option>
+                                                <option value="Spanish">Spanish (Español)</option>
+                                            </select>
+                                        </div>
+                                        <div class="input-group">
+                                            <label for="auto-dub-target">Target Language</label>
+                                            <select id="auto-dub-target">
+                                                <option value="Chinese" selected>Chinese</option>
+                                                <option value="English">English</option>
+                                                <option value="Japanese">Japanese</option>
+                                                <option value="French">French</option>
+                                                <option value="German">German</option>
+                                                <option value="Cantonese">Cantonese</option>
+                                                <option value="Spanish">Spanish</option>
+                                            </select>
+                                        </div>
+                                        <div class="input-group">
+                                            <label for="auto-dub-grouping-strategy">Sentence Grouping</label>
+                                            <select id="auto-dub-grouping-strategy">
+                                                <option value="legacy">Legacy</option>
+                                                <option value="sentence" selected>Sentence</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                    <div class="auto-dub-toggle-grid">
+                                        <div class="checkbox-row auto-dub-toggle-card">
+                                            <input type="checkbox" id="auto-dub-short-merge-enabled">
+                                            <label for="auto-dub-short-merge-enabled">Merge short source lines</label>
+                                        </div>
+                                        <div class="checkbox-row auto-dub-toggle-card">
+                                            <input type="checkbox" id="auto-dub-auto-pick-ranges">
+                                            <label for="auto-dub-auto-pick-ranges">Auto pick dubbing ranges</label>
+                                        </div>
+                                    </div>
+                                    <div id="auto-dub-short-merge-settings" class="auto-dub-inline-settings" style="display: none;">
+                                        <div class="input-group auto-dub-threshold-group">
+                                            <label for="auto-dub-short-merge-threshold">Short Merge Target (sec)</label>
+                                            <input
+                                                type="number"
+                                                id="auto-dub-short-merge-threshold"
+                                                min="6"
+                                                max="20"
+                                                step="1"
+                                                value="15"
+                                            >
+                                        </div>
+                                        <div class="auto-dub-inline-note">
+                                            Step 2 only merges adjacent source lines by original timing. Tolerance is `round(target / 3)`, and a 1.5s silence gap forces a split.
+                                        </div>
+                                    </div>
+                                </div>
 
-                        <button id="start-auto-dub-btn" class="primary-btn" type="button">Start Auto Dubbing</button>
+                                <div class="time-ranges-section auto-dub-section-card auto-dub-secondary-card">
+                                    <div class="auto-dub-section-head">
+                                        <div>
+                                            <div class="auto-dub-section-kicker">Ranges</div>
+                                            <div class="auto-dub-section-title">Optional dubbing windows</div>
+                                        </div>
+                                    </div>
+                                    <p class="auto-dub-secondary-note">If configured, only these ranges will be dubbed.</p>
+                                    <div id="auto-dub-time-ranges-list" class="time-ranges-list"></div>
+                                    <div class="time-range-inputs auto-dub-range-inputs">
+                                        <span class="auto-dub-range-label">Start</span>
+                                        <input type="text" id="auto-dub-range-start-m" placeholder="MM" maxlength="2" pattern="[0-9]{1,2}">
+                                        <span class="auto-dub-range-separator">:</span>
+                                        <input type="text" id="auto-dub-range-start-s" placeholder="SS" maxlength="2" pattern="[0-5][0-9]">
+                                        <span class="auto-dub-range-label auto-dub-range-label-end">End</span>
+                                        <input type="text" id="auto-dub-range-end-m" placeholder="MM" maxlength="2" pattern="[0-9]{1,2}">
+                                        <span class="auto-dub-range-separator">:</span>
+                                        <input type="text" id="auto-dub-range-end-s" placeholder="SS" maxlength="2" pattern="[0-5][0-9]">
+                                    </div>
+                                    <div class="auto-dub-range-actions">
+                                        <button id="auto-dub-add-range-btn" class="secondary-btn" type="button">Add Range</button>
+                                        <button id="auto-dub-use-current-time-btn" class="ghost-btn" type="button" title="Use current playback position as start time">Use Current</button>
+                                        <button id="auto-dub-clear-ranges-btn" class="ghost-btn" type="button">Clear All</button>
+                                    </div>
+                                    <div id="auto-dub-range-error" class="range-error" style="display: none;"></div>
+                                </div>
+                            </div>
 
-                        <div id="auto-dub-status-container" style="display: none;">
-                            <div class="progress-bar">
-                                <div id="auto-dub-progress-fill" class="progress-fill"></div>
+                            <div class="auto-dub-support-grid">
+                                <div class="auto-dub-section-card auto-dub-action-card">
+                                    <div class="auto-dub-section-head">
+                                        <div>
+                                            <div class="auto-dub-section-kicker">Run</div>
+                                            <div class="auto-dub-section-title">Launch or resume a dubbing job</div>
+                                        </div>
+                                    </div>
+                                    <div class="auto-dub-api-stack">
+                                        <input type="password" id="auto-dub-api-key" placeholder="DeepSeek API Key">
+                                        <div class="checkbox-row auto-dub-inline-check">
+                                            <input type="checkbox" id="auto-dub-save-key">
+                                            <label for="auto-dub-save-key">Save key for next time</label>
+                                        </div>
+                                    </div>
+                                    <div class="dub-step-list auto-dub-step-list">
+                                        <span id="step-transcribe">Prepare & ASR</span>
+                                        <span id="step-translate">Translate</span>
+                                        <span id="step-dub">Clone, align & mix</span>
+                                    </div>
+                                    <button id="start-auto-dub-btn" class="primary-btn auto-dub-start-btn" type="button">Start Auto Dubbing</button>
+                                </div>
+
+                                <div class="auto-dub-section-card auto-dub-secondary-card auto-dub-restore-card">
+                                    <div class="auto-dub-section-head">
+                                        <div>
+                                            <div class="auto-dub-section-kicker">Restore</div>
+                                            <div class="auto-dub-section-title">Load an existing result folder</div>
+                                        </div>
+                                    </div>
+                                    <div class="auto-dub-restore-row">
+                                        <select id="auto-dub-load-batch-select">
+                                            <option value="">选择已生成结果文件夹</option>
+                                        </select>
+                                        <div class="auto-dub-restore-actions">
+                                            <button id="auto-dub-refresh-batches-btn" class="ghost-btn" type="button">刷新列表</button>
+                                            <button id="auto-dub-load-batch-btn" class="ghost-btn" type="button">加载结果</button>
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
-                            <div class="status-meta">
-                                <span id="auto-dub-task-id">Task —</span>
-                                <span id="auto-dub-line-progress">Segments —</span>
-                                <span id="auto-dub-eta">ETA —</span>
+
+                            <div id="auto-dub-status-container" class="auto-dub-status-card" style="display: none;">
+                                <div class="progress-bar">
+                                    <div id="auto-dub-progress-fill" class="progress-fill"></div>
+                                </div>
+                                <div class="status-meta">
+                                    <span id="auto-dub-task-id">Task —</span>
+                                    <span id="auto-dub-line-progress">Segments —</span>
+                                    <span id="auto-dub-eta">ETA —</span>
+                                </div>
+                                <div id="auto-dub-status-text" class="status-text">Waiting</div>
                             </div>
-                            <div id="auto-dub-status-text" class="status-text">Waiting</div>
+
+                            <div id="auto-dub-results" class="export-section auto-dub-results-card" style="display: none;">
+                                <h3>CLI Outputs</h3>
+                                <div class="download-links"></div>
+                                <div id="auto-dub-review-panel" class="auto-dub-review-panel" style="display: none;">
+                                    <div class="auto-dub-review-toolbar">
+                                        <button id="auto-dub-review-load-btn" class="ghost-btn" type="button">加载逐句审阅</button>
+                                        <button id="auto-dub-review-save-redub-btn" class="ghost-btn" type="button">保存并重配改动句</button>
+                                    </div>
+                                    <div id="auto-dub-review-list" class="auto-dub-review-list"></div>
+                                </div>
+                            </div>
                         </div>
+                    </div>
+                </div>
 
-                        <div id="auto-dub-results" class="export-section" style="display: none;">
-                            <h3>CLI Outputs</h3>
-                            <div class="download-links"></div>
+                <!-- Panel 6: Auto Dubbing V2 -->
+                <div id="panel-auto-dub-v2" class="panel" style="display: none;">
+                    <div class="card auto-dub-card">
+                        <h2>🎙️ Auto Dubbing V2</h2>
+                        <div class="auto-dub-shell">
+                            <div class="auto-dub-top-grid">
+                                <div id="auto-dub-v2-upload-area" class="auto-upload-card auto-dub-media-card">
+                                    <input type="file" id="auto-dub-v2-file-input" accept="video/*,audio/*" style="display: none;">
+                                    <div class="auto-upload-visual">
+                                        <div class="auto-upload-icon">🎬</div>
+                                        <div class="auto-upload-content">
+                                            <div class="auto-upload-title">Drop media for full CLI dubbing</div>
+                                            <div class="auto-upload-hint">V2 pipeline: sentence-first timing + controlled TTS candidates.</div>
+                                            <div class="auto-upload-actions">
+                                                <button id="auto-dub-v2-browse-btn" class="ghost-btn" type="button">Browse File</button>
+                                                <span id="auto-dub-v2-filename" class="auto-upload-filename">No file selected</span>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="auto-dub-section-card auto-dub-subtitle-card">
+                                    <div class="auto-dub-section-head">
+                                        <div>
+                                            <div class="auto-dub-section-kicker">Optional Subtitle</div>
+                                            <div class="auto-dub-section-title">Use your own timeline when ASR is not needed</div>
+                                        </div>
+                                        <span class="auto-dub-inline-hint">SRT / VTT / Markdown</span>
+                                    </div>
+                                    <input type="file" id="auto-dub-v2-subtitle-input" accept=".srt,.vtt,.md" style="display: none;">
+                                    <div class="auto-dub-subtitle-row">
+                                        <button id="auto-dub-v2-subtitle-browse-btn" class="ghost-btn" type="button">选择字幕文件（可选）</button>
+                                        <span id="auto-dub-v2-subtitle-name" class="auto-upload-filename">未选择字幕文件（默认自动识别）</span>
+                                    </div>
+                                    <div class="auto-dub-subtitle-meta">
+                                        <label for="auto-dub-v2-subtitle-mode">字幕类型</label>
+                                        <select id="auto-dub-v2-subtitle-mode">
+                                            <option value="source" selected>源字幕（需翻译）</option>
+                                            <option value="translated">翻译字幕（跳过翻译）</option>
+                                        </select>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="auto-dub-main-grid">
+                                <div class="auto-dub-section-card auto-dub-config-card">
+                                    <div class="auto-dub-section-head">
+                                        <div>
+                                            <div class="auto-dub-section-kicker">Setup</div>
+                                            <div class="auto-dub-section-title">Core dubbing parameters</div>
+                                        </div>
+                                    </div>
+                                    <div class="auto-dub-config-grid">
+                                        <div class="input-group">
+                                            <label for="auto-dub-v2-source">Source Language</label>
+                                            <select id="auto-dub-v2-source">
+                                                <option value="auto">Auto Detect</option>
+                                                <option value="Chinese">Chinese (中文)</option>
+                                                <option value="English">English</option>
+                                                <option value="Cantonese">Cantonese (粤语)</option>
+                                                <option value="French">French (Français)</option>
+                                                <option value="German">German (Deutsch)</option>
+                                                <option value="Italian">Italian (Italiano)</option>
+                                                <option value="Japanese">Japanese (日本語)</option>
+                                                <option value="Korean">Korean (한국어)</option>
+                                                <option value="Portuguese">Portuguese (Português)</option>
+                                                <option value="Russian">Russian (Pусский)</option>
+                                                <option value="Spanish">Spanish (Español)</option>
+                                            </select>
+                                        </div>
+                                        <div class="input-group">
+                                            <label for="auto-dub-v2-target">Target Language</label>
+                                            <select id="auto-dub-v2-target">
+                                                <option value="Chinese" selected>Chinese</option>
+                                                <option value="English">English</option>
+                                                <option value="Japanese">Japanese</option>
+                                                <option value="French">French</option>
+                                                <option value="German">German</option>
+                                                <option value="Cantonese">Cantonese</option>
+                                                <option value="Spanish">Spanish</option>
+                                            </select>
+                                        </div>
+                                        <div class="input-group">
+                                            <label for="auto-dub-v2-grouping-strategy">Sentence Grouping</label>
+                                            <select id="auto-dub-v2-grouping-strategy">
+                                                <option value="legacy">Legacy</option>
+                                                <option value="sentence" selected>Sentence</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                    <div class="auto-dub-toggle-grid">
+                                        <div class="checkbox-row auto-dub-toggle-card">
+                                            <input type="checkbox" id="auto-dub-v2-short-merge-enabled">
+                                            <label for="auto-dub-v2-short-merge-enabled">Merge short source lines</label>
+                                        </div>
+                                        <div class="checkbox-row auto-dub-toggle-card">
+                                            <input type="checkbox" id="auto-dub-v2-auto-pick-ranges">
+                                            <label for="auto-dub-v2-auto-pick-ranges">Auto pick dubbing ranges</label>
+                                        </div>
+                                        <div class="checkbox-row auto-dub-toggle-card">
+                                            <input type="checkbox" id="auto-dub-v2-rewrite-translation" checked>
+                                            <label for="auto-dub-v2-rewrite-translation">Rewrite translation for timing fit</label>
+                                        </div>
+                                    </div>
+                                    <div id="auto-dub-v2-short-merge-settings" class="auto-dub-inline-settings" style="display: none;">
+                                        <div class="input-group auto-dub-threshold-group">
+                                            <label for="auto-dub-v2-short-merge-threshold">Short Merge Target (sec)</label>
+                                            <input
+                                                type="number"
+                                                id="auto-dub-v2-short-merge-threshold"
+                                                min="6"
+                                                max="20"
+                                                step="1"
+                                                value="15"
+                                            >
+                                        </div>
+                                        <div class="auto-dub-inline-note">
+                                            Step 2 only merges adjacent source lines by original timing. Tolerance is `round(target / 3)`, and a 1.5s silence gap forces a split.
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="time-ranges-section auto-dub-section-card auto-dub-secondary-card">
+                                    <div class="auto-dub-section-head">
+                                        <div>
+                                            <div class="auto-dub-section-kicker">Ranges</div>
+                                            <div class="auto-dub-section-title">Optional dubbing windows</div>
+                                        </div>
+                                    </div>
+                                    <p class="auto-dub-secondary-note">If configured, only these ranges will be dubbed.</p>
+                                    <div id="auto-dub-v2-time-ranges-list" class="time-ranges-list"></div>
+                                    <div class="time-range-inputs auto-dub-range-inputs">
+                                        <span class="auto-dub-range-label">Start</span>
+                                        <input type="text" id="auto-dub-v2-range-start-m" placeholder="MM" maxlength="2" pattern="[0-9]{1,2}">
+                                        <span class="auto-dub-range-separator">:</span>
+                                        <input type="text" id="auto-dub-v2-range-start-s" placeholder="SS" maxlength="2" pattern="[0-5][0-9]">
+                                        <span class="auto-dub-range-label auto-dub-range-label-end">End</span>
+                                        <input type="text" id="auto-dub-v2-range-end-m" placeholder="MM" maxlength="2" pattern="[0-9]{1,2}">
+                                        <span class="auto-dub-range-separator">:</span>
+                                        <input type="text" id="auto-dub-v2-range-end-s" placeholder="SS" maxlength="2" pattern="[0-5][0-9]">
+                                    </div>
+                                    <div class="auto-dub-range-actions">
+                                        <button id="auto-dub-v2-add-range-btn" class="secondary-btn" type="button">Add Range</button>
+                                        <button id="auto-dub-v2-use-current-time-btn" class="ghost-btn" type="button" title="Use current playback position as start time">Use Current</button>
+                                        <button id="auto-dub-v2-clear-ranges-btn" class="ghost-btn" type="button">Clear All</button>
+                                    </div>
+                                    <div id="auto-dub-v2-range-error" class="range-error" style="display: none;"></div>
+                                </div>
+                            </div>
+
+                            <div class="auto-dub-support-grid">
+                                <div class="auto-dub-section-card auto-dub-action-card">
+                                    <div class="auto-dub-section-head">
+                                        <div>
+                                            <div class="auto-dub-section-kicker">Run</div>
+                                            <div class="auto-dub-section-title">Launch or resume a dubbing job</div>
+                                        </div>
+                                    </div>
+                                    <div class="auto-dub-api-stack">
+                                        <input type="password" id="auto-dub-v2-api-key" placeholder="DeepSeek API Key">
+                                        <div class="checkbox-row auto-dub-inline-check">
+                                            <input type="checkbox" id="auto-dub-v2-save-key">
+                                            <label for="auto-dub-v2-save-key">Save key for next time</label>
+                                        </div>
+                                    </div>
+                                    <div class="dub-step-list auto-dub-step-list">
+                                        <span id="step-v2-transcribe">Prepare & ASR</span>
+                                        <span id="step-v2-translate">Translate</span>
+                                        <span id="step-v2-dub">Clone, align & mix</span>
+                                    </div>
+                                    <button id="start-auto-dub-v2-btn" class="primary-btn auto-dub-start-btn" type="button">Start Auto Dubbing V2</button>
+                                </div>
+
+                                <div class="auto-dub-section-card auto-dub-secondary-card auto-dub-restore-card">
+                                    <div class="auto-dub-section-head">
+                                        <div>
+                                            <div class="auto-dub-section-kicker">Restore</div>
+                                            <div class="auto-dub-section-title">Load an existing result folder</div>
+                                        </div>
+                                    </div>
+                                    <div class="auto-dub-restore-row">
+                                        <select id="auto-dub-v2-load-batch-select">
+                                            <option value="">选择已生成结果文件夹</option>
+                                        </select>
+                                        <div class="auto-dub-restore-actions">
+                                            <button id="auto-dub-v2-refresh-batches-btn" class="ghost-btn" type="button">刷新列表</button>
+                                            <button id="auto-dub-v2-load-batch-btn" class="ghost-btn" type="button">加载结果</button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div id="auto-dub-v2-status-container" class="auto-dub-status-card" style="display: none;">
+                                <div class="progress-bar">
+                                    <div id="auto-dub-v2-progress-fill" class="progress-fill"></div>
+                                </div>
+                                <div class="status-meta">
+                                    <span id="auto-dub-v2-task-id">Task —</span>
+                                    <span id="auto-dub-v2-line-progress">Segments —</span>
+                                    <span id="auto-dub-v2-eta">ETA —</span>
+                                </div>
+                                <div id="auto-dub-v2-status-text" class="status-text">Waiting</div>
+                            </div>
+
+                            <div id="auto-dub-v2-results" class="export-section auto-dub-results-card" style="display: none;">
+                                <h3>CLI Outputs</h3>
+                                <div class="download-links"></div>
+                                <div id="auto-dub-v2-review-panel" class="auto-dub-review-panel" style="display: none;">
+                                    <div class="auto-dub-review-toolbar">
+                                        <button id="auto-dub-v2-review-load-btn" class="ghost-btn" type="button">加载逐句审阅</button>
+                                        <button id="auto-dub-v2-review-save-redub-btn" class="ghost-btn" type="button">保存并重配改动句</button>
+                                    </div>
+                                    <div id="auto-dub-v2-review-list" class="auto-dub-review-list"></div>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -398,6 +726,32 @@
     </div>
     </main>
     </div>
+
+    <button id="agent-fab" class="agent-fab" type="button" aria-controls="agent-drawer" aria-expanded="false">
+        <span class="agent-fab-mark">?</span>
+        <span class="agent-fab-label">Help</span>
+    </button>
+
+    <aside id="agent-drawer" class="agent-drawer" aria-hidden="true">
+        <div class="agent-drawer-header">
+            <div>
+                <p class="agent-kicker">Project Agent</p>
+                <h2>使用助手</h2>
+            </div>
+            <button id="agent-close-btn" class="agent-close-btn" type="button" aria-label="Close assistant">×</button>
+        </div>
+        <p class="agent-subtitle">解释报错、说明下一步，只给建议，不执行操作。</p>
+        <div class="agent-key-row">
+            <input id="agent-api-key" type="password" autocomplete="off" placeholder="DeepSeek API Key（可选，优先使用环境变量）">
+        </div>
+        <div id="agent-messages" class="agent-messages" aria-live="polite"></div>
+        <form id="agent-form" class="agent-form">
+            <textarea id="agent-input" rows="3" placeholder="例如：为什么 Auto Dubbing V2 失败了？"></textarea>
+            <button id="agent-send-btn" class="primary-btn" type="submit">发送</button>
+        </form>
+    </aside>
+    <div id="agent-backdrop" class="agent-backdrop" hidden></div>
+
     <script src="/static/app.js?v={{ app_js_version }}"></script>
 </body>
 

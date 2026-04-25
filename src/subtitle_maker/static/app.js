@@ -14,6 +14,8 @@ const progressContainer = document.getElementById('progress-container');
 const progressFill = document.querySelector('.progress-fill');
 const progressText = document.getElementById('progress-text');
 const themeToggleBtn = document.getElementById('theme-toggle-btn');
+const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
+const appLayout = document.querySelector('.app-layout');
 
 const originalDisplay = document.getElementById('original-subtitles');
 const translatedDisplay = document.getElementById('translated-subtitles');
@@ -31,11 +33,38 @@ let timerInterval = null;
 const SEEK_STEP_SECONDS = 10;
 const SUBTITLE_POSITION_KEY = 'sm_subPosition';
 const THEME_KEY = 'sm_theme';
+const SIDEBAR_COLLAPSED_KEY = 'sm_sidebarCollapsed';
+const SHORT_MERGE_TARGET_DEFAULT = 15;
+const SHORT_MERGE_TARGET_MIN = 6;
+const SHORT_MERGE_TARGET_MAX = 20;
 let isAudioMode = false;
+
+// 保留 `/static/app.js?v=...` 作为单入口，并把同一版本号透传给子模块，避免半刷新缓存。
+const APP_SCRIPT_VERSION_QUERY = (() => {
+    try {
+        const currentScript = document.currentScript;
+        if (!currentScript || !currentScript.src) return '';
+        return new URL(currentScript.src, window.location.href).search || '';
+    } catch (error) {
+        console.warn('Resolve app.js version failed', error);
+        return '';
+    }
+})();
 
 // Time Ranges State
 let timeRanges = [];
 let videoDuration = 0;
+
+// 统一解析前端子模块 URL，并继承当前入口脚本的版本参数。
+function resolveStaticModuleUrl(modulePath) {
+    const normalized = String(modulePath || '').replace(/^\/+/, '');
+    return `/static/${normalized}${APP_SCRIPT_VERSION_QUERY}`;
+}
+
+// 使用浏览器原生 import() 装配子模块，不引入额外构建步骤。
+function loadFrontendModule(modulePath) {
+    return import(resolveStaticModuleUrl(modulePath));
+}
 
 function seekVideo(deltaSeconds) {
     if (!videoPlayer || Number.isNaN(videoPlayer.duration)) return;
@@ -90,6 +119,35 @@ function applyTheme(theme, persist = true) {
     }
 }
 
+function applySidebarCollapsed(collapsed, persist = true) {
+    if (!appLayout) return;
+    // 侧边栏收起态只通过根布局类控制，避免影响现有 tab/panel 切换逻辑
+    const nextCollapsed = collapsed === true;
+    appLayout.classList.toggle('sidebar-collapsed', nextCollapsed);
+    if (sidebarToggleBtn) {
+        // aria-expanded 表示当前侧边栏是否展开，按钮文案则表示下一步动作
+        const actionLabel = nextCollapsed ? 'Expand sidebar' : 'Collapse sidebar';
+        sidebarToggleBtn.setAttribute('aria-expanded', nextCollapsed ? 'false' : 'true');
+        sidebarToggleBtn.setAttribute('aria-label', actionLabel);
+        sidebarToggleBtn.title = actionLabel;
+    }
+    if (persist) {
+        localStorage.setItem(SIDEBAR_COLLAPSED_KEY, nextCollapsed ? 'true' : 'false');
+    }
+}
+
+function normalizeShortMergeTargetSeconds(value) {
+    // 历史 batch 的 30~80 表示旧“字数阈值”，这里统一回退到新的秒数默认值。
+    const parsed = Number.parseInt(String(value ?? ''), 10);
+    if (!Number.isInteger(parsed)) {
+        return SHORT_MERGE_TARGET_DEFAULT;
+    }
+    if (parsed > SHORT_MERGE_TARGET_MAX) {
+        return SHORT_MERGE_TARGET_DEFAULT;
+    }
+    return Math.min(SHORT_MERGE_TARGET_MAX, Math.max(SHORT_MERGE_TARGET_MIN, parsed));
+}
+
 const initialSubtitlePosition =
     localStorage.getItem(SUBTITLE_POSITION_KEY) ||
     (posSelect ? posSelect.value : "bottom");
@@ -97,6 +155,17 @@ applySubtitlePosition(initialSubtitlePosition, false);
 
 const initialTheme = localStorage.getItem(THEME_KEY) || 'dark';
 applyTheme(initialTheme, false);
+
+const initialSidebarCollapsed = localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === 'true';
+applySidebarCollapsed(initialSidebarCollapsed, false);
+
+if (sidebarToggleBtn) {
+    sidebarToggleBtn.addEventListener('click', () => {
+        // 读取当前根布局类，切换到相反状态并立即持久化
+        const isCollapsed = appLayout?.classList.contains('sidebar-collapsed');
+        applySidebarCollapsed(!isCollapsed);
+    });
+}
 
 function setMediaMode(isAudio) {
     isAudioMode = !!isAudio;
@@ -175,6 +244,15 @@ function buildAutoDubElapsedLabel(taskData, fallbackStartMs) {
         return `用时 ${formatElapsedClock((Date.now() - fallbackStartMs) / 1000)}`;
     }
     return '';
+}
+
+function formatEtaAsSegmentProgress(processed, total) {
+    const done = Number(processed);
+    const all = Number(total);
+    if (!Number.isFinite(done) || !Number.isFinite(all) || all <= 0) {
+        return 'ETA —';
+    }
+    return `Progress ${Math.max(0, done)}/${all}`;
 }
 
 function describeAutoStage(stage) {
@@ -455,7 +533,7 @@ function loadState() {
     // Sync Language if previously saved
     const savedLang = localStorage.getItem('sm_targetLang');
     if (savedLang) {
-        const dubbingSelects = ['dub-target-lang', 'auto-dub-target']
+        const dubbingSelects = ['auto-dub-target', 'auto-dub-v2-target']
             .map(id => document.getElementById(id))
             .filter(Boolean);
         for (const select of dubbingSelects) {
@@ -468,7 +546,7 @@ function loadState() {
 }
 
 function syncDubbingLanguage(lang) {
-    const dubbingSelects = ['dub-target-lang', 'auto-dub-target']
+    const dubbingSelects = ['auto-dub-target', 'auto-dub-v2-target']
         .map(id => document.getElementById(id))
         .filter(Boolean);
     if (dubbingSelects.length === 0) return;
@@ -963,6 +1041,18 @@ function renderSubtitles(subs, container) {
     });
 }
 
+// Auto Dubbing 完成后统一回写共享字幕状态，避免模块内复制一份本地状态。
+function applyAutoDubSubtitleItems(items) {
+    originalSubtitlesData = Array.isArray(items) ? items : [];
+    translatedSubtitlesData = [];
+    renderSubtitles(originalSubtitlesData, originalDisplay);
+    renderSubtitles([], translatedDisplay);
+    overlayMode = 'original';
+    const modeSelect = document.getElementById('display-mode');
+    if (modeSelect) modeSelect.value = 'original';
+    saveState();
+}
+
 function formatTime(seconds) {
     const pad = (num, size) => ('000' + num).slice(size * -1);
     const date = new Date(seconds * 1000);
@@ -1428,889 +1518,40 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // --- Dubbing Logic (Step 5) ---
-    const startDubbingBtn = document.getElementById('start-dubbing-btn');
-    const dubbingStatusContainer = document.getElementById('dubbing-status-container');
-    const dubbingProgressBar = document.getElementById('dubbing-progress-bar');
-    const dubbingStatusText = document.getElementById('dubbing-status-text');
-    const dubbingResults = document.getElementById('dubbing-results');
-
-    let currentDubTaskId = null;
-
-    if (startDubbingBtn) {
-        startDubbingBtn.addEventListener('click', async () => {
-            if (!currentTaskId) {
-                alert("Please complete the transcription (Step 2) first.");
-                return;
-            }
-
-            const targetLang = document.getElementById('dub-target-lang').value;
-
-            // UI Reset
-            startDubbingBtn.disabled = true;
-            dubbingStatusContainer.style.display = 'block';
-            dubbingResults.style.display = 'none';
-            dubbingProgressBar.style.width = '10%';
-            dubbingStatusText.textContent = "Starting Dubbing Task...";
-            dubbingStatusText.className = 'status-text';
-
-            try {
-                // Start Dubbing
-                const formData = new FormData();
-                formData.append('task_id', currentTaskId);
-                formData.append('target_lang', targetLang);
-
-                // Resilience: Pass current state to recover if server restarted
-                if (currentFilename) {
-                    formData.append('filename', currentFilename);
-                }
-                if (currentOriginalFilename) {
-                    formData.append('original_filename', currentOriginalFilename);
-                }
-                // Prefer translated, fallback to original
-                if (translatedSubtitlesData && translatedSubtitlesData.length > 0) {
-                    formData.append('subtitles_json', JSON.stringify(translatedSubtitlesData));
-                } else if (originalSubtitlesData && originalSubtitlesData.length > 0) {
-                    formData.append('subtitles_json', JSON.stringify(originalSubtitlesData));
-                }
-
-                const res = await fetch('/dubbing/start', { method: 'POST', body: formData });
-                if (!res.ok) {
-                    const err = await res.json();
-                    throw new Error(err.detail || "Failed to start dubbing");
-                }
-
-                const data = await res.json();
-                currentDubTaskId = data.dubbing_task_id;
-
-                // Poll Status
-                const pollInterval = setInterval(async () => {
-                    try {
-                        const sRes = await fetch(`/status/${currentDubTaskId}`);
-                        if (sRes.status === 404) {
-                            clearInterval(pollInterval);
-                            throw new Error("Dubbing task lost");
-                        }
-                        const sData = await sRes.json();
-
-                        if (sData.status === 'completed') {
-                            clearInterval(pollInterval);
-                            dubbingProgressBar.style.width = '100%';
-                            dubbingStatusText.textContent = "Dubbing Complete!";
-                            dubbingStatusText.className = 'status-text success';
-                            startDubbingBtn.disabled = false;
-
-                            renderDubbingResults(sData.result);
-
-                        } else if (sData.status === 'failed') {
-                            clearInterval(pollInterval);
-                            throw new Error(sData.error || "Dubbing failed");
-                        } else {
-                            // Processing
-                            if (typeof sData.progress === 'number') {
-                                dubbingProgressBar.style.width = `${sData.progress}%`;
-                            } else {
-                                dubbingProgressBar.style.width = '60%';
-                            }
-                            const manualStage = describeAutoStage(sData.stage);
-                            let detail = '';
-                            if (sData.processed_segments !== undefined && sData.total_segments) {
-                                detail = ` (${sData.processed_segments}/${sData.total_segments})`;
-                            }
-                            if (sData.eta_seconds !== undefined) {
-                                detail += ` · ${formatEtaLabel(sData.eta_seconds)}`;
-                            }
-                            dubbingStatusText.className = 'status-text';
-                            dubbingStatusText.textContent = `${manualStage}...${detail}`;
-                        }
-                    } catch (pe) {
-                        console.error(pe);
-                        clearInterval(pollInterval);
-                        dubbingStatusText.textContent = "Error polling status: " + pe.message;
-                        startDubbingBtn.disabled = false;
-                    }
-                }, 1200);
-
-            } catch (e) {
-                console.error(e);
-                dubbingStatusText.textContent = "Error: " + e.message;
-                dubbingStatusText.className = 'status-text error';
-                startDubbingBtn.disabled = false;
-            }
-        });
-    }
-
-    function renderDubbingResults(result) {
-        if (!result) return;
-        dubbingResults.style.display = 'block';
-
-        const container = dubbingResults.querySelector('.download-links');
-        container.innerHTML = '';
-
-        // Add Download Button for Video
-        if (result.video_url) {
-            const btn = document.createElement('a');
-            btn.href = result.video_url;
-            btn.className = 'primary-btn';
-            btn.textContent = '🎬 Download Dubbed Video';
-            btn.style.display = 'block';
-            btn.style.marginBottom = '10px';
-            btn.style.textAlign = 'center';
-            container.appendChild(btn);
-        }
-
-        // Add Download Button for Audio
-        if (result.audio_url) {
-            const btn = document.createElement('a');
-            btn.href = result.audio_url;
-            btn.className = 'secondary-btn';
-            btn.textContent = '🎵 Download Mixed Audio';
-            btn.style.display = 'block';
-            btn.style.marginBottom = '10px';
-            btn.style.textAlign = 'center';
-            container.appendChild(btn);
-        }
-
-        const count = result.total_clips;
-        const msg = document.createElement('p');
-        msg.style.fontSize = '0.9em';
-        msg.style.color = 'var(--text-muted)';
-        msg.textContent = `Generated ${count} TTS clips.`;
-        container.appendChild(msg);
-    }
-
     // --- Subtitle Position Toggle ---
     if (posSelect && subtitleOverlay) {
         posSelect.addEventListener('change', () => applySubtitlePosition(posSelect.value));
     }
 
-    // --- Auto Dubbing Module ---
-    setupAutoDubbing();
-
-    function setupAutoDubbing() {
-        const uploadArea = document.getElementById('auto-dub-upload-area');
-        const fileInput = document.getElementById('auto-dub-file-input');
-        const browseBtn = document.getElementById('auto-dub-browse-btn');
-        const filenameDisplay = document.getElementById('auto-dub-filename');
-        const subtitleInput = document.getElementById('auto-dub-subtitle-input');
-        const subtitleBrowseBtn = document.getElementById('auto-dub-subtitle-browse-btn');
-        const subtitleNameDisplay = document.getElementById('auto-dub-subtitle-name');
-        const subtitleModeSelect = document.getElementById('auto-dub-subtitle-mode');
-        const startBtn = document.getElementById('start-auto-dub-btn');
-        const statusContainer = document.getElementById('auto-dub-status-container');
-        const autoProgressFill = document.getElementById('auto-dub-progress-fill');
-        const statusText = document.getElementById('auto-dub-status-text');
-        const resultsContainer = document.getElementById('auto-dub-results');
-        const taskLabel = document.getElementById('auto-dub-task-id');
-        const lineProgressEl = document.getElementById('auto-dub-line-progress');
-        const etaEl = document.getElementById('auto-dub-eta');
-        const apiKeyInput = document.getElementById('auto-dub-api-key');
-        const saveKeyCheckbox = document.getElementById('auto-dub-save-key');
-        const audioTrackSwitcher = document.getElementById('audio-track-switcher');
-        const audioTrackModeSelect = document.getElementById('audio-track-mode');
-        const autoDubRangesList = document.getElementById('auto-dub-time-ranges-list');
-        const autoDubRangeError = document.getElementById('auto-dub-range-error');
-        const autoDubRangeStartM = document.getElementById('auto-dub-range-start-m');
-        const autoDubRangeStartS = document.getElementById('auto-dub-range-start-s');
-        const autoDubRangeEndM = document.getElementById('auto-dub-range-end-m');
-        const autoDubRangeEndS = document.getElementById('auto-dub-range-end-s');
-        const autoDubAddRangeBtn = document.getElementById('auto-dub-add-range-btn');
-        const autoDubUseCurrentBtn = document.getElementById('auto-dub-use-current-time-btn');
-        const autoDubClearRangesBtn = document.getElementById('auto-dub-clear-ranges-btn');
-
-        let selectedFile = null;
-        let selectedSubtitleFile = null;
-        let autoDubPreviewUrl = null;
-        let autoDubTimeRanges = [];
-        let autoDubStartedAtMs = 0;
-        const dubbedAudioPlayer = new Audio();
-        dubbedAudioPlayer.preload = 'metadata';
-        let dubbedAudioUrl = null;
-
-        // 校验自动配音时间区间，避免提交重叠或非法区间。
-        function validateAutoDubRange(startSec, endSec, durationSec) {
-            if (startSec < 0) {
-                return { valid: false, error: '起始时间不能小于 0' };
-            }
-            if (durationSec > 0 && endSec > durationSec) {
-                return { valid: false, error: `结束时间不能超过视频时长 ${secondsToDisplay(durationSec)}` };
-            }
-            if (endSec <= startSec) {
-                return { valid: false, error: '结束时间必须大于起始时间' };
-            }
-            for (const range of autoDubTimeRanges) {
-                if (!(endSec <= range.start || startSec >= range.end)) {
-                    return { valid: false, error: '该区间与已有区间重叠' };
-                }
-            }
-            return { valid: true, error: '' };
-        }
-
-        // 渲染自动配音区间标签列表，与「Generate Subtitles」保持一致交互。
-        function renderAutoDubTimeRanges() {
-            if (!autoDubRangesList) return;
-            autoDubRangesList.innerHTML = '';
-            autoDubTimeRanges.forEach((range, index) => {
-                const tag = document.createElement('div');
-                tag.className = 'time-range-tag';
-                tag.innerHTML = `
-                    <span class="range-times">${secondsToDisplay(range.start)} - ${secondsToDisplay(range.end)}</span>
-                    <button class="delete-range" data-index="${index}" title="删除">&times;</button>
-                `;
-                autoDubRangesList.appendChild(tag);
-            });
-            autoDubRangesList.querySelectorAll('.delete-range').forEach(btn => {
-                btn.addEventListener('click', (event) => {
-                    const idx = parseInt(event.target.dataset.index, 10);
-                    autoDubTimeRanges.splice(idx, 1);
-                    renderAutoDubTimeRanges();
-                });
-            });
-        }
-
-        // 清空自动配音区间输入框，减少重复输入操作。
-        function clearAutoDubRangeInputs() {
-            if (autoDubRangeStartM) autoDubRangeStartM.value = '';
-            if (autoDubRangeStartS) autoDubRangeStartS.value = '';
-            if (autoDubRangeEndM) autoDubRangeEndM.value = '';
-            if (autoDubRangeEndS) autoDubRangeEndS.value = '';
-        }
-
-        // 使用当前播放器时间填充起始时间，便于快速打点。
-        function setAutoDubStartFromCurrent() {
-            if (!videoPlayer || Number.isNaN(videoPlayer.currentTime)) return;
-            const current = videoPlayer.currentTime;
-            const mm = Math.floor(current / 60);
-            const ss = Math.floor(current % 60);
-            if (autoDubRangeStartM) autoDubRangeStartM.value = mm.toString().padStart(2, '0');
-            if (autoDubRangeStartS) autoDubRangeStartS.value = ss.toString().padStart(2, '0');
-        }
-
-        // 添加一个自动配音时间区间（MM:SS），并按时间排序。
-        function addAutoDubRange() {
-            const startM = autoDubRangeStartM?.value || '';
-            const startS = autoDubRangeStartS?.value || '';
-            const endM = autoDubRangeEndM?.value || '';
-            const endS = autoDubRangeEndS?.value || '';
-
-            if (!startM && !startS) {
-                if (autoDubRangeError) {
-                    autoDubRangeError.textContent = '请填写起始时间';
-                    autoDubRangeError.style.display = 'block';
-                }
-                return false;
-            }
-            if (!endM && !endS) {
-                if (autoDubRangeError) {
-                    autoDubRangeError.textContent = '请填写结束时间';
-                    autoDubRangeError.style.display = 'block';
-                }
-                return false;
-            }
-            const startSec = timeToSeconds(startM, startS);
-            const endSec = timeToSeconds(endM, endS);
-            const durationSec = (videoPlayer && !Number.isNaN(videoPlayer.duration)) ? videoPlayer.duration : 0;
-            const validation = validateAutoDubRange(startSec, endSec, durationSec);
-            if (!validation.valid) {
-                if (autoDubRangeError) {
-                    autoDubRangeError.textContent = validation.error;
-                    autoDubRangeError.style.display = 'block';
-                }
-                return false;
-            }
-            autoDubTimeRanges.push({ start: startSec, end: endSec });
-            autoDubTimeRanges.sort((a, b) => a.start - b.start);
-            if (autoDubRangeError) autoDubRangeError.style.display = 'none';
-            renderAutoDubTimeRanges();
-            return true;
-        }
-
-        if (autoDubAddRangeBtn) {
-            autoDubAddRangeBtn.addEventListener('click', () => {
-                if (addAutoDubRange()) {
-                    clearAutoDubRangeInputs();
-                }
-            });
-        }
-        if (autoDubUseCurrentBtn) {
-            autoDubUseCurrentBtn.addEventListener('click', () => {
-                setAutoDubStartFromCurrent();
-            });
-        }
-        if (autoDubClearRangesBtn) {
-            autoDubClearRangesBtn.addEventListener('click', () => {
-                autoDubTimeRanges = [];
-                renderAutoDubTimeRanges();
-                if (autoDubRangeError) autoDubRangeError.style.display = 'none';
-            });
-        }
-
-        // 根据可用音轨更新播放器模式：original=原视频声音，dubbed=配音音频
-        function applyAudioTrackMode(mode) {
-            if (!videoPlayer) return;
-            const targetMode = mode === 'dubbed' ? 'dubbed' : 'original';
-            const hasDubbed = !!dubbedAudioUrl;
-            if (targetMode === 'dubbed' && !hasDubbed) {
-                if (audioTrackModeSelect) {
-                    audioTrackModeSelect.value = 'original';
-                }
-                return;
-            }
-
-            if (targetMode === 'original') {
-                videoPlayer.muted = false;
-                dubbedAudioPlayer.pause();
-                return;
-            }
-
-            videoPlayer.muted = true;
-            dubbedAudioPlayer.playbackRate = videoPlayer.playbackRate || 1;
-            try {
-                dubbedAudioPlayer.currentTime = videoPlayer.currentTime || 0;
-            } catch (e) {
-                // 某些浏览器在 metadata 未就绪时会抛错，这里忽略即可
-                console.debug('sync dubbed audio time failed', e);
-            }
-            if (!videoPlayer.paused) {
-                dubbedAudioPlayer.play().catch(() => {});
-            }
-        }
-
-        // 在导入新媒体或新任务结果时重置音轨状态，避免沿用旧任务的配音链接
-        function resetAudioTrackState() {
-            dubbedAudioUrl = null;
-            dubbedAudioPlayer.pause();
-            dubbedAudioPlayer.removeAttribute('src');
-            dubbedAudioPlayer.load();
-            if (audioTrackModeSelect) {
-                audioTrackModeSelect.value = 'original';
-            }
-            if (audioTrackSwitcher) {
-                audioTrackSwitcher.style.display = 'none';
-            }
-            if (videoPlayer) {
-                videoPlayer.muted = false;
-            }
-        }
-
-        // 根据后端返回结果提取可播放的配音音频链接（优先 result_audio）
-        function pickDubbedAudioUrl(data) {
-            if (data && typeof data.result_audio === 'string' && data.result_audio) {
-                return data.result_audio;
-            }
-            const artifacts = Array.isArray(data?.artifacts) ? data.artifacts : [];
-            const preferred = artifacts.find(item => item?.key === 'preferred_audio' && item.url)
-                || artifacts.find(item => item?.key === 'mix' && item.url)
-                || artifacts.find(item => item?.key === 'vocals' && item.url);
-            return preferred?.url || null;
-        }
-
-        // 从任务结果中选择可自动加载的字幕文件（优先双语，其次翻译，再次原文）
-        function pickAutoDubSrtUrl(data) {
-            if (data && typeof data.result_srt === 'string' && data.result_srt) {
-                return data.result_srt;
-            }
-            const artifacts = Array.isArray(data?.artifacts) ? data.artifacts : [];
-            const preferred = artifacts.find(item => item?.key === 'bilingual_srt' && item.url)
-                || artifacts.find(item => item?.key === 'translated_srt' && item.url)
-                || artifacts.find(item => item?.key === 'source_srt' && item.url);
-            return preferred?.url || null;
-        }
-
-        // 将 SRT 时间戳（如 00:01:02,345）转换成秒
-        function parseSrtTimeToSeconds(timeText) {
-            const match = String(timeText || '').trim().match(/^(\d{2}):(\d{2}):(\d{2}),(\d{3})$/);
-            if (!match) return null;
-            const h = Number(match[1]);
-            const m = Number(match[2]);
-            const s = Number(match[3]);
-            const ms = Number(match[4]);
-            return h * 3600 + m * 60 + s + ms / 1000;
-        }
-
-        // 轻量 SRT 解析：输出与现有字幕渲染一致的数据结构
-        function parseSrtToSubtitleItems(srtText) {
-            const normalized = String(srtText || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
-            if (!normalized) return [];
-            const blocks = normalized.split(/\n{2,}/);
-            const items = [];
-            for (const block of blocks) {
-                const lines = block.split('\n').map(line => line.trimEnd()).filter(Boolean);
-                if (lines.length < 2) continue;
-                const timeLineIndex = lines.findIndex(line => line.includes('-->'));
-                if (timeLineIndex < 0) continue;
-                const timeLine = lines[timeLineIndex];
-                const [startText, endText] = timeLine.split('-->').map(part => part.trim());
-                const start = parseSrtTimeToSeconds(startText);
-                const end = parseSrtTimeToSeconds(endText);
-                if (start === null || end === null) continue;
-                const text = lines.slice(timeLineIndex + 1).join('\n').trim();
-                if (!text) continue;
-                items.push({ start, end, text });
-            }
-            return items;
-        }
-
-        // Auto Dubbing 完成后自动加载产出的字幕到播放器 overlay
-        async function autoLoadAutoDubSubtitles(data) {
-            const srtUrl = pickAutoDubSrtUrl(data);
-            if (!srtUrl) return;
-            try {
-                const response = await fetch(srtUrl);
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}`);
-                }
-                const srtText = await response.text();
-                const parsed = parseSrtToSubtitleItems(srtText);
-                if (!parsed.length) {
-                    throw new Error('empty or invalid srt');
-                }
-                originalSubtitlesData = parsed;
-                translatedSubtitlesData = [];
-                renderSubtitles(originalSubtitlesData, originalDisplay);
-                renderSubtitles([], translatedDisplay);
-                overlayMode = 'original';
-                const modeSelect = document.getElementById('display-mode');
-                if (modeSelect) modeSelect.value = 'original';
-                saveState();
-            } catch (error) {
-                console.warn('Auto load dubbing subtitles failed:', error);
-            }
-        }
-
-        // 绑定主播放器与配音音频的同步：播放/暂停/拖动/倍速都同步
-        if (videoPlayer) {
-            videoPlayer.addEventListener('play', () => {
-                if (audioTrackModeSelect?.value === 'dubbed' && dubbedAudioUrl) {
-                    dubbedAudioPlayer.play().catch(() => {});
-                }
-            });
-            videoPlayer.addEventListener('pause', () => {
-                dubbedAudioPlayer.pause();
-            });
-            videoPlayer.addEventListener('seeking', () => {
-                if (audioTrackModeSelect?.value === 'dubbed' && dubbedAudioUrl) {
-                    try {
-                        dubbedAudioPlayer.currentTime = videoPlayer.currentTime || 0;
-                    } catch (e) {
-                        console.debug('seek sync failed', e);
-                    }
-                }
-            });
-            videoPlayer.addEventListener('ratechange', () => {
-                dubbedAudioPlayer.playbackRate = videoPlayer.playbackRate || 1;
-            });
-            videoPlayer.addEventListener('ended', () => {
-                dubbedAudioPlayer.pause();
-                try {
-                    dubbedAudioPlayer.currentTime = 0;
-                } catch (e) {
-                    console.debug('reset dubbed audio failed', e);
-                }
-            });
-        }
-
-        if (audioTrackModeSelect) {
-            audioTrackModeSelect.addEventListener('change', () => {
-                applyAudioTrackMode(audioTrackModeSelect.value);
-            });
-        }
-
-        // Load saved API key
-        const SAVED_KEY = 'sm_autoDub_apiKey';
-        const SAVED_KEY_CHECKED = 'sm_autoDub_saveKey';
-        const savedApiKey = localStorage.getItem(SAVED_KEY);
-        const savedCheckState = localStorage.getItem(SAVED_KEY_CHECKED) === 'true';
-        if (savedApiKey && apiKeyInput) {
-            apiKeyInput.value = savedApiKey;
-        }
-        if (saveKeyCheckbox) {
-            saveKeyCheckbox.checked = savedCheckState;
-        }
-
-        // Save API key on checkbox change
-        if (saveKeyCheckbox && apiKeyInput) {
-            saveKeyCheckbox.addEventListener('change', () => {
-                if (saveKeyCheckbox.checked && apiKeyInput.value) {
-                    localStorage.setItem(SAVED_KEY, apiKeyInput.value);
-                } else if (!saveKeyCheckbox.checked) {
-                    localStorage.removeItem(SAVED_KEY);
-                }
-                localStorage.setItem(SAVED_KEY_CHECKED, saveKeyCheckbox.checked);
-            });
-        }
-
-        // Also save when user types in API key (if checkbox is already checked)
-        if (apiKeyInput && saveKeyCheckbox) {
-            apiKeyInput.addEventListener('input', () => {
-                if (saveKeyCheckbox.checked && apiKeyInput.value) {
-                    localStorage.setItem(SAVED_KEY, apiKeyInput.value);
-                }
-            });
-        }
-
-        // File Upload Logic
-        if (uploadArea && fileInput) {
-            uploadArea.addEventListener('click', () => fileInput.click());
-
-            if (browseBtn) {
-                browseBtn.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    fileInput.click();
-                });
-            }
-
-            uploadArea.addEventListener('dragover', (e) => {
-                e.preventDefault();
-                uploadArea.classList.add('drag-active');
-            });
-
-            uploadArea.addEventListener('dragleave', () => {
-                uploadArea.classList.remove('drag-active');
-            });
-
-            uploadArea.addEventListener('drop', (e) => {
-                e.preventDefault();
-                uploadArea.classList.remove('drag-active');
-                if (e.dataTransfer.files.length > 0) {
-                    handleAutoDubFile(e.dataTransfer.files[0]);
-                }
-            });
-
-            fileInput.addEventListener('change', (e) => {
-                if (e.target.files.length > 0) {
-                    handleAutoDubFile(e.target.files[0]);
-                }
-            });
-        }
-        if (subtitleBrowseBtn && subtitleInput) {
-            subtitleBrowseBtn.addEventListener('click', () => subtitleInput.click());
-            subtitleInput.addEventListener('change', (event) => {
-                const file = event.target.files && event.target.files.length > 0 ? event.target.files[0] : null;
-                if (!file) return;
-                const name = String(file.name || '').toLowerCase();
-                if (!name.endsWith('.srt')) {
-                    alert('字幕文件必须是 .srt');
-                    subtitleInput.value = '';
-                    return;
-                }
-                selectedSubtitleFile = file;
-                if (subtitleNameDisplay) {
-                    const mode = subtitleModeSelect ? subtitleModeSelect.value : 'source';
-                    const modeHint = mode === 'translated' ? '将跳过 ASR 与翻译' : '将跳过 ASR';
-                    subtitleNameDisplay.textContent = `已选择：${file.name}（${modeHint}）`;
-                }
-            });
-        }
-        if (subtitleModeSelect) {
-            subtitleModeSelect.addEventListener('change', () => {
-                if (!selectedSubtitleFile || !subtitleNameDisplay) return;
-                const modeHint = subtitleModeSelect.value === 'translated' ? '将跳过 ASR 与翻译' : '将跳过 ASR';
-                subtitleNameDisplay.textContent = `已选择：${selectedSubtitleFile.name}（${modeHint}）`;
-            });
-        }
-
-        function handleAutoDubFile(file) {
-            selectedFile = file;
-            // 切换媒体时清空已选字幕，避免旧字幕误绑定到新视频。
-            selectedSubtitleFile = null;
-            if (subtitleInput) subtitleInput.value = '';
-            if (subtitleNameDisplay) subtitleNameDisplay.textContent = '未选择字幕文件（默认自动识别）';
-            if (subtitleModeSelect) subtitleModeSelect.value = 'source';
-            // 切换新文件时清空旧区间，避免把上一个项目的配置误用于当前文件。
-            autoDubTimeRanges = [];
-            renderAutoDubTimeRanges();
-            if (autoDubRangeError) autoDubRangeError.style.display = 'none';
-            const sizeMb = (file.size / (1024 * 1024)).toFixed(2);
-            if (filenameDisplay) {
-                filenameDisplay.textContent = `${file.name} · ${sizeMb} MB`;
-            }
-            uploadArea.classList.add('has-file');
-
-            if (autoDubPreviewUrl) {
-                URL.revokeObjectURL(autoDubPreviewUrl);
-            }
-            autoDubPreviewUrl = URL.createObjectURL(file);
-            resetAudioTrackState();
-
-            if (videoPlayer) {
-                videoPlayer.src = autoDubPreviewUrl;
-                videoPlayer.style.display = 'block';
-                videoPlayer.load();
-                videoPlayer.controls = true;
-            }
-            if (videoPlaceholder) {
-                videoPlaceholder.style.display = 'none';
-            }
-        }
-
-        // Start Logic
-        if (startBtn) {
-            startBtn.addEventListener('click', async () => {
-                const sourceLang = document.getElementById('auto-dub-source').value;
-                const targetLang = document.getElementById('auto-dub-target').value;
-                const groupingStrategySelect = document.getElementById('auto-dub-grouping-strategy');
-                const groupingStrategy = groupingStrategySelect ? groupingStrategySelect.value : 'sentence';
-                const apiKey = document.getElementById('auto-dub-api-key').value;
-                const autoPickRangesEl = document.getElementById('auto-dub-auto-pick-ranges');
-                // 兜底默认关闭：当页面未渲染该控件时，避免误开启自动区间切分导致碎片分段。
-                const autoPickRanges = autoPickRangesEl ? !!autoPickRangesEl.checked : false;
-                // 字幕模式：source=源字幕需翻译，translated=已翻译字幕直接跳过翻译。
-                const subtitleMode = subtitleModeSelect ? subtitleModeSelect.value : 'source';
-                const skipTranslationBySubtitle = !!selectedSubtitleFile && subtitleMode === 'translated';
-
-                if (!selectedFile) {
-                    alert("Please select a video file first.");
-                    return;
-                }
-                if (!apiKey && !skipTranslationBySubtitle) {
-                    alert("Please enter your DeepSeek API Key.");
-                    return;
-                }
-                autoDubStartedAtMs = Date.now();
-
-                // UI Reset
-                startBtn.disabled = true;
-                statusContainer.style.display = 'block';
-                resultsContainer.style.display = 'none';
-                if (autoProgressFill) {
-                    autoProgressFill.style.width = '5%';
-                }
-                if (selectedSubtitleFile) {
-                    statusText.textContent = subtitleMode === 'translated'
-                        ? "Initializing... (Skip ASR + Translation with uploaded translated subtitles)"
-                        : "Initializing... (Skip ASR with uploaded subtitles)";
-                } else {
-                    statusText.textContent = "Initializing...";
-                }
-                statusText.className = 'status-text';
-
-                // Reset steps
-                ['step-transcribe', 'step-translate', 'step-dub'].forEach(id => {
-                    document.getElementById(id).style.fontWeight = 'normal';
-                    document.getElementById(id).style.color = 'var(--text-muted)';
-                });
-                if (taskLabel) taskLabel.textContent = 'Task —';
-                if (lineProgressEl) lineProgressEl.textContent = 'Lines —';
-                if (etaEl) etaEl.textContent = 'ETA —';
-
-                try {
-                    const formData = new FormData();
-                    formData.append('video', selectedFile);
-                    if (selectedSubtitleFile) {
-                        formData.append('subtitle_file', selectedSubtitleFile);
-                        formData.append('subtitle_mode', subtitleMode);
-                    }
-                    formData.append('source_lang', sourceLang);
-                    formData.append('target_lang', targetLang);
-                    formData.append('grouping_strategy', groupingStrategy);
-                    formData.append('api_key', apiKey);
-                    formData.append('auto_pick_ranges', autoPickRanges ? 'true' : 'false');
-                    // 手动区间优先：存在时按结构化 JSON 透传给后端。
-                    if (autoDubTimeRanges.length > 0) {
-                        const payload = autoDubTimeRanges.map(item => ({
-                            start_sec: Number(item.start),
-                            end_sec: Number(item.end),
-                        }));
-                        formData.append('time_ranges', JSON.stringify(payload));
-                    }
-
-                    const res = await fetch('/dubbing/auto/start', { method: 'POST', body: formData });
-                    if (!res.ok) {
-                        const err = await res.json().catch(() => ({}));
-                        throw new Error(err.detail || "Failed to start dubbing task");
-                    }
-
-                    const data = await res.json();
-                    const taskId = data.task_id;
-                    if (taskLabel && taskId) {
-                        taskLabel.textContent = `Task · ${taskId.split('-')[0].toUpperCase()}`;
-                    }
-
-                    pollAutoDubStatus(taskId);
-
-                } catch (e) {
-                    console.error(e);
-                    statusText.textContent = "Error: " + e.message;
-                    statusText.className = 'status-text error';
-                    startBtn.disabled = false;
-                }
-            });
-        }
-
-        function pollAutoDubStatus(taskId) {
-            const interval = setInterval(async () => {
-                try {
-                    const res = await fetch(`/dubbing/auto/status/${taskId}`);
-                    if (!res.ok) {
-                        clearInterval(interval);
-                        throw new Error("Status poll failed");
-                    }
-
-                    const data = await res.json();
-
-                    // Update Progress
-                    if (autoProgressFill && typeof data.progress === 'number') {
-                        autoProgressFill.style.width = `${data.progress}%`;
-                    }
-
-                    if (taskLabel && (data.short_id || data.id)) {
-                        taskLabel.textContent = `Task · ${(data.short_id || data.id.split('-')[0]).toUpperCase()}`;
-                    }
-
-                    const processed = data.processed_segments ?? data?.dub_progress?.processed_segments;
-                    const total = data.total_segments ?? data?.dub_progress?.total_segments;
-                    if (lineProgressEl) {
-                        lineProgressEl.textContent = formatLineProgress(processed, total);
-                    }
-
-                    const eta = data.eta_seconds ?? data?.dub_progress?.eta_seconds;
-                    if (etaEl) {
-                        etaEl.textContent = formatEtaLabel(eta);
-                    }
-
-                    const stageLabel = describeAutoStage(data.stage);
-                    if (statusText) {
-                        let suffix = '';
-                        if (data.status === 'completed') suffix = ' • Done';
-                        else if (data.status === 'failed') suffix = ' • Failed';
-                        statusText.textContent = `${stageLabel}${suffix}`;
-                        statusText.className = 'status-text';
-                        if (data.status === 'failed') statusText.classList.add('error');
-                        else if (data.status === 'completed') statusText.classList.add('success');
-                    }
-
-                    updateStepHighlights(data.stage);
-
-                    if (data.status === 'completed') {
-                        clearInterval(interval);
-                        startBtn.disabled = false;
-                        const elapsedLabel = buildAutoDubElapsedLabel(data, autoDubStartedAtMs);
-                        statusText.textContent = elapsedLabel ? `Process Complete · ${elapsedLabel}` : "Process Complete";
-                        statusText.className = 'status-text success';
-                        renderResults(data);
-                    } else if (data.status === 'failed') {
-                        clearInterval(interval);
-                        startBtn.disabled = false;
-                        statusText.textContent = "Failed: " + data.error;
-                        statusText.className = 'status-text error';
-                    }
-
-                } catch (e) {
-                    console.error(e);
-                    clearInterval(interval);
-                    statusText.textContent = "Polling Error: " + e.message;
-                    startBtn.disabled = false;
-                }
-            }, 1200);
-        }
-
-        function updateStepHighlights(stage) {
-            // stages: transcribing, translating, dubbing, finished
-            const steps = {
-                'transcribing': 'step-transcribe',
-                'translating': 'step-translate',
-                'dubbing': 'step-dub'
-            };
-
-            let normalized = stage;
-            if (stage && stage.startsWith('dubbing')) normalized = 'dubbing';
-            if (stage === 'finished') normalized = 'dubbing';
-
-            const activeId = steps[normalized];
-            for (const [key, id] of Object.entries(steps)) {
-                const el = document.getElementById(id);
-                if (el) {
-                    if (key === normalized) {
-                        el.style.fontWeight = 'bold';
-                        el.style.color = 'var(--accent)';
-                    } else {
-                        // Mark previous as done if needed? simple highlighting for now
-                        el.style.fontWeight = 'normal';
-                        el.style.color = 'var(--text-muted)';
-                    }
-                }
-            }
-        }
-
-        function renderResults(data) {
-            resultsContainer.style.display = 'block';
-            const links = resultsContainer.querySelector('.download-links');
-            if (!links) return;
-            links.innerHTML = '';
-
-            // 自动加载该任务产出的 SRT 到播放器字幕层（失败不阻断下载与播放）
-            autoLoadAutoDubSubtitles(data);
-
-            // 结果回填后启用音轨切换：原音=当前预览媒体，配音=任务输出音频
-            dubbedAudioUrl = pickDubbedAudioUrl(data);
-            if (dubbedAudioUrl) {
-                dubbedAudioPlayer.src = dubbedAudioUrl;
-                dubbedAudioPlayer.load();
-                if (audioTrackSwitcher) {
-                    audioTrackSwitcher.style.display = 'inline-flex';
-                }
-                if (audioTrackModeSelect) {
-                    audioTrackModeSelect.value = 'original';
-                }
-                applyAudioTrackMode('original');
-            } else {
-                resetAudioTrackState();
-            }
-
-            const artifacts = Array.isArray(data.artifacts) ? data.artifacts : [];
-            artifacts.forEach((artifact, index) => {
-                if (!artifact || !artifact.url) return;
-                const btn = document.createElement('a');
-                btn.href = artifact.url;
-                btn.className = index === 0 ? 'primary-btn' : 'secondary-btn';
-                btn.textContent = artifact.label || artifact.key || 'Download';
-                btn.style.display = 'block';
-                btn.style.textAlign = 'center';
-                links.appendChild(btn);
-            });
-
-            if (artifacts.length === 0 && data.result_audio) {
-                const audioBtn = document.createElement('a');
-                audioBtn.href = data.result_audio;
-                audioBtn.className = 'primary-btn';
-                audioBtn.textContent = 'Download Dubbed Audio';
-                audioBtn.style.display = 'block';
-                audioBtn.style.textAlign = 'center';
-                links.appendChild(audioBtn);
-            }
-
-            if (artifacts.length === 0 && data.result_video) {
-                const videoBtn = document.createElement('a');
-                videoBtn.href = data.result_video;
-                videoBtn.className = 'secondary-btn';
-                videoBtn.textContent = 'Download Final Video';
-                videoBtn.style.display = 'block';
-                videoBtn.style.textAlign = 'center';
-                links.appendChild(videoBtn);
-            }
-
-            const summary = document.createElement('p');
-            summary.style.marginTop = '5px';
-            summary.style.fontSize = '0.85rem';
-            summary.style.color = 'var(--text-muted)';
-            const processed = data.processed_segments ?? data.total_segments;
-            const total = data.total_segments ?? processed;
-            if (total) {
-                const manual = data.manual_review_segments || 0;
-                summary.textContent = manual > 0
-                    ? `Completed ${processed || total}/${total} segments. Manual review: ${manual}.`
-                    : `Completed ${processed || total}/${total} segments.`;
-            } else {
-                summary.textContent = 'Dub completed.';
-            }
-            const elapsedLabel = buildAutoDubElapsedLabel(data, autoDubStartedAtMs);
-            if (elapsedLabel) {
-                summary.textContent = `${summary.textContent} ${elapsedLabel}.`;
-            }
-            links.appendChild(summary);
-        }
-    }
+    // --- Auto Dubbing / Agent Modules ---
+    Promise.all([
+        loadFrontendModule('js/dubbingPanel.js'),
+        loadFrontendModule('js/agentDrawer.js'),
+    ]).then(([dubbingPanelModule, agentDrawerModule]) => {
+        dubbingPanelModule.setupDubbingPanels({
+            videoPlayer,
+            videoPlaceholder,
+            shortMergeTargetDefault: SHORT_MERGE_TARGET_DEFAULT,
+            shortMergeTargetMin: SHORT_MERGE_TARGET_MIN,
+            shortMergeTargetMax: SHORT_MERGE_TARGET_MAX,
+            secondsToDisplay,
+            timeToSeconds,
+            formatLineProgress,
+            formatEtaAsSegmentProgress,
+            buildAutoDubElapsedLabel,
+            describeAutoStage,
+            normalizeShortMergeTargetSeconds,
+            applyAutoDubSubtitleItems,
+        });
+        agentDrawerModule.setupAgentDrawer({
+            getCurrentPanelName: () => {
+                const activePanel = document.querySelector('.panel.active');
+                return activePanel?.id || 'unknown';
+            },
+        });
+    }).catch((error) => {
+        console.error('Frontend module bootstrap failed', error);
+    });
 });
 
 // 5. Export Segments (Event Delegation)

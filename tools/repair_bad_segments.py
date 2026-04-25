@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import re
 import subprocess
@@ -21,6 +22,28 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from subtitle_maker.transcriber import format_srt, parse_srt
+from subtitle_maker.backends import (
+    check_index_tts_service as check_index_tts_service_impl,
+    synthesize_via_index_tts_api as synthesize_via_index_tts_api_impl,
+)
+from subtitle_maker.core.ffmpeg import (
+    run_cmd as run_cmd_impl,
+    run_cmd_checked as run_cmd_checked_impl,
+)
+from subtitle_maker.domains.dubbing import (
+    build_atempo_filter_chain as build_atempo_filter_chain_impl,
+    compute_effective_target_duration as compute_effective_target_duration_impl,
+    fit_audio_to_duration as fit_audio_to_duration_impl,
+    trim_silence_edges as trim_silence_edges_impl,
+)
+from subtitle_maker.domains.media import (
+    audio_duration as audio_duration_impl,
+    compose_vocals_master as compose_vocals_master_impl,
+    concat_wav_files as concat_wav_files_impl,
+    merge_bilingual_srt_files as merge_bilingual_srt_files_impl,
+    merge_srt_files as merge_srt_files_impl,
+    mix_with_bgm as mix_with_bgm_impl,
+)
 from subtitle_maker.translator import Translator
 
 
@@ -29,23 +52,18 @@ def iso_now() -> str:
 
 
 def run_cmd(cmd: List[str], cwd: Optional[Path] = None) -> Tuple[int, str, str]:
-    proc = subprocess.run(
-        cmd,
-        cwd=str(cwd) if cwd else None,
-        capture_output=True,
-        text=True,
-    )
-    return proc.returncode, proc.stdout, proc.stderr
+    """兼容旧入口：执行命令并返回退出码、stdout、stderr。"""
+    return run_cmd_impl(cmd, cwd=cwd)
 
 
 def run_cmd_checked(cmd: List[str], cwd: Optional[Path] = None) -> None:
-    code, out, err = run_cmd(cmd, cwd=cwd)
-    if code != 0:
-        raise RuntimeError(f"command failed ({code}): {' '.join(cmd)}\n{out}\n{err}")
+    """兼容旧入口：执行命令，失败时保留 stdout/stderr 并抛出异常。"""
+    return run_cmd_checked_impl(cmd, cwd=cwd)
 
 
 def audio_duration(path: Path) -> float:
-    return float(sf.info(str(path)).duration)
+    """兼容旧入口：读取音频元信息并返回时长秒数。"""
+    return audio_duration_impl(path)
 
 
 def is_cjk_target_lang(target_lang: str) -> bool:
@@ -116,11 +134,8 @@ def _http_json_request(
 
 
 def check_index_tts_service(*, api_url: str, timeout_sec: float) -> Dict[str, Any]:
-    url = api_url.rstrip("/") + "/health"
-    payload = _http_json_request(method="GET", url=url, payload=None, timeout_sec=timeout_sec)
-    if not payload.get("ok"):
-        raise RuntimeError(f"index-tts service unhealthy: {payload}")
-    return payload
+    """兼容旧入口：检查 Index-TTS API 健康状态。"""
+    return check_index_tts_service_impl(api_url=api_url, timeout_sec=timeout_sec)
 
 
 def synthesize_via_index_tts_api(
@@ -135,43 +150,27 @@ def synthesize_via_index_tts_api(
     temperature: float,
     max_text_tokens: int,
 ) -> None:
-    payload = {
-        "text": text,
-        "spk_audio_prompt": str(ref_audio_path.expanduser().resolve()),
-        "output_path": str(output_path.expanduser().resolve()),
-        "emo_audio_prompt": None,
-        "emo_alpha": 1.0,
-        "use_emo_text": False,
-        "emo_text": None,
-        "top_p": top_p,
-        "top_k": top_k,
-        "temperature": temperature,
-        "max_text_tokens_per_segment": max_text_tokens,
-    }
-    url = api_url.rstrip("/") + "/synthesize"
-    result = _http_json_request(
-        method="POST",
-        url=url,
-        payload=payload,
+    """兼容旧入口：通过 Index-TTS API 执行一次合成。"""
+    return synthesize_via_index_tts_api_impl(
+        api_url=api_url,
         timeout_sec=timeout_sec,
+        text=text,
+        ref_audio_path=ref_audio_path,
+        output_path=output_path,
+        emo_audio_prompt=None,
+        emo_alpha=1.0,
+        use_emo_text=False,
+        emo_text=None,
+        top_p=top_p,
+        top_k=top_k,
+        temperature=temperature,
+        max_text_tokens=max_text_tokens,
     )
-    if not result.get("ok"):
-        raise RuntimeError(f"index-tts api returned non-ok: {result}")
-    if not output_path.exists():
-        raise RuntimeError("index-tts api finished but output missing")
 
 
 def build_atempo_filter_chain(tempo: float) -> str:
-    value = max(1e-4, float(tempo))
-    factors: List[float] = []
-    while value > 2.0:
-        factors.append(2.0)
-        value /= 2.0
-    while value < 0.5:
-        factors.append(0.5)
-        value /= 0.5
-    factors.append(value)
-    return ",".join(f"atempo={factor:.6f}" for factor in factors)
+    """兼容旧入口：构造 ffmpeg atempo 过滤链。"""
+    return build_atempo_filter_chain_impl(tempo)
 
 
 def fit_audio_to_duration(
@@ -180,25 +179,11 @@ def fit_audio_to_duration(
     output_path: Path,
     target_duration_sec: float,
 ) -> None:
-    target = max(0.05, float(target_duration_sec))
-    actual = max(0.01, audio_duration(input_path))
-    if actual <= target:
-        filter_expr = f"apad=pad_dur={target:.6f},atrim=0:{target:.6f}"
-    else:
-        tempo = actual / target
-        atempo_chain = build_atempo_filter_chain(tempo)
-        filter_expr = f"{atempo_chain},apad=pad_dur={target:.6f},atrim=0:{target:.6f}"
-    run_cmd_checked(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(input_path),
-            "-filter:a",
-            filter_expr,
-            "-vn",
-            str(output_path),
-        ]
+    """兼容旧入口：把音频拟合到目标时长。"""
+    return fit_audio_to_duration_impl(
+        input_path=input_path,
+        output_path=output_path,
+        target_duration_sec=target_duration_sec,
     )
 
 
@@ -209,15 +194,13 @@ def compute_effective_target_duration(
     next_start_sec: float | None,
     gap_guard_sec: float = 0.10,
 ) -> Tuple[float, float]:
-    """根据下一句开始时间扩展可用时长，减少过度压缩。"""
-    base_target_sec = max(0.05, float(end_sec) - float(start_sec))
-    if next_start_sec is None:
-        return base_target_sec, 0.0
-    gap_sec = float(next_start_sec) - float(end_sec)
-    if gap_sec <= 0:
-        return base_target_sec, 0.0
-    borrow_sec = max(0.0, gap_sec - max(0.0, float(gap_guard_sec)))
-    return max(base_target_sec, base_target_sec + borrow_sec), borrow_sec
+    """兼容旧入口：计算可借静音后的有效目标时长。"""
+    return compute_effective_target_duration_impl(
+        start_sec=start_sec,
+        end_sec=end_sec,
+        next_start_sec=next_start_sec,
+        gap_guard_sec=gap_guard_sec,
+    )
 
 
 def trim_silence_edges(
@@ -228,41 +211,14 @@ def trim_silence_edges(
     pad_sec: float = 0.03,
     min_keep_sec: float = 0.10,
 ) -> Tuple[float, float]:
-    wav, sr = sf.read(str(input_path))
-    if isinstance(wav, np.ndarray) and wav.ndim > 1:
-        mono = wav.mean(axis=1)
-    else:
-        mono = np.asarray(wav)
-    mono = np.asarray(mono, dtype=np.float32)
-
-    full_duration = float(len(mono) / sr) if len(mono) > 0 else 0.0
-    if mono.size == 0:
-        sf.write(str(output_path), wav, sr)
-        return full_duration, full_duration
-
-    threshold_amp = float(10 ** (threshold_db / 20.0))
-    active = np.where(np.abs(mono) >= threshold_amp)[0]
-    if active.size == 0:
-        sf.write(str(output_path), wav, sr)
-        return full_duration, full_duration
-
-    pad_samples = max(0, int(pad_sec * sr))
-    start = max(0, int(active[0]) - pad_samples)
-    end = min(len(mono), int(active[-1]) + 1 + pad_samples)
-    min_keep_samples = max(1, int(min_keep_sec * sr))
-    if end - start < min_keep_samples:
-        center = int((start + end) / 2)
-        half = int(min_keep_samples / 2)
-        start = max(0, center - half)
-        end = min(len(mono), start + min_keep_samples)
-
-    if isinstance(wav, np.ndarray) and wav.ndim > 1:
-        trimmed = wav[start:end, :]
-    else:
-        trimmed = wav[start:end]
-    sf.write(str(output_path), trimmed, sr)
-    trimmed_duration = float(max(0, end - start) / sr)
-    return full_duration, trimmed_duration
+    """兼容旧入口：裁掉音频首尾静音。"""
+    return trim_silence_edges_impl(
+        input_path=input_path,
+        output_path=output_path,
+        threshold_db=threshold_db,
+        pad_sec=pad_sec,
+        min_keep_sec=min_keep_sec,
+    )
 
 
 def compose_vocals_master(
@@ -270,67 +226,8 @@ def compose_vocals_master(
     segments: List[Dict[str, Any]],
     output_path: Path,
 ) -> Tuple[Path, int]:
-    valid_segments = [
-        segment
-        for segment in segments
-        if Path(segment["tts_audio_path"]).exists() and not bool(segment.get("skip_compose", False))
-    ]
-    if not valid_segments:
-        raise RuntimeError("no segment audio produced")
-
-    valid_segments.sort(key=lambda item: float(item["start_sec"]))
-
-    first_audio, sr = sf.read(valid_segments[0]["tts_audio_path"])
-    if isinstance(first_audio, np.ndarray) and first_audio.ndim > 1:
-        first_audio = first_audio.mean(axis=1)
-
-    max_len = 0
-    cached: List[Tuple[Dict[str, Any], np.ndarray]] = []
-    for index, segment in enumerate(valid_segments):
-        wav, cur_sr = sf.read(segment["tts_audio_path"])
-        if isinstance(wav, np.ndarray) and wav.ndim > 1:
-            wav = wav.mean(axis=1)
-        if cur_sr != sr:
-            raise RuntimeError("inconsistent segment sample rates")
-
-        start_sample = int(float(segment["start_sec"]) * sr)
-        # 关键逻辑：若存在“借静音后”的有效目标时长，合成窗口也要同步扩展，
-        # 否则会在最终拼轨阶段把尾音二次截断。
-        if segment.get("effective_target_duration_sec") is not None:
-            own_end_sec = float(segment["start_sec"]) + max(
-                0.05, float(segment.get("effective_target_duration_sec", 0.0) or 0.0)
-            )
-        else:
-            own_end_sec = float(segment.get("group_anchor_end_sec", segment["end_sec"]))
-        own_end_sample = max(start_sample + 1, int(own_end_sec * sr))
-
-        if index + 1 < len(valid_segments):
-            next_start_sample = int(float(valid_segments[index + 1]["start_sec"]) * sr)
-            if next_start_sample > start_sample:
-                window_end_sample = min(own_end_sample, next_start_sample)
-            else:
-                window_end_sample = own_end_sample
-        else:
-            window_end_sample = own_end_sample
-
-        max_allowed_len = max(1, window_end_sample - start_sample)
-        clipped = np.asarray(wav, dtype=np.float32)[:max_allowed_len]
-        cached.append((segment, clipped))
-        max_len = max(max_len, start_sample + len(clipped))
-
-    master = np.zeros(max_len, dtype=np.float32)
-    for segment, wav in cached:
-        start_sample = int(float(segment["start_sec"]) * sr)
-        end_sample = start_sample + len(wav)
-        master[start_sample:end_sample] = wav
-
-    peak = float(np.max(np.abs(master))) if master.size > 0 else 1.0
-    if peak > 0.99:
-        master = master / peak * 0.99
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    sf.write(str(output_path), master, sr)
-    return output_path, sr
+    """兼容旧入口：把逐句或逐段配音按时间轴回填为一条 master vocals。"""
+    return compose_vocals_master_impl(segments=segments, output_path=output_path)
 
 
 def mix_with_bgm(
@@ -340,54 +237,19 @@ def mix_with_bgm(
     output_path: Path,
     target_sr: int,
 ) -> None:
-    run_cmd_checked(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(vocals_path),
-            "-i",
-            str(bgm_path),
-            "-filter_complex",
-            "[0:a]volume=1.0[v];[1:a]volume=1.0[b];[v][b]amix=inputs=2:duration=longest:dropout_transition=0[m]",
-            "-map",
-            "[m]",
-            "-ac",
-            "1",
-            "-ar",
-            str(target_sr),
-            str(output_path),
-        ]
+    """兼容旧入口：混合配音人声和背景音。"""
+    return mix_with_bgm_impl(
+        vocals_path=vocals_path,
+        bgm_path=bgm_path,
+        output_path=output_path,
+        target_sr=target_sr,
+        error_prefix=None,
     )
 
 
 def concat_wav_files(inputs: List[Path], output_wav: Path) -> None:
-    if not inputs:
-        return
-    output_wav.parent.mkdir(parents=True, exist_ok=True)
-    list_path = output_wav.parent / f"{output_wav.stem}_concat.txt"
-    lines: List[str] = []
-    for item in inputs:
-        escaped = str(item.resolve()).replace("'", "'\\''")
-        lines.append(f"file '{escaped}'")
-    list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    run_cmd_checked(
-        [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(list_path),
-            "-ac",
-            "1",
-            "-ar",
-            "44100",
-            str(output_wav),
-        ]
-    )
+    """兼容旧入口：拼接多个 wav 文件。"""
+    return concat_wav_files_impl(inputs, output_wav, sample_rate=44100, error_on_empty=False)
 
 
 def merge_srt_files(
@@ -395,19 +257,8 @@ def merge_srt_files(
     inputs: List[Tuple[Path, float]],
     output_srt: Path,
 ) -> None:
-    merged: List[Dict[str, Any]] = []
-    for path, offset_sec in inputs:
-        subs = parse_srt(path.read_text(encoding="utf-8"))
-        for item in subs:
-            merged.append(
-                {
-                    "start": float(item["start"]) + offset_sec,
-                    "end": float(item["end"]) + offset_sec,
-                    "text": item["text"],
-                }
-            )
-    output_srt.parent.mkdir(parents=True, exist_ok=True)
-    output_srt.write_text(format_srt(merged), encoding="utf-8")
+    """兼容旧入口：把多段 SRT 按全局时间轴偏移拼接为完整字幕。"""
+    return merge_srt_files_impl(inputs=inputs, output_srt=output_srt)
 
 
 def merge_bilingual_srt_files(
@@ -417,32 +268,13 @@ def merge_bilingual_srt_files(
     output_srt: Path,
     translated_first: bool = True,
 ) -> None:
-    merged: List[Dict[str, Any]] = []
-    for (translated_path, translated_offset), (source_path, source_offset) in zip(translated_inputs, source_inputs):
-        if abs(float(translated_offset) - float(source_offset)) > 1e-6:
-            raise RuntimeError("offset mismatch while building bilingual srt")
-        translated_subs = parse_srt(translated_path.read_text(encoding="utf-8"))
-        source_subs = parse_srt(source_path.read_text(encoding="utf-8"))
-        if len(translated_subs) != len(source_subs):
-            raise RuntimeError("line count mismatch while building bilingual srt")
-
-        for translated, source in zip(translated_subs, source_subs):
-            translated_text = (translated.get("text") or "").strip()
-            source_text = (source.get("text") or "").strip()
-            if translated_first:
-                text = translated_text if not source_text else f"{translated_text}\n{source_text}"
-            else:
-                text = source_text if not translated_text else f"{source_text}\n{translated_text}"
-            merged.append(
-                {
-                    "start": float(translated["start"]) + translated_offset,
-                    "end": float(translated["end"]) + translated_offset,
-                    "text": text,
-                }
-            )
-
-    output_srt.parent.mkdir(parents=True, exist_ok=True)
-    output_srt.write_text(format_srt(merged), encoding="utf-8")
+    """兼容旧入口：把原文和译文双轨字幕拼接为完整双语字幕。"""
+    return merge_bilingual_srt_files_impl(
+        translated_inputs=translated_inputs,
+        source_inputs=source_inputs,
+        output_srt=output_srt,
+        translated_first=translated_first,
+    )
 
 
 def resolve_output_path(path_text: Optional[str]) -> Optional[Path]:
@@ -691,6 +523,8 @@ def rebuild_batch_outputs(batch_dir: Path) -> Dict[str, Any]:
     source_srt_inputs: List[Tuple[Path, float]] = []
     translated_srt_inputs: List[Tuple[Path, float]] = []
     dubbed_final_srt_inputs: List[Tuple[Path, float]] = []
+    # 复用 dub_long_video 的“全时轴重建”能力所需上下文。
+    segment_runtime_items: List[Dict[str, Any]] = []
 
     for entry in segment_entries:
         start_sec = float(entry["start_sec"])
@@ -730,6 +564,17 @@ def rebuild_batch_outputs(batch_dir: Path) -> Dict[str, Any]:
             translated_srt_inputs.append((translated_srt, start_sec))
         if dubbed_final_srt and dubbed_final_srt.exists():
             dubbed_final_srt_inputs.append((dubbed_final_srt, start_sec))
+        segment_audio = resolve_output_path(entry.get("segment_audio")) or (batch_dir / "segments" / f"segment_{int(entry['index']):04d}.wav")
+        segment_runtime_items.append(
+            {
+                "index": int(entry["index"]),
+                "start_sec": start_sec,
+                "end_sec": float(entry.get("end_sec", start_sec) or start_sec),
+                "segment_audio": segment_audio,
+                "job_dir": job_dir,
+                "manifest": manifest,
+            }
+        )
 
     out_vocals = resolve_output_path(final_paths.get("dubbed_vocals_full")) or (batch_dir / "final" / "dubbed_vocals_full.wav")
     out_mix = resolve_output_path(final_paths.get("dubbed_mix_full")) or (batch_dir / "final" / "dubbed_mix_full.wav")
@@ -738,16 +583,65 @@ def rebuild_batch_outputs(batch_dir: Path) -> Dict[str, Any]:
     out_translated_srt = resolve_output_path(final_paths.get("translated_full_srt")) or (batch_dir / "final" / "translated_full.srt")
     out_dubbed_final_srt = resolve_output_path(final_paths.get("dubbed_final_full_srt")) or (batch_dir / "final" / "dubbed_final_full.srt")
 
+    vocals_rebuilt = False
+    mix_rebuilt = False
+    bgm_rebuilt = False
+    source_srt_rebuilt = False
+    translated_srt_rebuilt = False
+    dubbed_final_srt_rebuilt = False
+
     if out_vocals and len(vocals_inputs) == len(segment_entries):
         concat_wav_files(vocals_inputs, out_vocals)
-    if out_mix and len(mix_inputs) == len(segment_entries):
-        concat_wav_files(mix_inputs, out_mix)
+        vocals_rebuilt = True
+    # 优先复用 dub_long_video 的全时轴混音实现：
+    # - 区间内使用分段配音/混音
+    # - 区间外自动保留原始声音
+    # 这样可避免局部重配后“非配音区静音”的问题。
+    if out_mix:
+        try:
+            tool_path = REPO_ROOT / "tools" / "dub_long_video.py"
+            spec = importlib.util.spec_from_file_location("dub_long_video_runtime", str(tool_path))
+            if spec is not None and spec.loader is not None:
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                SegmentResult = module.SegmentResult
+                source_audio = (batch_dir / "source_audio.wav").resolve()
+                if not source_audio.exists() and segment_runtime_items:
+                    first_paths = (segment_runtime_items[0].get("manifest") or {}).get("paths") or {}
+                    source_audio = resolve_output_path(first_paths.get("source_audio")) or source_audio
+                if source_audio and Path(source_audio).exists():
+                    timeline_results = [
+                        SegmentResult(
+                            index=int(item["index"]),
+                            start_sec=float(item["start_sec"]),
+                            end_sec=float(item["end_sec"]),
+                            segment_audio=Path(item["segment_audio"]),
+                            job_dir=Path(item["job_dir"]),
+                            manifest=dict(item["manifest"]),
+                        )
+                        for item in sorted(segment_runtime_items, key=lambda value: int(value["index"]))
+                    ]
+                    built_mix = module.build_full_timeline_mix(
+                        results=timeline_results,
+                        output_wav=out_mix,
+                        source_audio=Path(source_audio),
+                    )
+                    mix_rebuilt = bool(built_mix and Path(built_mix).exists())
+        except Exception:
+            mix_rebuilt = False
+    # 若全时轴重建不可用，再回退到旧的拼接模式。
+    # 注意：局部重配场景禁止再回退到“concat 段内 mix”。
+    # 原因：该路径在某些任务会导致区间外听感异常（被误认为静音/丢原声）。
+    # 若全时轴重建失败，宁可保留旧 mix，也不覆盖成潜在错误结果。
     if out_bgm and len(bgm_inputs) == len(segment_entries):
         concat_wav_files(bgm_inputs, out_bgm)
+        bgm_rebuilt = True
     if out_source_srt and len(source_srt_inputs) == len(segment_entries):
         merge_srt_files(inputs=source_srt_inputs, output_srt=out_source_srt)
+        source_srt_rebuilt = True
     if out_translated_srt and len(translated_srt_inputs) == len(segment_entries):
         merge_srt_files(inputs=translated_srt_inputs, output_srt=out_translated_srt)
+        translated_srt_rebuilt = True
     bilingual_translated_inputs = (
         dubbed_final_srt_inputs if len(dubbed_final_srt_inputs) == len(segment_entries) else translated_srt_inputs
     )
@@ -760,19 +654,52 @@ def rebuild_batch_outputs(batch_dir: Path) -> Dict[str, Any]:
             output_srt=out_dubbed_final_srt,
             translated_first=True,
         )
+        dubbed_final_srt_rebuilt = True
 
-    final_paths["dubbed_vocals_full"] = str(out_vocals.resolve()) if len(vocals_inputs) == len(segment_entries) else None
-    final_paths["dubbed_mix_full"] = str(out_mix.resolve()) if len(mix_inputs) == len(segment_entries) else None
-    final_paths["source_bgm_full"] = str(out_bgm.resolve()) if len(bgm_inputs) == len(segment_entries) else None
-    final_paths["source_full_srt"] = str(out_source_srt.resolve()) if len(source_srt_inputs) == len(segment_entries) else None
-    final_paths["translated_full_srt"] = (
-        str(out_translated_srt.resolve()) if len(translated_srt_inputs) == len(segment_entries) else None
-    )
-    final_paths["dubbed_final_full_srt"] = (
-        str(out_dubbed_final_srt.resolve())
-        if len(source_srt_inputs) == len(segment_entries) and len(bilingual_translated_inputs) == len(segment_entries)
-        else None
-    )
+    # 关键修复：
+    # 局部重配重拼时，如果某类产物未能完整重建，不要把已有 final 路径清空。
+    # 否则前端会从 mix 回退到 vocals，表现成“只有配音区有声，其他像静音”。
+    if vocals_rebuilt and out_vocals and out_vocals.exists():
+        final_paths["dubbed_vocals_full"] = str(out_vocals.resolve())
+    elif not final_paths.get("dubbed_vocals_full"):
+        final_paths["dubbed_vocals_full"] = None
+
+    if mix_rebuilt and out_mix and out_mix.exists():
+        final_paths["dubbed_mix_full"] = str(out_mix.resolve())
+    else:
+        existing_mix = resolve_output_path(final_paths.get("dubbed_mix_full"))
+        if not (existing_mix and existing_mix.exists()):
+            final_paths["dubbed_mix_full"] = None
+
+    if bgm_rebuilt and out_bgm and out_bgm.exists():
+        final_paths["source_bgm_full"] = str(out_bgm.resolve())
+    elif not final_paths.get("source_bgm_full"):
+        final_paths["source_bgm_full"] = None
+
+    if source_srt_rebuilt and out_source_srt and out_source_srt.exists():
+        final_paths["source_full_srt"] = str(out_source_srt.resolve())
+    elif not final_paths.get("source_full_srt"):
+        final_paths["source_full_srt"] = None
+
+    if translated_srt_rebuilt and out_translated_srt and out_translated_srt.exists():
+        final_paths["translated_full_srt"] = str(out_translated_srt.resolve())
+    elif not final_paths.get("translated_full_srt"):
+        final_paths["translated_full_srt"] = None
+
+    if dubbed_final_srt_rebuilt and out_dubbed_final_srt and out_dubbed_final_srt.exists():
+        final_paths["dubbed_final_full_srt"] = str(out_dubbed_final_srt.resolve())
+    elif not final_paths.get("dubbed_final_full_srt"):
+        final_paths["dubbed_final_full_srt"] = None
+
+    # 同步 preferred_audio，优先 mix，保证前端默认播放可保留原声的成品轨。
+    effective_mix = resolve_output_path(final_paths.get("dubbed_mix_full"))
+    effective_vocals = resolve_output_path(final_paths.get("dubbed_vocals_full"))
+    if effective_mix and effective_mix.exists():
+        final_paths["preferred_audio"] = str(effective_mix.resolve())
+    elif effective_vocals and effective_vocals.exists():
+        final_paths["preferred_audio"] = str(effective_vocals.resolve())
+    else:
+        final_paths["preferred_audio"] = None
 
     batch_manifest["updated_at"] = iso_now()
     batch_manifest["paths"] = final_paths
@@ -785,6 +712,9 @@ def rebuild_batch_outputs(batch_dir: Path) -> Dict[str, Any]:
         "source_srt_inputs": len(source_srt_inputs),
         "translated_srt_inputs": len(translated_srt_inputs),
         "dubbed_final_srt_inputs": len(dubbed_final_srt_inputs),
+        "vocals_rebuilt": vocals_rebuilt,
+        "mix_rebuilt": mix_rebuilt,
+        "bgm_rebuilt": bgm_rebuilt,
     }
 
 

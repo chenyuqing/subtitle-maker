@@ -14,16 +14,34 @@ import signal
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+import importlib.util
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
+from subtitle_maker.domains.dubbing import resolve_segment_redub_runtime_options
+from subtitle_maker.jobs import (
+    AutoDubbingCommandConfig,
+    SegmentRedubCommandConfig,
+    TaskPayload,
+    TaskStore,
+    build_batch_artifacts,
+    build_batch_task_updates,
+    build_auto_dubbing_command,
+    build_loaded_batch_task,
+    build_segment_redub_command,
+    find_batch_manifest_by_name,
+    list_available_batches,
+)
+from subtitle_maker.manifests import load_batch_manifest, load_segment_manifest
+from subtitle_maker.transcriber import format_srt, parse_srt
 
 router = APIRouter(prefix="/dubbing/auto", tags=["dubbing"])
 
@@ -36,11 +54,16 @@ INDEX_TTS_START_SCRIPT = REPO_ROOT / "start_index_tts_api.sh"
 UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-_tasks: Dict[str, Dict[str, Any]] = {}
-_lock = threading.Lock()
+_task_store = TaskStore()
+# 保留旧全局名，兼容现有测试与少量尚未迁移的代码。
+_tasks: Dict[str, TaskPayload] = _task_store.items
+_lock = _task_store.lock
 DEFAULT_TRANSLATE_BASE_URL = "https://api.deepseek.com"
 DEFAULT_TRANSLATE_MODEL = "deepseek-chat"
 DEFAULT_INDEX_TTS_API_URL = "http://127.0.0.1:8010"
+DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC = 15
+MIN_SOURCE_SHORT_MERGE_TARGET_SEC = 6
+MAX_SOURCE_SHORT_MERGE_TARGET_SEC = 20
 
 
 def _index_tts_target_lang_supported(target_lang: str) -> bool:
@@ -66,12 +89,222 @@ def _iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def _normalize_short_merge_target_seconds_for_display(
+    value: Any,
+    *,
+    mode: str = "",
+) -> int:
+    """把历史 batch 中的旧字数字段兼容回新的秒数语义。"""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC
+
+    if MIN_SOURCE_SHORT_MERGE_TARGET_SEC <= parsed <= MAX_SOURCE_SHORT_MERGE_TARGET_SEC:
+        return parsed
+    if (mode or "").strip().lower() == "seconds":
+        return max(
+            MIN_SOURCE_SHORT_MERGE_TARGET_SEC,
+            min(MAX_SOURCE_SHORT_MERGE_TARGET_SEC, parsed),
+        )
+    # 历史 manifest 的 30~80 表示“字数阈值”，这里统一回退到新默认 15 秒。
+    return DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC
+
+
 def _sanitize_filename(name: str) -> str:
     stem = Path(name or "media").stem
     suffix = Path(name or "").suffix
     safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._-") or "media"
     safe_suffix = suffix if re.fullmatch(r"\.[A-Za-z0-9]{1,8}", suffix or "") else ""
     return f"{safe_stem}{safe_suffix}"
+
+
+def _vtt_token_to_srt_time(token: str) -> str:
+    # 将 VTT 时间戳（HH:MM:SS.mmm 或 MM:SS.mmm）转换为 SRT 时间戳格式。
+    text = (token or "").strip().replace(",", ".")
+    parts = text.split(":")
+    if len(parts) == 2:
+        hours = 0
+        minutes = int(parts[0] or "0")
+        seconds = float(parts[1] or "0")
+    elif len(parts) == 3:
+        hours = int(parts[0] or "0")
+        minutes = int(parts[1] or "0")
+        seconds = float(parts[2] or "0")
+    else:
+        raise ValueError(f"invalid VTT timestamp: {token}")
+    sec_int = int(seconds)
+    millis = int(round((seconds - sec_int) * 1000.0))
+    # 处理四舍五入导致的 1000ms 进位。
+    if millis >= 1000:
+        sec_int += 1
+        millis -= 1000
+    if sec_int >= 60:
+        minutes += sec_int // 60
+        sec_int = sec_int % 60
+    if minutes >= 60:
+        hours += minutes // 60
+        minutes = minutes % 60
+    return f"{hours:02d}:{minutes:02d}:{sec_int:02d},{millis:03d}"
+
+
+def _convert_vtt_to_srt_text(vtt_text: str) -> str:
+    # 轻量 VTT 解析：提取时间轴与正文，忽略 NOTE/STYLE/REGION 块。
+    lines = (vtt_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    entries: List[Dict[str, Any]] = []
+    index = 0
+    total = len(lines)
+
+    while index < total:
+        line = (lines[index] or "").strip()
+        if not line:
+            index += 1
+            continue
+        # 跳过 WEBVTT 头与元信息块。
+        upper = line.upper()
+        if upper == "WEBVTT" or upper.startswith("X-TIMESTAMP-MAP="):
+            index += 1
+            continue
+        if upper.startswith("NOTE") or upper.startswith("STYLE") or upper.startswith("REGION"):
+            index += 1
+            while index < total and (lines[index] or "").strip():
+                index += 1
+            continue
+
+        # 支持可选 cue id：下一行才是时间轴。
+        timing_line = line
+        if "-->" not in timing_line and (index + 1) < total and "-->" in (lines[index + 1] or ""):
+            index += 1
+            timing_line = (lines[index] or "").strip()
+
+        if "-->" not in timing_line:
+            index += 1
+            continue
+
+        left, right = timing_line.split("-->", 1)
+        start_token = (left or "").strip().split()[0]
+        end_token = (right or "").strip().split()[0]
+        try:
+            start_time = _vtt_token_to_srt_time(start_token)
+            end_time = _vtt_token_to_srt_time(end_token)
+        except Exception:
+            index += 1
+            continue
+
+        index += 1
+        text_lines: List[str] = []
+        while index < total:
+            text_line = lines[index]
+            if not (text_line or "").strip():
+                break
+            text_lines.append(text_line.rstrip())
+            index += 1
+
+        entries.append(
+            {
+                "start": start_time,
+                "end": end_time,
+                "text": "\n".join(text_lines).strip(),
+            }
+        )
+
+    if not entries:
+        raise HTTPException(status_code=400, detail="Invalid subtitle_file: VTT contains no valid cues")
+
+    # 按 SRT 结构重组。
+    chunks: List[str] = []
+    for idx, entry in enumerate(entries, start=1):
+        chunks.append(
+            "\n".join(
+                [
+                    str(idx),
+                    f"{entry['start']} --> {entry['end']}",
+                    entry["text"],
+                    "",
+                ]
+            )
+        )
+    return "\n".join(chunks).rstrip() + "\n"
+
+
+def _markdown_time_to_seconds(token: str) -> float:
+    # 解析 Markdown 时间稿中的时间（支持 MM:SS / HH:MM:SS，允许秒带小数）。
+    value = (token or "").strip()
+    parts = value.split(":")
+    if len(parts) == 2:
+        hours = 0
+        minutes = int(parts[0] or "0")
+        seconds = float(parts[1] or "0")
+    elif len(parts) == 3:
+        hours = int(parts[0] or "0")
+        minutes = int(parts[1] or "0")
+        seconds = float(parts[2] or "0")
+    else:
+        raise ValueError(f"invalid markdown timestamp: {token}")
+    return float(hours * 3600 + minutes * 60 + seconds)
+
+
+def _seconds_to_srt_time(seconds_value: float) -> str:
+    # 将秒数转换为 SRT 时间戳格式。
+    total_ms = max(0, int(round(float(seconds_value) * 1000.0)))
+    hours = total_ms // 3_600_000
+    total_ms = total_ms % 3_600_000
+    minutes = total_ms // 60_000
+    total_ms = total_ms % 60_000
+    seconds = total_ms // 1000
+    millis = total_ms % 1000
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{millis:03d}"
+
+
+def _convert_markdown_timeline_to_srt_text(markdown_text: str) -> str:
+    # 支持形如：[0:04] hello / [02:17:39] hello 的时间稿转 SRT。
+    # 规则：当前行 end 使用下一行 start；最后一行使用 +2 秒兜底。
+    lines = (markdown_text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    pattern = re.compile(r"^\s*\[(?P<ts>(?:\d{1,2}:)?\d{1,2}:\d{2}(?:\.\d+)?)\]\s*(?P<text>.*)$")
+    entries: List[Dict[str, Any]] = []
+
+    for line in lines:
+        raw = (line or "").strip()
+        if not raw:
+            continue
+        match = pattern.match(raw)
+        if match:
+            try:
+                start_sec = _markdown_time_to_seconds(match.group("ts"))
+            except Exception:
+                continue
+            text = (match.group("text") or "").strip()
+            entries.append({"start_sec": float(start_sec), "text": text})
+            continue
+        # 兼容文本换行：无时间戳时追加到上一条。
+        if entries:
+            previous_text = (entries[-1].get("text") or "").strip()
+            appended = raw if not previous_text else f"{previous_text} {raw}"
+            entries[-1]["text"] = appended.strip()
+
+    if not entries:
+        raise HTTPException(status_code=400, detail="Invalid subtitle_file: Markdown timeline contains no valid cues")
+
+    chunks: List[str] = []
+    for idx, entry in enumerate(entries, start=1):
+        start_sec = float(entry["start_sec"])
+        if idx < len(entries):
+            end_sec = float(entries[idx]["start_sec"])
+        else:
+            end_sec = start_sec + 2.0
+        if end_sec <= start_sec:
+            end_sec = start_sec + 0.2
+        chunks.append(
+            "\n".join(
+                [
+                    str(idx),
+                    f"{_seconds_to_srt_time(start_sec)} --> {_seconds_to_srt_time(end_sec)}",
+                    (entry.get("text") or "").strip(),
+                    "",
+                ]
+            )
+        )
+    return "\n".join(chunks).rstrip() + "\n"
 
 
 def _read_bool_form(value: str, *, field_name: str) -> bool:
@@ -82,6 +315,20 @@ def _read_bool_form(value: str, *, field_name: str) -> bool:
     if lowered in {"0", "false", "no", "off"}:
         return False
     raise HTTPException(status_code=400, detail=f"Invalid {field_name}")
+
+
+def _coerce_bool(value: Any, *, default: bool) -> bool:
+    # 宽松解析 manifest/任务状态里的布尔值，缺失或异常时回退默认值。
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    lowered = str(value).strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return bool(default)
 
 
 def _parse_time_ranges_form(raw: str) -> List[Dict[str, float]]:
@@ -146,8 +393,7 @@ def _parse_time_ranges_form(raw: str) -> List[Dict[str, float]]:
 def _build_readable_task_id() -> str:
     # 生成可读任务 ID：UTC 时间戳 + 冲突递增序号，不使用随机串。
     base = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
-    with _lock:
-        existing_ids = set(_tasks.keys())
+    existing_ids = set(_task_store.keys_snapshot())
     candidate = base
     index = 2
     while (
@@ -161,33 +407,15 @@ def _build_readable_task_id() -> str:
 
 
 def _set_task(task_id: str, **updates: Any) -> None:
-    with _lock:
-        task = _tasks.get(task_id)
-        if not task:
-            return
-        task.update(updates)
-        task["updated_at"] = _iso_now()
+    _task_store.update(task_id, updated_at=_iso_now(), **updates)
 
 
 def _append_stdout(task_id: str, line: str) -> None:
-    with _lock:
-        task = _tasks.get(task_id)
-        if not task:
-            return
-        tail = task.setdefault("stdout_tail", [])
-        tail.append(line)
-        if len(tail) > 120:
-            del tail[:-120]
+    _task_store.append_stdout(task_id, line)
 
 
 def _public_task(task: Dict[str, Any]) -> Dict[str, Any]:
-    public = {
-        key: value
-        for key, value in task.items()
-        if key not in {"process", "input_path", "out_root", "upload_dir"}
-    }
-    public.setdefault("artifacts", [])
-    return public
+    return _task_store.to_public(task)
 
 
 def _progress_for_segment(processed: int, total: Optional[int]) -> float:
@@ -197,13 +425,7 @@ def _progress_for_segment(processed: int, total: Optional[int]) -> float:
 
 
 def _bump_stage(task_id: str, stage: str, minimum_progress: float) -> None:
-    with _lock:
-        task = _tasks.get(task_id)
-        if not task:
-            return
-        task["stage"] = stage
-        task["progress"] = max(float(task.get("progress", 0.0) or 0.0), minimum_progress)
-        task["updated_at"] = _iso_now()
+    _task_store.set_stage(task_id, stage, minimum_progress, updated_at=_iso_now())
 
 
 def _update_from_stdout(task_id: str, line: str) -> None:
@@ -248,7 +470,7 @@ def _update_from_stdout(task_id: str, line: str) -> None:
     done_match = re.search(r"===== Segment\s+(\d+)\s+done", line)
     if done_match:
         with _lock:
-            task = _tasks.get(task_id)
+            task = _task_store.get(task_id)
             if not task:
                 return
             processed = max(int(task.get("processed_segments", 0)), int(done_match.group(1)))
@@ -318,6 +540,16 @@ def _find_batch_manifest(out_root: Path) -> Optional[Path]:
     return manifests[0] if manifests else None
 
 
+def _find_batch_manifest_by_name(batch_id: str) -> Optional[Path]:
+    # 根据 longdub 批次目录名回查 manifest，支持刷新后恢复结果。
+    return find_batch_manifest_by_name(output_root=OUTPUT_ROOT, batch_id=batch_id)
+
+
+def _list_available_batches(limit: int = 200) -> List[Dict[str, Any]]:
+    # 列出可回载的 longdub 批次目录，供前端下拉选择。
+    return list_available_batches(output_root=OUTPUT_ROOT, limit=limit)
+
+
 def _artifact_url(task_id: str, key: str) -> str:
     return f"/dubbing/auto/artifact/{task_id}/{key}"
 
@@ -381,94 +613,32 @@ def _ensure_index_tts_service(api_url: str) -> None:
 
 
 def _build_artifacts(task_id: str, manifest_path: Path) -> List[Dict[str, str]]:
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    paths = manifest.get("paths", {})
-    candidates = [
-        ("preferred_audio", "Preferred Audio", paths.get("preferred_audio")),
-        ("mix", "Mixed Audio WAV", paths.get("dubbed_mix_full")),
-        ("vocals", "Vocals WAV", paths.get("dubbed_vocals_full")),
-        ("bilingual_srt", "Bilingual SRT", paths.get("dubbed_final_full_srt")),
-        ("translated_srt", "Translated SRT", paths.get("translated_full_srt")),
-        ("source_srt", "Source SRT", paths.get("source_full_srt")),
-        ("manifest", "Batch Manifest", str(manifest_path)),
-    ]
-    artifacts: List[Dict[str, str]] = []
-    seen_paths = set()
-    for key, label, path_text in candidates:
-        if not path_text:
-            continue
-        path = Path(path_text).expanduser()
-        if not path.exists():
-            continue
-        resolved = str(path.resolve())
-        if key != "manifest" and resolved in seen_paths:
-            continue
-        seen_paths.add(resolved)
-        artifacts.append({"key": key, "label": label, "url": _artifact_url(task_id, key)})
-    return artifacts
+    return build_batch_artifacts(
+        task_id=task_id,
+        manifest_path=manifest_path,
+        artifact_url_builder=_artifact_url,
+    )
 
 
 def _complete_task_from_manifest(task_id: str, manifest_path: Path) -> None:
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    artifacts = _build_artifacts(task_id, manifest_path)
-    paths = manifest.get("paths", {})
-    # 统计批处理级别的人工复核/成功片段数量，用于判定任务是否“真成功”
-    total_done = 0
-    total_segments = 0
-    total_manual_review = 0
-    for segment in manifest.get("segments", []):
-        summary = segment.get("summary") or {}
-        total_done += int(summary.get("done", 0) or 0)
-        total_segments += int(summary.get("total", 0) or 0)
-        total_manual_review += int(summary.get("manual_review", 0) or 0)
-
-    # 当所有片段都进入 manual_review 且没有任何成功 TTS 时，输出通常是静音兜底文件：
-    # 这种情况应标记为失败，避免前端显示“完成”误导用户。
-    if total_done <= 0 and total_segments > 0 and total_manual_review >= total_segments:
-        _set_task(
-            task_id,
-            status="failed",
-            stage="failed",
-            progress=100.0,
-            batch_id=manifest.get("batch_id"),
-            batch_manifest_path=str(manifest_path),
-            processed_segments=manifest.get("segments_total"),
-            total_segments=manifest.get("segments_total"),
-            manual_review_segments=total_manual_review,
-            artifacts=artifacts,
-            error=(
-                "TTS synthesis failed for all subtitle segments "
-                "(all segments fell back to manual_review/silent placeholders)."
-            ),
+    updates = build_batch_task_updates(
+        task_id=task_id,
+        manifest_path=manifest_path,
+        artifact_url_builder=_artifact_url,
+    )
+    task = _task_store.get(task_id)
+    if task is None:
+        loaded = build_loaded_batch_task(
+            task_id=task_id,
+            manifest_path=manifest_path,
+            created_at=_iso_now(),
+            default_short_merge_threshold=DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC,
+            default_index_tts_api_url=DEFAULT_INDEX_TTS_API_URL,
+            artifact_url_builder=_artifact_url,
         )
+        _task_store.create(task_id, loaded)
         return
-
-    manual_review_segments = sum(
-        int((segment.get("summary") or {}).get("manual_review", 0) or 0)
-        for segment in manifest.get("segments", [])
-    )
-    result_audio = None
-    if paths.get("preferred_audio") and Path(paths["preferred_audio"]).exists():
-        result_audio = _artifact_url(task_id, "preferred_audio")
-    elif paths.get("dubbed_mix_full") and Path(paths["dubbed_mix_full"]).exists():
-        result_audio = _artifact_url(task_id, "mix")
-    elif paths.get("dubbed_vocals_full") and Path(paths["dubbed_vocals_full"]).exists():
-        result_audio = _artifact_url(task_id, "vocals")
-
-    _set_task(
-        task_id,
-        status="completed",
-        stage="finished",
-        progress=100.0,
-        batch_id=manifest.get("batch_id"),
-        batch_manifest_path=str(manifest_path),
-        processed_segments=manifest.get("segments_total"),
-        total_segments=manifest.get("segments_total"),
-        manual_review_segments=manual_review_segments,
-        artifacts=artifacts,
-        result_audio=result_audio,
-        result_srt=_artifact_url(task_id, "bilingual_srt") if paths.get("dubbed_final_full_srt") else None,
-    )
+    _set_task(task_id, **updates)
 
 
 def _run_cli_task(task_id: str, cmd: List[str], env: Dict[str, str], out_root: Path) -> None:
@@ -497,15 +667,13 @@ def _run_cli_task(task_id: str, cmd: List[str], env: Dict[str, str], out_root: P
 
             code = proc.wait()
 
-        with _lock:
-            task = _tasks.get(task_id)
-            if task and task.get("status") == "cancelled":
-                return
+        task = _task_store.get(task_id)
+        if task and task.get("status") == "cancelled":
+            return
 
         if code != 0:
-            with _lock:
-                task = _tasks.get(task_id) or {}
-                stdout_tail = list(task.get("stdout_tail", []))
+            task = _task_store.get_copy(task_id) or {}
+            stdout_tail = list(task.get("stdout_tail", []))
             _set_task(
                 task_id,
                 status="failed",
@@ -543,7 +711,6 @@ async def start_auto_dubbing(
     subtitle_mode: str = Form("source"),
     source_lang: str = Form("auto"),
     target_lang: str = Form(...),
-    speaker_mode: str = Form("single-speaker"),
     api_key: str = Form(""),
     translate_base_url: str = Form(DEFAULT_TRANSLATE_BASE_URL),
     translate_model: str = Form(DEFAULT_TRANSLATE_MODEL),
@@ -552,10 +719,14 @@ async def start_auto_dubbing(
     min_segment_minutes: float = Form(4.0),
     timing_mode: str = Form("strict"),
     grouping_strategy: str = Form("sentence"),
+    short_merge_enabled: str = Form("false"),
+    short_merge_threshold: int = Form(DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC),
     time_ranges: str = Form(""),
     auto_pick_ranges: str = Form("false"),
     auto_pick_min_silence_sec: float = Form(0.8),
     auto_pick_min_speech_sec: float = Form(1.0),
+    pipeline_version: str = Form("v1"),
+    rewrite_translation: str = Form("true"),
 ):
     if not TOOL_PATH.exists():
         raise HTTPException(status_code=500, detail=f"CLI not found: {TOOL_PATH}")
@@ -571,16 +742,17 @@ async def start_auto_dubbing(
                 f"Unsupported target_lang: {target_lang}"
             ),
         )
-    # 允许前端显式传入说话人模式；默认保持单人模式，确保兼容历史行为
-    speaker_mode = (speaker_mode or "").strip() or "single-speaker"
-    if speaker_mode not in {"single-speaker", "per-speaker", "auto"}:
-        raise HTTPException(status_code=400, detail="Invalid speaker_mode")
     timing_mode = (timing_mode or "").strip() or "strict"
     if timing_mode not in {"strict", "balanced"}:
         raise HTTPException(status_code=400, detail="Invalid timing_mode")
     grouping_strategy = (grouping_strategy or "").strip() or "sentence"
     if grouping_strategy not in {"legacy", "sentence"}:
         raise HTTPException(status_code=400, detail="Invalid grouping_strategy")
+    short_merge_enabled_value = _read_bool_form(short_merge_enabled, field_name="short_merge_enabled")
+    if short_merge_enabled_value and not (
+        MIN_SOURCE_SHORT_MERGE_TARGET_SEC <= short_merge_threshold <= MAX_SOURCE_SHORT_MERGE_TARGET_SEC
+    ):
+        raise HTTPException(status_code=400, detail="Invalid short_merge_threshold")
     if auto_pick_min_silence_sec < 0.1 or auto_pick_min_silence_sec > 10.0:
         raise HTTPException(status_code=400, detail="Invalid auto_pick_min_silence_sec")
     if auto_pick_min_speech_sec < 0.1 or auto_pick_min_speech_sec > 30.0:
@@ -588,6 +760,10 @@ async def start_auto_dubbing(
     subtitle_mode = (subtitle_mode or "").strip().lower() or "source"
     if subtitle_mode not in {"source", "translated"}:
         raise HTTPException(status_code=400, detail="Invalid subtitle_mode")
+    pipeline_version = (pipeline_version or "").strip().lower() or "v1"
+    if pipeline_version not in {"v1", "v2"}:
+        raise HTTPException(status_code=400, detail="Invalid pipeline_version")
+    rewrite_translation_enabled = _read_bool_form(rewrite_translation, field_name="rewrite_translation")
     auto_pick_ranges_enabled = _read_bool_form(auto_pick_ranges, field_name="auto_pick_ranges")
     parsed_time_ranges = _parse_time_ranges_form(time_ranges)
     translate_base_url = (translate_base_url or "").strip() or DEFAULT_TRANSLATE_BASE_URL
@@ -602,12 +778,7 @@ async def start_auto_dubbing(
             detail="Translation API key is required. Provide api_key or configure a custom translate_base_url.",
         )
     _ensure_index_tts_service(index_tts_api_url)
-    with _lock:
-        active = [
-            task_id
-            for task_id, task in _tasks.items()
-            if task.get("status") not in {"completed", "failed", "cancelled"}
-        ]
+    active = _task_store.list_active_ids()
     if active:
         raise HTTPException(status_code=409, detail="Another auto dubbing job is already running")
 
@@ -624,74 +795,63 @@ async def start_auto_dubbing(
     input_srt_path: Optional[Path] = None
     if subtitle_file is not None and subtitle_file.filename:
         subtitle_name = _sanitize_filename(subtitle_file.filename)
-        if not subtitle_name.lower().endswith(".srt"):
-            raise HTTPException(status_code=400, detail="subtitle_file must be .srt")
-        input_srt_path = upload_dir / f"manual_{subtitle_name}"
-        with input_srt_path.open("wb") as handle:
-            shutil.copyfileobj(subtitle_file.file, handle)
+        suffix = Path(subtitle_name).suffix.lower()
+        raw_bytes = subtitle_file.file.read()
+        if suffix == ".srt":
+            input_srt_path = upload_dir / f"manual_{subtitle_name}"
+            input_srt_path.write_bytes(raw_bytes)
+        elif suffix == ".vtt":
+            try:
+                vtt_text = raw_bytes.decode("utf-8-sig")
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid subtitle_file encoding: {exc}") from exc
+            srt_text = _convert_vtt_to_srt_text(vtt_text)
+            srt_name = f"{Path(subtitle_name).stem}.srt"
+            input_srt_path = upload_dir / f"manual_{srt_name}"
+            input_srt_path.write_text(srt_text, encoding="utf-8")
+        elif suffix == ".md":
+            try:
+                markdown_text = raw_bytes.decode("utf-8-sig")
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid subtitle_file encoding: {exc}") from exc
+            srt_text = _convert_markdown_timeline_to_srt_text(markdown_text)
+            srt_name = f"{Path(subtitle_name).stem}.srt"
+            input_srt_path = upload_dir / f"manual_{srt_name}"
+            input_srt_path.write_text(srt_text, encoding="utf-8")
+        else:
+            raise HTTPException(status_code=400, detail="subtitle_file must be .srt, .vtt or .md")
     # 上传字幕时，默认走“按字幕时间轴处理”的稳定链路，避免自动语音区间切成大量碎片段。
     # 这能防止出现“用户未显式开启 auto-pick，但任务仍按 auto ranges 切 10 段”的误行为。
     if input_srt_path is not None and auto_pick_ranges_enabled:
         auto_pick_ranges_enabled = False
 
-    cmd = [
-        sys.executable,
-        "-u",  # 使用无缓冲输出，确保前端能实时收到阶段日志而非长期停留在 Queued
-        str(TOOL_PATH),
-        "--input-media",
-        str(input_path),
-        "--target-lang",
-        target_lang,
-        "--speaker-mode",
-        speaker_mode,
-        # 关键逻辑：Web 默认优先 pyannote（community-1），失败会在 dub_pipeline 内自动回退 simple。
-        "--diarization-provider",
-        "auto",
-        "--pyannote-model",
-        os.environ.get("PYANNOTE_MODEL_SOURCE", "pyannote/speaker-diarization-community-1"),
-        "--pyannote-python-bin",
-        os.environ.get("PYANNOTE_PYTHON_BIN", ""),
-        "--out-dir",
-        str(out_root),
-        "--segment-minutes",
-        str(segment_minutes),
-        "--min-segment-minutes",
-        str(min_segment_minutes),
-        "--merge-track",
-        "auto",
-        "--timing-mode",
-        timing_mode,
-        "--grouping-strategy",
-        grouping_strategy,
-        # 这里不要再拼接“--”分隔符，避免被下游 dub_pipeline 误解析为未知参数
-        "--tts-backend",
-        "index-tts",
-        "--index-tts-via-api",
-        "true",
-        "--index-tts-api-url",
-        index_tts_api_url,
-        "--index-tts-api-release-after-job",
-        "true",
-        "--index-max-text-tokens",
-        "40",
-        "--translate-base-url",
-        translate_base_url,
-        "--translate-model",
-        translate_model,
-        "--auto-pick-ranges",
-        "true" if auto_pick_ranges_enabled else "false",
-        "--auto-pick-min-silence-sec",
-        str(auto_pick_min_silence_sec),
-        "--auto-pick-min-speech-sec",
-        str(auto_pick_min_speech_sec),
-    ]
-    if input_srt_path is not None:
-        cmd.extend(["--input-srt", str(input_srt_path)])
-        cmd.extend(["--input-srt-kind", subtitle_mode])
-    if parsed_time_ranges:
-        cmd.extend(["--time-ranges-json", json.dumps(parsed_time_ranges, ensure_ascii=False)])
-    if source_lang and source_lang != "auto":
-        cmd.extend(["--asr-language", source_lang])
+    cmd = build_auto_dubbing_command(
+        AutoDubbingCommandConfig(
+            python_executable=sys.executable,
+            tool_path=TOOL_PATH,
+            input_media=input_path,
+            target_lang=target_lang,
+            out_dir=out_root,
+            segment_minutes=segment_minutes,
+            min_segment_minutes=min_segment_minutes,
+            timing_mode=timing_mode,
+            grouping_strategy=grouping_strategy,
+            short_merge_enabled=short_merge_enabled_value,
+            short_merge_threshold=int(short_merge_threshold),
+            translate_base_url=translate_base_url,
+            translate_model=translate_model,
+            index_tts_api_url=index_tts_api_url,
+            auto_pick_ranges=auto_pick_ranges_enabled,
+            auto_pick_min_silence_sec=auto_pick_min_silence_sec,
+            auto_pick_min_speech_sec=auto_pick_min_speech_sec,
+            input_srt=input_srt_path,
+            input_srt_kind=subtitle_mode,
+            time_ranges=parsed_time_ranges,
+            source_lang=source_lang,
+            pipeline_version=pipeline_version,
+            rewrite_translation=rewrite_translation_enabled,
+        )
+    )
 
     env = os.environ.copy()
     # 双保险：即使底层入口再次拉起 Python，也尽量保持 stdout/stderr 实时刷新
@@ -711,9 +871,11 @@ async def start_auto_dubbing(
         "updated_at": _iso_now(),
         "filename": filename,
         "target_lang": target_lang,
-        "speaker_mode": speaker_mode,
         "timing_mode": timing_mode,
         "grouping_strategy": grouping_strategy,
+        "source_short_merge_enabled": short_merge_enabled_value,
+        "source_short_merge_threshold": int(short_merge_threshold),
+        "source_short_merge_threshold_mode": "seconds",
         "source_lang": source_lang,
         "subtitle_mode": subtitle_mode,
         "translate_base_url": translate_base_url,
@@ -721,6 +883,8 @@ async def start_auto_dubbing(
         "index_tts_api_url": index_tts_api_url,
         "time_ranges": parsed_time_ranges,
         "auto_pick_ranges": auto_pick_ranges_enabled,
+        "pipeline_version": pipeline_version,
+        "rewrite_translation": rewrite_translation_enabled,
         "auto_pick_min_silence_sec": auto_pick_min_silence_sec,
         "auto_pick_min_speech_sec": auto_pick_min_speech_sec,
         "processed_segments": 0,
@@ -733,8 +897,7 @@ async def start_auto_dubbing(
         "out_root": str(out_root),
         "command": [part if part != api_key else "***" for part in cmd],
     }
-    with _lock:
-        _tasks[task_id] = task
+    _task_store.create(task_id, task)
 
     thread = threading.Thread(target=_run_cli_task, args=(task_id, cmd, env, out_root), daemon=True)
     thread.start()
@@ -742,13 +905,217 @@ async def start_auto_dubbing(
     return {"task_id": task_id, "short_id": task["short_id"], "status": "queued"}
 
 
+@router.post("/load-batch")
+async def load_auto_dubbing_batch(batch_id: str = Form(...)):
+    # 通过 longdub 文件夹名恢复历史任务状态与下载入口（页面刷新后可继续查看结果）。
+    manifest_path = _find_batch_manifest_by_name(batch_id)
+    if manifest_path is None:
+        raise HTTPException(status_code=404, detail="Batch folder not found")
+
+    task_id = _build_readable_task_id()
+    task = build_loaded_batch_task(
+        task_id=task_id,
+        manifest_path=manifest_path,
+        created_at=_iso_now(),
+        default_short_merge_threshold=DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC,
+        default_index_tts_api_url=DEFAULT_INDEX_TTS_API_URL,
+        artifact_url_builder=_artifact_url,
+    )
+    _task_store.create(task_id, task)
+
+    loaded = _task_store.get_public(task_id)
+    if not loaded:
+        raise HTTPException(status_code=500, detail="Failed to load batch result")
+    return loaded
+
+
+@router.get("/batches")
+async def list_auto_dubbing_batches(limit: int = 200):
+    # 返回可加载的批次列表，前端用于“选择文件夹”下拉框。
+    safe_limit = max(1, min(int(limit), 500))
+    return {"batches": _list_available_batches(limit=safe_limit)}
+
+
 @router.get("/status/{task_id}")
 async def get_auto_dubbing_status(task_id: str):
-    with _lock:
-        task = _tasks.get(task_id)
-        if not task:
-            raise HTTPException(status_code=404, detail="Dubbing task not found")
-        return _public_task(dict(task))
+    task = _task_store.get_public(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Dubbing task not found")
+    return task
+
+
+@router.get("/review/{task_id}")
+async def get_auto_dubbing_review_lines(task_id: str):
+    # 返回可逐句审阅的翻译列表（来自 batch + segment manifest）。
+    task_copy = _task_store.get_copy(task_id)
+    if not task_copy:
+        raise HTTPException(status_code=404, detail="Dubbing task not found")
+    manifest_path = _resolve_task_manifest(task_copy)
+    lines = _collect_review_lines(manifest_path)
+    return {"task_id": task_id, "total": len(lines), "lines": lines}
+
+
+@router.post("/review/{task_id}/save")
+async def save_auto_dubbing_review_lines(task_id: str, edits_json: str = Form(...)):
+    # 保存逐句审阅结果，写回 final 目录字幕文件。
+    task_copy = _task_store.get_copy(task_id)
+    if not task_copy:
+        raise HTTPException(status_code=404, detail="Dubbing task not found")
+
+    manifest_path = _resolve_task_manifest(task_copy)
+    try:
+        payload = json.loads(edits_json or "[]")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid edits_json: {exc}") from exc
+    if not isinstance(payload, list):
+        raise HTTPException(status_code=400, detail="Invalid edits_json: must be list")
+
+    updates: Dict[int, str] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        index = int(item.get("index", 0) or 0)
+        text = str(item.get("translated_text", "") or "").strip()
+        if index <= 0:
+            continue
+        updates[index] = text
+    if not updates:
+        return {"status": "no_changes"}
+    updates = _filter_effective_review_updates(manifest_path, updates)
+    if not updates:
+        return {"status": "no_changes"}
+
+    written = _persist_review_lines(manifest_path, updates)
+    return {"status": "saved", "updated_count": len(updates), "written": written}
+
+
+@router.post("/review/{task_id}/save-and-redub")
+async def save_and_redub_review_lines(
+    task_id: str,
+    edits_json: str = Form(...),
+):
+    # 保存逐句修改后，一气呵成执行“局部重配 + final 重拼”。
+    task_copy = _task_store.get_copy(task_id)
+    if not task_copy:
+        raise HTTPException(status_code=404, detail="Dubbing task not found")
+    _set_task(task_id, status="running", stage="dubbing:review_redub", progress=35.0)
+
+    manifest_path = _resolve_task_manifest(task_copy)
+    try:
+        payload = json.loads(edits_json or "[]")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid edits_json: {exc}") from exc
+    if not isinstance(payload, list):
+        raise HTTPException(status_code=400, detail="Invalid edits_json: must be list")
+
+    updates: Dict[int, str] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        index = int(item.get("index", 0) or 0)
+        text = str(item.get("translated_text", "") or "").strip()
+        if index <= 0:
+            continue
+        updates[index] = text
+    if not updates:
+        return {"status": "no_changes"}
+    updates = _filter_effective_review_updates(manifest_path, updates)
+    if not updates:
+        return {"status": "no_changes"}
+
+    # 将全局行号映射到 segment 局部行号，并更新段内 translated.srt。
+    mapping = _build_review_line_mapping(manifest_path)
+    segment_updates: Dict[Path, Dict[int, str]] = {}
+    for global_index, text in updates.items():
+        item = mapping.get(global_index)
+        if not item:
+            continue
+        segment_job_dir = Path(str(item["job_dir"])).expanduser().resolve()
+        local_index = int(item["local_index"])
+        segment_updates.setdefault(segment_job_dir, {})[local_index] = text
+
+    if not segment_updates:
+        return {"status": "no_changes"}
+
+    redubbed_segments = 0
+    batch_manifest = load_batch_manifest(manifest_path)
+    target_lang = str(task_copy.get("target_lang") or batch_manifest.options.target_lang)
+    index_tts_api_url = str(task_copy.get("index_tts_api_url") or batch_manifest.options.index_tts_api_url)
+    pipeline_version = str(task_copy.get("pipeline_version") or batch_manifest.options.pipeline_version)
+    rewrite_translation = _coerce_bool(
+        task_copy.get("rewrite_translation"),
+        default=batch_manifest.options.rewrite_translation,
+    )
+    snapshot = _create_review_redub_snapshot(manifest_path=manifest_path, segment_job_dirs=list(segment_updates.keys()))
+
+    try:
+        for segment_job_dir, local_updates in segment_updates.items():
+            translated_srt_path = segment_job_dir / "subtitles" / "translated.srt"
+            source_srt_path = segment_job_dir / "subtitles" / "source.srt"
+            dubbed_final_srt_path = segment_job_dir / "subtitles" / "dubbed_final.srt"
+            segment_manifest_path = segment_job_dir / "manifest.json"
+            if not translated_srt_path.exists() or not source_srt_path.exists() or not segment_manifest_path.exists():
+                continue
+
+            translated_items = parse_srt(translated_srt_path.read_text(encoding="utf-8"))
+            source_items = parse_srt(source_srt_path.read_text(encoding="utf-8"))
+            if not translated_items or len(translated_items) != len(source_items):
+                continue
+
+            for local_index, new_text in local_updates.items():
+                if 1 <= local_index <= len(translated_items):
+                    translated_items[local_index - 1]["text"] = new_text
+            translated_srt_path.write_text(format_srt(translated_items), encoding="utf-8")
+            dubbed_final_srt_path.write_text(_build_segment_bilingual_srt(source_items, translated_items), encoding="utf-8")
+
+            # 同步更新段 manifest 中的 translated_text，保持调试信息一致。
+            segment_manifest = load_segment_manifest(segment_manifest_path)
+            records = list(segment_manifest.segment_rows)
+            for local_index, new_text in local_updates.items():
+                if 1 <= local_index <= len(records):
+                    records[local_index - 1]["translated_text"] = new_text
+            segment_manifest.raw["segments"] = records
+            segment_manifest_path.write_text(json.dumps(segment_manifest.raw, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            _rerun_segment_with_translated_srt(
+                segment_job_dir=segment_job_dir,
+                target_lang=target_lang,
+                index_tts_api_url=index_tts_api_url,
+                pipeline_version=pipeline_version,
+                rewrite_translation=rewrite_translation,
+                redub_local_indices=list(local_updates.keys()),
+            )
+            redubbed_segments += 1
+            # 局部进度回写：让前端状态轮询可见“重配进行中”。
+            progress = min(82.0, 35.0 + 45.0 * (redubbed_segments / max(1, len(segment_updates))))
+            _set_task(task_id, stage="dubbing:review_redub", progress=progress)
+
+        # 段内重配完成后，重拼 batch final 产物并刷新任务状态。
+        batch_dir = manifest_path.parent
+        _set_task(task_id, stage="dubbing:merging", progress=90.0)
+        rebuild = _rebuild_batch_outputs(batch_dir)
+        _complete_task_from_manifest(task_id, manifest_path)
+        written = _collect_written_batch_paths(manifest_path)
+        return {
+            "status": "saved_and_redubbed",
+            "updated_count": len(updates),
+            "redubbed_segments": redubbed_segments,
+            "written": written,
+            "rebuild": rebuild,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        try:
+            _restore_review_redub_snapshot(snapshot)
+            _rebuild_batch_outputs(manifest_path.parent)
+        except Exception:
+            pass
+        # 失败时显式回写任务状态，避免前端“无反应/一直转圈”。
+        _set_task(task_id, status="failed", stage="failed", progress=100.0, error=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        _cleanup_review_redub_snapshot(snapshot)
 
 
 @router.post("/cancel/{task_id}")
@@ -775,9 +1142,10 @@ def _resolve_artifact(task: Dict[str, Any], artifact: str) -> Path:
         raise HTTPException(status_code=404, detail="Artifacts are not ready yet")
 
     manifest_path = Path(manifest_path_text).resolve()
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    paths = manifest.get("paths", {})
+    manifest = load_batch_manifest(manifest_path)
+    paths = manifest.paths
     key_to_path = {
+        "input_media": manifest.input_media_path,
         "preferred_audio": paths.get("preferred_audio"),
         "mix": paths.get("dubbed_mix_full"),
         "vocals": paths.get("dubbed_vocals_full"),
@@ -794,29 +1162,388 @@ def _resolve_artifact(task: Dict[str, Any], artifact: str) -> Path:
 
     path = Path(path_text).expanduser().resolve()
     out_root = Path(task["out_root"]).resolve()
+    upload_root = UPLOAD_ROOT.resolve()
     try:
         path.relative_to(out_root)
-    except ValueError as exc:
-        raise HTTPException(status_code=403, detail="Artifact path is outside task output") from exc
+    except ValueError:
+        try:
+            path.relative_to(upload_root)
+        except ValueError as exc:
+            raise HTTPException(status_code=403, detail="Artifact path is outside task output") from exc
     if not path.exists():
         raise HTTPException(status_code=404, detail="Artifact file not found")
     return path
 
 
+def _resolve_task_manifest(task: Dict[str, Any]) -> Path:
+    # 解析任务关联的 batch_manifest 路径并校验存在性。
+    manifest_path_text = task.get("batch_manifest_path")
+    if not manifest_path_text:
+        raise HTTPException(status_code=404, detail="Batch manifest not ready")
+    manifest_path = Path(str(manifest_path_text)).expanduser().resolve()
+    if not manifest_path.exists():
+        raise HTTPException(status_code=404, detail="Batch manifest not found")
+    return manifest_path
+
+
+def _collect_review_lines(manifest_path: Path) -> List[Dict[str, Any]]:
+    # 收集逐句 review 数据：按全局时间轴输出 source/translated/质量指标。
+    # 关键修复：
+    # - translated_text 优先使用 final/translated_full.srt（用户真正看到和修改的文本）
+    # - source_text 优先使用 final/source_full.srt（避免 segment manifest 历史字段漂移）
+    # 这样可避免“审阅界面加载成源字幕”的错读问题。
+    batch_manifest = load_batch_manifest(manifest_path)
+    lines: List[Dict[str, Any]] = []
+    line_index = 1
+    for segment in batch_manifest.segments:
+        segment_start = float(segment.get("start_sec", 0.0) or 0.0)
+        job_dir = Path(str(segment.get("job_dir") or "")).expanduser()
+        segment_manifest_path = job_dir / "manifest.json"
+        if not segment_manifest_path.exists():
+            continue
+        segment_manifest = load_segment_manifest(segment_manifest_path)
+        for row in segment_manifest.segment_rows:
+            start_local = float(row.get("start_sec", 0.0) or 0.0)
+            end_local = float(row.get("end_sec", start_local) or start_local)
+            lines.append(
+                {
+                    "index": line_index,
+                    "segment_id": row.get("id"),
+                    "start_sec": round(segment_start + start_local, 3),
+                    "end_sec": round(segment_start + end_local, 3),
+                    "source_text": row.get("source_text") or "",
+                    "translated_text": row.get("translated_text") or "",
+                    "status": row.get("status") or "unknown",
+                    "duration_error_ratio": row.get("duration_error_ratio"),
+                    "prosody_distance": row.get("prosody_distance"),
+                    "selection_score": row.get("selection_score"),
+                }
+            )
+            line_index += 1
+    lines.sort(key=lambda item: (float(item.get("start_sec", 0.0) or 0.0), int(item.get("index", 0) or 0)))
+    for idx, item in enumerate(lines, start=1):
+        item["index"] = idx
+
+    # 使用 final 字幕文件覆盖文本字段，确保审阅数据与最终产物一致。
+    paths = batch_manifest.paths
+    translated_path_text = paths.get("translated_full_srt")
+    source_path_text = paths.get("source_full_srt")
+
+    if translated_path_text:
+        try:
+            translated_path = Path(str(translated_path_text)).expanduser().resolve()
+            if translated_path.exists():
+                translated_items = parse_srt(translated_path.read_text(encoding="utf-8"))
+                for idx, item in enumerate(lines, start=1):
+                    if idx <= len(translated_items):
+                        item["translated_text"] = str(translated_items[idx - 1].get("text") or "")
+        except Exception:
+            # 容错：final 文件异常时回退 segment manifest 文本。
+            pass
+
+    if source_path_text:
+        try:
+            source_path = Path(str(source_path_text)).expanduser().resolve()
+            if source_path.exists():
+                source_items = parse_srt(source_path.read_text(encoding="utf-8"))
+                for idx, item in enumerate(lines, start=1):
+                    if idx <= len(source_items):
+                        item["source_text"] = str(source_items[idx - 1].get("text") or "")
+        except Exception:
+            # 容错：source 文件异常时保留已有字段。
+            pass
+
+    return lines
+
+
+def _persist_review_lines(manifest_path: Path, updates: Dict[int, str]) -> Dict[str, Optional[str]]:
+    # 将逐句审阅文本写回 translated_full.srt / dubbed_final_full.srt。
+    batch_manifest = load_batch_manifest(manifest_path)
+    paths = batch_manifest.paths
+    translated_path_text = paths.get("translated_full_srt")
+    bilingual_path_text = paths.get("dubbed_final_full_srt")
+    source_path_text = paths.get("source_full_srt")
+
+    translated_path = Path(str(translated_path_text)).expanduser().resolve() if translated_path_text else None
+    bilingual_path = Path(str(bilingual_path_text)).expanduser().resolve() if bilingual_path_text else None
+    source_path = Path(str(source_path_text)).expanduser().resolve() if source_path_text else None
+
+    if translated_path is None or not translated_path.exists():
+        raise HTTPException(status_code=404, detail="translated_full.srt not found")
+
+    translated_items = parse_srt(translated_path.read_text(encoding="utf-8"))
+    for idx, item in enumerate(translated_items, start=1):
+        if idx in updates:
+            item["text"] = updates[idx]
+    translated_path.write_text(format_srt(translated_items), encoding="utf-8")
+
+    if bilingual_path is not None and bilingual_path.exists() and source_path is not None and source_path.exists():
+        source_items = parse_srt(source_path.read_text(encoding="utf-8"))
+        if len(source_items) == len(translated_items):
+            bilingual_items: List[Dict[str, Any]] = []
+            for src, tgt in zip(source_items, translated_items):
+                src_text = (src.get("text") or "").strip()
+                tgt_text = (tgt.get("text") or "").strip()
+                text = tgt_text if not src_text else f"{tgt_text}\n{src_text}"
+                bilingual_items.append(
+                    {
+                        "start": float(tgt.get("start", 0.0) or 0.0),
+                        "end": float(tgt.get("end", 0.0) or 0.0),
+                        "text": text,
+                    }
+                )
+            bilingual_path.write_text(format_srt(bilingual_items), encoding="utf-8")
+
+    return {
+        "translated_full_srt": str(translated_path) if translated_path.exists() else None,
+        "dubbed_final_full_srt": str(bilingual_path) if bilingual_path and bilingual_path.exists() else None,
+    }
+
+
+def _filter_effective_review_updates(manifest_path: Path, updates: Dict[int, str]) -> Dict[int, str]:
+    # 仅保留“真正有变化”的字幕更新，避免保存/重配时把全量行都当作改动处理。
+    if not updates:
+        return {}
+    batch_manifest = load_batch_manifest(manifest_path)
+    translated_path_text = batch_manifest.paths.get("translated_full_srt")
+    if not translated_path_text:
+        return dict(updates)
+    translated_path = Path(str(translated_path_text)).expanduser().resolve()
+    if not translated_path.exists():
+        return dict(updates)
+    translated_items = parse_srt(translated_path.read_text(encoding="utf-8"))
+    effective: Dict[int, str] = {}
+    for index, new_text in updates.items():
+        if index <= 0 or index > len(translated_items):
+            continue
+        old_text = str(translated_items[index - 1].get("text") or "").strip()
+        next_text = str(new_text or "").strip()
+        if old_text != next_text:
+            effective[index] = next_text
+    return effective
+
+
+def _build_review_line_mapping(manifest_path: Path) -> Dict[int, Dict[str, Any]]:
+    # 构建全局行号到段内行号的映射，用于“只重配改动句”。
+    batch_manifest = load_batch_manifest(manifest_path)
+    mapping: Dict[int, Dict[str, Any]] = {}
+    global_index = 1
+    for segment in batch_manifest.segments:
+        segment_index = int(segment.get("index", 0) or 0)
+        job_dir = Path(str(segment.get("job_dir") or "")).expanduser()
+        segment_manifest_path = job_dir / "manifest.json"
+        if not segment_manifest_path.exists():
+            continue
+        segment_manifest = load_segment_manifest(segment_manifest_path)
+        rows = segment_manifest.segment_rows
+        for local_index, _ in enumerate(rows, start=1):
+            mapping[global_index] = {
+                "segment_index": segment_index,
+                "job_dir": str(job_dir),
+                "local_index": local_index,
+            }
+            global_index += 1
+    return mapping
+
+
+def _build_segment_bilingual_srt(source_items: List[Dict[str, Any]], translated_items: List[Dict[str, Any]]) -> str:
+    # 按“翻译在上、原文在下”重建段内双语字幕。
+    merged: List[Dict[str, Any]] = []
+    for source, translated in zip(source_items, translated_items):
+        src_text = (source.get("text") or "").strip()
+        tgt_text = (translated.get("text") or "").strip()
+        text = tgt_text if not src_text else f"{tgt_text}\n{src_text}"
+        merged.append(
+            {
+                "start": float(translated.get("start", 0.0) or 0.0),
+                "end": float(translated.get("end", 0.0) or 0.0),
+                "text": text,
+            }
+        )
+    return format_srt(merged)
+
+
+def _compact_process_error_output(stdout: str, stderr: str, *, keep_lines: int = 120) -> str:
+    # 提炼子进程错误：合并 stdout/stderr，过滤 flash-attn 噪音，保留尾部关键上下文。
+    noise_markers = ("Warning: flash-attn is not installed",)
+    raw_lines = (f"{stdout or ''}\n{stderr or ''}").splitlines()
+    filtered_lines: List[str] = []
+    for line in raw_lines:
+        text = (line or "").strip()
+        if not text:
+            continue
+        if text == "********":
+            continue
+        if any(marker in text for marker in noise_markers):
+            continue
+        filtered_lines.append(line.rstrip())
+    if not filtered_lines:
+        filtered_lines = [line.rstrip() for line in raw_lines if (line or "").strip()]
+    tail_lines = filtered_lines[-max(1, int(keep_lines)) :]
+    return "\n".join(tail_lines).strip()
+
+
+def _snapshot_file(path: Path, backup_root: Path) -> Dict[str, Optional[str]]:
+    # 为单个文件创建快照；原本不存在的文件仅记录状态，不额外复制。
+    resolved = path.expanduser().resolve()
+    entry: Dict[str, Optional[str]] = {
+        "path": str(resolved),
+        "exists": "true" if resolved.exists() else "false",
+        "backup": None,
+    }
+    if not resolved.exists():
+        return entry
+    backup_path = backup_root / "files" / resolved.name
+    backup_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(resolved, backup_path)
+    entry["backup"] = str(backup_path)
+    return entry
+
+
+def _create_review_redub_snapshot(*, manifest_path: Path, segment_job_dirs: List[Path]) -> Dict[str, Any]:
+    # review redub 前备份受影响 segment 与 batch manifest，便于失败时回滚。
+    batch_dir = manifest_path.parent
+    backup_root = Path(tempfile.mkdtemp(prefix="review_redub_", dir=str(batch_dir))).resolve()
+    segment_entries: List[Dict[str, str]] = []
+    for segment_job_dir in sorted({item.expanduser().resolve() for item in segment_job_dirs}, key=lambda item: str(item)):
+        backup_dir = backup_root / "segments" / segment_job_dir.name
+        shutil.copytree(segment_job_dir, backup_dir)
+        segment_entries.append({"path": str(segment_job_dir), "backup": str(backup_dir)})
+    return {
+        "backup_root": str(backup_root),
+        "segment_dirs": segment_entries,
+        "files": [_snapshot_file(manifest_path, backup_root)],
+    }
+
+
+def _restore_review_redub_snapshot(snapshot: Dict[str, Any]) -> None:
+    # 回滚局部重配过程中对 segment/batch manifest 的改动。
+    for entry in snapshot.get("segment_dirs", []):
+        target = Path(str(entry.get("path") or "")).expanduser().resolve()
+        backup = Path(str(entry.get("backup") or "")).expanduser().resolve()
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(backup, target)
+
+    for entry in snapshot.get("files", []):
+        target = Path(str(entry.get("path") or "")).expanduser().resolve()
+        existed = str(entry.get("exists") or "").lower() == "true"
+        backup_text = entry.get("backup")
+        if existed and backup_text:
+            backup = Path(str(backup_text)).expanduser().resolve()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(backup, target)
+        elif (not existed) and target.exists():
+            target.unlink(missing_ok=True)
+
+
+def _cleanup_review_redub_snapshot(snapshot: Dict[str, Any]) -> None:
+    # 清理事务临时目录，避免 batch 目录残留大量备份。
+    backup_root_text = snapshot.get("backup_root")
+    if not backup_root_text:
+        return
+    shutil.rmtree(Path(str(backup_root_text)).expanduser(), ignore_errors=True)
+
+
+def _collect_written_batch_paths(manifest_path: Path) -> Dict[str, Optional[str]]:
+    # 从最新 batch manifest 提取最终字幕产物路径。
+    batch_manifest = load_batch_manifest(manifest_path)
+    paths = batch_manifest.paths
+    translated_text = paths.get("translated_full_srt")
+    bilingual_text = paths.get("dubbed_final_full_srt")
+    translated_path = Path(str(translated_text)).expanduser().resolve() if translated_text else None
+    bilingual_path = Path(str(bilingual_text)).expanduser().resolve() if bilingual_text else None
+    return {
+        "translated_full_srt": str(translated_path) if translated_path and translated_path.exists() else None,
+        "dubbed_final_full_srt": str(bilingual_path) if bilingual_path and bilingual_path.exists() else None,
+    }
+
+
+def _rerun_segment_with_translated_srt(
+    *,
+    segment_job_dir: Path,
+    target_lang: str,
+    index_tts_api_url: str,
+    pipeline_version: str,
+    rewrite_translation: bool,
+    redub_local_indices: List[int],
+) -> None:
+    # 仅重跑单个 segment（跳过 ASR/翻译），实现局部重配而非全量重跑。
+    segment_manifest_path = segment_job_dir / "manifest.json"
+    if not segment_manifest_path.exists():
+        raise RuntimeError(f"segment manifest missing: {segment_manifest_path}")
+    segment_manifest = load_segment_manifest(segment_manifest_path)
+    input_media_path = segment_manifest.input_media_path
+    if not input_media_path:
+        raise RuntimeError("segment input_media_path missing")
+    runtime_options = resolve_segment_redub_runtime_options(
+        segment_manifest=segment_manifest,
+        fallback_pipeline_version=pipeline_version,
+        fallback_rewrite_translation=rewrite_translation,
+        fallback_index_tts_api_url=index_tts_api_url,
+    )
+
+    translated_srt = segment_job_dir / "subtitles" / "translated.srt"
+    if not translated_srt.exists():
+        raise RuntimeError(f"translated.srt missing: {translated_srt}")
+
+    cmd = build_segment_redub_command(
+        SegmentRedubCommandConfig(
+            python_executable=sys.executable,
+            tool_path=REPO_ROOT / "tools" / "dub_pipeline.py",
+            segment_job_dir=segment_job_dir,
+            out_dir=segment_job_dir.parent,
+            input_media=Path(str(input_media_path)).expanduser().resolve(),
+            target_lang=target_lang or "Chinese",
+            translated_srt=translated_srt,
+            index_tts_api_url=runtime_options.index_tts_api_url,
+            pipeline_version=runtime_options.pipeline_version,
+            rewrite_translation=runtime_options.rewrite_translation,
+            grouped_synthesis=runtime_options.grouped_synthesis,
+            force_fit_timing=runtime_options.force_fit_timing,
+            redub_local_indices=redub_local_indices,
+            tts_backend=runtime_options.tts_backend,
+        )
+    )
+
+    proc = subprocess.run(
+        cmd,
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode not in (0, 2):
+        # 报错信息优先展示真实尾部错误，而不是 flash-attn 的无害 warning 横幅。
+        detail = _compact_process_error_output(proc.stdout or "", proc.stderr or "", keep_lines=120)
+        segment_name = segment_job_dir.name
+        if not detail:
+            detail = "no diagnostic output"
+        raise RuntimeError(f"segment re-dub failed [{segment_name}] ({proc.returncode}): {detail[:2000]}")
+
+
+def _rebuild_batch_outputs(batch_dir: Path) -> Dict[str, Any]:
+    # 复用 tools/repair_bad_segments.py 内的重拼逻辑，更新 final 全量产物。
+    tool_path = REPO_ROOT / "tools" / "repair_bad_segments.py"
+    spec = importlib.util.spec_from_file_location("repair_bad_segments_runtime", str(tool_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load repair_bad_segments module")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.rebuild_batch_outputs(batch_dir)
+
+
 @router.get("/artifact/{task_id}/{artifact}")
 async def download_auto_dubbing_artifact(task_id: str, artifact: str):
-    with _lock:
-        task = _tasks.get(task_id)
-        if not task:
-            raise HTTPException(status_code=404, detail="Dubbing task not found")
-        task_copy = dict(task)
+    task_copy = _task_store.get_copy(task_id)
+    if not task_copy:
+        raise HTTPException(status_code=404, detail="Dubbing task not found")
     path = _resolve_artifact(task_copy, artifact)
     return FileResponse(path, filename=path.name)
 
 
 def _cancel_task(task_id: str, reason: str) -> bool:
     with _lock:
-        task = _tasks.get(task_id)
+        task = _task_store.get(task_id)
         if not task or task.get("status") in {"completed", "failed", "cancelled"}:
             return False
         proc: Optional[subprocess.Popen[str]] = task.get("process")
@@ -847,10 +1574,5 @@ def _cancel_task(task_id: str, reason: str) -> bool:
 
 
 def cancel_active_dubbing(reason: str) -> int:
-    with _lock:
-        active_ids = [
-            task_id
-            for task_id, task in _tasks.items()
-            if task.get("status") not in {"completed", "failed", "cancelled"}
-        ]
+    active_ids = _task_store.list_active_ids()
     return sum(1 for task_id in active_ids if _cancel_task(task_id, reason))

@@ -34,4 +34,9 @@ align-deepsearch.md
 x-ArtemXTech-original.md
 x-arthem-zhutov-recall.md
 config/
-docs/
+
+# 文档默认视为本地资料，但重构计划属于项目产物，需要纳入版本管理。
+docs/*
+!docs/
+!docs/refactor/
+!docs/refactor/*.md
