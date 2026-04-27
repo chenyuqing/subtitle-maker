@@ -72,11 +72,13 @@ class DubbingCliApiTests(unittest.TestCase):
             patch.object(dubbing_cli_api, "UPLOAD_ROOT", self.upload_root),
             patch.object(dubbing_cli_api, "OUTPUT_ROOT", self.output_root),
             patch.object(dubbing_cli_api, "TOOL_PATH", self.tool_path),
+            patch.object(dubbing_cli_api.legacy_runtime, "UPLOAD_DIR", str(self.upload_root)),
         ]
         for patcher in self.patchers:
             patcher.start()
             self.addCleanup(patcher.stop)
         self.addCleanup(dubbing_cli_api._tasks.clear)
+        self.addCleanup(dubbing_cli_api.legacy_runtime.tasks.clear)
         self.addCleanup(lambda: shutil.rmtree(self.tmpdir, ignore_errors=True))
 
     def test_start_auto_dubbing_creates_isolated_task(self):
@@ -123,6 +125,91 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertTrue(FakeThread.instances[0].started)
         self.assertEqual(FakeThread.instances[0].args[0], task_id)
         self.assertEqual(FakeThread.instances[0].args[2]["DEEPSEEK_API_KEY"], "secret-key")
+
+    def test_start_auto_dubbing_from_project_reuses_existing_media_and_task_media_mapping(self):
+        media_path = self.upload_root / "demo.mp4"
+        media_path.write_bytes(b"video-data")
+        dubbing_cli_api.legacy_runtime.tasks["legacy-task"] = {
+            "status": "completed",
+            "filename": "demo.srt",
+            "video_filename": "demo.mp4",
+        }
+
+        with patch.object(dubbing_cli_api.threading, "Thread", FakeThread), patch.object(
+            dubbing_cli_api, "_check_index_tts_service", return_value=None
+        ):
+            response = self.client.post(
+                "/dubbing/auto/start-from-project",
+                data={
+                    "task_id": "legacy-task",
+                    "original_filename": "project-original.mp4",
+                    "target_lang": "Chinese",
+                    "api_key": "secret-key",
+                    "subtitle_mode": "source",
+                    "subtitles_json": json.dumps(
+                        [{"start": 0.0, "end": 1.2, "text": "hello project"}],
+                        ensure_ascii=False,
+                    ),
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["project_filename"], "demo.mp4")
+        task = self.client.get(f"/dubbing/auto/status/{payload['task_id']}").json()
+        task_internal = dubbing_cli_api._tasks[payload["task_id"]]
+        self.assertEqual(task["filename"], "project-original.mp4")
+        self.assertEqual(Path(task_internal["input_path"]).read_bytes(), b"video-data")
+        self.assertTrue(str(task_internal["input_srt"]).endswith("project_source.srt"))
+        self.assertIn("--input-srt", task["command"])
+        self.assertIn("source", task["command"])
+
+    def test_start_auto_dubbing_from_project_accepts_translated_subtitles_without_api_key(self):
+        media_path = self.upload_root / "demo.mp4"
+        media_path.write_bytes(b"video-data")
+
+        with patch.object(dubbing_cli_api.threading, "Thread", FakeThread), patch.object(
+            dubbing_cli_api, "_check_index_tts_service", return_value=None
+        ):
+            response = self.client.post(
+                "/dubbing/auto/start-from-project",
+                data={
+                    "filename": "demo.mp4",
+                    "target_lang": "Chinese",
+                    "subtitle_mode": "translated",
+                    "subtitles_json": json.dumps(
+                        [{"start": 0.0, "end": 1.0, "text": "你好"}],
+                        ensure_ascii=False,
+                    ),
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        task = self.client.get(f"/dubbing/auto/status/{payload['task_id']}").json()
+        self.assertEqual(task["subtitle_mode"], "translated")
+        self.assertIn("--input-srt-kind", task["command"])
+        self.assertIn("translated", task["command"])
+
+    def test_start_auto_dubbing_from_project_rejects_srt_only_project(self):
+        dubbing_cli_api.legacy_runtime.tasks["srt-only"] = {
+            "status": "completed",
+            "filename": "demo.srt",
+            "video_filename": None,
+        }
+
+        with patch.object(dubbing_cli_api, "_check_index_tts_service", return_value=None):
+            response = self.client.post(
+                "/dubbing/auto/start-from-project",
+                data={
+                    "task_id": "srt-only",
+                    "target_lang": "Chinese",
+                    "api_key": "secret-key",
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("no reusable media", response.json()["detail"])
 
     def test_start_auto_dubbing_accepts_enabled_short_merge_settings(self):
         with patch.object(dubbing_cli_api.threading, "Thread", FakeThread), patch.object(

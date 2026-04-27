@@ -13,7 +13,6 @@ export function setupDubbingPanels(deps) {
             dubbing: 'step-dub',
         },
         pipelineVersion: 'v1',
-        keyStoragePrefix: 'sm_autoDub_v1',
     }, deps);
     setupAutoDubbing({
         prefix: 'auto-dub-v2',
@@ -25,7 +24,6 @@ export function setupDubbingPanels(deps) {
             dubbing: 'step-v2-dub',
         },
         pipelineVersion: 'v2',
-        keyStoragePrefix: 'sm_autoDub_v2',
     }, deps);
 }
 
@@ -52,8 +50,20 @@ function setupAutoDubbing(config, deps) {
         describeAutoStage,
         normalizeShortMergeTargetSeconds,
         applyAutoDubSubtitleItems,
+        getDeepSeekApiKey,
+        getProjectDubbingContext,
     } = deps;
 
+    const projectModeBtn = byId('mode-project-btn');
+    const standaloneModeBtn = byId('mode-standalone-btn');
+    const projectReadinessEl = byId('project-readiness');
+    const projectMediaEl = byId('project-media');
+    const projectTaskEl = byId('project-task');
+    const projectSourceCountEl = byId('project-source-count');
+    const projectTranslatedCountEl = byId('project-translated-count');
+    const projectSubtitleModeSelect = byId('project-subtitle-mode');
+    const projectNoteEl = byId('project-note');
+    const standaloneDetailsEl = byId('standalone-details');
     const uploadArea = byId('upload-area');
     const fileInput = byId('file-input');
     const browseBtn = byId('browse-btn');
@@ -82,8 +92,6 @@ function setupAutoDubbing(config, deps) {
     const taskLabel = byId('task-id');
     const lineProgressEl = byId('line-progress');
     const etaEl = byId('eta');
-    const apiKeyInput = byId('api-key');
-    const saveKeyCheckbox = byId('save-key');
     const loadBatchSelect = byId('load-batch-select');
     const refreshBatchesBtn = byId('refresh-batches-btn');
     const loadBatchBtn = byId('load-batch-btn');
@@ -106,9 +114,130 @@ function setupAutoDubbing(config, deps) {
     let autoDubStartedAtMs = 0;
     let currentAutoDubTaskId = '';
     let reviewLinesCache = [];
+    let startMode = 'project';
     const dubbedAudioPlayer = new Audio();
     dubbedAudioPlayer.preload = 'metadata';
     let dubbedAudioUrl = null;
+
+    /**
+     * 读取主 workflow 当前上下文，供 Current Project 模式复用已有媒体与字幕。
+     */
+    function readProjectContext() {
+        if (typeof getProjectDubbingContext === 'function') {
+            return getProjectDubbingContext() || {};
+        }
+        return {};
+    }
+
+    /**
+     * 计算 Current Project 模式下可选的字幕策略，避免前端隐式猜测字幕语义。
+     */
+    function buildProjectSubtitleOptions(projectContext) {
+        const sourceItems = Array.isArray(projectContext?.sourceSubtitles) ? projectContext.sourceSubtitles : [];
+        const translatedItems = Array.isArray(projectContext?.translatedSubtitles) ? projectContext.translatedSubtitles : [];
+        const options = [];
+        if (translatedItems.length > 0) {
+            options.push({
+                value: 'translated',
+                label: `使用当前译文直接配音（${translatedItems.length} 行，跳过 ASR / 翻译）`,
+            });
+        }
+        if (sourceItems.length > 0) {
+            options.push({
+                value: 'source',
+                label: `使用当前原字幕继续翻译（${sourceItems.length} 行，跳过 ASR）`,
+            });
+        }
+        options.push({
+            value: 'media_only',
+            label: '只使用当前媒体，重新执行完整流程',
+        });
+        return options;
+    }
+
+    /**
+     * 渲染 Current Project 摘要卡，让用户看到当前项目是否真的具备可直接配音的输入。
+     */
+    function renderProjectContextSummary() {
+        const projectContext = readProjectContext();
+        const sourceItems = Array.isArray(projectContext?.sourceSubtitles) ? projectContext.sourceSubtitles : [];
+        const translatedItems = Array.isArray(projectContext?.translatedSubtitles) ? projectContext.translatedSubtitles : [];
+        const mediaName = projectContext?.mediaOriginalFilename || projectContext?.mediaFilename || '';
+        if (projectMediaEl) {
+            projectMediaEl.textContent = mediaName || '未上传媒体';
+        }
+        if (projectTaskEl) {
+            projectTaskEl.textContent = projectContext?.taskId || '未生成';
+        }
+        if (projectSourceCountEl) {
+            projectSourceCountEl.textContent = `${sourceItems.length} 行`;
+        }
+        if (projectTranslatedCountEl) {
+            projectTranslatedCountEl.textContent = `${translatedItems.length} 行`;
+        }
+        if (projectSubtitleModeSelect) {
+            const previous = projectSubtitleModeSelect.value;
+            const options = buildProjectSubtitleOptions(projectContext);
+            projectSubtitleModeSelect.innerHTML = '';
+            options.forEach((option) => {
+                const node = document.createElement('option');
+                node.value = option.value;
+                node.textContent = option.label;
+                projectSubtitleModeSelect.appendChild(node);
+            });
+            const values = options.map((item) => item.value);
+            if (values.includes(previous)) {
+                projectSubtitleModeSelect.value = previous;
+            } else if (values.includes('translated')) {
+                projectSubtitleModeSelect.value = 'translated';
+            } else if (values.includes('source')) {
+                projectSubtitleModeSelect.value = 'source';
+            } else {
+                projectSubtitleModeSelect.value = 'media_only';
+            }
+        }
+        if (projectReadinessEl) {
+            projectReadinessEl.textContent = mediaName ? '可复用' : '缺少媒体';
+        }
+        if (projectNoteEl) {
+            if (!mediaName) {
+                projectNoteEl.textContent = '当前项目还没有可复用的媒体文件。若只导入了 SRT，请切换到 Standalone Upload 或先上传媒体。';
+            } else if (translatedItems.length > 0) {
+                projectNoteEl.textContent = '当前项目已有译文，默认可直接跳过 ASR 与翻译。';
+            } else if (sourceItems.length > 0) {
+                projectNoteEl.textContent = '当前项目已有原字幕，可直接跳过 ASR，仅继续翻译与配音。';
+            } else {
+                projectNoteEl.textContent = '当前项目只有媒体，启动后会重新执行完整流程。';
+            }
+        }
+        // 当前项目没有媒体时，默认展开独立上传模式，让用户能直接开始使用，而不是停在不可执行的 project 模式。
+        if (!mediaName && !selectedFile && startMode !== 'standalone') {
+            setStartMode('standalone');
+        }
+    }
+
+    /**
+     * 在 Current Project / Standalone Upload 之间切换，避免两套流程并行显示造成误导。
+     */
+    function setStartMode(nextMode) {
+        startMode = nextMode === 'standalone' ? 'standalone' : 'project';
+        if (projectModeBtn) {
+            projectModeBtn.classList.toggle('active', startMode === 'project');
+            projectModeBtn.setAttribute('aria-pressed', startMode === 'project' ? 'true' : 'false');
+        }
+        if (standaloneModeBtn) {
+            standaloneModeBtn.classList.toggle('active', startMode === 'standalone');
+            standaloneModeBtn.setAttribute('aria-pressed', startMode === 'standalone' ? 'true' : 'false');
+        }
+        if (standaloneDetailsEl) {
+            standaloneDetailsEl.open = startMode === 'standalone';
+        }
+        if (startBtn) {
+            startBtn.textContent = startMode === 'project'
+                ? `Start ${config?.pipelineVersion === 'v2' ? 'Auto Dubbing V2' : 'Auto Dubbing'} From Current Project`
+                : `Start ${config?.pipelineVersion === 'v2' ? 'Auto Dubbing V2' : 'Auto Dubbing'}`;
+        }
+    }
 
     /**
      * 同步“短句合并”开关与阈值面板显示，避免默认关闭时仍暴露无效参数。
@@ -567,36 +696,17 @@ function setupAutoDubbing(config, deps) {
         });
     }
 
-    // Load saved API key.
-    const SAVED_KEY = `${config?.keyStoragePrefix || 'sm_autoDub'}_apiKey`;
-    const SAVED_KEY_CHECKED = `${config?.keyStoragePrefix || 'sm_autoDub'}_saveKey`;
-    const savedApiKey = localStorage.getItem(SAVED_KEY);
-    const savedCheckState = localStorage.getItem(SAVED_KEY_CHECKED) === 'true';
-    if (savedApiKey && apiKeyInput) {
-        apiKeyInput.value = savedApiKey;
+    if (projectModeBtn) {
+        projectModeBtn.addEventListener('click', () => setStartMode('project'));
     }
-    if (saveKeyCheckbox) {
-        saveKeyCheckbox.checked = savedCheckState;
+    if (standaloneModeBtn) {
+        standaloneModeBtn.addEventListener('click', () => setStartMode('standalone'));
     }
-
-    if (saveKeyCheckbox && apiKeyInput) {
-        saveKeyCheckbox.addEventListener('change', () => {
-            if (saveKeyCheckbox.checked && apiKeyInput.value) {
-                localStorage.setItem(SAVED_KEY, apiKeyInput.value);
-            } else if (!saveKeyCheckbox.checked) {
-                localStorage.removeItem(SAVED_KEY);
-            }
-            localStorage.setItem(SAVED_KEY_CHECKED, saveKeyCheckbox.checked);
-        });
-    }
-
-    if (apiKeyInput && saveKeyCheckbox) {
-        apiKeyInput.addEventListener('input', () => {
-            if (saveKeyCheckbox.checked && apiKeyInput.value) {
-                localStorage.setItem(SAVED_KEY, apiKeyInput.value);
-            }
-        });
-    }
+    window.addEventListener('subtitle-maker:project-context-changed', () => {
+        renderProjectContextSummary();
+    });
+    renderProjectContextSummary();
+    setStartMode('project');
 
     // File Upload Logic.
     if (uploadArea && fileInput) {
@@ -637,6 +747,7 @@ function setupAutoDubbing(config, deps) {
         subtitleInput.addEventListener('change', (event) => {
             const file = event.target.files && event.target.files.length > 0 ? event.target.files[0] : null;
             if (!file) return;
+            setStartMode('standalone');
             const name = String(file.name || '').toLowerCase();
             if (!(name.endsWith('.srt') || name.endsWith('.vtt') || name.endsWith('.md'))) {
                 alert('字幕文件必须是 .srt / .vtt / .md');
@@ -663,6 +774,7 @@ function setupAutoDubbing(config, deps) {
      * 处理 Auto Dubbing 的媒体文件选择与预览。
      */
     function handleAutoDubFile(file) {
+        setStartMode('standalone');
         selectedFile = file;
         selectedSubtitleFile = null;
         if (subtitleInput) subtitleInput.value = '';
@@ -737,41 +849,124 @@ function setupAutoDubbing(config, deps) {
     }
     syncShortMergeControls();
 
+    /**
+     * 组装两种启动模式共用的表单字段，避免 Current Project / Standalone 出现参数漂移。
+     */
+    function buildCommonStartFormData(apiKey, options = {}) {
+        const formData = new FormData();
+        const sourceLang = sourceLangSelect?.value || 'auto';
+        const targetLang = targetLangSelect?.value || 'Chinese';
+        const groupingStrategy = groupingStrategySelect ? groupingStrategySelect.value : 'sentence';
+        const shortMergeEnabled = shortMergeEnabledCheckbox ? !!shortMergeEnabledCheckbox.checked : false;
+        const shortMergeThreshold = Number.parseInt(
+            shortMergeThresholdInput?.value || String(shortMergeTargetDefault),
+            10,
+        );
+        const autoPickRanges = autoPickRangesCheckbox ? !!autoPickRangesCheckbox.checked : false;
+        const rewriteTranslation = rewriteTranslationCheckbox ? !!rewriteTranslationCheckbox.checked : null;
+        if (
+            shortMergeEnabled
+            && (
+                !Number.isInteger(shortMergeThreshold)
+                || shortMergeThreshold < shortMergeTargetMin
+                || shortMergeThreshold > shortMergeTargetMax
+            )
+        ) {
+            throw new Error(`Short merge target must be an integer between ${shortMergeTargetMin} and ${shortMergeTargetMax} seconds.`);
+        }
+        formData.append('source_lang', sourceLang);
+        formData.append('target_lang', targetLang);
+        formData.append('grouping_strategy', groupingStrategy);
+        formData.append('short_merge_enabled', shortMergeEnabled ? 'true' : 'false');
+        formData.append('short_merge_threshold', String(shortMergeThreshold));
+        formData.append('api_key', apiKey || '');
+        formData.append('auto_pick_ranges', autoPickRanges ? 'true' : 'false');
+        formData.append('pipeline_version', config?.pipelineVersion || 'v1');
+        if (rewriteTranslation !== null) {
+            formData.append('rewrite_translation', rewriteTranslation ? 'true' : 'false');
+        }
+        if (autoDubTimeRanges.length > 0) {
+            const payload = autoDubTimeRanges.map((item) => ({
+                start_sec: Number(item.start),
+                end_sec: Number(item.end),
+            }));
+            formData.append('time_ranges', JSON.stringify(payload));
+        }
+        Object.entries(options).forEach(([key, value]) => {
+            if (value === undefined || value === null || value === '') return;
+            formData.append(key, value);
+        });
+        return formData;
+    }
+
+    /**
+     * Current Project 模式下，从主 workflow 读取媒体和字幕，并映射成 project-aware 请求。
+     */
+    function buildCurrentProjectRequest(apiKey) {
+        const projectContext = readProjectContext();
+        const mediaFilename = String(projectContext?.mediaFilename || '').trim();
+        if (!mediaFilename) {
+            throw new Error('Current project has no reusable media. Upload media first or switch to Standalone Upload.');
+        }
+        const requestedMode = projectSubtitleModeSelect ? projectSubtitleModeSelect.value : 'media_only';
+        let subtitleMode = 'source';
+        let subtitlesJson = '';
+        if (requestedMode === 'translated') {
+            subtitleMode = 'translated';
+            subtitlesJson = JSON.stringify(projectContext?.translatedSubtitles || []);
+        } else if (requestedMode === 'source') {
+            subtitleMode = 'source';
+            subtitlesJson = JSON.stringify(projectContext?.sourceSubtitles || []);
+        }
+        const formData = buildCommonStartFormData(apiKey, {
+            filename: mediaFilename,
+            original_filename: projectContext?.mediaOriginalFilename || mediaFilename,
+            task_id: projectContext?.taskId || '',
+            subtitle_mode: subtitleMode,
+            subtitles_json: subtitlesJson,
+        });
+        const subtitleLabel = requestedMode === 'translated'
+            ? 'Skip ASR + Translation with current translated subtitles'
+            : requestedMode === 'source'
+                ? 'Skip ASR with current source subtitles'
+                : 'Run from current project media';
+        return {
+            endpoint: '/dubbing/auto/start-from-project',
+            formData,
+            initLabel: `Initializing... (${subtitleLabel})`,
+        };
+    }
+
+    /**
+     * Standalone 模式继续走原有上传入口，但统一复用全局 key 和公共参数拼装。
+     */
+    function buildStandaloneRequest(apiKey) {
+        const subtitleMode = subtitleModeSelect ? subtitleModeSelect.value : 'source';
+        if (!selectedFile) {
+            throw new Error('Please select a video file first.');
+        }
+        const formData = buildCommonStartFormData(apiKey, {
+            subtitle_mode: selectedSubtitleFile ? subtitleMode : '',
+        });
+        formData.append('video', selectedFile);
+        if (selectedSubtitleFile) {
+            formData.append('subtitle_file', selectedSubtitleFile);
+        }
+        const initLabel = selectedSubtitleFile
+            ? (subtitleMode === 'translated'
+                ? 'Initializing... (Skip ASR + Translation with uploaded translated subtitles)'
+                : 'Initializing... (Skip ASR with uploaded subtitles)')
+            : 'Initializing...';
+        return {
+            endpoint: '/dubbing/auto/start',
+            formData,
+            initLabel,
+        };
+    }
+
     if (startBtn) {
         startBtn.addEventListener('click', async () => {
-            const sourceLang = sourceLangSelect?.value || 'auto';
-            const targetLang = targetLangSelect?.value || 'Chinese';
-            const groupingStrategy = groupingStrategySelect ? groupingStrategySelect.value : 'sentence';
-            const shortMergeEnabled = shortMergeEnabledCheckbox ? !!shortMergeEnabledCheckbox.checked : false;
-            const shortMergeThreshold = Number.parseInt(
-                shortMergeThresholdInput?.value || String(shortMergeTargetDefault),
-                10
-            );
-            const apiKey = byId('api-key')?.value || '';
-            const autoPickRanges = autoPickRangesCheckbox ? !!autoPickRangesCheckbox.checked : false;
-            const rewriteTranslation = rewriteTranslationCheckbox ? !!rewriteTranslationCheckbox.checked : null;
-            const subtitleMode = subtitleModeSelect ? subtitleModeSelect.value : 'source';
-            const skipTranslationBySubtitle = !!selectedSubtitleFile && subtitleMode === 'translated';
-
-            if (!selectedFile) {
-                alert('Please select a video file first.');
-                return;
-            }
-            if (!apiKey && !skipTranslationBySubtitle) {
-                alert('Please enter your DeepSeek API Key.');
-                return;
-            }
-            if (
-                shortMergeEnabled
-                && (
-                    !Number.isInteger(shortMergeThreshold)
-                    || shortMergeThreshold < shortMergeTargetMin
-                    || shortMergeThreshold > shortMergeTargetMax
-                )
-            ) {
-                alert(`Short merge target must be an integer between ${shortMergeTargetMin} and ${shortMergeTargetMax} seconds.`);
-                return;
-            }
+            const apiKey = typeof getDeepSeekApiKey === 'function' ? getDeepSeekApiKey() : '';
             autoDubStartedAtMs = Date.now();
 
             startBtn.disabled = true;
@@ -779,13 +974,6 @@ function setupAutoDubbing(config, deps) {
             resultsContainer.style.display = 'none';
             if (autoProgressFill) {
                 autoProgressFill.style.width = '5%';
-            }
-            if (selectedSubtitleFile) {
-                statusText.textContent = subtitleMode === 'translated'
-                    ? 'Initializing... (Skip ASR + Translation with uploaded translated subtitles)'
-                    : 'Initializing... (Skip ASR with uploaded subtitles)';
-            } else {
-                statusText.textContent = 'Initializing...';
             }
             statusText.className = 'status-text';
 
@@ -800,32 +988,11 @@ function setupAutoDubbing(config, deps) {
             if (etaEl) etaEl.textContent = 'ETA —';
 
             try {
-                const formData = new FormData();
-                formData.append('video', selectedFile);
-                if (selectedSubtitleFile) {
-                    formData.append('subtitle_file', selectedSubtitleFile);
-                    formData.append('subtitle_mode', subtitleMode);
-                }
-                formData.append('source_lang', sourceLang);
-                formData.append('target_lang', targetLang);
-                formData.append('grouping_strategy', groupingStrategy);
-                formData.append('short_merge_enabled', shortMergeEnabled ? 'true' : 'false');
-                formData.append('short_merge_threshold', String(shortMergeThreshold));
-                formData.append('api_key', apiKey);
-                formData.append('auto_pick_ranges', autoPickRanges ? 'true' : 'false');
-                formData.append('pipeline_version', config?.pipelineVersion || 'v1');
-                if (rewriteTranslation !== null) {
-                    formData.append('rewrite_translation', rewriteTranslation ? 'true' : 'false');
-                }
-                if (autoDubTimeRanges.length > 0) {
-                    const payload = autoDubTimeRanges.map((item) => ({
-                        start_sec: Number(item.start),
-                        end_sec: Number(item.end),
-                    }));
-                    formData.append('time_ranges', JSON.stringify(payload));
-                }
-
-                const res = await fetch('/dubbing/auto/start', { method: 'POST', body: formData });
+                const request = startMode === 'project'
+                    ? buildCurrentProjectRequest(apiKey)
+                    : buildStandaloneRequest(apiKey);
+                statusText.textContent = request.initLabel;
+                const res = await fetch(request.endpoint, { method: 'POST', body: request.formData });
                 if (!res.ok) {
                     const err = await res.json().catch(() => ({}));
                     throw new Error(err.detail || 'Failed to start dubbing task');
@@ -859,7 +1026,9 @@ function setupAutoDubbing(config, deps) {
             const payload = await res.json();
             const batches = Array.isArray(payload?.batches) ? payload.batches : [];
             const previous = loadBatchSelect.value;
-            loadBatchSelect.innerHTML = '<option value="">选择已生成结果文件夹</option>';
+            loadBatchSelect.innerHTML = batches.length
+                ? '<option value="">选择已生成结果文件夹</option>'
+                : '<option value="">暂无可加载结果，请先运行一次 Auto Dubbing</option>';
             for (const item of batches) {
                 const id = item?.batch_id || '';
                 if (!id) continue;

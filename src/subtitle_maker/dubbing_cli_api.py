@@ -26,6 +26,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
+from subtitle_maker.app import legacy_runtime
 from subtitle_maker.domains.dubbing import resolve_segment_redub_runtime_options
 from subtitle_maker.jobs import (
     AutoDubbingCommandConfig,
@@ -406,6 +407,291 @@ def _build_readable_task_id() -> str:
     return candidate
 
 
+def _normalize_auto_dubbing_request(
+    *,
+    subtitle_mode: str,
+    source_lang: str,
+    target_lang: str,
+    api_key: str,
+    translate_base_url: str,
+    translate_model: str,
+    index_tts_api_url: str,
+    segment_minutes: float,
+    min_segment_minutes: float,
+    timing_mode: str,
+    grouping_strategy: str,
+    short_merge_enabled: str,
+    short_merge_threshold: int,
+    time_ranges: str,
+    auto_pick_ranges: str,
+    auto_pick_min_silence_sec: float,
+    auto_pick_min_speech_sec: float,
+    pipeline_version: str,
+    rewrite_translation: str,
+    has_subtitle_input: bool,
+) -> Dict[str, Any]:
+    """统一解析两条启动入口的公共参数，避免 Current Project / Standalone 语义漂移。"""
+
+    if not TOOL_PATH.exists():
+        raise HTTPException(status_code=500, detail=f"CLI not found: {TOOL_PATH}")
+    if segment_minutes <= 0 or min_segment_minutes <= 0 or min_segment_minutes > segment_minutes:
+        raise HTTPException(status_code=400, detail="Invalid segment duration settings")
+    if not target_lang.strip():
+        raise HTTPException(status_code=400, detail="target_lang is required")
+    if not _index_tts_target_lang_supported(target_lang):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Current index-tts backend in this project only supports Chinese/English reliably. "
+                f"Unsupported target_lang: {target_lang}"
+            ),
+        )
+
+    normalized_timing_mode = (timing_mode or "").strip() or "strict"
+    if normalized_timing_mode not in {"strict", "balanced"}:
+        raise HTTPException(status_code=400, detail="Invalid timing_mode")
+    normalized_grouping_strategy = (grouping_strategy or "").strip() or "sentence"
+    if normalized_grouping_strategy not in {"legacy", "sentence"}:
+        raise HTTPException(status_code=400, detail="Invalid grouping_strategy")
+    short_merge_enabled_value = _read_bool_form(short_merge_enabled, field_name="short_merge_enabled")
+    if short_merge_enabled_value and not (
+        MIN_SOURCE_SHORT_MERGE_TARGET_SEC <= short_merge_threshold <= MAX_SOURCE_SHORT_MERGE_TARGET_SEC
+    ):
+        raise HTTPException(status_code=400, detail="Invalid short_merge_threshold")
+    if auto_pick_min_silence_sec < 0.1 or auto_pick_min_silence_sec > 10.0:
+        raise HTTPException(status_code=400, detail="Invalid auto_pick_min_silence_sec")
+    if auto_pick_min_speech_sec < 0.1 or auto_pick_min_speech_sec > 30.0:
+        raise HTTPException(status_code=400, detail="Invalid auto_pick_min_speech_sec")
+
+    normalized_subtitle_mode = (subtitle_mode or "").strip().lower() or "source"
+    if normalized_subtitle_mode not in {"source", "translated"}:
+        raise HTTPException(status_code=400, detail="Invalid subtitle_mode")
+    normalized_pipeline_version = (pipeline_version or "").strip().lower() or "v1"
+    if normalized_pipeline_version not in {"v1", "v2"}:
+        raise HTTPException(status_code=400, detail="Invalid pipeline_version")
+
+    rewrite_translation_enabled = _read_bool_form(rewrite_translation, field_name="rewrite_translation")
+    auto_pick_ranges_enabled = _read_bool_form(auto_pick_ranges, field_name="auto_pick_ranges")
+    parsed_time_ranges = _parse_time_ranges_form(time_ranges)
+    normalized_translate_base_url = (translate_base_url or "").strip() or DEFAULT_TRANSLATE_BASE_URL
+    normalized_translate_model = (translate_model or "").strip() or DEFAULT_TRANSLATE_MODEL
+    normalized_index_tts_api_url = (index_tts_api_url or "").strip() or DEFAULT_INDEX_TTS_API_URL
+    effective_api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
+    skip_translation_by_subtitle = bool(has_subtitle_input and normalized_subtitle_mode == "translated")
+    if (not skip_translation_by_subtitle) and (not effective_api_key) and normalized_translate_base_url == DEFAULT_TRANSLATE_BASE_URL:
+        raise HTTPException(
+            status_code=400,
+            detail="Translation API key is required. Provide api_key or configure a custom translate_base_url.",
+        )
+    _ensure_index_tts_service(normalized_index_tts_api_url)
+    return {
+        "subtitle_mode": normalized_subtitle_mode,
+        "source_lang": source_lang,
+        "target_lang": target_lang,
+        "effective_api_key": effective_api_key,
+        "translate_base_url": normalized_translate_base_url,
+        "translate_model": normalized_translate_model,
+        "index_tts_api_url": normalized_index_tts_api_url,
+        "segment_minutes": segment_minutes,
+        "min_segment_minutes": min_segment_minutes,
+        "timing_mode": normalized_timing_mode,
+        "grouping_strategy": normalized_grouping_strategy,
+        "short_merge_enabled": short_merge_enabled_value,
+        "short_merge_threshold": int(short_merge_threshold),
+        "time_ranges": parsed_time_ranges,
+        "auto_pick_ranges": auto_pick_ranges_enabled,
+        "auto_pick_min_silence_sec": auto_pick_min_silence_sec,
+        "auto_pick_min_speech_sec": auto_pick_min_speech_sec,
+        "pipeline_version": normalized_pipeline_version,
+        "rewrite_translation": rewrite_translation_enabled,
+    }
+
+
+def _write_subtitles_json_to_srt(
+    *,
+    upload_dir: Path,
+    subtitles_json: str,
+    subtitle_mode: str,
+) -> Optional[Path]:
+    """把主 workflow 内存中的字幕数组落成 SRT，供 CLI 直接复用当前项目上下文。"""
+
+    raw = (subtitles_json or "").strip()
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid subtitles_json: {exc}") from exc
+    if not isinstance(payload, list):
+        raise HTTPException(status_code=400, detail="Invalid subtitles_json: must be a list")
+    if not payload:
+        return None
+
+    subtitle_items: List[Dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail="Invalid subtitles_json item")
+        start_sec = item.get("start", item.get("start_sec"))
+        end_sec = item.get("end", item.get("end_sec"))
+        text = str(item.get("text", "") or "").strip()
+        if start_sec is None or end_sec is None or not text:
+            continue
+        try:
+            start_value = float(start_sec)
+            end_value = float(end_sec)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid subtitles_json timing: {exc}") from exc
+        if end_value <= start_value:
+            continue
+        subtitle_items.append(
+            {
+                "start": start_value,
+                "end": end_value,
+                "text": text,
+            }
+        )
+
+    if not subtitle_items:
+        raise HTTPException(status_code=400, detail="Invalid subtitles_json: no valid subtitle rows")
+
+    srt_path = upload_dir / f"project_{subtitle_mode}.srt"
+    srt_path.write_text(format_srt(subtitle_items), encoding="utf-8")
+    return srt_path
+
+
+def _resolve_project_media_path(filename: str, task_id: str) -> Path:
+    """只从已知上传目录解析 Current Project 媒体，避免 project-aware 启动变成任意文件读取。"""
+
+    candidates: List[str] = []
+    requested_name = (filename or "").strip()
+    if requested_name:
+        normalized_name = Path(requested_name).name
+        if normalized_name != requested_name:
+            raise HTTPException(status_code=400, detail="Invalid project filename")
+        candidates.append(normalized_name)
+
+    task_payload = legacy_runtime.tasks.get(task_id) if task_id else None
+    for key in ("video_filename", "filename"):
+        value = str((task_payload or {}).get(key, "") or "").strip()
+        if not value:
+            continue
+        normalized_name = Path(value).name
+        if normalized_name == value and normalized_name not in candidates:
+            candidates.append(normalized_name)
+
+    upload_dir = Path(legacy_runtime.UPLOAD_DIR)
+    for candidate in candidates:
+        if candidate.lower().endswith(".srt"):
+            continue
+        media_path = upload_dir / candidate
+        if media_path.exists() and media_path.is_file():
+            return media_path
+
+    if task_payload and str(task_payload.get("filename", "") or "").lower().endswith(".srt"):
+        raise HTTPException(status_code=400, detail="Current project has subtitles but no reusable media file")
+    raise HTTPException(status_code=404, detail="Current project media not found")
+
+
+def _queue_auto_dubbing_task(
+    *,
+    task_id: Optional[str] = None,
+    filename: str,
+    input_path: Path,
+    input_srt_path: Optional[Path],
+    options: Dict[str, Any],
+) -> Dict[str, str]:
+    """创建 Auto Dubbing 任务记录并启动后台 CLI 线程，供两条启动入口共用。"""
+
+    active = _task_store.list_active_ids()
+    if active:
+        raise HTTPException(status_code=409, detail="Another auto dubbing job is already running")
+
+    resolved_task_id = task_id or _build_readable_task_id()
+    out_root = OUTPUT_ROOT / f"web_{resolved_task_id}"
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    auto_pick_ranges_enabled = bool(options["auto_pick_ranges"])
+    if input_srt_path is not None and auto_pick_ranges_enabled:
+        auto_pick_ranges_enabled = False
+
+    cmd = build_auto_dubbing_command(
+        AutoDubbingCommandConfig(
+            python_executable=sys.executable,
+            tool_path=TOOL_PATH,
+            input_media=input_path,
+            target_lang=options["target_lang"],
+            out_dir=out_root,
+            segment_minutes=options["segment_minutes"],
+            min_segment_minutes=options["min_segment_minutes"],
+            timing_mode=options["timing_mode"],
+            grouping_strategy=options["grouping_strategy"],
+            short_merge_enabled=options["short_merge_enabled"],
+            short_merge_threshold=options["short_merge_threshold"],
+            translate_base_url=options["translate_base_url"],
+            translate_model=options["translate_model"],
+            index_tts_api_url=options["index_tts_api_url"],
+            auto_pick_ranges=auto_pick_ranges_enabled,
+            auto_pick_min_silence_sec=options["auto_pick_min_silence_sec"],
+            auto_pick_min_speech_sec=options["auto_pick_min_speech_sec"],
+            input_srt=input_srt_path,
+            input_srt_kind=options["subtitle_mode"],
+            time_ranges=options["time_ranges"],
+            source_lang=options["source_lang"],
+            pipeline_version=options["pipeline_version"],
+            rewrite_translation=options["rewrite_translation"],
+        )
+    )
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    if options["effective_api_key"]:
+        env["DEEPSEEK_API_KEY"] = options["effective_api_key"]
+    elif options["translate_base_url"] != DEFAULT_TRANSLATE_BASE_URL:
+        env["DEEPSEEK_API_KEY"] = "sk-no-key-required"
+
+    task = {
+        "id": resolved_task_id,
+        "short_id": resolved_task_id.split("-")[0],
+        "status": "queued",
+        "stage": "queued",
+        "progress": 0.0,
+        "created_at": _iso_now(),
+        "updated_at": _iso_now(),
+        "filename": filename,
+        "target_lang": options["target_lang"],
+        "timing_mode": options["timing_mode"],
+        "grouping_strategy": options["grouping_strategy"],
+        "source_short_merge_enabled": options["short_merge_enabled"],
+        "source_short_merge_threshold": options["short_merge_threshold"],
+        "source_short_merge_threshold_mode": "seconds",
+        "source_lang": options["source_lang"],
+        "subtitle_mode": options["subtitle_mode"],
+        "translate_base_url": options["translate_base_url"],
+        "translate_model": options["translate_model"],
+        "index_tts_api_url": options["index_tts_api_url"],
+        "time_ranges": options["time_ranges"],
+        "auto_pick_ranges": auto_pick_ranges_enabled,
+        "pipeline_version": options["pipeline_version"],
+        "rewrite_translation": options["rewrite_translation"],
+        "auto_pick_min_silence_sec": options["auto_pick_min_silence_sec"],
+        "auto_pick_min_speech_sec": options["auto_pick_min_speech_sec"],
+        "processed_segments": 0,
+        "total_segments": None,
+        "artifacts": [],
+        "stdout_tail": [],
+        "input_path": str(input_path),
+        "input_srt": str(input_srt_path) if input_srt_path else None,
+        "upload_dir": str(input_path.parent),
+        "out_root": str(out_root),
+        "command": [part if part != options["effective_api_key"] else "***" for part in cmd],
+    }
+    _task_store.create(resolved_task_id, task)
+
+    thread = threading.Thread(target=_run_cli_task, args=(resolved_task_id, cmd, env, out_root), daemon=True)
+    thread.start()
+    return {"task_id": resolved_task_id, "short_id": task["short_id"], "status": "queued"}
+
+
 def _set_task(task_id: str, **updates: Any) -> None:
     _task_store.update(task_id, updated_at=_iso_now(), **updates)
 
@@ -728,65 +1014,9 @@ async def start_auto_dubbing(
     pipeline_version: str = Form("v1"),
     rewrite_translation: str = Form("true"),
 ):
-    if not TOOL_PATH.exists():
-        raise HTTPException(status_code=500, detail=f"CLI not found: {TOOL_PATH}")
-    if segment_minutes <= 0 or min_segment_minutes <= 0 or min_segment_minutes > segment_minutes:
-        raise HTTPException(status_code=400, detail="Invalid segment duration settings")
-    if not target_lang.strip():
-        raise HTTPException(status_code=400, detail="target_lang is required")
-    if not _index_tts_target_lang_supported(target_lang):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Current index-tts backend in this project only supports Chinese/English reliably. "
-                f"Unsupported target_lang: {target_lang}"
-            ),
-        )
-    timing_mode = (timing_mode or "").strip() or "strict"
-    if timing_mode not in {"strict", "balanced"}:
-        raise HTTPException(status_code=400, detail="Invalid timing_mode")
-    grouping_strategy = (grouping_strategy or "").strip() or "sentence"
-    if grouping_strategy not in {"legacy", "sentence"}:
-        raise HTTPException(status_code=400, detail="Invalid grouping_strategy")
-    short_merge_enabled_value = _read_bool_form(short_merge_enabled, field_name="short_merge_enabled")
-    if short_merge_enabled_value and not (
-        MIN_SOURCE_SHORT_MERGE_TARGET_SEC <= short_merge_threshold <= MAX_SOURCE_SHORT_MERGE_TARGET_SEC
-    ):
-        raise HTTPException(status_code=400, detail="Invalid short_merge_threshold")
-    if auto_pick_min_silence_sec < 0.1 or auto_pick_min_silence_sec > 10.0:
-        raise HTTPException(status_code=400, detail="Invalid auto_pick_min_silence_sec")
-    if auto_pick_min_speech_sec < 0.1 or auto_pick_min_speech_sec > 30.0:
-        raise HTTPException(status_code=400, detail="Invalid auto_pick_min_speech_sec")
-    subtitle_mode = (subtitle_mode or "").strip().lower() or "source"
-    if subtitle_mode not in {"source", "translated"}:
-        raise HTTPException(status_code=400, detail="Invalid subtitle_mode")
-    pipeline_version = (pipeline_version or "").strip().lower() or "v1"
-    if pipeline_version not in {"v1", "v2"}:
-        raise HTTPException(status_code=400, detail="Invalid pipeline_version")
-    rewrite_translation_enabled = _read_bool_form(rewrite_translation, field_name="rewrite_translation")
-    auto_pick_ranges_enabled = _read_bool_form(auto_pick_ranges, field_name="auto_pick_ranges")
-    parsed_time_ranges = _parse_time_ranges_form(time_ranges)
-    translate_base_url = (translate_base_url or "").strip() or DEFAULT_TRANSLATE_BASE_URL
-    translate_model = (translate_model or "").strip() or DEFAULT_TRANSLATE_MODEL
-    index_tts_api_url = (index_tts_api_url or "").strip() or DEFAULT_INDEX_TTS_API_URL
-    effective_api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
-    # 当上传的是“已翻译字幕”时，自动跳过翻译环节，不强制要求翻译 API Key。
-    skip_translation_by_uploaded_subtitle = bool(subtitle_file is not None and subtitle_file.filename and subtitle_mode == "translated")
-    if (not skip_translation_by_uploaded_subtitle) and (not effective_api_key) and translate_base_url == DEFAULT_TRANSLATE_BASE_URL:
-        raise HTTPException(
-            status_code=400,
-            detail="Translation API key is required. Provide api_key or configure a custom translate_base_url.",
-        )
-    _ensure_index_tts_service(index_tts_api_url)
-    active = _task_store.list_active_ids()
-    if active:
-        raise HTTPException(status_code=409, detail="Another auto dubbing job is already running")
-
     task_id = _build_readable_task_id()
     upload_dir = UPLOAD_ROOT / task_id
-    out_root = OUTPUT_ROOT / f"web_{task_id}"
     upload_dir.mkdir(parents=True, exist_ok=True)
-    out_root.mkdir(parents=True, exist_ok=True)
 
     filename = _sanitize_filename(video.filename or "input_media")
     input_path = upload_dir / filename
@@ -820,89 +1050,109 @@ async def start_auto_dubbing(
             input_srt_path.write_text(srt_text, encoding="utf-8")
         else:
             raise HTTPException(status_code=400, detail="subtitle_file must be .srt, .vtt or .md")
-    # 上传字幕时，默认走“按字幕时间轴处理”的稳定链路，避免自动语音区间切成大量碎片段。
-    # 这能防止出现“用户未显式开启 auto-pick，但任务仍按 auto ranges 切 10 段”的误行为。
-    if input_srt_path is not None and auto_pick_ranges_enabled:
-        auto_pick_ranges_enabled = False
-
-    cmd = build_auto_dubbing_command(
-        AutoDubbingCommandConfig(
-            python_executable=sys.executable,
-            tool_path=TOOL_PATH,
-            input_media=input_path,
-            target_lang=target_lang,
-            out_dir=out_root,
-            segment_minutes=segment_minutes,
-            min_segment_minutes=min_segment_minutes,
-            timing_mode=timing_mode,
-            grouping_strategy=grouping_strategy,
-            short_merge_enabled=short_merge_enabled_value,
-            short_merge_threshold=int(short_merge_threshold),
-            translate_base_url=translate_base_url,
-            translate_model=translate_model,
-            index_tts_api_url=index_tts_api_url,
-            auto_pick_ranges=auto_pick_ranges_enabled,
-            auto_pick_min_silence_sec=auto_pick_min_silence_sec,
-            auto_pick_min_speech_sec=auto_pick_min_speech_sec,
-            input_srt=input_srt_path,
-            input_srt_kind=subtitle_mode,
-            time_ranges=parsed_time_ranges,
-            source_lang=source_lang,
-            pipeline_version=pipeline_version,
-            rewrite_translation=rewrite_translation_enabled,
-        )
+    options = _normalize_auto_dubbing_request(
+        subtitle_mode=subtitle_mode,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        api_key=api_key,
+        translate_base_url=translate_base_url,
+        translate_model=translate_model,
+        index_tts_api_url=index_tts_api_url,
+        segment_minutes=segment_minutes,
+        min_segment_minutes=min_segment_minutes,
+        timing_mode=timing_mode,
+        grouping_strategy=grouping_strategy,
+        short_merge_enabled=short_merge_enabled,
+        short_merge_threshold=short_merge_threshold,
+        time_ranges=time_ranges,
+        auto_pick_ranges=auto_pick_ranges,
+        auto_pick_min_silence_sec=auto_pick_min_silence_sec,
+        auto_pick_min_speech_sec=auto_pick_min_speech_sec,
+        pipeline_version=pipeline_version,
+        rewrite_translation=rewrite_translation,
+        has_subtitle_input=input_srt_path is not None,
+    )
+    return _queue_auto_dubbing_task(
+        task_id=task_id,
+        filename=filename,
+        input_path=input_path,
+        input_srt_path=input_srt_path,
+        options=options,
     )
 
-    env = os.environ.copy()
-    # 双保险：即使底层入口再次拉起 Python，也尽量保持 stdout/stderr 实时刷新
-    env["PYTHONUNBUFFERED"] = "1"
-    if effective_api_key:
-        env["DEEPSEEK_API_KEY"] = effective_api_key
-    elif translate_base_url != DEFAULT_TRANSLATE_BASE_URL:
-        env["DEEPSEEK_API_KEY"] = "sk-no-key-required"
 
-    task = {
-        "id": task_id,
-        "short_id": task_id.split("-")[0],
-        "status": "queued",
-        "stage": "queued",
-        "progress": 0.0,
-        "created_at": _iso_now(),
-        "updated_at": _iso_now(),
-        "filename": filename,
-        "target_lang": target_lang,
-        "timing_mode": timing_mode,
-        "grouping_strategy": grouping_strategy,
-        "source_short_merge_enabled": short_merge_enabled_value,
-        "source_short_merge_threshold": int(short_merge_threshold),
-        "source_short_merge_threshold_mode": "seconds",
-        "source_lang": source_lang,
-        "subtitle_mode": subtitle_mode,
-        "translate_base_url": translate_base_url,
-        "translate_model": translate_model,
-        "index_tts_api_url": index_tts_api_url,
-        "time_ranges": parsed_time_ranges,
-        "auto_pick_ranges": auto_pick_ranges_enabled,
-        "pipeline_version": pipeline_version,
-        "rewrite_translation": rewrite_translation_enabled,
-        "auto_pick_min_silence_sec": auto_pick_min_silence_sec,
-        "auto_pick_min_speech_sec": auto_pick_min_speech_sec,
-        "processed_segments": 0,
-        "total_segments": None,
-        "artifacts": [],
-        "stdout_tail": [],
-        "input_path": str(input_path),
-        "input_srt": str(input_srt_path) if input_srt_path else None,
-        "upload_dir": str(upload_dir),
-        "out_root": str(out_root),
-        "command": [part if part != api_key else "***" for part in cmd],
-    }
-    _task_store.create(task_id, task)
+@router.post("/start-from-project")
+async def start_auto_dubbing_from_project(
+    filename: str = Form(""),
+    original_filename: str = Form(""),
+    task_id: str = Form(""),
+    subtitles_json: str = Form(""),
+    subtitle_mode: str = Form("source"),
+    source_lang: str = Form("auto"),
+    target_lang: str = Form(...),
+    api_key: str = Form(""),
+    translate_base_url: str = Form(DEFAULT_TRANSLATE_BASE_URL),
+    translate_model: str = Form(DEFAULT_TRANSLATE_MODEL),
+    index_tts_api_url: str = Form(DEFAULT_INDEX_TTS_API_URL),
+    segment_minutes: float = Form(8.0),
+    min_segment_minutes: float = Form(4.0),
+    timing_mode: str = Form("strict"),
+    grouping_strategy: str = Form("sentence"),
+    short_merge_enabled: str = Form("false"),
+    short_merge_threshold: int = Form(DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC),
+    time_ranges: str = Form(""),
+    auto_pick_ranges: str = Form("false"),
+    auto_pick_min_silence_sec: float = Form(0.8),
+    auto_pick_min_speech_sec: float = Form(1.0),
+    pipeline_version: str = Form("v1"),
+    rewrite_translation: str = Form("true"),
+):
+    """基于主 workflow 当前项目状态启动 Auto Dubbing，避免前端重新上传同一份媒体。"""
 
-    thread = threading.Thread(target=_run_cli_task, args=(task_id, cmd, env, out_root), daemon=True)
-    thread.start()
+    readable_task_id = _build_readable_task_id()
+    upload_dir = UPLOAD_ROOT / readable_task_id
+    upload_dir.mkdir(parents=True, exist_ok=True)
 
-    return {"task_id": task_id, "short_id": task["short_id"], "status": "queued"}
+    source_media_path = _resolve_project_media_path(filename, task_id)
+    display_name = _sanitize_filename(original_filename or source_media_path.name)
+    input_path = upload_dir / display_name
+    shutil.copy2(source_media_path, input_path)
+    input_srt_path = _write_subtitles_json_to_srt(
+        upload_dir=upload_dir,
+        subtitles_json=subtitles_json,
+        subtitle_mode=subtitle_mode,
+    )
+    options = _normalize_auto_dubbing_request(
+        subtitle_mode=subtitle_mode,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        api_key=api_key,
+        translate_base_url=translate_base_url,
+        translate_model=translate_model,
+        index_tts_api_url=index_tts_api_url,
+        segment_minutes=segment_minutes,
+        min_segment_minutes=min_segment_minutes,
+        timing_mode=timing_mode,
+        grouping_strategy=grouping_strategy,
+        short_merge_enabled=short_merge_enabled,
+        short_merge_threshold=short_merge_threshold,
+        time_ranges=time_ranges,
+        auto_pick_ranges=auto_pick_ranges,
+        auto_pick_min_silence_sec=auto_pick_min_silence_sec,
+        auto_pick_min_speech_sec=auto_pick_min_speech_sec,
+        pipeline_version=pipeline_version,
+        rewrite_translation=rewrite_translation,
+        has_subtitle_input=input_srt_path is not None,
+    )
+    response = _queue_auto_dubbing_task(
+        task_id=readable_task_id,
+        filename=input_path.name,
+        input_path=input_path,
+        input_srt_path=input_srt_path,
+        options=options,
+    )
+    response["project_filename"] = source_media_path.name
+    return response
 
 
 @router.post("/load-batch")

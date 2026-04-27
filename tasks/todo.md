@@ -254,6 +254,20 @@
 - 校验通过：`node --check src/subtitle_maker/static/app.js`。
 - 校验通过：`uv run python -m unittest tests/test_dubbing_cli_api.py`，`Ran 12 tests ... OK`。
 
+## 2026-04-27 Panel 2/3 布局与内部滚动修复（#panel-transcribe / #panel-results）
+
+- [x] 定位布局根因：`dynamic-content-section` 统一 padding + `.panel` 统一 max-width 造成顶部缝隙与宽度锁定
+- [x] 实施：为 2/3 面板新增 `panel-internal-scroll-active` 布局状态
+- [x] 实施：切换到 2/3 面板时启用“父容器固定 + 面板内部滚动”
+- [x] 实施：移除 2/3 面板固定宽度约束并保持 flex 自适应
+- [x] 验证：`node --check src/subtitle_maker/static/app.js`
+
+## Review（2026-04-27 Panel 2/3 布局修复）
+- `src/subtitle_maker/static/app.js` 新增 `PANEL_INTERNAL_SCROLL_IDS`，并在 `syncFloatingUiForActivePanel()` 中切换 `body.panel-internal-scroll-active`。
+- `src/subtitle_maker/static/style.css` 在该 body 状态下为 2/3 面板启用独立滚动链路：`.dynamic-content-section` 固定、`#panel-transcribe/#panel-results` 占满可用空间、`.card` 内部 `overflow-y:auto`。
+- 2/3 面板宽度改为弹性填充：取消 `max-width: 900px` 的影响（仅对该场景覆写为 `max-width:none`，并保留 `min-width:0` 防止 flex 挤压异常）。
+- 顶部贴合通过 `padding-top:0`（仅在 2/3 面板激活时）实现，不改动播放器和侧边栏固定区。
+
 ## 2026-04-17 停用 pyannote，改为逐句原音频参考
 
 - [x] 停用多说话人 pyannote/simple diarization 路径
@@ -1310,3 +1324,188 @@
   - `node --check src/subtitle_maker/static/app.js src/subtitle_maker/static/js/agentDrawer.js src/subtitle_maker/static/js/dubbingPanel.js`
 - 大回归里 `tests.test_dub_long_video` 仍会打印 `flash-attn is not installed` 的环境警告，但测试本身通过，当前语义仍走手工 PyTorch fallback；这不是这轮重构新增问题。
 - 当前最合理的下一步已经不再是继续拆 phase，而是整理这整条重构线的未提交改动并准备提交。
+
+## 2026-04-25 前端协同改造（统一 DeepSeek API Key + Auto Dubbing 与主 workflow 配合）
+- [x] Spec-1：审计 API key 分散位置、Auto Dubbing 与主 workflow 的状态断层
+- [x] Spec-2：确认统一 API key 控件、状态模型与 Auto Dubbing 配合方案
+- [x] Spec-3：锁定风险、验证方式和回退策略
+- [x] HARD-GATE：已确认并开始实现
+- [x] 实现统一侧边栏 DeepSeek 配置，并移除前端重复 key 输入
+- [x] 实现 Auto Dubbing `Current Project / Standalone Upload` 双模式与 project-aware 启动接口
+- [x] 补测试与最小运行校验
+
+## Review（2026-04-25 前端协同改造 Spec-1）
+- DeepSeek API key 当前至少分散在 4 个前端入口：
+  - 主翻译面板 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html:676) 的 `#api-key` + `#save-api-key`，并由 [src/subtitle_maker/static/app.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js:1337) 读写 `sm_apiKey` / `sm_saveApiKey`
+  - Auto Dubbing V1 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html:302) 的 `#auto-dub-api-key` + `#auto-dub-save-key`
+  - Auto Dubbing V2 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html:520) 的 `#auto-dub-v2-api-key` + `#auto-dub-v2-save-key`
+  - Agent 抽屉 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html:745) 的 `#agent-api-key`
+- 这 4 处不仅是 UI 分散，连本地存储语义也不统一：
+  - 主翻译面板在 [app.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js:1337) 使用 `sm_apiKey`
+  - Auto Dubbing V1/V2 在 [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js:571) 分别使用 `${keyStoragePrefix}_apiKey`，也就是 `sm_autoDub_v1_apiKey` / `sm_autoDub_v2_apiKey`
+  - Agent 抽屉在 [src/subtitle_maker/static/js/agentDrawer.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/agentDrawer.js:105) 每次直接透传 `api_key`，本地不复用主 key，也不落统一存储
+- 后端消费面也分成了 3 套：
+  - 主翻译 route [src/subtitle_maker/app/routes/translation.py::translate()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/app/routes/translation.py:15) 强制要求 `api_key`
+  - Auto Dubbing route [src/subtitle_maker/dubbing_cli_api.py::start_auto_dubbing()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py:700) 接收 `api_key` 表单，并回退到 `DEEPSEEK_API_KEY`
+  - Agent route [src/subtitle_maker/agent_api.py::chat_with_agent()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/agent_api.py:81) 直接把 `payload.api_key` 传给 `OpenAICompatibleChatClient`
+  这说明“统一 key”不只是把 3 个输入框删成 1 个，还要统一前端状态来源和各 route 的取值约定。
+- Auto Dubbing 与主 workflow 的重复，不只是“界面上又出现了一次上传/翻译”，而是已经形成两套独立状态机：
+  - 主 workflow 在 [src/subtitle_maker/static/app.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js:28) 维护 `currentTaskId`、`originalSubtitlesData`、`translatedSubtitlesData`
+  - 上传、转写、轮询、翻译分别走 [handleMediaUpload()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js:748)、[pollStatus()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js:936)、翻译提交流程 [app.js 1070 行附近](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js:1070)
+  - Auto Dubbing 面板在 [src/subtitle_maker/static/js/dubbingPanel.js::setupAutoDubbing()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js:31) 内部又维护 `selectedFile`、`selectedSubtitleFile`、`currentAutoDubTaskId`、`reviewLinesCache`
+  - 两边唯一已接上的共享点只有 [applyAutoDubSubtitleItems()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js:1045)，也就是 Auto Dubbing 完成后把字幕结果回填给主播放器/editor；启动前并没有复用主 workflow 现有状态
+- 模板层的重复也很明确：
+  - 主流程已经有 `panel-upload`、`panel-transcribe`、`panel-results`、`panel-srt` [index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html:124)
+  - Auto Dubbing V1/V2 又各自重新放了一套媒体上传、字幕上传、source/target language、translation key、时间区间、启动区 [index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html:150) 和 [index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html:364)
+  因此用户感知到的“前面流程重复”是事实，不只是代码层重复。
+- 当前更深的耦合点在后端 contract：Auto Dubbing 启动接口 [src/subtitle_maker/dubbing_cli_api.py::start_auto_dubbing()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py:700) 目前强制入口就是 `video: UploadFile = File(...)`，也就是“重新上传媒体文件”。它支持可选 `subtitle_file`，但不支持“基于主 workflow 现有 `task_id` / `filename` / 已生成字幕直接启动”。这意味着如果要让 Auto Dubbing 真正和主 workflow 接起来，不能只改前端面板顺序，必须一起评估 route contract。
+- `Spec-1` 的现状结论先固定为两点：
+  - 第一目标应是“统一 DeepSeek API key 的单一前端来源”，最合适的位置是侧边栏全局设置区，而不是继续在 panel 内各放一份输入框
+  - 第二目标应是“把 Auto Dubbing 从一套并行 workflow 收成一个附着在主项目状态上的高级操作入口”；也就是说，前端真正需要规划的是“从当前项目启动 dubbing 的几种模式”，而不是继续复制一套上传/翻译表单
+- 本段只完成现状审计与方向收敛，尚未进入方案设计；下一步应按流程进入 `Spec-2`。
+
+## Review（2026-04-25 前端协同改造 Spec-2）
+- 首轮精确改动范围先固定为 6 个位置：
+  - `src/subtitle_maker/templates/index.html`
+  - `src/subtitle_maker/static/style.css`
+  - `src/subtitle_maker/static/app.js`
+  - `src/subtitle_maker/static/js/dubbingPanel.js`
+  - `src/subtitle_maker/static/js/agentDrawer.js`
+  - `src/subtitle_maker/dubbing_cli_api.py`
+  其中前 5 个负责统一前端状态和 UI，`dubbing_cli_api.py` 负责补“从当前项目启动 Auto Dubbing”的后端 contract；这一轮不改 `app/routes/subtitles.py`、`translation.py` 的基本协议，也不触碰 `tools/*`。
+- DeepSeek API key 的统一方案固定为“侧边栏单一来源 + 各业务面板只消费、不自存”：
+  - 侧边栏位置采用现有 [sidebar-footer](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html:61) 下方，新增一个全局 `DeepSeek` 设置块，包含：
+    - `api key` 输入框
+    - `save key` 复选框
+    - 当前是否使用环境变量 / 本地保存值的状态提示
+  - 前端状态统一收口到 `app.js`，只保留一套存储 key，例如 `sm_deepseekApiKey` / `sm_saveDeepseekApiKey`
+  - [主翻译流程](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js:1070)、[Auto Dubbing V1/V2](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js:571)、[Agent 抽屉](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/agentDrawer.js:105) 全部只通过 `app.js` 暴露的 getter / setter 读取这套统一状态，不再各自维护 localStorage
+- 因此 UI 上首轮会移除或降级 3 处局部 key 输入：
+  - 主翻译面板 [index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html:676)
+  - Auto Dubbing V1/V2 运行区 [index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html:302) / [520](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html:520)
+  - Agent 抽屉 [index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html:745)
+  其中 Agent 抽屉不再单独接受 key 输入；它直接消费统一的全局 DeepSeek key，并继续保留环境变量回退。
+- Auto Dubbing 与主 workflow 的配合方式也先固定为“两种启动模式，但默认主项目优先”：
+  1. `Current Project`：默认模式，基于当前主 workflow 已上传的媒体和已有字幕状态启动
+  2. `Standalone Upload`：保留现有独立上传模式，作为高级/兜底入口
+  这样可以避免用户已经在主 workflow 里上传过视频、做过转写或翻译后，还要在 Auto Dubbing 再重复上传一遍。
+- `Current Project` 模式下的前端状态来源固定为：
+  - 媒体：`currentFilename` / `currentOriginalFilename`，来源于 [handleMediaUpload()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js:748)
+  - 原字幕：`originalSubtitlesData`
+  - 译文字幕：`translatedSubtitlesData`
+  - 当前项目任务：`currentTaskId`
+  - 播放器当前位置与时间范围：继续复用现有 `videoPlayer`、时间区间输入和 `Use Current`
+  这意味着 Auto Dubbing 前端首轮不再默认显示大块媒体上传卡，而是先显示“当前项目是否可直接启动”的状态摘要。
+- 为了让 `Current Project` 模式不重新上传视频，后端 contract 首轮建议采用“新增路由”而不是硬改旧 `/dubbing/auto/start`：
+  - 保留现有 [start_auto_dubbing()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py:700) 作为 `Standalone Upload` 路径
+  - 新增一个 project-aware 启动入口，例如 `POST /dubbing/auto/start-from-project`
+  - 新路由接收：
+    - `filename` / `original_filename`
+    - 可选 `task_id`
+    - `subtitle_mode`
+    - `subtitles_json`
+    - 其余现有 dubbing 参数（`target_lang`、`grouping_strategy`、`short_merge_*`、`pipeline_version`、`rewrite_translation`、`time_ranges` 等）
+  这样旧上传路径和测试不会被直接打碎，同时 Current Project 模式也不用前端把 `/stream/{filename}` 再拉成 blob 重新上传一遍。
+- `Current Project` 模式下的字幕策略也固定为 3 档，避免前端重新拼业务规则：
+  - 若有 `translatedSubtitlesData`：默认按 `translated` 字幕启动，跳过 ASR 和翻译
+  - 否则若有 `originalSubtitlesData`：默认按 `source` 字幕启动，跳过 ASR，但仍翻译
+  - 否则：回退为仅用当前项目媒体启动完整流程
+  这三档都直接对应当前后端 [subtitle_mode](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py:708) 和“上传 translated/source 字幕”的既有语义，不再在前端发明新的业务含义。
+- Auto Dubbing 面板本身首轮不做“大重画”，但布局方向要变：
+  - 顶部先显示 `Current Project` 摘要卡：当前媒体、字幕状态、翻译状态、可否直接启动
+  - `Standalone Upload` 收进一个次级卡或 disclosure 区域
+  - `V1 / V2` 仍保留为两块运行配置，但共享同一套项目上下文，而不是各自再带一遍完整上传流程
+  这能把“重复上传/重复翻译”的问题压下去，同时不把 V1/V2 的运行参数合并到看不清的状态。
+- 这一轮明确不做：
+  - 不统一 OpenAI / DeepSeek / 其他 provider 抽象；本轮只统一 DeepSeek key
+  - 不改 [app/routes/translation.py::translate()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/app/routes/translation.py:15) 的 form 协议
+  - 不把 Auto Dubbing V1/V2 合成单面板
+  - 不删除 `Standalone Upload`
+  - 不把 Agent 变成自动执行器
+- 首轮迁移顺序固定为：
+  1. 先在侧边栏落全局 DeepSeek 设置，并由 `app.js` 托管统一状态
+  2. 再让主翻译 / Agent / Auto Dubbing 全部转成消费统一 key
+  3. 然后补 `start-from-project` 这条后端入口
+  4. 最后把 Auto Dubbing 面板改成“Current Project 优先，Standalone Upload 次级”
+- 本段只锁定方案边界和迁移顺序，尚未开始实现；下一步应按流程进入 `Spec-3`。
+
+## Review（2026-04-25 前端协同改造 Spec-3）
+- 第一风险是把“全局 DeepSeek key”做成了新的状态污染源。当前 [clearState()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js:563) 在 `New Project` 时会清理字幕任务与项目 localStorage，但不会动 `sm_apiKey`；这与“侧边栏里的全局设置”语义是相容的。首轮实现必须坚持这个边界：全局 DeepSeek 设置属于跨项目用户偏好，不应被 `New Project` 清掉；否则统一入口反而比现在更烦。
+- 第二风险是把“统一 key”误做成“强制只认本地保存值”。当前三条消费链都保留了环境变量回退：
+  - Agent 通过 [OpenAICompatibleChatClient](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/core/llm_client.py:20) 回退 `DEEPSEEK_API_KEY`
+  - Auto Dubbing 在 [start_auto_dubbing()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py:772) 回退 `DEEPSEEK_API_KEY`
+  - 主翻译虽然前端强传 `api_key`，但产品上也允许用户直接填入
+  所以首轮前端统一时，侧边栏状态必须同时表达“已保存本地 key”和“当前依赖环境变量”两种来源，不能因为输入框为空就一律把页面判成不可用。
+- 第三风险是 `Current Project` 模式误判“当前项目一定有媒体”。当前 [handleSrtUpload()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js:1279) 上传 SRT 后，会把 `currentFilename` 改成 `.srt` 文件名；后端 [upload_srt()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/app/routes/subtitles.py:18) 只在已有视频时把 `video_filename` 存进任务记录。因此首轮实现里，`Current Project` 不能简单依赖 `currentFilename` 判断媒体来源，必须显式区分“项目媒体文件名”和“当前字幕文件名”，否则导入 SRT 后会把一个只有字幕的项目误当成可直接配音的视频项目。
+- 第四风险是 `start-from-project` 路由变成任意文件访问入口。现有 [upload_video()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/app/routes/projects.py:24) 和 [stream_video()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/app/routes/projects.py:37) 都只在 `UPLOAD_DIR` 范围内工作。新增 project-aware dubbing 路由时，也必须只接受“当前项目已知文件名”或 `task_id` 能反查到的媒体，不能让前端直接传任意路径，更不能信任本地 localStorage 里伪造的文件名。
+- 第五风险是把 Auto Dubbing 与主 workflow 的共享点做成“隐式推断”，导致字幕语义错位。当前主 workflow 的翻译结果在 [translatedSubtitlesData](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js:30)，Auto Dubbing 又支持 `source` / `translated` 两种字幕语义 [dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py:708)。因此 `Current Project` 模式下必须把“使用原字幕继续翻译”与“使用当前译文直接配音”明确显示成可见选项或明确默认规则，不能只凭数组非空就静默切换，否则用户很容易在 review/redub 上下文里拿错字幕版本。
+- 第六风险是侧边栏空间与移动端可用性。当前侧边栏 footer 只有 [theme/new project/release models](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html:61)，而 [style.css](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/style.css:87) 里侧边栏是固定宽度 + 收起态。首轮新增全局 DeepSeek 设置时，不能把 footer 撑成一长列导致按钮溢出，尤其不能在收起态保留一个不可用的密码框；实现上要么在收起态隐藏设置内容，只保留入口按钮，要么给侧边栏 footer 做可折叠设置区。
+- 首轮验证固定为四层：
+  1. 前端语法：`node --check src/subtitle_maker/static/app.js src/subtitle_maker/static/js/dubbingPanel.js src/subtitle_maker/static/js/agentDrawer.js`
+  2. Python 语法：`uv run python -m py_compile src/subtitle_maker/dubbing_cli_api.py src/subtitle_maker/app/routes/projects.py src/subtitle_maker/app/routes/subtitles.py`
+  3. API / route 回归：`uv run python -m unittest tests.test_dubbing_cli_api tests.test_web_routes_legacy`
+  4. 浏览器 smoke：
+     - 侧边栏可设置并保存全局 DeepSeek key
+     - 主翻译不再单独要求 panel 内 key
+     - Agent 抽屉可直接复用全局 key 发起请求
+     - `Current Project` 模式下，已有媒体 + 原字幕 / 译文字幕时可直接启动 Auto Dubbing
+- 首轮建议新增两类测试护栏：
+  - 在 [tests/test_web_routes_legacy.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_web_routes_legacy.py:23) 增加首页 HTML 断言，确认侧边栏全局 DeepSeek 控件存在
+  - 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py:47) 增加 `start-from-project` 用例，至少覆盖：
+    - 用已上传媒体文件名启动成功
+    - 无媒体的 SRT-only 项目被拒绝
+    - translated/source 两种字幕模式正确透传
+- 回退策略固定为两段式：
+  - 若全局 key 统一后影响主翻译 / Agent / Auto Dubbing 任一链路，只回退“前端统一 key 状态”，恢复各面板独立输入框；不回退 `start-from-project` 后端入口
+  - 若 `Current Project` 模式引发媒体判定或字幕语义错乱，只回退 project-aware 启动与 UI 默认模式，保留统一全局 key
+- HARD-GATE 前的结论：
+  这轮实现目标是“统一 DeepSeek API key 来源，并让 Auto Dubbing 默认依附当前项目状态启动”，不是“重写整套项目工作流”；
+  只有在你明确确认后，才进入代码实现。
+
+## Review（2026-04-25 前端协同改造实施）
+- 统一 DeepSeek key 已落到侧边栏单一入口：
+  - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 新增 `global-deepseek-api-key` / `global-deepseek-save-key`
+  - [src/subtitle_maker/static/app.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js) 现在统一托管 `sm_deepseekApiKey` / `sm_saveDeepseekApiKey`
+  - 主翻译、Auto Dubbing、Agent 都改成只消费这套共享状态，不再各自保存 localStorage
+- Auto Dubbing 前端已改成 `Current Project` 优先：
+  - [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js) 新增项目摘要卡、字幕策略选择，以及 `Current Project / Standalone Upload` 模式切换
+  - [src/subtitle_maker/static/app.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js) 额外维护“项目媒体文件名”与“当前字幕文件名”的分离状态，避免导入 SRT 后误判成可直接配音的视频项目
+- 后端已补 project-aware 启动入口：
+  - [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 新增 `POST /dubbing/auto/start-from-project`
+  - 新入口只从已知 `UPLOAD_DIR` 与 legacy `task_id` 解析当前项目媒体，并支持把主 workflow 的 `subtitles_json` 直接落成 SRT 后启动
+- 验证结果：
+  - `node --check src/subtitle_maker/static/app.js src/subtitle_maker/static/js/dubbingPanel.js src/subtitle_maker/static/js/agentDrawer.js`：通过
+  - `uv run python -m py_compile src/subtitle_maker/dubbing_cli_api.py src/subtitle_maker/app/routes/projects.py src/subtitle_maker/app/routes/subtitles.py tests/test_dubbing_cli_api.py tests/test_web_routes_legacy.py`：通过
+  - `uv run python -m unittest tests.test_web_routes_legacy`：`Ran 4 tests ... OK`
+  - `uv run python -m unittest tests.test_dubbing_cli_api`：`Ran 43 tests ... OK`
+- 运行侧补充说明：
+  - 本地用 `uvicorn subtitle_maker.web:app --host 127.0.0.1 --port 8765` 验证过应用可启动
+  - 但当前桌面沙箱里跨命令访问该本地端口不稳定，所以这轮没有把浏览器 smoke 作为完成阻塞项；HTML 与 API 行为由单测和语法校验兜住
+
+## Review（2026-04-25 前端回归修复记录，已判定失败/废弃）
+- 状态结论：这轮修复未解决用户真实问题，且后续改动一度引入了 `#panel-transcribe` 与 `#panel-results` 同时显示的回归；该记录仅保留为失败样本，不再作为“当前有效方案”。
+- 针对用户反馈“`2. Generate Subtitles` / `3. Subtitles & Translation` 右下区域异常”，已记录两类回归：
+  1. [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 里 `panel-results` 的 `translated-subtitles` / export 区块不能挂在 `.subtitle-column` 外面，否则右列会形成明显空洞。
+  2. [src/subtitle_maker/static/app.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js) 切 panel 时不能使用整页 `scrollIntoView()`；播放器和侧边栏必须保持固定，只允许 `.dynamic-content-section` 自己回顶。
+- 追加待修回归：
+  - `Auto Dubbing V2` 右下角 restore 区（`#auto-dub-v2-load-batch-select` / `#auto-dub-v2-load-batch-btn`）用户反馈“菜单用不了”，需要下次优先在浏览器里针对 [panel-auto-dub-v2](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html:423) 做真实交互排查，重点看布局遮挡、滚动可视区和 `dubbingPanel.js` 的 V2 restore 事件绑定。
+- 当前收敛后的实现边界：
+  - 播放器固定在顶部区域，不随 panel 切换整体滚动
+  - 侧边栏固定，不因修复 panel 可视区而被带着滚动
+  - `panel-results` 恢复为正常两列：右列包含翻译控件、翻译结果和导出区
+- 本轮已做的最小验证：
+  - `node --check src/subtitle_maker/static/app.js`：通过
+  - `uv run python -m unittest tests.test_web_routes_legacy`：`Ran 4 tests ... OK`
+
+## Review（2026-04-27 前端面板修复复盘，当前有效）
+- 修复目标：`#panel-transcribe` / `#panel-results` 在 Step 2/3 中保持“仅当前面板可见”，同时实现内部滚动、顶部贴合与非贴边宽度。
+- 关键改动：
+  - [src/subtitle_maker/static/app.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js) 新增 `PANEL_INTERNAL_SCROLL_IDS`，并在 `syncFloatingUiForActivePanel()` 中只在 Step 2/3 切换 `body.panel-internal-scroll-active` 状态。
+  - [src/subtitle_maker/static/style.css](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/style.css) 将布局修复限定到 `.active` 面板：`body.panel-internal-scroll-active #panel-transcribe.active` 与 `#panel-results.active`，避免覆盖 tab 的 `display:none` 机制。
+  - 同文件中 `.card` 级滚动也限定为 `.active .card`，确保只给当前面板开启内部滚动，不影响未激活面板。
+  - 面板宽度改为“自适应 + 居中留白”：`width:100% + max-width:1180px + margin:0 auto`，不再贴两边。
+- 回归修正：
+  - 已修复一次错误覆盖：曾经把两面板都强制 `display:flex !important`，导致 2/3 同时显示；现已改回 `.active` 精确选择器。
+- 本轮验证：
+  - `node --check src/subtitle_maker/static/app.js`：通过
+  - 布局与可见性由用户在页面回归验证（Step 2 仅显示 transcribe，Step 3 仅显示 results）。

@@ -9,7 +9,6 @@ export function setupAgentDrawer(options = {}) {
     const backdrop = document.getElementById('agent-backdrop');
     const form = document.getElementById('agent-form');
     const input = document.getElementById('agent-input');
-    const apiKeyInput = document.getElementById('agent-api-key');
     const sendBtn = document.getElementById('agent-send-btn');
     const messagesEl = document.getElementById('agent-messages');
     const HISTORY_KEY = 'sm_agentMessages';
@@ -102,7 +101,7 @@ export function setupAgentDrawer(options = {}) {
             message,
             page: currentPanelName(),
             conversation_id: sessionStorage.getItem(CONVERSATION_KEY) || '',
-            api_key: apiKeyInput ? apiKeyInput.value.trim() : '',
+            api_key: typeof options.getDeepSeekApiKey === 'function' ? options.getDeepSeekApiKey() : '',
         };
         const response = await fetch('/api/agent/chat', {
             method: 'POST',

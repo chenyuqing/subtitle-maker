@@ -272,6 +272,62 @@ body {
     gap: var(--space-sm);
 }
 
+.sidebar-deepseek-card {
+    display: grid;
+    gap: 10px;
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-primary);
+}
+
+.sidebar-deepseek-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+}
+
+.sidebar-deepseek-kicker {
+    color: var(--accent);
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    line-height: 1;
+    margin-bottom: 4px;
+}
+
+.sidebar-deepseek-title {
+    color: var(--text-primary);
+    font-size: 0.92rem;
+    font-weight: 600;
+    line-height: 1.3;
+}
+
+.sidebar-deepseek-badge {
+    display: inline-flex;
+    align-items: center;
+    min-height: 24px;
+    padding: 0 8px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    white-space: nowrap;
+}
+
+.sidebar-deepseek-check {
+    margin-top: 0;
+}
+
+.sidebar-deepseek-hint {
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    line-height: 1.55;
+}
+
 @media (min-width: 769px) {
     .app-layout.sidebar-collapsed .sidebar {
         width: var(--sidebar-collapsed-width);
@@ -307,7 +363,10 @@ body {
     flex: 1;
     display: flex;
     flex-direction: column;
+    gap: 0;
+    padding: 0;
     overflow: hidden;
+    min-height: 0;
     position: relative;
     background: var(--bg-primary);
 }
@@ -318,6 +377,7 @@ body {
     flex-shrink: 0;
     height: 55vh;
     min-height: 400px;
+    margin-bottom: 0;
     position: relative;
     border-bottom: 1px solid var(--border);
 }
@@ -452,7 +512,12 @@ video {
 /* Dynamic Content */
 .dynamic-content-section {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
+    overflow-x: hidden;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
     padding: var(--space-xl);
     background: var(--bg-primary);
     scroll-behavior: smooth;
@@ -478,9 +543,178 @@ video {
 
 /* Panel */
 .panel {
+    width: 100%;
+    min-width: 0;
+    min-height: 0;
     max-width: 900px;
     margin: 0 auto;
     animation: slideUp 0.4s var(--transition-smooth);
+}
+
+/* 2/3 面板使用独立滚动容器，避免长内容把整页布局撑开。 */
+body.panel-internal-scroll-active .dynamic-content-section {
+    overflow: hidden !important;
+    padding-top: 0 !important;
+    padding-bottom: var(--space-lg) !important;
+}
+
+/* 2/3 面板顶部贴合播放器边界，并取消固定宽度限制。 */
+body.panel-internal-scroll-active #panel-transcribe.active,
+body.panel-internal-scroll-active #panel-results.active {
+    display: flex !important;
+    flex: 1 1 auto !important;
+    flex-direction: column;
+    min-height: 0 !important;
+    max-width: 1180px !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    margin: 0 auto !important;
+    margin-top: 0 !important;
+    padding-top: 0 !important;
+    overflow-y: auto !important;
+}
+
+/* 让卡片承担内部滚动，保持父级主布局稳定。 */
+body.panel-internal-scroll-active #panel-transcribe.active .card,
+body.panel-internal-scroll-active #panel-results.active .card {
+    flex: 1 1 auto !important;
+    min-height: 0 !important;
+    margin-bottom: 0 !important;
+    margin-top: 0 !important;
+    overflow-y: auto !important;
+    overflow-x: visible !important;
+}
+
+/* 修复 2/3 面板下拉框被裁剪：仅放开这两个面板的 overflow，避免影响其它卡片布局 */
+#panel-transcribe,
+#panel-results,
+#panel-transcribe .card,
+#panel-results .card {
+    overflow: visible;
+}
+
+/* 提升下拉控件层级，避免被同层装饰元素覆盖 */
+#panel-transcribe select,
+#panel-results select {
+    position: relative;
+    z-index: 2;
+}
+
+/* 2/3 面板 select fallback：可视控件走自定义菜单，原生 select 保留给既有业务逻辑读取。 */
+.sm-select-wrap {
+    position: relative;
+    width: 100%;
+}
+
+.sm-select-native-hidden {
+    position: absolute !important;
+    width: 1px !important;
+    height: 1px !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border: 0 !important;
+    opacity: 0 !important;
+    pointer-events: none !important;
+}
+
+.sm-select-trigger {
+    width: 100%;
+    min-height: 44px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    color: var(--text-primary);
+    padding: var(--space-md);
+    border-radius: var(--radius-md);
+    font-size: 0.9rem;
+    font-family: inherit;
+    text-align: left;
+    cursor: pointer;
+    transition: all var(--transition-normal);
+    position: relative;
+}
+
+.sm-select-trigger::after {
+    content: '▾';
+    position: absolute;
+    right: 12px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--text-muted);
+    font-size: 0.8rem;
+}
+
+.sm-select-wrap.open .sm-select-trigger {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-subtle);
+}
+
+.sm-select-wrap.open .sm-select-trigger::after {
+    content: '▴';
+}
+
+.sm-select-menu {
+    display: none;
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: calc(100% + 6px);
+    max-height: 280px;
+    overflow-y: auto;
+    border: 1px solid var(--border-light);
+    border-radius: var(--radius-md);
+    background: var(--bg-secondary);
+    box-shadow: var(--shadow-lg);
+    z-index: 260;
+}
+
+.sm-select-wrap.open .sm-select-menu {
+    display: block;
+}
+
+.sm-select-wrap.drop-up .sm-select-menu {
+    top: auto;
+    bottom: calc(100% + 6px);
+}
+
+.sm-select-option {
+    width: 100%;
+    border: 0;
+    border-bottom: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-primary);
+    padding: 10px 12px;
+    text-align: left;
+    font-size: 0.9rem;
+    cursor: pointer;
+}
+
+.sm-select-option:last-child {
+    border-bottom: 0;
+}
+
+.sm-select-option:hover {
+    background: var(--surface);
+}
+
+.sm-select-option.active {
+    color: var(--accent);
+    background: var(--accent-subtle);
+}
+
+/* Safari/部分浏览器在滚动容器内会裁剪原生 select 下拉：打开时临时放开容器裁剪。 */
+body.panel-select-open .main-content {
+    overflow: visible;
+}
+
+body.panel-select-open .dynamic-content-section {
+    overflow: visible;
+    padding-bottom: calc(var(--space-xl) + 220px);
+}
+
+body.panel-select-open #panel-transcribe,
+body.panel-select-open #panel-results {
+    position: relative;
+    z-index: 120;
 }
 
 /* Auto Dubbing 面板需要吃满内容区，不能沿用通用 900px 面板宽度 */
@@ -908,6 +1142,113 @@ textarea::placeholder {
     justify-content: space-between;
 }
 
+.auto-dub-project-card {
+    display: grid;
+    gap: 14px;
+}
+
+.auto-dub-mode-switch {
+    display: inline-flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.auto-dub-mode-btn {
+    min-height: 36px;
+    padding: 0 12px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text-secondary);
+    background: var(--surface);
+    cursor: pointer;
+    transition: all var(--transition-fast);
+}
+
+.auto-dub-mode-btn:hover {
+    color: var(--text-primary);
+    border-color: var(--border-light);
+}
+
+.auto-dub-mode-btn.active {
+    color: var(--accent);
+    border-color: rgba(249, 115, 22, 0.32);
+    background: var(--accent-subtle);
+}
+
+.auto-dub-project-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.auto-dub-project-item {
+    display: grid;
+    gap: 4px;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+}
+
+.auto-dub-project-label {
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+.auto-dub-project-item strong {
+    color: var(--text-primary);
+    font-size: 0.86rem;
+    line-height: 1.4;
+    word-break: break-word;
+}
+
+.auto-dub-project-controls {
+    display: grid;
+    gap: 10px;
+}
+
+.auto-dub-standalone-card details {
+    display: grid;
+    gap: 12px;
+}
+
+.auto-dub-standalone-card summary {
+    list-style: none;
+    cursor: pointer;
+    color: var(--text-primary);
+    font-size: 0.9rem;
+    font-weight: 600;
+}
+
+.auto-dub-standalone-card summary::-webkit-details-marker {
+    display: none;
+}
+
+.auto-dub-standalone-card summary::before {
+    content: '▸';
+    display: inline-block;
+    margin-right: 8px;
+    color: var(--text-muted);
+    transition: transform var(--transition-fast);
+}
+
+.auto-dub-standalone-card details[open] summary::before {
+    transform: rotate(90deg);
+}
+
+.auto-dub-standalone-body {
+    display: grid;
+    gap: 14px;
+    margin-top: 12px;
+}
+
+.auto-dub-standalone-subtitle-card {
+    padding: 16px;
+}
+
 .auto-dub-subtitle-row,
 .auto-dub-subtitle-meta,
 .auto-dub-restore-row,
@@ -986,6 +1327,13 @@ textarea::placeholder {
 
 .auto-dub-inline-note,
 .auto-dub-secondary-note {
+    color: var(--text-muted);
+    font-size: 0.82rem;
+    line-height: 1.6;
+}
+
+.shared-api-note {
+    margin: 10px 0 0;
     color: var(--text-muted);
     font-size: 0.82rem;
     line-height: 1.6;
@@ -1599,6 +1947,50 @@ body[data-theme="light"] .auto-upload-card.has-file {
     transition: transform var(--transition-fast), box-shadow var(--transition-fast), opacity var(--transition-fast);
 }
 
+/* Auto Dubbing 面板右下有 Restore/Review 操作区：激活时给悬浮助手留出避让空间，避免遮挡点击。 */
+body.auto-dub-panel-active .dynamic-content-section {
+    padding-bottom: calc(var(--space-xl) + 96px);
+}
+
+body.auto-dub-panel-active .agent-fab {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(8px);
+}
+
+body.auto-dub-panel-active .agent-drawer {
+    transform: translateX(calc(100% + 32px));
+    opacity: 0;
+    pointer-events: none;
+}
+
+body.auto-dub-panel-active .agent-backdrop {
+    display: none !important;
+    pointer-events: none !important;
+}
+
+/* 2/3 面板的右下控件也会与悬浮按钮重叠，激活时同样做避让。 */
+body.floating-ui-avoid-panel-active .dynamic-content-section {
+    padding-bottom: calc(var(--space-xl) + 96px);
+}
+
+body.floating-ui-avoid-panel-active .agent-fab {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(8px);
+}
+
+body.floating-ui-avoid-panel-active .agent-drawer {
+    transform: translateX(calc(100% + 32px));
+    opacity: 0;
+    pointer-events: none;
+}
+
+body.floating-ui-avoid-panel-active .agent-backdrop {
+    display: none !important;
+    pointer-events: none !important;
+}
+
 .agent-fab:hover {
     transform: translateY(-2px);
     box-shadow: 0 22px 48px rgba(0, 0, 0, 0.45), 0 0 24px rgba(249, 115, 22, 0.35);
@@ -1690,7 +2082,7 @@ body[data-theme="light"] .auto-upload-card.has-file {
     font-size: 0.9rem;
 }
 
-.agent-key-row input,
+.agent-shared-key-note,
 .agent-form textarea {
     width: 100%;
     border: 1px solid var(--border-light);
@@ -1699,10 +2091,12 @@ body[data-theme="light"] .auto-upload-card.has-file {
     background: rgba(10, 10, 11, 0.72);
 }
 
-.agent-key-row input {
-    height: 40px;
-    padding: 0 12px;
-    margin-bottom: 12px;
+.agent-shared-key-note {
+    margin: 0 0 12px;
+    padding: 10px 12px;
+    color: var(--text-secondary);
+    font-size: 0.84rem;
+    line-height: 1.55;
 }
 
 .agent-messages {
@@ -1781,7 +2175,7 @@ body[data-theme="light"] .agent-drawer {
     box-shadow: 0 30px 80px rgba(15, 23, 42, 0.22);
 }
 
-body[data-theme="light"] .agent-key-row input,
+body[data-theme="light"] .agent-shared-key-note,
 body[data-theme="light"] .agent-form textarea {
     background: rgba(255, 255, 255, 0.92);
 }

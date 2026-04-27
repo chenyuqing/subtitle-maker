@@ -1,5 +1,27 @@
 # Changelog
 
+## [Unreleased] - 2026-04-27
+
+### Fixed
+- **Step 2/3 面板可见性回归**: 修复 `#panel-transcribe` 与 `#panel-results` 在样式覆盖下同时显示的问题，恢复为仅激活面板可见（`.active` 约束）。
+- **Step 2/3 面板滚动与宽度体验**: 面板改为内部滚动且保持播放器/侧栏固定，并将宽度调整为自适应居中留白（不再贴边）。
+
+## [Unreleased] - 2026-04-19
+
+### Added
+- **Auto Dubbing V2 独立入口**: 左侧新增 Step 6「Auto Dubbing V2」，前端状态与轮询逻辑与 V1 隔离，支持并行调试。
+- **V2 主链路开关**: `/dubbing/auto/start` 新增 `pipeline_version`，V2 透传 `--v2-mode` 到后端链路。
+- **V2 翻译改写开关**: V2 面板新增 `Rewrite translation for timing fit`（默认开启），支持按任务控制是否允许改写以贴时长。
+- **Markdown 时间稿字幕支持**: Auto Dubbing 上传字幕新增 `.md`，支持 `[MM:SS]` / `[HH:MM:SS]` 格式并自动转换为 `.srt`。
+- **历史结果恢复增强**: 新增 `/dubbing/auto/batches` + `/dubbing/auto/load-batch`，支持下拉选择 `longdub_*` 目录并一键恢复结果。
+- **历史结果回载原视频**: 加载批次时回传 `input_media_url`，播放器可直接恢复原视频画面。
+
+### Fixed
+- **V2 音轨切换被重置**: 修复 V1/V2 双实例共享音轨选择器时互相覆盖的问题，V2 可正常切换到 dubbed 音轨。
+- **区间模式 final 混音缺失 BGM**: 段内未导出 `dubbed_mix` 时，最终合成改为用 `dubbed_vocals + source_bgm` 在线重建 mix，避免听感近似纯人声。
+- **V2 全量 manual_review 误报失败**: 在存在可用候选语音时接受最佳折中结果，并记录评分，避免整批直接失败。
+- **New Project 上传清理策略**: `uploads/dubbing` 改为保留最新 3 个视频任务目录，其余自动清理。
+
 ## [Unreleased] - 2026-04-18
 
 ### Added

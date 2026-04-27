@@ -16,6 +16,11 @@ const progressText = document.getElementById('progress-text');
 const themeToggleBtn = document.getElementById('theme-toggle-btn');
 const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
 const appLayout = document.querySelector('.app-layout');
+const dynamicContentSection = document.querySelector('.dynamic-content-section');
+const globalDeepSeekApiKeyInput = document.getElementById('global-deepseek-api-key');
+const globalDeepSeekSaveKeyCheckbox = document.getElementById('global-deepseek-save-key');
+const globalDeepSeekHint = document.getElementById('global-deepseek-hint');
+const deepSeekKeySourceBadge = document.getElementById('deepseek-key-source');
 
 const originalDisplay = document.getElementById('original-subtitles');
 const translatedDisplay = document.getElementById('translated-subtitles');
@@ -25,6 +30,8 @@ const downloadOriginal = document.getElementById('download-original');
 
 let currentFilename = null;
 let currentOriginalFilename = null;
+let currentProjectMediaFilename = null;
+let currentProjectMediaOriginalFilename = null;
 let currentTaskId = null;
 let originalSubtitlesData = [];
 let translatedSubtitlesData = [];
@@ -34,12 +41,17 @@ const SEEK_STEP_SECONDS = 10;
 const SUBTITLE_POSITION_KEY = 'sm_subPosition';
 const THEME_KEY = 'sm_theme';
 const SIDEBAR_COLLAPSED_KEY = 'sm_sidebarCollapsed';
+const DEEPSEEK_API_KEY = 'sm_deepseekApiKey';
+const SAVE_DEEPSEEK_API_KEY = 'sm_saveDeepseekApiKey';
+const PROJECT_MEDIA_FILENAME_KEY = 'sm_projectMediaFilename';
+const PROJECT_MEDIA_ORIGINAL_FILENAME_KEY = 'sm_projectMediaOriginalFilename';
 const SHORT_MERGE_TARGET_DEFAULT = 15;
 const SHORT_MERGE_TARGET_MIN = 6;
 const SHORT_MERGE_TARGET_MAX = 20;
 let isAudioMode = false;
 
 // 保留 `/static/app.js?v=...` 作为单入口，并把同一版本号透传给子模块，避免半刷新缓存。
+// 这里改动也会刷新子模块导入 URL，防止浏览器继续复用旧的 `dubbingPanel.js`。
 const APP_SCRIPT_VERSION_QUERY = (() => {
     try {
         const currentScript = document.currentScript;
@@ -66,6 +78,95 @@ function loadFrontendModule(modulePath) {
     return import(resolveStaticModuleUrl(modulePath));
 }
 
+// 统一读取左侧侧边栏中的 DeepSeek key；翻译、Auto Dubbing、Agent 共用这一处状态。
+function getDeepSeekApiKey() {
+    return globalDeepSeekApiKeyInput ? globalDeepSeekApiKeyInput.value.trim() : '';
+}
+
+// 统一发布“当前项目上下文已变化”，由 Auto Dubbing 面板按需重新读取详情。
+function notifyProjectContextChanged() {
+    window.dispatchEvent(new CustomEvent('subtitle-maker:project-context-changed'));
+}
+
+// 统一发布“全局 DeepSeek 配置已变化”，便于子模块做只读消费。
+function notifyDeepSeekConfigChanged() {
+    window.dispatchEvent(new CustomEvent('subtitle-maker:deepseek-config-changed'));
+}
+
+// 供 Auto Dubbing 读取当前项目的媒体、任务与字幕状态；避免模块自行维护重复状态。
+function getProjectDubbingContext() {
+    return {
+        mediaFilename: currentProjectMediaFilename,
+        mediaOriginalFilename: currentProjectMediaOriginalFilename || currentProjectMediaFilename,
+        currentFilename,
+        currentOriginalFilename,
+        taskId: currentTaskId,
+        sourceSubtitles: Array.isArray(originalSubtitlesData) ? originalSubtitlesData : [],
+        translatedSubtitles: Array.isArray(translatedSubtitlesData) ? translatedSubtitlesData : [],
+    };
+}
+
+// 统一刷新侧边栏里的全局 DeepSeek 配置提示，避免用户分不清“本地保存 / 当前会话 / 环境变量兜底”。
+function syncDeepSeekSettingsUi() {
+    const hasKey = !!getDeepSeekApiKey();
+    const saved = globalDeepSeekSaveKeyCheckbox ? !!globalDeepSeekSaveKeyCheckbox.checked : false;
+    if (deepSeekKeySourceBadge) {
+        if (hasKey && saved) {
+            deepSeekKeySourceBadge.textContent = 'Local';
+        } else if (hasKey) {
+            deepSeekKeySourceBadge.textContent = 'Session';
+        } else {
+            deepSeekKeySourceBadge.textContent = 'Env';
+        }
+    }
+    if (globalDeepSeekHint) {
+        if (hasKey && saved) {
+            globalDeepSeekHint.textContent = '当前浏览器已保存全局 DeepSeek key；翻译、Auto Dubbing、Agent 共用。';
+        } else if (hasKey) {
+            globalDeepSeekHint.textContent = '当前页面正在使用输入的 DeepSeek key；勾选“记住当前浏览器”后会持久化。';
+        } else {
+            globalDeepSeekHint.textContent = '留空时，Agent 与 Auto Dubbing 仍可使用后端环境变量；翻译接口需要这里提供 key。';
+        }
+    }
+}
+
+// 初始化并托管全局 DeepSeek key 的本地状态，不再让各面板各自保存一份。
+function initDeepSeekSettings() {
+    if (!globalDeepSeekApiKeyInput) return;
+    const savedKey = localStorage.getItem(DEEPSEEK_API_KEY);
+    const savedChecked = localStorage.getItem(SAVE_DEEPSEEK_API_KEY) === 'true';
+    if (savedKey && savedChecked) {
+        globalDeepSeekApiKeyInput.value = savedKey;
+    }
+    if (globalDeepSeekSaveKeyCheckbox) {
+        globalDeepSeekSaveKeyCheckbox.checked = savedChecked;
+        globalDeepSeekSaveKeyCheckbox.addEventListener('change', () => {
+            if (globalDeepSeekSaveKeyCheckbox.checked && getDeepSeekApiKey()) {
+                localStorage.setItem(DEEPSEEK_API_KEY, getDeepSeekApiKey());
+            } else if (!globalDeepSeekSaveKeyCheckbox.checked) {
+                localStorage.removeItem(DEEPSEEK_API_KEY);
+            }
+            localStorage.setItem(
+                SAVE_DEEPSEEK_API_KEY,
+                globalDeepSeekSaveKeyCheckbox.checked ? 'true' : 'false',
+            );
+            syncDeepSeekSettingsUi();
+            notifyDeepSeekConfigChanged();
+        });
+    }
+    globalDeepSeekApiKeyInput.addEventListener('input', () => {
+        if (globalDeepSeekSaveKeyCheckbox?.checked && getDeepSeekApiKey()) {
+            localStorage.setItem(DEEPSEEK_API_KEY, getDeepSeekApiKey());
+        }
+        if (globalDeepSeekSaveKeyCheckbox?.checked && !getDeepSeekApiKey()) {
+            localStorage.removeItem(DEEPSEEK_API_KEY);
+        }
+        syncDeepSeekSettingsUi();
+        notifyDeepSeekConfigChanged();
+    });
+    syncDeepSeekSettingsUi();
+}
+
 function seekVideo(deltaSeconds) {
     if (!videoPlayer || Number.isNaN(videoPlayer.duration)) return;
     const targetTime = Math.min(
@@ -80,6 +181,7 @@ function isTypingTarget(el) {
     const tag = el.tagName ? el.tagName.toLowerCase() : "";
     return (
         tag === "input" ||
+        tag === "select" ||
         tag === "textarea" ||
         el.isContentEditable ||
         el.getAttribute?.("role") === "textbox"
@@ -413,6 +515,43 @@ function updateVideoDuration() {
 // --- Navigation Logic ---
 const navButtons = document.querySelectorAll('.nav-item');
 const panels = document.querySelectorAll('.panel');
+const AUTO_DUB_PANEL_IDS = new Set(['panel-auto-dub', 'panel-auto-dub-v2']);
+const FLOATING_UI_AVOID_PANEL_IDS = new Set(['panel-auto-dub', 'panel-auto-dub-v2', 'panel-transcribe', 'panel-results']);
+const PANEL_INTERNAL_SCROLL_IDS = new Set(['panel-transcribe', 'panel-results']);
+
+/**
+ * 在需要“面板优先点击”的页面强制收起 Agent 浮层，
+ * 避免 backdrop 残留时吞掉 select/button 的点击事件。
+ */
+function forceCloseAgentOverlayIfNeeded(shouldAvoidFloatingUi) {
+    if (!shouldAvoidFloatingUi) return;
+    const drawer = document.getElementById('agent-drawer');
+    const fab = document.getElementById('agent-fab');
+    const backdrop = document.getElementById('agent-backdrop');
+    if (drawer) {
+        drawer.classList.remove('open');
+        drawer.setAttribute('aria-hidden', 'true');
+    }
+    if (fab) {
+        fab.setAttribute('aria-expanded', 'false');
+    }
+    if (backdrop) {
+        backdrop.hidden = true;
+    }
+}
+
+// 在 Auto Dubbing 面板激活时，给右下悬浮控件预留点击安全区，避免遮挡右下操作按钮。
+function syncFloatingUiForActivePanel(panelId) {
+    const targetId = String(panelId || '').trim();
+    const isAutoDubPanel = AUTO_DUB_PANEL_IDS.has(targetId);
+    const shouldAvoidFloatingUi = FLOATING_UI_AVOID_PANEL_IDS.has(targetId);
+    const shouldUsePanelInternalScroll = PANEL_INTERNAL_SCROLL_IDS.has(targetId);
+    document.body.classList.toggle('auto-dub-panel-active', isAutoDubPanel);
+    document.body.classList.toggle('floating-ui-avoid-panel-active', shouldAvoidFloatingUi);
+    // 2/3 面板需要“容器固定 + 面板内部滚动”，避免长内容撑开整个页面。
+    document.body.classList.toggle('panel-internal-scroll-active', shouldUsePanelInternalScroll);
+    forceCloseAgentOverlayIfNeeded(shouldAvoidFloatingUi);
+}
 
 navButtons.forEach(btn => {
     btn.addEventListener('click', () => {
@@ -428,12 +567,254 @@ navButtons.forEach(btn => {
         // Show target panel
         const targetId = btn.getAttribute('data-target');
         const targetPanel = document.getElementById(targetId);
+        syncFloatingUiForActivePanel(targetId);
         if (targetPanel) {
             targetPanel.style.display = 'block';
+            // 切换到更短的面板时，强制把下方滚动区回到顶部，避免保留旧滚动位置导致面板看起来“空了”。
+            if (dynamicContentSection) {
+                dynamicContentSection.scrollTop = 0;
+            }
             setTimeout(() => targetPanel.classList.add('active'), 10);
         }
     });
 });
+
+// 页面初始化时同步一次，避免刷新后“当前激活面板”与浮层避让状态不一致。
+syncFloatingUiForActivePanel(document.querySelector('.panel.active')?.id || 'panel-upload');
+
+/**
+ * 修复原生 select 在滚动容器里被裁剪的问题（Safari/部分浏览器）：
+ * 在 2/3 面板点击下拉时，临时放开主滚动区 overflow，关闭后自动恢复。
+ */
+function initPanelSelectOverflowFix() {
+    const selector = '#panel-transcribe select, #panel-results select';
+    const selects = Array.from(document.querySelectorAll(selector));
+    if (selects.length === 0) return;
+
+    let restoreTimer = null;
+    const markOpen = () => {
+        if (restoreTimer) {
+            clearTimeout(restoreTimer);
+            restoreTimer = null;
+        }
+        document.body.classList.add('panel-select-open');
+    };
+    const markClose = () => {
+        if (restoreTimer) {
+            clearTimeout(restoreTimer);
+        }
+        restoreTimer = setTimeout(() => {
+            document.body.classList.remove('panel-select-open');
+        }, 120);
+    };
+
+    selects.forEach((selectEl) => {
+        selectEl.addEventListener('mousedown', markOpen);
+        selectEl.addEventListener('focus', markOpen);
+        selectEl.addEventListener('click', markOpen);
+        selectEl.addEventListener('blur', markClose);
+        selectEl.addEventListener('change', markClose);
+    });
+
+    document.addEventListener(
+        'pointerdown',
+        (event) => {
+            const target = event.target;
+            if (!(target instanceof Element)) {
+                markClose();
+                return;
+            }
+            if (target.closest(selector)) {
+                markOpen();
+                return;
+            }
+            markClose();
+        },
+        true
+    );
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape' || event.key === 'Enter') {
+            markClose();
+        }
+    });
+}
+
+initPanelSelectOverflowFix();
+
+/**
+ * 为 2/3 面板提供自定义下拉 fallback：
+ * - 保留原生 select（供既有业务逻辑读取与写入）
+ * - 用同值的可视 trigger/menu 承接交互，规避原生下拉在部分浏览器的遮挡/裁剪问题
+ */
+function initPanelCustomSelectFallback() {
+    const selector = '#panel-transcribe select, #panel-results select';
+    const selects = Array.from(document.querySelectorAll(selector));
+    if (selects.length === 0) return;
+
+    const wraps = [];
+
+    /**
+     * 关闭全部自定义下拉；若传入 except，则保留该项打开。
+     */
+    function closeAll(except = null) {
+        wraps.forEach((entry) => {
+            if (except && entry.wrap === except) return;
+            entry.wrap.classList.remove('open');
+        });
+    }
+
+    selects.forEach((selectEl) => {
+        if (!(selectEl instanceof HTMLSelectElement)) return;
+        // 兼容历史模板残留：即使 HTML 里带了 `data-sm-custom-select="true"` 也不能阻断初始化。
+        // 真正的“已初始化”判定改为：
+        // 1) 已在 `.sm-select-wrap` 内
+        // 2) 内部专用标记 `data-sm-custom-initialized`
+        selectEl.removeAttribute('data-sm-custom-select');
+        if (selectEl.closest('.sm-select-wrap')) return;
+        if (selectEl.dataset.smCustomInitialized === 'true') return;
+        selectEl.dataset.smCustomInitialized = 'true';
+
+        const parent = selectEl.parentElement;
+        if (!parent) return;
+
+        const wrap = document.createElement('div');
+        wrap.className = 'sm-select-wrap';
+
+        // 继承原 select 上的 inline 布局属性（例如 flex:1），避免破坏原有栅格。
+        const inlineStyle = selectEl.getAttribute('style');
+        if (inlineStyle) {
+            wrap.setAttribute('style', inlineStyle);
+            selectEl.removeAttribute('style');
+        }
+
+        parent.insertBefore(wrap, selectEl);
+        wrap.appendChild(selectEl);
+        selectEl.classList.add('sm-select-native-hidden');
+
+        const trigger = document.createElement('button');
+        trigger.type = 'button';
+        trigger.className = 'sm-select-trigger';
+        trigger.setAttribute('aria-haspopup', 'listbox');
+        trigger.setAttribute('aria-expanded', 'false');
+
+        const menu = document.createElement('div');
+        menu.className = 'sm-select-menu';
+        menu.setAttribute('role', 'listbox');
+
+        wrap.appendChild(trigger);
+        wrap.appendChild(menu);
+
+        /**
+         * 根据当前可视区空间决定下拉方向：
+         * - 下方空间不足时自动改为向上展开
+         * - 菜单高度按可用空间自适应，避免“已打开但掉出视口”
+         */
+        function applyMenuPlacement() {
+            const triggerRect = trigger.getBoundingClientRect();
+            const viewportPadding = 10;
+            const gap = 6;
+            const minMenuHeight = 120;
+            const maxMenuHeight = 360;
+            const contentHeight = Math.max(minMenuHeight, Math.min(maxMenuHeight, menu.scrollHeight || 0));
+            const spaceBelow = Math.max(0, window.innerHeight - triggerRect.bottom - viewportPadding - gap);
+            const spaceAbove = Math.max(0, triggerRect.top - viewportPadding - gap);
+
+            const shouldDropUp = spaceBelow < Math.min(contentHeight, 180) && spaceAbove > spaceBelow;
+            wrap.classList.toggle('drop-up', shouldDropUp);
+
+            const availableHeight = shouldDropUp ? spaceAbove : spaceBelow;
+            const finalMaxHeight = Math.max(minMenuHeight, Math.min(maxMenuHeight, availableHeight));
+            menu.style.maxHeight = `${Math.round(finalMaxHeight)}px`;
+        }
+
+        /**
+         * 同步 trigger 文案到当前选中项。
+         */
+        function syncTriggerLabel() {
+            const option = selectEl.options[selectEl.selectedIndex];
+            trigger.textContent = (option?.textContent || '').trim() || '请选择';
+        }
+
+        /**
+         * 重绘下拉选项列表，并同步 active 状态。
+         */
+        function renderOptions() {
+            menu.innerHTML = '';
+            Array.from(selectEl.options).forEach((option) => {
+                const itemBtn = document.createElement('button');
+                itemBtn.type = 'button';
+                itemBtn.className = 'sm-select-option';
+                itemBtn.setAttribute('role', 'option');
+                itemBtn.textContent = (option.textContent || '').trim();
+                if (option.value === selectEl.value) {
+                    itemBtn.classList.add('active');
+                    itemBtn.setAttribute('aria-selected', 'true');
+                } else {
+                    itemBtn.setAttribute('aria-selected', 'false');
+                }
+                itemBtn.addEventListener('click', () => {
+                    if (selectEl.value !== option.value) {
+                        selectEl.value = option.value;
+                        // 触发既有监听逻辑（翻译语言、导出格式等）。
+                        selectEl.dispatchEvent(new Event('change', { bubbles: true }));
+                    }
+                    syncTriggerLabel();
+                    renderOptions();
+                    wrap.classList.remove('open');
+                    trigger.setAttribute('aria-expanded', 'false');
+                });
+                menu.appendChild(itemBtn);
+            });
+        }
+
+        trigger.addEventListener('click', (event) => {
+            event.preventDefault();
+            const willOpen = !wrap.classList.contains('open');
+            closeAll(wrap);
+            if (willOpen) {
+                wrap.classList.add('open');
+                applyMenuPlacement();
+                trigger.setAttribute('aria-expanded', 'true');
+            } else {
+                wrap.classList.remove('open');
+                trigger.setAttribute('aria-expanded', 'false');
+            }
+        });
+
+        // 原生 select 被程序修改时，保持自定义 UI 与之同步。
+        selectEl.addEventListener('change', () => {
+            syncTriggerLabel();
+            renderOptions();
+        });
+
+        wraps.push({ wrap, trigger, selectEl });
+        syncTriggerLabel();
+        renderOptions();
+    });
+
+    document.addEventListener('click', (event) => {
+        const target = event.target;
+        if (!(target instanceof Element)) {
+            closeAll();
+            return;
+        }
+        const insideAny = wraps.some((entry) => entry.wrap.contains(target));
+        if (!insideAny) {
+            closeAll();
+            wraps.forEach((entry) => entry.trigger.setAttribute('aria-expanded', 'false'));
+        }
+    });
+
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            closeAll();
+            wraps.forEach((entry) => entry.trigger.setAttribute('aria-expanded', 'false'));
+        }
+    });
+}
+
+initPanelCustomSelectFallback();
 
 function switchTab(stepIndex) {
     if (stepIndex >= 0 && stepIndex < navButtons.length) {
@@ -446,6 +827,16 @@ function saveState() {
     if (currentTaskId) localStorage.setItem('sm_taskId', currentTaskId);
     if (currentFilename) localStorage.setItem('sm_filename', currentFilename);
     if (currentOriginalFilename) localStorage.setItem('sm_originalFilename', currentOriginalFilename);
+    if (currentProjectMediaFilename) {
+        localStorage.setItem(PROJECT_MEDIA_FILENAME_KEY, currentProjectMediaFilename);
+    } else {
+        localStorage.removeItem(PROJECT_MEDIA_FILENAME_KEY);
+    }
+    if (currentProjectMediaOriginalFilename) {
+        localStorage.setItem(PROJECT_MEDIA_ORIGINAL_FILENAME_KEY, currentProjectMediaOriginalFilename);
+    } else {
+        localStorage.removeItem(PROJECT_MEDIA_ORIGINAL_FILENAME_KEY);
+    }
     if (transcriptionStartTime) localStorage.setItem('sm_startTime', transcriptionStartTime);
 
     // Save subtitles content
@@ -455,26 +846,20 @@ function saveState() {
     if (translatedSubtitlesData && translatedSubtitlesData.length > 0) {
         localStorage.setItem('sm_translatedSubtitles', JSON.stringify(translatedSubtitlesData));
     }
-
-    const apiKey = document.getElementById('api-key').value;
-    if (apiKey) localStorage.setItem('sm_apiKey', apiKey);
+    notifyProjectContextChanged();
 }
 
 function loadState() {
     const savedTaskId = localStorage.getItem('sm_taskId');
     const savedFilename = localStorage.getItem('sm_filename');
     const savedOriginalFilename = localStorage.getItem('sm_originalFilename');
-    const savedApiKey = localStorage.getItem('sm_apiKey');
+    const savedProjectMediaFilename = localStorage.getItem(PROJECT_MEDIA_FILENAME_KEY);
+    const savedProjectMediaOriginalFilename = localStorage.getItem(PROJECT_MEDIA_ORIGINAL_FILENAME_KEY);
     const savedStartTime = localStorage.getItem('sm_startTime');
 
     // Restore Subtitles Independent of Task Status
     const savedOriginalSubs = localStorage.getItem('sm_originalSubtitles');
     const savedTranslatedSubs = localStorage.getItem('sm_translatedSubtitles');
-
-    if (savedApiKey) {
-        const apiKeyEl = document.getElementById('api-key');
-        if (apiKeyEl) apiKeyEl.value = savedApiKey;
-    }
 
     if (savedStartTime) {
         transcriptionStartTime = parseInt(savedStartTime);
@@ -494,7 +879,6 @@ function loadState() {
 
     if (originalSubtitlesData && originalSubtitlesData.length > 0) {
         if (translateBtn) translateBtn.disabled = false;
-        if (exportBtn) exportBtn.disabled = false;
         // Note: convert exportBtn usage to be safe by ID lookup or check if variable exists
         const expBtn = document.getElementById('export-btn');
         if (expBtn) expBtn.disabled = false;
@@ -516,18 +900,35 @@ function loadState() {
         currentTaskId = savedTaskId;
         currentFilename = savedFilename;
         currentOriginalFilename = savedOriginalFilename || savedFilename;
+        currentProjectMediaFilename =
+            savedProjectMediaFilename
+            || (savedFilename.toLowerCase().endsWith('.srt') ? null : savedFilename);
+        currentProjectMediaOriginalFilename =
+            savedProjectMediaOriginalFilename
+            || currentProjectMediaFilename
+            || null;
 
         // Restore video
-        if (videoPlayer) {
+        if (videoPlayer && currentProjectMediaFilename) {
             // Note: If server restarted, this URL might be invalid if it was a temp file? 
             // We'll try. 
-            videoPlayer.src = `/stream/${currentFilename}`;
+            videoPlayer.src = `/stream/${currentProjectMediaFilename}`;
             videoPlayer.style.display = 'block';
         }
-        if (videoPlaceholder) videoPlaceholder.style.display = 'none';
+        if (videoPlaceholder && currentProjectMediaFilename) videoPlaceholder.style.display = 'none';
 
         // Poll to see if task is still alive/running on server
         pollStatus();
+    } else {
+        currentProjectMediaFilename = savedProjectMediaFilename || null;
+        currentProjectMediaOriginalFilename = savedProjectMediaOriginalFilename || null;
+        if (videoPlayer && currentProjectMediaFilename) {
+            videoPlayer.src = `/stream/${currentProjectMediaFilename}`;
+            videoPlayer.style.display = 'block';
+        }
+        if (videoPlaceholder && currentProjectMediaFilename) {
+            videoPlaceholder.style.display = 'none';
+        }
     }
 
     // Sync Language if previously saved
@@ -543,6 +944,7 @@ function loadState() {
             syncDubbingLanguage(savedLang);
         }
     }
+    notifyProjectContextChanged();
 }
 
 function syncDubbingLanguage(lang) {
@@ -590,6 +992,8 @@ async function clearState() {
     localStorage.removeItem('sm_taskId');
     localStorage.removeItem('sm_filename');
     localStorage.removeItem('sm_originalFilename');
+    localStorage.removeItem(PROJECT_MEDIA_FILENAME_KEY);
+    localStorage.removeItem(PROJECT_MEDIA_ORIGINAL_FILENAME_KEY);
     localStorage.removeItem('sm_startTime');
     localStorage.removeItem('sm_originalSubtitles');
     localStorage.removeItem('sm_translatedSubtitles');
@@ -632,8 +1036,11 @@ if (themeToggleBtn) {
     });
 }
 
-// Initialize
-window.addEventListener('DOMContentLoaded', loadState);
+// 初始化共享前端状态：先恢复全局 DeepSeek 配置，再恢复项目上下文。
+window.addEventListener('DOMContentLoaded', () => {
+    initDeepSeekSettings();
+    loadState();
+});
 
 // Bind Overlay Mode Selector
 const displayModeSelect = document.getElementById('display-mode');
@@ -763,9 +1170,11 @@ async function handleMediaUpload(file) {
         if (!res.ok) throw new Error("Upload failed");
 
         const data = await res.json();
-        currentTaskId = data.task_id;
+        currentTaskId = data.task_id || null;
         currentFilename = data.filename;
         currentOriginalFilename = file.name;
+        currentProjectMediaFilename = data.filename;
+        currentProjectMediaOriginalFilename = file.name;
 
         // Clear previous subtitles
         originalSubtitlesData = [];
@@ -1075,7 +1484,7 @@ if (translateBtn) {
 
         const provider = document.getElementById('model-provider').value;
         const targetLang = document.getElementById('target-lang').value; // Get target language
-        const apiKey = document.getElementById('api-key').value;
+        const apiKey = getDeepSeekApiKey();
         const systemPrompt = document.getElementById('system-prompt').value;
 
         console.log("Provider:", provider, "Target:", targetLang);
@@ -1284,10 +1693,9 @@ async function handleSrtUpload(file) {
     const formData = new FormData();
     formData.append('file', file);
 
-    // Pass existing video filename if available (so Dubbing knows about it)
-    // Simple check: if currentFilename exists and is NOT an srt (meaning it's likely a video from Step 1)
-    if (currentFilename && !currentFilename.toLowerCase().endsWith('.srt')) {
-        formData.append('video_filename', currentFilename);
+    // 若当前项目已有媒体，显式把媒体文件名传给后端，避免导入 SRT 后丢失“当前项目对应的视频”。
+    if (currentProjectMediaFilename && !currentProjectMediaFilename.toLowerCase().endsWith('.srt')) {
+        formData.append('video_filename', currentProjectMediaFilename);
     }
 
     try {
@@ -1330,43 +1738,6 @@ async function handleSrtUpload(file) {
         alert("SRT Upload Failed: " + e.message);
         if (uploadStatus) uploadStatus.textContent = "Upload Failed";
     }
-}
-
-// --- API Key Auto-Save ---
-const apiKeyInput = document.getElementById('api-key');
-const saveApiKeyCheckbox = document.getElementById('save-api-key');
-const MAIN_API_KEY = 'sm_apiKey';
-const MAIN_SAVE_KEY = 'sm_saveApiKey';
-
-if (apiKeyInput) {
-    // Load saved key
-    const savedKey = localStorage.getItem(MAIN_API_KEY);
-    const savedChecked = localStorage.getItem(MAIN_SAVE_KEY) === 'true';
-    if (savedKey && savedChecked) {
-        apiKeyInput.value = savedKey;
-    }
-    if (saveApiKeyCheckbox) {
-        saveApiKeyCheckbox.checked = savedChecked;
-    }
-
-    // Save on checkbox change
-    if (saveApiKeyCheckbox) {
-        saveApiKeyCheckbox.addEventListener('change', () => {
-            if (saveApiKeyCheckbox.checked && apiKeyInput.value) {
-                localStorage.setItem(MAIN_API_KEY, apiKeyInput.value);
-            } else if (!saveApiKeyCheckbox.checked) {
-                localStorage.removeItem(MAIN_API_KEY);
-            }
-            localStorage.setItem(MAIN_SAVE_KEY, saveApiKeyCheckbox.checked);
-        });
-    }
-
-    // Also save when typing if checkbox is checked
-    apiKeyInput.addEventListener('input', () => {
-        if (saveApiKeyCheckbox && saveApiKeyCheckbox.checked && apiKeyInput.value) {
-            localStorage.setItem(MAIN_API_KEY, apiKeyInput.value);
-        }
-    });
 }
 
 // --- Fullscreen Support ---
@@ -1542,12 +1913,15 @@ document.addEventListener('DOMContentLoaded', () => {
             describeAutoStage,
             normalizeShortMergeTargetSeconds,
             applyAutoDubSubtitleItems,
+            getDeepSeekApiKey,
+            getProjectDubbingContext,
         });
         agentDrawerModule.setupAgentDrawer({
             getCurrentPanelName: () => {
                 const activePanel = document.querySelector('.panel.active');
                 return activePanel?.id || 'unknown';
             },
+            getDeepSeekApiKey,
         });
     }).catch((error) => {
         console.error('Frontend module bootstrap failed', error);

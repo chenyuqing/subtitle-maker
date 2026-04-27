@@ -16,3 +16,11 @@
 
 - 2026-04-21：当文档已明确给出参数计算公式时，Spec 不能擅自把用户举例值（如 10s ±2s）固化成默认规则；应优先采用文档公式并仅把举例当示例。
 - 2026-04-24：推进产品化重构时，必须明确引用 `/docs/refactor/` 的 phase 名称（如 `Phase 5 Subtitle Domain`、`Phase 6 Media Domain`），不要只按 `tasks/todo.md` 中的日期段落口头描述，否则容易让用户误以为还在做旧的 4 月 20 日功能型 Todo。
+- 2026-04-25：修前端 panel 可视区时，播放器和侧边栏都必须保持固定；禁止用整页 `scrollIntoView()` 之类会带着整页滚动的办法，只能操作 `.dynamic-content-section` 自己的滚动位置。
+- 2026-04-25：Auto Dubbing V1/V2 改布局后，不能只看 HTML 存在和单测通过；像 restore/load-batch 这类右下角交互块必须在浏览器里逐块点一遍，尤其要检查 V2 分支没有因为遮挡、滚动区或独立事件绑定而失效。
+- 2026-04-27：修前端下拉失效时，先检查模板里是否残留 `data-sm-custom-select=\"true\"` 这类“初始化短路”属性；JS 不能把 DOM 初始属性当作“已初始化”判据，必须使用内部专用标记位并兼容清理旧属性。
+- 2026-04-27（高优先事故复盘，必须执行）：这次 `#panel-transcribe` / `#panel-results` 修复中，错误把 `body.panel-internal-scroll-active #panel-transcribe,#panel-results` 都设成 `display:flex !important`，覆盖了 tab 切换依赖的 `style=\"display:none\"`，导致 2/3 面板同时渲染；以后凡是 tab 面板场景，`display` 类属性必须带 `.active` 或显式可见态选择器，禁止对同级全部面板做 `display:* !important` 的宽范围覆盖。
+- 2026-04-27（样式改动禁令）：当页面使用“导航按钮 + 内联 display 切换”机制时，CSS 禁止直接改写面板可见性语义；允许改 `height/overflow/flex/min-height/max-width`，不允许改“显示/隐藏控制权”。若必须改 `display`，先在代码里标注“谁控制可见性（JS/CSS）”再改。
+- 2026-04-27（强制验证清单，未完成不得提交）：前端面板布局修复后必须执行 5 项最小验证：1）点击 Step 2 只出现 `#panel-transcribe`；2）点击 Step 3 只出现 `#panel-results`；3）两个面板互切 3 次不出现叠层；4）面板内部滚动生效且播放器/侧栏不滚；5）右下交互控件可点击。任一失败，先回滚“最近一条覆盖规则”再继续定位。
+- 2026-04-27（排障流程升级）：用户已给出明确根因或修复点时（例如 `data-sm-custom-select`），优先验证并实现该点，不得先堆叠新补丁；连续 2 次修复仍未解决时，必须停下来输出“根因假设 -> 证据 -> 下一刀改动”的三列表，再动代码，避免重复消耗 token。
+- 2026-04-27（范围控制规则）：处理 Flex 滚动问题优先局部状态类（如 `body.panel-internal-scroll-active`）+ 精确选择器（`.active`）+ 最小 `!important`，禁止把“临时救火规则”扩散为全局结构覆盖，尤其禁止同时改 `main-content`、`dynamic-content-section`、`panel` 可见性三层语义而不做逐步验证。

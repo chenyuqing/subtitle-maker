@@ -39,6 +39,10 @@ class WebLegacyRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("text/html", response.headers.get("content-type", ""))
         self.assertIn('/static/app.js?v=', response.text)
+        self.assertIn('id="global-deepseek-api-key"', response.text)
+        self.assertIn('id="global-deepseek-save-key"', response.text)
+        self.assertNotIn('id="agent-api-key"', response.text)
+        self.assertNotIn('id="api-key"', response.text)
 
         upload = self.client.post(
             "/upload",
