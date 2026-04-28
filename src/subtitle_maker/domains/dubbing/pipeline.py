@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import re
 from datetime import datetime
@@ -10,8 +11,16 @@ import librosa
 import numpy as np
 import soundfile as sf
 
-from subtitle_maker.backends import IndexTtsBackend, TtsSynthesisRequest
-from subtitle_maker.domains.media import audio_duration
+from subtitle_maker.backends import IndexTtsBackend, OmniVoiceBackend, TtsSynthesisRequest
+from subtitle_maker.backends.omni_voice import DEFAULT_OMNIVOICE_QUALITY_MIN_TARGET_SEC
+from subtitle_maker.domains.media import (
+    DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB,
+    DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB,
+    DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING,
+    DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS,
+    audio_duration,
+    normalize_speech_audio_level,
+)
 
 from .alignment import (
     apply_atempo,
@@ -24,6 +33,10 @@ from .alignment import (
 if TYPE_CHECKING:
     from subtitle_maker.qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
     from subtitle_maker.translator import Translator
+
+DEFAULT_MISSING_AUDIO_SR = 24000
+OMNIVOICE_DURATION_PRECHECK_REASON_CODE = "omnivoice_target_duration_below_safe_floor"
+OMNIVOICE_DURATION_PRECHECK_ERROR_CODE = "E-TTS-001"
 
 
 def _is_sentence_end(text: str) -> bool:
@@ -127,48 +140,91 @@ def synthesize_text_once(
     index_max_text_tokens: int,
     text: str,
     output_path: Path,
+    target_duration_sec: Optional[float] = None,
+    fallback_tts_backend: str = "none",
+    omnivoice_root: str = "",
+    omnivoice_python_bin: str = "",
+    omnivoice_model: str = "",
+    omnivoice_device: str = "auto",
+    omnivoice_via_api: bool = True,
+    omnivoice_api_url: str = "",
+    ref_text: Optional[str] = None,
+    target_lang: str = "",
 ) -> None:
-    """执行一次单句 TTS 合成，并把 backend 分发收口。"""
+    """执行一次单句 TTS 合成，主 backend 失败时可切换到备胎 backend。"""
 
-    if tts_backend == "qwen":
-        if tts_qwen is None or qwen_prompt_items is None:
-            raise RuntimeError("qwen backend not initialized")
-        wavs, sample_rate = tts_qwen.generate_voice_clone(
-            text=text,
-            language="Auto",
-            voice_clone_prompt=qwen_prompt_items,
-            x_vector_only_mode=True,
-            non_streaming_mode=True,
-        )
-        wav = np.asarray(wavs[0], dtype=np.float32)
-        sf.write(str(output_path), wav, sample_rate)
-        return
+    synthesis_request = TtsSynthesisRequest(
+        text=text,
+        ref_audio_path=ref_audio_path,
+        output_path=output_path,
+        ref_text=(ref_text or "").strip() or None,
+        language=target_lang,
+        emo_audio_prompt=index_emo_audio_prompt,
+        emo_alpha=index_emo_alpha,
+        use_emo_text=index_use_emo_text,
+        emo_text=index_emo_text,
+        top_p=index_top_p,
+        top_k=index_top_k,
+        temperature=index_temperature,
+        max_text_tokens=index_max_text_tokens,
+        target_duration_sec=target_duration_sec,
+    )
 
-    if tts_backend == "index-tts":
-        backend = IndexTtsBackend(
-            via_api=index_tts_via_api,
-            api_url=index_tts_api_url,
-            timeout_sec=index_tts_api_timeout_sec,
-            local_model=tts_index,
-        )
-        backend.synthesize(
-            TtsSynthesisRequest(
+    def _run_backend(backend_name: str) -> None:
+        normalized = (backend_name or "").strip().lower()
+        if normalized == "qwen":
+            if tts_qwen is None or qwen_prompt_items is None:
+                raise RuntimeError("qwen backend not initialized")
+            wavs, sample_rate = tts_qwen.generate_voice_clone(
                 text=text,
-                ref_audio_path=ref_audio_path,
-                output_path=output_path,
-                emo_audio_prompt=index_emo_audio_prompt,
-                emo_alpha=index_emo_alpha,
-                use_emo_text=index_use_emo_text,
-                emo_text=index_emo_text,
-                top_p=index_top_p,
-                top_k=index_top_k,
-                temperature=index_temperature,
-                max_text_tokens=index_max_text_tokens,
+                language="Auto",
+                voice_clone_prompt=qwen_prompt_items,
+                x_vector_only_mode=True,
+                non_streaming_mode=True,
             )
-        )
-        return
+            wav = np.asarray(wavs[0], dtype=np.float32)
+            sf.write(str(output_path), wav, sample_rate)
+            return
+        if normalized == "index-tts":
+            backend = IndexTtsBackend(
+                via_api=index_tts_via_api,
+                api_url=index_tts_api_url,
+                timeout_sec=index_tts_api_timeout_sec,
+                local_model=tts_index,
+            )
+            backend.synthesize(synthesis_request)
+            return
+        if normalized == "omnivoice":
+            backend = OmniVoiceBackend(
+                python_bin=omnivoice_python_bin,
+                root_dir=omnivoice_root,
+                model=omnivoice_model,
+                device=omnivoice_device,
+                timeout_sec=index_tts_api_timeout_sec,
+                via_api=bool(omnivoice_via_api),
+                api_url=str(omnivoice_api_url or "").strip() or os.environ.get("OMNIVOICE_API_URL", ""),
+            )
+            backend.synthesize(synthesis_request)
+            return
+        raise RuntimeError(f"Unsupported tts backend: {backend_name}")
 
-    raise RuntimeError(f"Unsupported tts backend: {tts_backend}")
+    primary_backend = (tts_backend or "").strip().lower()
+    fallback_backend = (fallback_tts_backend or "none").strip().lower()
+    try:
+        _run_backend(primary_backend)
+        return
+    except Exception as primary_exc:
+        if fallback_backend in {"", "none"} or fallback_backend == primary_backend:
+            raise
+        try:
+            _run_backend(fallback_backend)
+            return
+        except Exception as fallback_exc:
+            raise RuntimeError(
+                "E-TTS-001 primary backend failed and fallback backend failed: "
+                f"primary={primary_backend}:{primary_exc}; "
+                f"fallback={fallback_backend}:{fallback_exc}"
+            ) from fallback_exc
 
 
 def _iso_now() -> str:
@@ -189,6 +245,26 @@ def _is_cjk_target_lang(target_lang: str) -> bool:
     lowered = (target_lang or "").strip().lower()
     markers = ["chinese", "中文", "mandarin", "cantonese", "zh", "japanese", "korean", "日文", "韩文"]
     return any(marker in lowered for marker in markers)
+
+
+def _is_cantonese_target_lang(target_lang: str) -> bool:
+    """判断目标语种是否为粤语。"""
+
+    lowered = (target_lang or "").strip().lower()
+    markers = ["cantonese", "粤语", "廣東話", "广东话", "yue"]
+    return any(marker in lowered for marker in markers)
+
+
+def _build_cantonese_prompt_constraints() -> str:
+    """返回粤语重写约束，降低普通话书面表达渗透。"""
+
+    return (
+        "Cantonese constraints:\n"
+        "- Use natural spoken Cantonese (Hong Kong style), not written Mandarin.\n"
+        "- Prefer Traditional Chinese characters for output.\n"
+        "- Keep colloquial Cantonese function words natural (e.g. 佢/我哋/你哋/喺/咗/嘅/唔/咩/呀/喇/啦).\n"
+        "- Avoid stiff Mandarin book-style wording when a Cantonese alternative exists.\n"
+    )
 
 
 def _has_speakable_content(text: str) -> bool:
@@ -223,6 +299,62 @@ def _audio_is_effectively_silent(
     rms = float(np.sqrt(np.mean(mono * mono)))
     peak = float(np.max(np.abs(mono)))
     return rms < rms_threshold and peak < peak_threshold
+
+
+def _is_omnivoice_target_duration_unsafe(
+    *,
+    tts_backend: str,
+    effective_target_duration_sec: float,
+    has_speakable_content: bool,
+) -> bool:
+    """仅对 OmniVoice 可发音文本判断是否落入已知高失败率时长区间。"""
+
+    if not has_speakable_content:
+        return False
+    if (tts_backend or "").strip().lower() != "omnivoice":
+        return False
+    try:
+        duration_sec = float(effective_target_duration_sec)
+    except (TypeError, ValueError):
+        return False
+    return 0.0 < duration_sec < DEFAULT_OMNIVOICE_QUALITY_MIN_TARGET_SEC
+
+
+def _build_omnivoice_duration_precheck_reason_detail(
+    *,
+    effective_target_duration_sec: float,
+    requested_target_duration_sec: float,
+    borrowed_gap_sec: float,
+) -> str:
+    """构造 OmniVoice 过短时长前置拦截的统一原因文本。"""
+
+    return (
+        "effective_target_duration_sec="
+        f"{float(effective_target_duration_sec):.3f}s below safe_floor_sec="
+        f"{float(DEFAULT_OMNIVOICE_QUALITY_MIN_TARGET_SEC):.1f}s "
+        "(requested_target_duration_sec="
+        f"{float(requested_target_duration_sec):.3f}s, "
+        f"borrowed_gap_sec={float(borrowed_gap_sec):.3f}s, "
+        "tts_backend=omnivoice)"
+    )
+
+
+def _write_missing_audio_placeholder(*, output_path: Path, target_duration_sec: float) -> float:
+    """写出统一规格的缺失占位音频，并返回占位时长。"""
+
+    safe_target_duration_sec = max(0.05, float(target_duration_sec))
+    sf.write(
+        str(output_path),
+        np.zeros(
+            max(
+                int(DEFAULT_MISSING_AUDIO_SR * 0.1),
+                int(DEFAULT_MISSING_AUDIO_SR * safe_target_duration_sec),
+            ),
+            dtype=np.float32,
+        ),
+        DEFAULT_MISSING_AUDIO_SR,
+    )
+    return audio_duration(output_path)
 
 
 def _extract_prosody_fingerprint(path: Path) -> Optional[Dict[str, float]]:
@@ -345,6 +477,13 @@ def _retranslate_single_line(
         f"Current translation: {current_translation}\n\n"
         "Return ONE line only. No numbering. No explanations."
     )
+    if _is_cantonese_target_lang(target_lang):
+        prompt = (
+            prompt
+            + "\n\n"
+            + _build_cantonese_prompt_constraints()
+            + "Do not switch to Mandarin written style."
+        )
     response = translator.client.chat.completions.create(
         model=translator.model,
         messages=[
@@ -391,6 +530,18 @@ def synthesize_segments_grouped(
     grouping_strategy: str,
     logger: Any,
     target_lang: str,
+    fallback_tts_backend: str = "none",
+    omnivoice_root: str = "",
+    omnivoice_python_bin: str = "",
+    omnivoice_model: str = "",
+    omnivoice_device: str = "auto",
+    omnivoice_via_api: bool = True,
+    omnivoice_api_url: str = "",
+    dub_audio_leveling_enabled: bool = True,
+    dub_audio_leveling_target_rms: float = DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS,
+    dub_audio_leveling_activity_threshold_db: float = DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB,
+    dub_audio_leveling_max_gain_db: float = DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB,
+    dub_audio_leveling_peak_ceiling: float = DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """执行 grouped / legacy 路径的整组合成编排。"""
 
@@ -398,6 +549,41 @@ def synthesize_segments_grouped(
     segment_dir.mkdir(parents=True, exist_ok=True)
     records_by_index: Dict[int, Dict[str, Any]] = {}
     manual_review: List[Dict[str, Any]] = []
+
+    def maybe_level_output_audio(output_path: Path, *, log_segment_id: str) -> Dict[str, Any]:
+        """对最终保留的人声音频做一次活动语音归一化，并吞掉调音异常。"""
+
+        if not dub_audio_leveling_enabled:
+            return {"applied": False, "skipped": True, "reason": "disabled"}
+        if not output_path.exists() or output_path.name.endswith("_missing.wav"):
+            return {"applied": False, "skipped": True, "reason": "missing_or_absent"}
+        try:
+            leveling_stats = normalize_speech_audio_level(
+                input_path=output_path,
+                target_rms=dub_audio_leveling_target_rms,
+                activity_threshold_db=dub_audio_leveling_activity_threshold_db,
+                max_gain_db=dub_audio_leveling_max_gain_db,
+                peak_ceiling=dub_audio_leveling_peak_ceiling,
+            )
+            logger.log(
+                "INFO",
+                "audio_level",
+                "segment_audio_leveled",
+                f"leveled output audio for {log_segment_id}",
+                segment_id=log_segment_id,
+                data=leveling_stats,
+            )
+            return leveling_stats
+        except Exception as exc:
+            logger.log(
+                "WARN",
+                "audio_level",
+                "segment_audio_leveling_failed",
+                f"leveling failed for {log_segment_id}",
+                segment_id=log_segment_id,
+                data={"error": str(exc)},
+            )
+            return {"applied": False, "error": str(exc)}
 
     groups = build_synthesis_groups(
         subtitles=subtitles,
@@ -430,6 +616,10 @@ def synthesize_segments_grouped(
             for index in indices
         ]
         group_text = _merge_text_lines(group_texts, cjk_mode=cjk_mode)
+        group_source_text = _merge_text_lines(
+            [subtitles[index].get("text") or "" for index in indices],
+            cjk_mode=cjk_mode,
+        )
         subtitle_empty = _group_subtitle_is_empty(
             subtitles=subtitles,
             translated_lines=translated_lines,
@@ -497,9 +687,117 @@ def synthesize_segments_grouped(
                         f"non-speech group uses silence: {group_id}",
                         data={"group_text": group_text},
                     )
+                elif _is_omnivoice_target_duration_unsafe(
+                    tts_backend=tts_backend,
+                    effective_target_duration_sec=group_effective_target_duration,
+                    has_speakable_content=True,
+                ):
+                    reason_detail = _build_omnivoice_duration_precheck_reason_detail(
+                        effective_target_duration_sec=group_effective_target_duration,
+                        requested_target_duration_sec=group_target_duration,
+                        borrowed_gap_sec=group_borrowed_gap_sec,
+                    )
+                    logger.log(
+                        "WARN",
+                        "tts",
+                        "group_tts_precheck_rejected",
+                        f"{group_id} rejected by omnivoice duration precheck",
+                        data={
+                            "effective_target_duration_sec": round(group_effective_target_duration, 3),
+                            "requested_target_duration_sec": round(group_target_duration, 3),
+                            "borrowed_gap_sec": round(group_borrowed_gap_sec, 3),
+                            "safe_floor_sec": round(float(DEFAULT_OMNIVOICE_QUALITY_MIN_TARGET_SEC), 1),
+                        },
+                    )
+                    for global_index in indices:
+                        seg_id = f"seg_{global_index + 1:04d}"
+                        target_duration = max(
+                            0.05,
+                            float(subtitles[global_index]["end"]) - float(subtitles[global_index]["start"]),
+                        )
+                        missing_path = segment_dir / f"{seg_id}_missing.wav"
+                        missing_actual = _write_missing_audio_placeholder(
+                            output_path=missing_path,
+                            target_duration_sec=target_duration,
+                        )
+                        records_by_index[global_index] = {
+                            "id": seg_id,
+                            "start_sec": round(float(subtitles[global_index]["start"]), 3),
+                            "end_sec": round(float(subtitles[global_index]["end"]), 3),
+                            "target_duration_sec": round(target_duration, 3),
+                            "source_text": subtitles[global_index]["text"],
+                            "translated_text": (
+                                translated_lines[global_index]
+                                if global_index < len(translated_lines)
+                                else subtitles[global_index]["text"]
+                            ),
+                            "segment_type": (
+                                "speech"
+                                if _has_speakable_content(
+                                    translated_lines[global_index]
+                                    if global_index < len(translated_lines)
+                                    else subtitles[global_index]["text"]
+                                )
+                                else "non_speech"
+                            ),
+                            "voice_ref_path": str(group_ref_audio_path),
+                            "tts_audio_path": str(missing_path),
+                            "actual_duration_sec": round(missing_actual, 3),
+                            "delta_sec": round(missing_actual - target_duration, 3),
+                            "effective_target_duration_sec": round(group_effective_target_duration, 3),
+                            "borrowed_gap_sec": round(group_borrowed_gap_sec, 3),
+                            "effective_delta_sec": round(missing_actual - group_effective_target_duration, 3),
+                            "status": "manual_review",
+                            "retry_count": 0,
+                            "attempt_history": [
+                                {
+                                    "attempt_no": 0,
+                                    "action": "group_omnivoice_duration_precheck",
+                                    "input_text": group_text,
+                                    "actual_duration_sec": None,
+                                    "delta_sec": None,
+                                    "result": "fail",
+                                    "error": reason_detail,
+                                    "data": {
+                                        "effective_target_duration_sec": round(group_effective_target_duration, 3),
+                                        "requested_target_duration_sec": round(group_target_duration, 3),
+                                        "borrowed_gap_sec": round(group_borrowed_gap_sec, 3),
+                                        "safe_floor_sec": round(float(DEFAULT_OMNIVOICE_QUALITY_MIN_TARGET_SEC), 1),
+                                    },
+                                    "ts": _iso_now(),
+                                }
+                            ],
+                            "audio_leveling_applied": False,
+                            "audio_leveling_target_rms": round(float(dub_audio_leveling_target_rms), 4),
+                            "audio_leveling_input_rms": None,
+                            "audio_leveling_output_rms": None,
+                            "audio_leveling_gain_db": 0.0,
+                            "audio_leveling_peak_before": None,
+                            "audio_leveling_peak_after": None,
+                            "audio_leveling_active_duration_sec": 0.0,
+                            "audio_leveling_peak_limited": False,
+                            "audio_leveling_error": None,
+                        }
+                        manual_review.append(
+                            {
+                                "segment_id": seg_id,
+                                "reason_code": OMNIVOICE_DURATION_PRECHECK_REASON_CODE,
+                                "reason_detail": reason_detail,
+                                "last_delta_sec": round(missing_actual - target_duration, 3),
+                                "last_effective_delta_sec": round(
+                                    missing_actual - group_effective_target_duration,
+                                    3,
+                                ),
+                                "last_attempt_no": 0,
+                                "error_code": OMNIVOICE_DURATION_PRECHECK_ERROR_CODE,
+                                "error_stage": "tts_precheck",
+                            }
+                        )
+                    continue
                 else:
                     synthesize_text_once(
                         tts_backend=tts_backend,
+                        fallback_tts_backend=fallback_tts_backend,
                         index_tts_via_api=index_tts_via_api,
                         index_tts_api_url=index_tts_api_url,
                         index_tts_api_timeout_sec=index_tts_api_timeout_sec,
@@ -515,6 +813,15 @@ def synthesize_segments_grouped(
                         index_top_k=index_top_k,
                         index_temperature=index_temperature,
                         index_max_text_tokens=index_max_text_tokens,
+                        omnivoice_root=omnivoice_root,
+                        omnivoice_python_bin=omnivoice_python_bin,
+                        omnivoice_model=omnivoice_model,
+                        omnivoice_device=omnivoice_device,
+                        omnivoice_via_api=omnivoice_via_api,
+                        omnivoice_api_url=omnivoice_api_url,
+                        ref_text=group_source_text,
+                        target_lang=target_lang,
+                        target_duration_sec=group_effective_target_duration,
                         text=group_text,
                         output_path=raw_path,
                     )
@@ -646,29 +953,49 @@ def synthesize_segments_grouped(
                                     }
                                 )
                         elif timing_mode == "strict":
-                            fit_audio_to_duration(
-                                input_path=use_path,
-                                output_path=fit_path,
-                                target_duration_sec=group_effective_target_duration,
-                            )
-                            fit_actual = audio_duration(fit_path)
-                            attempts_base.append(
-                                {
-                                    "attempt_no": 0,
-                                    "action": "group_fit_timing",
-                                    "input_text": group_text,
-                                    "actual_duration_sec": round(fit_actual, 3),
-                                    "delta_sec": round(fit_actual - group_target_duration, 3),
-                                    "result": "pass",
-                                    "error": None,
-                                    "data": {
-                                        "effective_target_sec": round(group_effective_target_duration, 3),
-                                        "borrowed_gap_sec": round(group_borrowed_gap_sec, 3),
-                                    },
-                                    "ts": _iso_now(),
-                                }
-                            )
-                            use_path = fit_path
+                            # OmniVoice 在阈值内保留原始尾音，避免 strict fit 的 atrim 截断句尾。
+                            if (tts_backend or "").strip().lower() == "omnivoice" and abs(raw_group_delta_effective) * 1000 <= delta_pass_ms:
+                                attempts_base.append(
+                                    {
+                                        "attempt_no": 0,
+                                        "action": "group_fit_timing_skip_tail_preserve",
+                                        "input_text": group_text,
+                                        "actual_duration_sec": round(raw_group_actual, 3),
+                                        "delta_sec": round(raw_group_delta, 3),
+                                        "result": "pass",
+                                        "error": None,
+                                        "data": {
+                                            "effective_target_sec": round(group_effective_target_duration, 3),
+                                            "borrowed_gap_sec": round(group_borrowed_gap_sec, 3),
+                                            "effective_delta_sec": round(raw_group_delta_effective, 3),
+                                        },
+                                        "ts": _iso_now(),
+                                    }
+                                )
+                            else:
+                                fit_audio_to_duration(
+                                    input_path=use_path,
+                                    output_path=fit_path,
+                                    target_duration_sec=group_effective_target_duration,
+                                )
+                                fit_actual = audio_duration(fit_path)
+                                attempts_base.append(
+                                    {
+                                        "attempt_no": 0,
+                                        "action": "group_fit_timing",
+                                        "input_text": group_text,
+                                        "actual_duration_sec": round(fit_actual, 3),
+                                        "delta_sec": round(fit_actual - group_target_duration, 3),
+                                        "result": "pass",
+                                        "error": None,
+                                        "data": {
+                                            "effective_target_sec": round(group_effective_target_duration, 3),
+                                            "borrowed_gap_sec": round(group_borrowed_gap_sec, 3),
+                                        },
+                                        "ts": _iso_now(),
+                                    }
+                                )
+                                use_path = fit_path
                         else:
                             relative_shift = abs(raw_group_delta_effective) / max(0.05, group_effective_target_duration)
                             if relative_shift > max(0.0, float(balanced_max_tempo_shift)):
@@ -739,9 +1066,17 @@ def synthesize_segments_grouped(
                 retry_trim = segment_dir / f"{group_id}_retry1_trim.wav"
                 retry_fit = segment_dir / f"{group_id}_retry1_fit.wav"
                 retry_use = retry_raw
+                retry_backend = tts_backend
+                retry_fallback_backend = fallback_tts_backend
+                normalized_fallback_backend = (fallback_tts_backend or "none").strip().lower()
+                if normalized_fallback_backend == "omnivoice" and (tts_backend or "").strip().lower() != "omnivoice":
+                    # 组内检测到无效音频时，第二次优先直接切备胎，避免继续复用同一失败路径。
+                    retry_backend = "omnivoice"
+                    retry_fallback_backend = "none"
 
                 synthesize_text_once(
-                    tts_backend=tts_backend,
+                    tts_backend=retry_backend,
+                    fallback_tts_backend=retry_fallback_backend,
                     index_tts_via_api=index_tts_via_api,
                     index_tts_api_url=index_tts_api_url,
                     index_tts_api_timeout_sec=index_tts_api_timeout_sec,
@@ -757,6 +1092,15 @@ def synthesize_segments_grouped(
                     index_top_k=index_top_k,
                     index_temperature=index_temperature,
                     index_max_text_tokens=index_max_text_tokens,
+                    omnivoice_root=omnivoice_root,
+                    omnivoice_python_bin=omnivoice_python_bin,
+                    omnivoice_model=omnivoice_model,
+                    omnivoice_device=omnivoice_device,
+                    omnivoice_via_api=omnivoice_via_api,
+                    omnivoice_api_url=omnivoice_api_url,
+                    ref_text=group_source_text,
+                    target_lang=target_lang,
+                    target_duration_sec=group_effective_target_duration,
                     text=group_text,
                     output_path=retry_raw,
                 )
@@ -790,12 +1134,15 @@ def synthesize_segments_grouped(
                                 )
                                 retry_use = retry_fit
                     elif timing_mode == "strict":
-                        fit_audio_to_duration(
-                            input_path=retry_use,
-                            output_path=retry_fit,
-                            target_duration_sec=group_effective_target_duration,
-                        )
-                        retry_use = retry_fit
+                        if (retry_backend or "").strip().lower() == "omnivoice" and abs(retry_delta_effective) * 1000 <= delta_pass_ms:
+                            pass
+                        else:
+                            fit_audio_to_duration(
+                                input_path=retry_use,
+                                output_path=retry_fit,
+                                target_duration_sec=group_effective_target_duration,
+                            )
+                            retry_use = retry_fit
                     else:
                         relative_shift = abs(retry_delta_effective) / max(0.05, group_effective_target_duration)
                         if relative_shift > max(0.0, float(balanced_max_tempo_shift)):
@@ -816,6 +1163,9 @@ def synthesize_segments_grouped(
                         "delta_sec": round(audio_duration(retry_use) - group_target_duration, 3),
                         "result": "pass" if not retry_still_silent else "fail",
                         "error": None if not retry_still_silent else "E-TTS-001 still silent after one retry",
+                        "data": {
+                            "retry_backend": str(retry_backend),
+                        },
                         "ts": _iso_now(),
                     }
                 )
@@ -837,6 +1187,7 @@ def synthesize_segments_grouped(
             anchor_status = "done" if abs(group_delta_effective) * 1000 <= delta_pass_ms else "manual_review"
             if group_review_reason is not None:
                 anchor_status = "manual_review"
+            leveling_stats = maybe_level_output_audio(use_path, log_segment_id=group_id)
 
             for local_index, global_index in enumerate(indices):
                 seg_id = f"seg_{global_index + 1:04d}"
@@ -866,6 +1217,16 @@ def synthesize_segments_grouped(
                     "attempt_history": [dict(item) for item in attempts_base],
                     "skip_compose": True,
                     "group_id": group_id,
+                    "audio_leveling_applied": bool(leveling_stats.get("applied")),
+                    "audio_leveling_target_rms": round(float(dub_audio_leveling_target_rms), 4),
+                    "audio_leveling_input_rms": leveling_stats.get("input_active_rms"),
+                    "audio_leveling_output_rms": leveling_stats.get("output_active_rms"),
+                    "audio_leveling_gain_db": leveling_stats.get("applied_gain_db"),
+                    "audio_leveling_peak_before": leveling_stats.get("peak_before"),
+                    "audio_leveling_peak_after": leveling_stats.get("peak_after"),
+                    "audio_leveling_active_duration_sec": leveling_stats.get("active_duration_sec"),
+                    "audio_leveling_peak_limited": bool(leveling_stats.get("peak_limited", False)),
+                    "audio_leveling_error": leveling_stats.get("error"),
                 }
 
                 if local_index == 0:
@@ -910,7 +1271,12 @@ def synthesize_segments_grouped(
                 seg_id = f"seg_{global_index + 1:04d}"
                 target_duration = max(0.05, float(subtitles[global_index]["end"]) - float(subtitles[global_index]["start"]))
                 missing_path = segment_dir / f"{seg_id}_missing.wav"
-                sf.write(str(missing_path), np.zeros(max(1600, int(16000 * target_duration)), dtype=np.float32), 16000)
+                # 占位音频默认写成 24k，和主流 TTS 输出采样率对齐，降低后续拼轨冲突概率。
+                sf.write(
+                    str(missing_path),
+                    np.zeros(max(int(DEFAULT_MISSING_AUDIO_SR * 0.1), int(DEFAULT_MISSING_AUDIO_SR * target_duration)), dtype=np.float32),
+                    DEFAULT_MISSING_AUDIO_SR,
+                )
                 records_by_index[global_index] = {
                     "id": seg_id,
                     "start_sec": round(float(subtitles[global_index]["start"]), 3),
@@ -937,6 +1303,16 @@ def synthesize_segments_grouped(
                             "ts": _iso_now(),
                         }
                     ],
+                    "audio_leveling_applied": False,
+                    "audio_leveling_target_rms": round(float(dub_audio_leveling_target_rms), 4),
+                    "audio_leveling_input_rms": None,
+                    "audio_leveling_output_rms": None,
+                    "audio_leveling_gain_db": 0.0,
+                    "audio_leveling_peak_before": None,
+                    "audio_leveling_peak_after": None,
+                    "audio_leveling_active_duration_sec": 0.0,
+                    "audio_leveling_peak_limited": False,
+                    "audio_leveling_error": None,
                 }
                 manual_review.append(
                     {
@@ -992,6 +1368,18 @@ def synthesize_segments(
     redub_line_indices: Optional[set[int]],
     v2_mode: bool,
     logger: Any,
+    fallback_tts_backend: str = "none",
+    omnivoice_root: str = "",
+    omnivoice_python_bin: str = "",
+    omnivoice_model: str = "",
+    omnivoice_device: str = "auto",
+    omnivoice_via_api: bool = True,
+    omnivoice_api_url: str = "",
+    dub_audio_leveling_enabled: bool = True,
+    dub_audio_leveling_target_rms: float = DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS,
+    dub_audio_leveling_activity_threshold_db: float = DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB,
+    dub_audio_leveling_max_gain_db: float = DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB,
+    dub_audio_leveling_peak_ceiling: float = DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """执行逐句合成主循环。"""
 
@@ -1005,6 +1393,86 @@ def synthesize_segments(
     records: List[Dict[str, Any]] = []
     manual_review: List[Dict[str, Any]] = []
     ref_fp_cache: Dict[str, Optional[Dict[str, float]]] = {}
+    primary_backend_name = (tts_backend or "").strip().lower()
+
+    def maybe_level_output_audio(output_path: Path, *, log_segment_id: str) -> Dict[str, Any]:
+        """对最终保留的人声音频做一次活动语音归一化，并吞掉调音异常。"""
+
+        if not dub_audio_leveling_enabled:
+            return {"applied": False, "skipped": True, "reason": "disabled"}
+        if not output_path.exists() or output_path.name.endswith("_missing.wav"):
+            return {"applied": False, "skipped": True, "reason": "missing_or_absent"}
+        try:
+            leveling_stats = normalize_speech_audio_level(
+                input_path=output_path,
+                target_rms=dub_audio_leveling_target_rms,
+                activity_threshold_db=dub_audio_leveling_activity_threshold_db,
+                max_gain_db=dub_audio_leveling_max_gain_db,
+                peak_ceiling=dub_audio_leveling_peak_ceiling,
+            )
+            logger.log(
+                "INFO",
+                "audio_level",
+                "segment_audio_leveled",
+                f"leveled output audio for {log_segment_id}",
+                segment_id=log_segment_id,
+                data=leveling_stats,
+            )
+            return leveling_stats
+        except Exception as exc:
+            logger.log(
+                "WARN",
+                "audio_level",
+                "segment_audio_leveling_failed",
+                f"leveling failed for {log_segment_id}",
+                segment_id=log_segment_id,
+                data={"error": str(exc)},
+            )
+            return {"applied": False, "error": str(exc)}
+
+    def resolve_existing_audio_path(seg_id: str, reused_record: Optional[Dict[str, Any]]) -> Optional[Path]:
+        """选择可复用的历史音频，优先 `seg_xxxx.wav`，避免 `*_missing.wav` 抢占。"""
+
+        if not reused_record:
+            return None
+        canonical_path = segment_dir / f"{seg_id}.wav"
+        if canonical_path.exists():
+            return canonical_path
+        raw_text = str(reused_record.get("tts_audio_path") or "").strip()
+        if not raw_text:
+            return None
+        reused_path = Path(raw_text).expanduser()
+        # 历史 manifest 可能指向 `seg_xxxx_missing.wav`，但同目录已有真实 `seg_xxxx.wav`。
+        sibling_canonical = reused_path.parent / f"{seg_id}.wav"
+        if sibling_canonical.exists():
+            return sibling_canonical
+        if reused_path.exists():
+            return reused_path
+        return None
+
+    def persist_single_segment_output(seg_id: str, selected_path: Path) -> Path:
+        """把当前分句输出收敛成单文件：同一 seg 只保留一种结果文件。"""
+
+        selected = selected_path.expanduser()
+        canonical_ok = segment_dir / f"{seg_id}.wav"
+        canonical_missing = segment_dir / f"{seg_id}_missing.wav"
+        is_missing = selected.name.endswith("_missing.wav")
+        target = canonical_missing if is_missing else canonical_ok
+        counterpart = canonical_ok if is_missing else canonical_missing
+
+        if selected.exists():
+            try:
+                same_file = selected.resolve() == target.resolve()
+            except Exception:
+                same_file = False
+            if not same_file:
+                shutil.copy2(selected, target)
+
+        try:
+            counterpart.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return target
 
     for idx, (subtitle, translated_text) in enumerate(zip(subtitles, translated_lines), start=1):
         seg_id = f"seg_{idx:04d}"
@@ -1024,23 +1492,48 @@ def synthesize_segments(
         )
         source_text = subtitle["text"]
         current_text = (translated_text or "").strip() if prefer_translated_text else (translated_text or source_text)
+        segment_has_speakable_content = _has_speakable_content(current_text)
 
-        if redub_line_indices is not None and idx not in redub_line_indices:
+        # 断点续传默认优先复用已有分句音频，避免从第 1 句开始重配并覆盖历史结果。
+        # 局部重配（redub_line_indices）仍保持“仅未选中行复用”的原语义。
+        should_try_reuse_existing = bool(existing_records_by_id) and (
+            redub_line_indices is None or idx not in redub_line_indices
+        )
+        if should_try_reuse_existing:
             reused = (existing_records_by_id or {}).get(seg_id) if existing_records_by_id else None
-            reused_audio = Path(str(reused.get("tts_audio_path") or "")).expanduser() if reused else None
-            if reused and reused_audio and reused_audio.exists():
+            reused_audio = resolve_existing_audio_path(seg_id, reused)
+            reused_status = str(reused.get("status") or "").strip().lower() if reused else ""
+            # 普通 resume 只复用 done/manual_review（兼容旧 manifest 缺失 status 的情况），
+            # 让历史失败行仍可重新合成；局部 redub 则沿用旧逻辑只要有文件就复用。
+            resume_reuse_allowed = redub_line_indices is not None or reused_status in {"", "done", "manual_review"}
+            if reused and reused_audio is not None and reused_audio.exists() and resume_reuse_allowed:
                 reused_record = dict(reused)
+                reused_output = persist_single_segment_output(seg_id, reused_audio)
                 reused_record["source_text"] = source_text
                 reused_record["translated_text"] = current_text
                 reused_record["start_sec"] = round(start_sec, 3)
                 reused_record["end_sec"] = round(end_sec, 3)
                 reused_record["target_duration_sec"] = round(target_duration, 3)
                 reused_record["segment_type"] = "speech" if _has_speakable_content(current_text) else "non_speech"
+                reused_record["tts_audio_path"] = str(reused_output)
+                reused_record["audio_leveling_applied"] = bool(reused_record.get("audio_leveling_applied", False))
+                reused_record["audio_leveling_target_rms"] = round(
+                    float(reused_record.get("audio_leveling_target_rms", dub_audio_leveling_target_rms) or dub_audio_leveling_target_rms),
+                    4,
+                )
+                reused_record["audio_leveling_input_rms"] = reused_record.get("audio_leveling_input_rms")
+                reused_record["audio_leveling_output_rms"] = reused_record.get("audio_leveling_output_rms")
+                reused_record["audio_leveling_gain_db"] = reused_record.get("audio_leveling_gain_db")
+                reused_record["audio_leveling_peak_before"] = reused_record.get("audio_leveling_peak_before")
+                reused_record["audio_leveling_peak_after"] = reused_record.get("audio_leveling_peak_after")
+                reused_record["audio_leveling_active_duration_sec"] = reused_record.get("audio_leveling_active_duration_sec")
+                reused_record["audio_leveling_peak_limited"] = bool(reused_record.get("audio_leveling_peak_limited", False))
+                reused_record["audio_leveling_error"] = reused_record.get("audio_leveling_error")
                 history = list(reused_record.get("attempt_history") or [])
                 history.append(
                     {
                         "attempt_no": 0,
-                        "action": "reuse_existing",
+                        "action": "resume_reuse_existing" if redub_line_indices is None else "reuse_existing",
                         "input_text": current_text,
                         "actual_duration_sec": reused_record.get("actual_duration_sec"),
                         "delta_sec": reused_record.get("delta_sec"),
@@ -1066,6 +1559,102 @@ def synthesize_segments(
                         }
                     )
                 continue
+
+        if _is_omnivoice_target_duration_unsafe(
+            tts_backend=tts_backend,
+            effective_target_duration_sec=effective_target_duration,
+            has_speakable_content=segment_has_speakable_content,
+        ):
+            reason_detail = _build_omnivoice_duration_precheck_reason_detail(
+                effective_target_duration_sec=effective_target_duration,
+                requested_target_duration_sec=target_duration,
+                borrowed_gap_sec=borrowed_gap_sec,
+            )
+            logger.log(
+                "WARN",
+                "tts",
+                "segment_tts_precheck_rejected",
+                f"{seg_id} rejected by omnivoice duration precheck",
+                segment_id=seg_id,
+                data={
+                    "effective_target_duration_sec": round(effective_target_duration, 3),
+                    "requested_target_duration_sec": round(target_duration, 3),
+                    "borrowed_gap_sec": round(borrowed_gap_sec, 3),
+                    "safe_floor_sec": round(float(DEFAULT_OMNIVOICE_QUALITY_MIN_TARGET_SEC), 1),
+                },
+            )
+            output_path = segment_dir / f"{seg_id}_missing.wav"
+            actual_best = _write_missing_audio_placeholder(
+                output_path=output_path,
+                target_duration_sec=target_duration,
+            )
+            output_path = persist_single_segment_output(seg_id, output_path)
+            delta_best = actual_best - target_duration
+            effective_delta_best = actual_best - effective_target_duration
+            records.append(
+                {
+                    "id": seg_id,
+                    "start_sec": round(start_sec, 3),
+                    "end_sec": round(end_sec, 3),
+                    "target_duration_sec": round(target_duration, 3),
+                    "source_text": source_text,
+                    "translated_text": current_text,
+                    "segment_type": "speech" if segment_has_speakable_content else "non_speech",
+                    "voice_ref_path": str(seg_ref_audio_path),
+                    "tts_audio_path": str(output_path),
+                    "actual_duration_sec": round(actual_best, 3),
+                    "delta_sec": round(delta_best, 3),
+                    "effective_target_duration_sec": round(effective_target_duration, 3),
+                    "borrowed_gap_sec": round(borrowed_gap_sec, 3),
+                    "effective_delta_sec": round(effective_delta_best, 3),
+                    "selection_score": None,
+                    "duration_error_ratio": None,
+                    "prosody_distance": None,
+                    "status": "manual_review",
+                    "retry_count": 0,
+                    "attempt_history": [
+                        {
+                            "attempt_no": 0,
+                            "action": "omnivoice_duration_precheck",
+                            "input_text": current_text,
+                            "actual_duration_sec": None,
+                            "delta_sec": None,
+                            "result": "fail",
+                            "error": reason_detail,
+                            "data": {
+                                "effective_target_duration_sec": round(effective_target_duration, 3),
+                                "requested_target_duration_sec": round(target_duration, 3),
+                                "borrowed_gap_sec": round(borrowed_gap_sec, 3),
+                                "safe_floor_sec": round(float(DEFAULT_OMNIVOICE_QUALITY_MIN_TARGET_SEC), 1),
+                            },
+                            "ts": _iso_now(),
+                        }
+                    ],
+                    "audio_leveling_applied": False,
+                    "audio_leveling_target_rms": round(float(dub_audio_leveling_target_rms), 4),
+                    "audio_leveling_input_rms": None,
+                    "audio_leveling_output_rms": None,
+                    "audio_leveling_gain_db": 0.0,
+                    "audio_leveling_peak_before": None,
+                    "audio_leveling_peak_after": None,
+                    "audio_leveling_active_duration_sec": 0.0,
+                    "audio_leveling_peak_limited": False,
+                    "audio_leveling_error": None,
+                }
+            )
+            manual_review.append(
+                {
+                    "segment_id": seg_id,
+                    "reason_code": OMNIVOICE_DURATION_PRECHECK_REASON_CODE,
+                    "reason_detail": reason_detail,
+                    "last_delta_sec": round(delta_best, 3),
+                    "last_effective_delta_sec": round(effective_delta_best, 3),
+                    "last_attempt_no": 0,
+                    "error_code": OMNIVOICE_DURATION_PRECHECK_ERROR_CODE,
+                    "error_stage": "tts_precheck",
+                }
+            )
+            continue
 
         attempts: List[Dict[str, Any]] = []
         attempt_artifacts: List[Path] = []
@@ -1118,6 +1707,7 @@ def synthesize_segments(
             try:
                 synthesize_text_once(
                     tts_backend=tts_backend,
+                    fallback_tts_backend=fallback_tts_backend,
                     index_tts_via_api=index_tts_via_api,
                     index_tts_api_url=index_tts_api_url,
                     index_tts_api_timeout_sec=index_tts_api_timeout_sec,
@@ -1133,6 +1723,15 @@ def synthesize_segments(
                     index_top_k=index_top_k,
                     index_temperature=index_temperature,
                     index_max_text_tokens=index_max_text_tokens,
+                    omnivoice_root=omnivoice_root,
+                    omnivoice_python_bin=omnivoice_python_bin,
+                    omnivoice_model=omnivoice_model,
+                    omnivoice_device=omnivoice_device,
+                    omnivoice_via_api=omnivoice_via_api,
+                    omnivoice_api_url=omnivoice_api_url,
+                    ref_text=source_text,
+                    target_lang=target_lang,
+                    target_duration_sec=effective_target_duration,
                     text=current_text,
                     output_path=raw_path,
                 )
@@ -1166,30 +1765,106 @@ def synthesize_segments(
             min_valid_duration = max(0.20, min(0.60, target_duration * 0.25))
             invalid_audio = _audio_is_effectively_silent(raw_path) or actual < min_valid_duration
             if invalid_audio:
-                failure_reason_code = "tts_invalid_audio"
-                failure_error_code = "E-TTS-002"
-                failure_stage = "tts"
-                attempts.append(
-                    {
-                        "attempt_no": attempt_no,
-                        "action": "validate_audio",
-                        "input_text": current_text,
-                        "actual_duration_sec": round(actual, 3),
-                        "delta_sec": round(actual - target_duration, 3),
-                        "result": "fail",
-                        "error": f"E-TTS-002 invalid audio output (too short/silent, min={min_valid_duration:.2f}s)",
-                        "ts": _iso_now(),
-                    }
-                )
-                if seg_ref_audio_path != ref_audio_path:
-                    seg_ref_audio_path = ref_audio_path
-                    ref_key = str(seg_ref_audio_path.resolve()) if seg_ref_audio_path.exists() else str(seg_ref_audio_path)
-                    if ref_key not in ref_fp_cache:
-                        ref_fp_cache[ref_key] = _extract_prosody_fingerprint(seg_ref_audio_path)
-                    reference_fp = ref_fp_cache.get(ref_key)
-                if attempt_no < max_retry:
-                    continue
-                break
+                fallback_used = False
+                fallback_backend = (fallback_tts_backend or "none").strip().lower()
+                if fallback_backend == "omnivoice" and (tts_backend or "").strip().lower() != "omnivoice":
+                    fallback_path = segment_dir / f"{seg_id}_a{attempt_no}_fallback.wav"
+                    attempt_artifacts.append(fallback_path)
+                    try:
+                        synthesize_text_once(
+                            tts_backend=fallback_backend,
+                            fallback_tts_backend="none",
+                            index_tts_via_api=index_tts_via_api,
+                            index_tts_api_url=index_tts_api_url,
+                            index_tts_api_timeout_sec=index_tts_api_timeout_sec,
+                            tts_qwen=tts_qwen,
+                            qwen_prompt_items=qwen_prompt_items,
+                            tts_index=tts_index,
+                            ref_audio_path=seg_ref_audio_path,
+                            index_emo_audio_prompt=seg_emo_audio_prompt,
+                            index_emo_alpha=index_emo_alpha,
+                            index_use_emo_text=index_use_emo_text,
+                            index_emo_text=index_emo_text,
+                            index_top_p=index_top_p,
+                            index_top_k=index_top_k,
+                            index_temperature=index_temperature,
+                            index_max_text_tokens=index_max_text_tokens,
+                            omnivoice_root=omnivoice_root,
+                            omnivoice_python_bin=omnivoice_python_bin,
+                            omnivoice_model=omnivoice_model,
+                            omnivoice_device=omnivoice_device,
+                            omnivoice_via_api=omnivoice_via_api,
+                            omnivoice_api_url=omnivoice_api_url,
+                            ref_text=source_text,
+                            target_lang=target_lang,
+                            target_duration_sec=effective_target_duration,
+                            text=current_text,
+                            output_path=fallback_path,
+                        )
+                        fallback_actual = audio_duration(fallback_path)
+                        fallback_invalid = _audio_is_effectively_silent(fallback_path) or fallback_actual < min_valid_duration
+                        attempts.append(
+                            {
+                                "attempt_no": attempt_no,
+                                "action": "fallback_tts_after_invalid_audio",
+                                "input_text": current_text,
+                                "actual_duration_sec": round(fallback_actual, 3),
+                                "delta_sec": round(fallback_actual - target_duration, 3),
+                                "result": "pass" if not fallback_invalid else "fail",
+                                "error": None
+                                if not fallback_invalid
+                                else (
+                                    "E-TTS-002 invalid fallback audio output "
+                                    f"(too short/silent, min={min_valid_duration:.2f}s)"
+                                ),
+                                "ts": _iso_now(),
+                            }
+                        )
+                        if not fallback_invalid:
+                            raw_path = fallback_path
+                            actual = fallback_actual
+                            invalid_audio = False
+                            fallback_used = True
+                    except Exception as fallback_exc:
+                        attempts.append(
+                            {
+                                "attempt_no": attempt_no,
+                                "action": "fallback_tts_after_invalid_audio",
+                                "input_text": current_text,
+                                "actual_duration_sec": None,
+                                "delta_sec": None,
+                                "result": "fail",
+                                "error": f"E-TTS-001 {type(fallback_exc).__name__}: {fallback_exc}",
+                                "ts": _iso_now(),
+                            }
+                        )
+                if fallback_used:
+                    pass
+                elif invalid_audio:
+                    failure_reason_code = "tts_invalid_audio"
+                    failure_error_code = "E-TTS-002"
+                    failure_stage = "tts"
+                    attempts.append(
+                        {
+                            "attempt_no": attempt_no,
+                            "action": "validate_audio",
+                            "input_text": current_text,
+                            "actual_duration_sec": round(actual, 3),
+                            "delta_sec": round(actual - target_duration, 3),
+                            "result": "fail",
+                            "error": f"E-TTS-002 invalid audio output (too short/silent, min={min_valid_duration:.2f}s)",
+                            "ts": _iso_now(),
+                        }
+                    )
+                    if seg_ref_audio_path != ref_audio_path:
+                        seg_ref_audio_path = ref_audio_path
+                        ref_key = str(seg_ref_audio_path.resolve()) if seg_ref_audio_path.exists() else str(seg_ref_audio_path)
+                        if ref_key not in ref_fp_cache:
+                            ref_fp_cache[ref_key] = _extract_prosody_fingerprint(seg_ref_audio_path)
+                        reference_fp = ref_fp_cache.get(ref_key)
+                    if attempt_no < max_retry:
+                        continue
+                    break
             delta = actual - target_duration
             delta_effective = actual - effective_target_duration
             abs_delta = abs(delta_effective)
@@ -1212,6 +1887,38 @@ def synthesize_segments(
             )
 
             if force_fit_timing:
+                # OmniVoice 已经支持原生 duration 控制，阈值内优先保留原始尾音，
+                # 避免再次 fit(含 atrim)造成句尾字被截断。
+                if primary_backend_name == "omnivoice" and abs_delta * 1000 <= delta_pass_ms:
+                    attempts.append(
+                        {
+                            "attempt_no": attempt_no,
+                            "action": "fit_timing_skip_tail_preserve",
+                            "input_text": current_text,
+                            "actual_duration_sec": round(actual, 3),
+                            "delta_sec": round(delta, 3),
+                            "result": "pass",
+                            "error": None,
+                            "data": {
+                                "effective_target_sec": round(effective_target_duration, 3),
+                                "borrowed_gap_sec": round(borrowed_gap_sec, 3),
+                                "effective_delta_sec": round(delta_effective, 3),
+                            },
+                            "ts": _iso_now(),
+                        }
+                    )
+                    maybe_update_best(
+                        evaluate_candidate(
+                            path=raw_path,
+                            actual_sec=actual,
+                            delta_sec=delta,
+                            attempt_no=attempt_no,
+                            action="fit_timing_skip_tail_preserve",
+                        )
+                    )
+                    final_status = "done"
+                    retry_count = attempt_no
+                    break
                 fit_path = segment_dir / f"{seg_id}_a{attempt_no}_fit.wav"
                 try:
                     fit_audio_to_duration(
@@ -1287,6 +1994,32 @@ def synthesize_segments(
                 break
 
             if abs_delta * 1000 <= delta_rewrite_ms:
+                # OmniVoice 在短句场景下再次 atempo 容易损伤句首辅音，
+                # 优先保留模型原始波形，避免“吞前词”。
+                if primary_backend_name == "omnivoice":
+                    omnivoice_natural_pass_ms = max(delta_pass_ms, min(delta_rewrite_ms, 260.0))
+                    if abs_delta * 1000 <= omnivoice_natural_pass_ms:
+                        attempts.append(
+                            {
+                                "attempt_no": attempt_no,
+                                "action": "omnivoice_keep_natural_no_atempo",
+                                "input_text": current_text,
+                                "actual_duration_sec": round(actual, 3),
+                                "delta_sec": round(delta, 3),
+                                "result": "pass",
+                                "error": None,
+                                "data": {
+                                    "effective_target_sec": round(effective_target_duration, 3),
+                                    "borrowed_gap_sec": round(borrowed_gap_sec, 3),
+                                    "effective_delta_sec": round(delta_effective, 3),
+                                    "natural_pass_ms": round(float(omnivoice_natural_pass_ms), 1),
+                                },
+                                "ts": _iso_now(),
+                            }
+                        )
+                        final_status = "done"
+                        retry_count = attempt_no
+                        break
                 tempo = _clamp(actual / effective_target_duration, atempo_min, atempo_max)
                 adjusted_path = segment_dir / f"{seg_id}_a{attempt_no}_atempo.wav"
                 try:
@@ -1389,16 +2122,64 @@ def synthesize_segments(
                     )
 
         if best is None:
-            output_path = segment_dir / f"{seg_id}_missing.wav"
-            sf.write(str(output_path), np.zeros(1600, dtype=np.float32), 16000)
-            actual_best = 0.1
-            delta_best = actual_best - target_duration
-            best_score = None
-            best_duration_error_ratio = None
-            best_prosody_distance = None
+            reused = (existing_records_by_id or {}).get(seg_id) if existing_records_by_id else None
+            rescue_audio = resolve_existing_audio_path(seg_id, reused)
+            rescue_is_missing = rescue_audio is not None and rescue_audio.name.endswith("_missing.wav")
+            # 兜底保护：本轮失败时若历史存在真实 `seg_xxxx.wav`，优先保留旧音频，避免合并阶段被 missing 覆盖。
+            if rescue_audio is not None and rescue_audio.exists() and not rescue_is_missing:
+                output_path = persist_single_segment_output(seg_id, rescue_audio)
+                leveling_stats = {
+                    "applied": False,
+                    "input_active_rms": (reused or {}).get("audio_leveling_input_rms"),
+                    "output_active_rms": (reused or {}).get("audio_leveling_output_rms"),
+                    "applied_gain_db": (reused or {}).get("audio_leveling_gain_db", 0.0),
+                    "peak_before": (reused or {}).get("audio_leveling_peak_before"),
+                    "peak_after": (reused or {}).get("audio_leveling_peak_after"),
+                    "active_duration_sec": (reused or {}).get("audio_leveling_active_duration_sec", 0.0),
+                    "peak_limited": bool((reused or {}).get("audio_leveling_peak_limited", False)),
+                    "error": (reused or {}).get("audio_leveling_error"),
+                    "skipped": True,
+                    "reason": "reuse_existing_after_failed_attempts",
+                }
+                actual_best = audio_duration(output_path)
+                delta_best = actual_best - target_duration
+                best_score = None
+                best_duration_error_ratio = None
+                best_prosody_distance = None
+                attempts.append(
+                    {
+                        "attempt_no": max_retry,
+                        "action": "reuse_existing_after_failed_attempts",
+                        "input_text": current_text,
+                        "actual_duration_sec": round(actual_best, 3),
+                        "delta_sec": round(delta_best, 3),
+                        "result": "pass",
+                        "error": None,
+                        "ts": _iso_now(),
+                    }
+                )
+                reused_status = str((reused or {}).get("status") or "").strip().lower()
+                final_status = "done" if reused_status == "done" else "manual_review"
+            else:
+                output_path = segment_dir / f"{seg_id}_missing.wav"
+                # 失败占位音频统一采样率，避免和正常 TTS 片段拼接时出现采样率不一致。
+                sf.write(
+                    str(output_path),
+                    np.zeros(int(DEFAULT_MISSING_AUDIO_SR * 0.1), dtype=np.float32),
+                    DEFAULT_MISSING_AUDIO_SR,
+                )
+                output_path = persist_single_segment_output(seg_id, output_path)
+                leveling_stats = {"applied": False, "skipped": True, "reason": "missing_placeholder"}
+                actual_best = 0.1
+                delta_best = actual_best - target_duration
+                best_score = None
+                best_duration_error_ratio = None
+                best_prosody_distance = None
         else:
             output_path = segment_dir / f"{seg_id}.wav"
             shutil.copy2(best["path"], output_path)
+            output_path = persist_single_segment_output(seg_id, output_path)
+            leveling_stats = maybe_level_output_audio(output_path, log_segment_id=seg_id)
             actual_best = float(best["actual_sec"])
             delta_best = float(best["delta_sec"])
             best_score = float(best["selection_score"])
@@ -1448,6 +2229,16 @@ def synthesize_segments(
             "status": final_status if final_status == "done" else "manual_review",
             "retry_count": retry_count,
             "attempt_history": attempts,
+            "audio_leveling_applied": bool(leveling_stats.get("applied")),
+            "audio_leveling_target_rms": round(float(dub_audio_leveling_target_rms), 4),
+            "audio_leveling_input_rms": leveling_stats.get("input_active_rms"),
+            "audio_leveling_output_rms": leveling_stats.get("output_active_rms"),
+            "audio_leveling_gain_db": leveling_stats.get("applied_gain_db"),
+            "audio_leveling_peak_before": leveling_stats.get("peak_before"),
+            "audio_leveling_peak_after": leveling_stats.get("peak_after"),
+            "audio_leveling_active_duration_sec": leveling_stats.get("active_duration_sec"),
+            "audio_leveling_peak_limited": bool(leveling_stats.get("peak_limited", False)),
+            "audio_leveling_error": leveling_stats.get("error"),
         }
         records.append(record)
 

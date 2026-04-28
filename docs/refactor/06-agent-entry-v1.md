@@ -18,7 +18,7 @@ Agent V1 是产品内使用帮助助手，不是自动执行代理。
 | 项目 | 决策 |
 |---|---|
 | 入口 | 右下角浮动抽屉。 |
-| 模型 | DeepSeek `deepseek-chat`。 |
+| 模型 | DeepSeek `deepseek-v4-flash`。 |
 | Base URL | `https://api.deepseek.com`。 |
 | API Key | 用户输入优先，其次 `DEEPSEEK_API_KEY`。 |
 | 能力 | 使用帮助、报错解释、下一步建议。 |
@@ -155,7 +155,7 @@ Prompt 必须固定写入以下边界：
 |---|---|
 | SDK | 复用 `openai` Python package 的 OpenAI-compatible client。 |
 | 默认 base URL | `https://api.deepseek.com`。 |
-| 默认 model | `deepseek-chat`。 |
+| 默认 model | `deepseek-v4-flash`。 |
 | timeout | 第一版使用 30 秒。 |
 | temperature | `0.2`，降低排查建议发散。 |
 | API key | 仅内存使用，不写入日志、不写入响应、不写入 localStorage。 |

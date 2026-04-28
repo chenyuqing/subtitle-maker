@@ -5,6 +5,7 @@ import argparse
 import gc
 import importlib
 import json
+import os
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -19,6 +20,8 @@ import torch
 DEFAULT_INDEX_TTS_ROOT = Path("/Users/tim/Documents/vibe-coding/MVP/index-tts-1108").resolve()
 DEFAULT_CFG_PATH = (DEFAULT_INDEX_TTS_ROOT / "checkpoints" / "config.yaml").resolve()
 DEFAULT_MODEL_DIR = (DEFAULT_INDEX_TTS_ROOT / "checkpoints").resolve()
+DEFAULT_AUTO_RESTART_REQUESTS = 50
+AUTO_RESTART_EXIT_CODE = 75
 
 
 def _ensure_file(path_text: str, field_name: str) -> Path:
@@ -46,12 +49,29 @@ def _load_index_tts_class(root_dir: Path) -> Type[Any]:
     return module.IndexTTS2
 
 
+def _resolve_runtime_device(requested_device: str) -> str:
+    """解析 Index-TTS 运行设备，避免本机不支持 MPS 时在首个请求才崩溃。"""
+
+    normalized = str(requested_device or "").strip().lower()
+    if normalized and normalized != "auto":
+        return normalized
+    if torch.cuda.is_available():
+        return "cuda"
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is not None and bool(mps_backend.is_available()):
+        return "mps"
+    return "cpu"
+
+
 class ServerState:
     def __init__(self, cfg: Dict[str, Any]):
         self.tts: Optional[Any] = None
         self.cfg = cfg
         self.lock = threading.Lock()
         self.index_tts_cls = _load_index_tts_class(Path(cfg["indextts_root"]))
+        self.requests_served = 0
+        self.restart_after_requests = max(0, int(cfg.get("auto_restart_requests") or 0))
+        self.restart_pending = False
 
     def _build_tts(self) -> Any:
         return self.index_tts_cls(
@@ -79,6 +99,26 @@ class ServerState:
             torch.cuda.empty_cache()
         gc.collect()
         return True
+
+    def record_successful_synthesis(self) -> bool:
+        """记录一次成功请求；达到阈值时标记服务应在响应后轮换。"""
+
+        self.requests_served += 1
+        if self.restart_after_requests <= 0:
+            return False
+        if self.requests_served < self.restart_after_requests:
+            return False
+        self.restart_pending = True
+        return True
+
+    def health_payload(self) -> Dict[str, Any]:
+        """输出健康检查扩展字段，便于观察轮换状态。"""
+
+        return {
+            "requests_served": int(self.requests_served),
+            "restart_after_requests": int(self.restart_after_requests),
+            "restart_pending": bool(self.restart_pending),
+        }
 
 
 state: Optional[ServerState] = None
@@ -128,6 +168,7 @@ class IndexTTSRequestHandler(BaseHTTPRequestHandler):
                 "loaded": state.tts is not None,
                 "model": "IndexTTS2",
                 "cfg": state.cfg,
+                **state.health_payload(),
             }
         )
 
@@ -195,14 +236,25 @@ class IndexTTSRequestHandler(BaseHTTPRequestHandler):
             raise RuntimeError("synthesis finished but output file missing")
 
         info = sf.info(str(output_path))
+        should_restart = False
+        with state.lock:
+            should_restart = state.record_successful_synthesis()
         self._send_json(
             {
                 "ok": True,
                 "output_path": str(output_path),
                 "duration_sec": float(info.duration),
                 "sample_rate": int(info.samplerate),
+                "requests_served": int(state.requests_served),
+                "restart_pending": bool(state.restart_pending),
             }
         )
+        if should_restart:
+            try:
+                self.wfile.flush()
+            except Exception:
+                pass
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
 
 
 def parse_args() -> argparse.Namespace:
@@ -212,11 +264,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--indextts-root", default=str(DEFAULT_INDEX_TTS_ROOT))
     parser.add_argument("--cfg-path", default=str(DEFAULT_CFG_PATH))
     parser.add_argument("--model-dir", default=str(DEFAULT_MODEL_DIR))
-    parser.add_argument("--device", default="mps")
+    parser.add_argument("--device", default="auto")
     parser.add_argument("--use-fp16", action="store_true")
     parser.add_argument("--use-accel", action="store_true")
     parser.add_argument("--use-torch-compile", action="store_true")
     parser.add_argument("--load-on-startup", action="store_true")
+    parser.add_argument(
+        "--auto-restart-requests",
+        type=int,
+        default=int(os.environ.get("INDEX_TTS_AUTO_RESTART_REQUESTS", str(DEFAULT_AUTO_RESTART_REQUESTS))),
+    )
     return parser.parse_args()
 
 
@@ -234,22 +291,27 @@ def main() -> int:
     if not model_dir.exists():
         raise SystemExit(f"model_dir not found: {model_dir}")
 
+    resolved_device = _resolve_runtime_device(args.device)
     state = ServerState(
         cfg={
             "indextts_root": str(indextts_root),
             "cfg_path": str(cfg_path),
             "model_dir": str(model_dir),
-            "device": args.device,
+            "device": resolved_device,
             "use_fp16": bool(args.use_fp16),
             "use_accel": bool(args.use_accel),
             "use_torch_compile": bool(args.use_torch_compile),
+            "auto_restart_requests": max(0, int(args.auto_restart_requests)),
         },
     )
     if bool(args.load_on_startup):
         state.ensure_loaded()
 
     server = ThreadingHTTPServer((args.host, args.port), IndexTTSRequestHandler)
-    print(f"Index-TTS API listening on http://{args.host}:{args.port}")
+    print(
+        f"Index-TTS API listening on http://{args.host}:{args.port} "
+        f"(device={resolved_device}, pid={os.getpid()})"
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -259,6 +321,8 @@ def main() -> int:
         if state is not None:
             with state.lock:
                 state.release()
+    if state is not None and state.restart_pending:
+        return AUTO_RESTART_EXIT_CODE
     return 0
 
 

@@ -7,6 +7,8 @@ from .readwrite import (
     build_skipped_segment_manifest,
     load_batch_manifest,
     load_segment_manifest,
+    resolve_output_path,
+    resolve_preferred_segment_subtitle_path,
     write_manifest_json,
 )
 from .schema import BatchManifestView, BatchReplayOptions, SegmentManifestView
@@ -21,5 +23,7 @@ __all__ = [
     "build_skipped_segment_manifest",
     "load_batch_manifest",
     "load_segment_manifest",
+    "resolve_output_path",
+    "resolve_preferred_segment_subtitle_path",
     "write_manifest_json",
 ]

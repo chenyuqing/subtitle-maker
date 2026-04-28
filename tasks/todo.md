@@ -1,5 +1,210 @@
 # TODO
 
+## TODO（2026-04-27 上传 translated.srt 后强制重配 missing 行）
+- [x] 现状确认：上传 `translated.srt` 时后端跳过翻译并关闭 rewrite，`missing` 仅由 TTS 失败产生
+- [x] 后端新增“保持译文不变，强制重配指定 review 行”的入口，覆盖 `manual_review/missing` 补跑
+- [x] 前端接 review 面板动作，支持不改字幕文本直接触发重配
+- [x] OmniVoice API 增加逐请求日志，记录输入/输出/耗时/异常，便于排查中途掉线
+- [x] 定向验证：语法检查 + review/OmniVoice 相关单测
+
+## Review（2026-04-27 上传 translated.srt 后强制重配 missing 行）
+- 现状确认：
+  - Web 入口 [src/subtitle_maker/dubbing_cli_api.py::start_auto_dubbing()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py:1759) 在上传字幕文件时会把 `input_srt_kind` 透传为 `translated`；
+  - 运行日志 [segment_0001.jsonl](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/web_20260427_135229/longdub_20260427_215234/segment_jobs/segment_0001/logs/segment_0001.jsonl) 已确认 `translation_skipped_input_translated_srt` 与 `translation_rewrite_disabled`，因此这类任务里的 `missing` 不是翻译链路问题，而是 TTS 失败后留下的产物。
+- 修复：
+  - [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py)
+    - 新增 `_segment_row_needs_force_redub()`、`_collect_force_redub_review_indices()`，从 segment manifest 中识别 `*_missing.wav` / 失败态候选；
+    - 新增 `_execute_review_redub()`，统一“改字幕重配”和“保持字幕不变强制重配”两类事务，避免重复维护 segment rerun 逻辑；
+    - 新增 `POST /dubbing/auto/review/{task_id}/redub-failed`，支持不改 `translated.srt` 直接补跑失败句；
+    - 顺手修复 `save-and-redub` / `redub-failed` 在 `no_changes` / `no_candidates` 时误把任务状态留在 `running` 的问题。
+  - [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js) 与 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html)
+    - review 工具栏新增“重配失败句”按钮，直接调用新后端入口，不要求用户先改字幕文本。
+  - [tools/omnivoice_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/omnivoice_fastapi_server.py)
+    - 新增结构化服务端日志：`server_started`、`model_loading_started/finished`、`synthesize_started/finished/failed`、`model_released`；
+    - 日志包含 `request_id/output_path/text_length/text_preview/duration/elapsed_ms/error`，后续排查中途断联可直接看 `outputs/omnivoice_api.log`。
+- 回归测试：
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py)
+    - 新增 `test_review_redub_failed_reuses_existing_translated_text`
+    - 新增 `test_review_redub_failed_no_candidates_keeps_task_completed`
+    - 追加 `save-and-redub no_changes` 场景的状态保持断言
+- 验证证据：
+  - `uv run python -m py_compile src/subtitle_maker/dubbing_cli_api.py tools/omnivoice_fastapi_server.py tests/test_dubbing_cli_api.py`：通过
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js`：通过
+  - `uv run python -m unittest tests.test_dubbing_cli_api`：`Ran 61 tests ... OK`
+
+## TODO（2026-04-27 Auto Dubbing 断点续传）
+- [x] 后端新增 `POST /dubbing/auto/resume/{task_id}`，支持失败/取消任务从既有 `longdub_*` 批次续跑
+- [x] 命令拼装支持 `--resume-batch-dir` 透传，保证 Web 续跑可复用 CLI 现有 resume 语义
+- [x] 前端 V1/V2 增加“从失败处继续”按钮，并在失败状态展示、续跑后自动轮询新任务
+- [x] 补单测覆盖：续跑成功、状态拦截（非 failed/cancelled）、批次目录缺失
+- [x] 执行最小验证（语法检查 + 相关单测）并回填 Review
+
+## Review（2026-04-27 Auto Dubbing 断点续传）
+- 后端续跑入口：
+  - [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 新增 `POST /dubbing/auto/resume/{task_id}`。
+  - 仅允许 `failed/cancelled` 任务续跑；若已有其他活跃任务则返回 `409`。
+  - 续跑会自动解析原 `longdub_*` 目录、原输入媒体路径与历史参数，并创建新任务继续轮询。
+- 命令透传：
+  - [src/subtitle_maker/jobs/command_builder.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/jobs/command_builder.py) 的 `AutoDubbingCommandConfig` 新增 `resume_batch_dir`，并在命令中追加 `--resume-batch-dir`。
+  - 续跑路径由 Web 直接复用 `tools/dub_long_video.py` 已有的 resume 语义，不重造分段逻辑。
+- 前端交互：
+  - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 为 V1/V2 各新增“从失败处继续”按钮。
+  - [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js) 新增失败态按钮显隐、`/resume/{task_id}` 调用、续跑后自动切换到新 task 继续 poll。
+  - [src/subtitle_maker/static/style.css](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/style.css) 增加按钮布局样式。
+- 兼容补充：
+  - [src/subtitle_maker/jobs/recovery.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/jobs/recovery.py) 回填 `segment_minutes/min_segment_minutes` 到任务状态，便于历史任务续跑参数回放。
+  - [src/subtitle_maker/jobs/models.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/jobs/models.py) 同步新增对应字段类型。
+- 验证结果：
+  - `uv run python -m py_compile src/subtitle_maker/dubbing_cli_api.py src/subtitle_maker/jobs/command_builder.py src/subtitle_maker/jobs/recovery.py src/subtitle_maker/jobs/models.py tests/test_dubbing_cli_api.py tests/test_command_builder.py` 通过。
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js && node --check src/subtitle_maker/static/app.js` 通过。
+  - `uv run python -m unittest tests.test_command_builder tests.test_dubbing_cli_api`：`Ran 60 tests ... OK`。
+
+## TODO（2026-04-27 中断批次可见性修复）
+- [x] `batches` 列表从“仅 manifest”改为“longdub 目录全量可见”，包含中断批次
+- [x] `load-batch` 支持加载无 `batch_manifest.json` 的中断目录（作为 failed 可续跑任务）
+- [x] 前端 Restore 区补“已检测到 N 个结果文件夹/未检测到可加载结果”提示
+- [x] 回归测试覆盖中断批次列表与加载后续跑
+
+## Review（2026-04-27 中断批次可见性修复）
+- 根因：
+  - [src/subtitle_maker/jobs/recovery.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/jobs/recovery.py) 的 `list_available_batches()` 之前只扫描 `batch_manifest.json`，中断任务目录被直接过滤。
+- 修复点：
+  - `list_available_batches()` 改为扫描 `web_*/longdub_*` 目录，并返回 `has_manifest/status(incomplete|completed)`。
+  - 新增 `find_batch_dir_by_name()`，供无 manifest 的目录回查。
+  - [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `/dubbing/auto/load-batch` 在 manifest 缺失时改为“加载为 failed 中断任务”，并注入 `resume_batch_dir`，可直接走“从失败处继续”。
+  - [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js) 增加 Restore 列表状态提示，避免“空白无反馈”。
+- 验证：
+  - `uv run python -m py_compile src/subtitle_maker/jobs/recovery.py src/subtitle_maker/jobs/__init__.py src/subtitle_maker/dubbing_cli_api.py tests/test_dubbing_cli_api.py` 通过。
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js` 通过。
+  - `uv run python -m unittest tests.test_dubbing_cli_api tests.test_command_builder`：`Ran 62 tests ... OK`。
+
+## TODO（2026-04-27 OmniVoice 自动启动超时修复）
+- [x] 定位前端切换 index-tts -> OmniVoice 时 `auto-start failed` 的根因
+- [x] 修复后端 OmniVoice 自动启动等待策略（避免 120s 超时误杀）
+- [x] 修复 `start_omnivoice_api.sh` 健康检查超时控制，避免单次请求卡死
+- [x] 补回归测试并执行最小验证（单测 + 语法检查）
+
+## Review（2026-04-27 OmniVoice 自动启动超时修复）
+- 根因确认：
+  - 自动切换链路由 [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_auto_start_local_omnivoice()` 调用 `start_omnivoice_api.sh`。
+  - 该链路之前使用固定 `120s` 等待；当 OmniVoice 启动偏慢或 health 探活卡住时，会出现父进程等待窗口耗尽，脚本非 0 返回并在 stderr 出现 `Terminated: 15 nohup ...`，前端收到 `omnivoice auto-start failed`。
+- 修复点：
+  - [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py)：
+    - 自动启动超时改为可配置 `OMNIVOICE_AUTO_START_TIMEOUT_SEC`（默认 420s，范围 60~1800）。
+    - 脚本返回非 0 或触发超时后，追加一次健康探活；若服务已就绪则视为成功，不再误报失败。
+    - 向脚本透传 `OMNIVOICE_START_WAIT_SEC`，让脚本等待窗口与后端超时一致。
+  - [start_omnivoice_api.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/start_omnivoice_api.sh)：
+    - 新增 `OMNIVOICE_START_WAIT_SEC`（默认 180）与 `OMNIVOICE_CURL_TIMEOUT_SEC`（默认 2）；
+    - health 探活 `curl` 增加 `--max-time`；
+    - 启动轮询由固定 45 次改为按 `OMNIVOICE_START_WAIT_SEC` 可配置循环。
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py)：
+    - 新增 2 条回归：`_auto_start_local_omnivoice` 在“脚本非 0但服务已就绪”与“脚本超时但服务已就绪”两种场景不应失败。
+- 验证结果：
+  - `bash -n start_omnivoice_api.sh`：通过
+  - `uv run python -m py_compile src/subtitle_maker/dubbing_cli_api.py tests/test_dubbing_cli_api.py`：通过
+  - `uv run python -m unittest tests.test_dubbing_cli_api`：`Ran 52 tests ... OK`
+
+## 2026-04-27 OmniVoice 时长压缩丢尾字修复
+
+- [x] 记录问题：OmniVoice 句子超时后压缩到时间线时会丢掉句尾几个字
+- [x] 定位根因：OmniVoice 链路未透传目标时长，且 `force_fit_timing` 在阈值内仍强制 `fit_audio_to_duration(atrim)`，导致句尾更易被截断
+- [x] 修复：OmniVoice 增加 `duration` 透传（API/CLI），并在阈值内跳过二次 fit，优先保留原始尾音
+- [ ] 验证：复测粤语样例，检查超时句不再丢尾字（待你本地听感回归）
+
+## Review（2026-04-27 OmniVoice 时长压缩丢尾字修复）
+- 代码修复点：
+  - [src/subtitle_maker/backends/base.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/base.py)：`TtsSynthesisRequest` 新增 `target_duration_sec`。
+  - [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py)：OmniVoice API/CLI 透传 `duration`。
+  - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py)：逐句/分组合成都透传目标时长；OmniVoice 在 `force_fit_timing` 且已在阈值内时跳过二次 fit（`fit_timing_skip_tail_preserve`）。
+  - [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py)：兼容层 `synthesize_text_once` 同步透传 `target_duration_sec`。
+- 测试与校验：
+  - `uv run python -m compileall -q src/subtitle_maker tools tests` 通过。
+  - `uv run python -m unittest tests.test_dubbing_runtime` 通过（`Ran 12 tests ... OK`）。
+  - 新增回归覆盖：
+    - OmniVoice 请求包含 `target_duration_sec -> duration`。
+    - OmniVoice + `force_fit_timing=true` + 阈值内时不再调用 `fit_audio_to_duration`。
+
+## 2026-04-27 OmniVoice seg_0001_missing.wav 修复
+
+- [x] 定位 V2 任务失败根因（从 job/segment 日志提取 `E-TTS-001`）
+- [x] 修正 OmniVoice 启动默认模型为本地 checkpoints，避免依赖 HF 在线下载
+- [x] 兜底：`omnivoice_fastapi_server.py` 默认模型同步改为本地 checkpoints
+- [x] 实机验证：后台脚本启动 + `/synthesize` 成功产出 wav
+
+## Review（2026-04-27 OmniVoice seg_0001_missing.wav 修复）
+- 失败根因已确认：`segment_0001.jsonl` 报错 `E-TTS-001 omnivoice api http 500`，detail 为“无法连接 huggingface.co 且本地无缓存”，导致每句回退 `manual_review` 并生成 `seg_0001_missing.wav` 占位文件。
+- 修复文件：
+  - [start_omnivoice_api.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/start_omnivoice_api.sh)：`OMNIVOICE_MODEL` 默认值从 `k2-fsa/OmniVoice` 改为 `$OMNIVOICE_ROOT/omnivoice/checkpoints`。
+  - [tools/omnivoice_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/omnivoice_fastapi_server.py)：`DEFAULT_OMNIVOICE_MODEL` 改为本地 checkpoints 绝对路径。
+- 验证结果：
+  - `start_omnivoice_api.sh` 启动后 `/health` 返回 `model=/Users/tim/Documents/vibe-coding/MVP/OmniVoice/omnivoice/checkpoints`。
+  - 后台脚本模式 `/synthesize` 成功，产物 `/tmp/omnivoice_api_smoke2.wav` 存在且大小正常（`412880` bytes）。
+
+## 2026-04-27 TTS 懒汉式切换（单模型驻留）
+
+- [x] `start.sh` 默认模式改为懒启动：不预热 index-tts/OmniVoice
+- [x] 新增 `stop_omnivoice_api.sh`，提供与 index-tts 对称的停服脚本
+- [x] `dubbing_cli_api` 启动前改为“先停旧模型，再起新模型”
+- [x] review redub 链路复用同一套懒切换逻辑
+- [x] 脚本语法 + Python 语法校验
+
+## Review（2026-04-27 TTS 懒汉式切换）
+- `src/subtitle_maker/dubbing_cli_api.py` 新增 `_switch_tts_runtime_on_demand()`：`index-tts` 与 `omnivoice` 互切时会先停止对侧本地服务，再启动当前主后端服务，避免双模型常驻内存。
+- `src/subtitle_maker/dubbing_cli_api.py` 的 Auto Dubbing 启动参数归一化与 review redub 都已调用该函数，保证正式任务与重配任务行为一致。
+- 新增脚本 [stop_omnivoice_api.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/stop_omnivoice_api.sh)，并通过 `dubbing_cli_api` 在需要切换时由后端 CLI 调起。
+- `start.sh` 默认 `TTS_BACKEND=auto` 已改为懒启动（`INDEX_TTS_AUTO_START=0`、`OMNIVOICE_AUTO_START=0`），不再首启预热两套模型。
+
+## 2026-04-27 start.sh OmniVoice 测试启动链路
+
+- [x] `start.sh` 新增 `TTS_BACKEND` 启动档位（`index-tts` / `omnivoice` / `qwen`）
+- [x] `TTS_BACKEND=omnivoice` 时默认自动拉起 OmniVoice（8020），并默认关闭 index-tts 自动拉起，避免测试混淆
+- [x] `stop.sh` 同步补充 OmniVoice 进程与端口清理，避免测试后残留
+- [x] 脚本语法校验与端口探活验证
+
+## Review（2026-04-27 start.sh OmniVoice 测试启动链路）
+- `start.sh` 已支持通过环境变量切换启动档位：`TTS_BACKEND=omnivoice ./start.sh` 会优先保证 8020 服务可用，不再默认拉起 8010。
+- `start.sh` 仍保留显式覆盖能力：`INDEX_TTS_AUTO_START` 与 `OMNIVOICE_AUTO_START` 可单独强制开/关，兼容原有调试习惯。
+- `stop.sh` 已新增 OmniVoice 停止逻辑：匹配 `tools/omnivoice_fastapi_server.py`、清理 `:8020` 占用并删除 `omnivoice_api.pid`。
+
+## 2026-04-27 start.sh 交互体验修正（前端自由切换）
+
+- [x] `start.sh` 默认档位改为 `TTS_BACKEND=auto`，默认同时准备 index-tts 与 OmniVoice
+- [x] 保留显式档位：`index-tts` / `omnivoice` / `qwen`，用于定向压测
+- [x] 脚本语法校验
+
+## Review（2026-04-27 start.sh 交互体验修正）
+- 现在直接执行 `./start.sh` 会默认启动两套本地 TTS 服务（8010/8020），前端切换底座无需再手动补启动。
+- 如需单底座测试，仍可使用 `TTS_BACKEND=omnivoice ./start.sh` 或 `TTS_BACKEND=index-tts ./start.sh`。
+
+## 2026-04-27 OmniVoice 底座接入（自动拉起 + API 透传）
+
+- [x] 对齐 `start.sh` / `start_index_tts_api.sh` 启动模式，补 `start_omnivoice_api.sh` 作为本地 OmniVoice 启动入口
+- [x] 新增 `tools/omnivoice_fastapi_server.py`（`/health`、`/synthesize`、`/model/release`）
+- [x] `dubbing_cli_api` 增加 OmniVoice 健康检查、默认 URL 自动启动与失败回传
+- [x] `dubbing_cli_api` 增加 `omnivoice_via_api` / `omnivoice_api_url` 表单参数解析与任务状态透传
+- [x] `command_builder -> dub_pipeline -> manifest -> review redub` 全链路透传 `omnivoice_via_api` / `omnivoice_api_url`
+- [x] 补单测与回归：命令拼装、manifest 合约、runtime 解析、API 自动启动
+- [x] 前端侧边栏新增 OmniVoice 运行参数（API URL / via_api）并透传到 Auto Dubbing V1/V2 启动请求
+- [x] 增加保护：fallback=omnivoice 不触发自动拉起，仅 `tts_backend=omnivoice` 触发
+- [x] 侧边栏布局优化：TTS 底座模型从 DeepSeek 卡片拆分为独立控件
+- [x] DeepSeek API 卡片支持折叠（默认收起）并持久化折叠状态
+- [x] 交互简化：隐藏 OmniVoice API URL/via_api 前端控件，保持与 index-tts 一致的默认体验
+
+## Review（2026-04-27 OmniVoice 底座接入）
+- `src/subtitle_maker/dubbing_cli_api.py` 已新增 `DEFAULT_OMNIVOICE_API_URL`、`_check_omnivoice_service()`、`_auto_start_local_omnivoice()`、`_ensure_omnivoice_service()`；当 `tts_backend=omnivoice` 且 `omnivoice_via_api=true` 时会先探活，不可用则自动调用 `./start_omnivoice_api.sh`。
+- `src/subtitle_maker/dubbing_cli_api.py` 的 `/dubbing/auto/start` 与 `/dubbing/auto/start-from-project` 已新增表单字段 `omnivoice_via_api`、`omnivoice_api_url`，并写入任务状态和 CLI 命令。
+- `src/subtitle_maker/manifests/schema.py`、`src/subtitle_maker/manifests/readwrite.py`、`src/subtitle_maker/domains/dubbing/review.py` 已补齐 `omnivoice_via_api`、`omnivoice_api_url`，保证 load-batch 与 review redub 不丢参数。
+- `tools/dub_pipeline.py` 与 `tools/dub_long_video.py` 已把 `omnivoice_via_api`、`omnivoice_api_url` 写入/回放 manifest，和 `jobs/command_builder.py` 的新 flags 对齐。
+- `tests/test_command_builder.py`、`tests/test_dubbing_cli_api.py`、`tests/test_dubbing_runtime.py`、`tests/test_manifest_contracts.py` 已新增/更新断言，覆盖新字段和自动启动路径。
+- `src/subtitle_maker/templates/index.html`、`src/subtitle_maker/static/app.js`、`src/subtitle_maker/static/js/dubbingPanel.js` 已新增全局 OmniVoice 参数控件与请求透传：仅当侧边栏底座选择 OmniVoice 时显示并提交 `omnivoice_via_api` / `omnivoice_api_url`。
+- `src/subtitle_maker/templates/index.html` 与 `src/subtitle_maker/static/style.css` 已将 `TTS 底座模型` 从 DeepSeek 区块拆出为独立 `sidebar-tts-card`，避免配置混在同一卡片里。
+- `src/subtitle_maker/static/app.js` 已新增 DeepSeek 卡片折叠状态管理（`sm_deepseekCollapsed`），默认收起并支持本地持久化。
+- `src/subtitle_maker/templates/index.html`、`src/subtitle_maker/static/app.js`、`src/subtitle_maker/static/js/dubbingPanel.js` 已移除 OmniVoice API URL 与 via_api 的前端可见配置；前端只传 `tts_backend=omnivoice`，其余走后端默认值与环境变量。
+- `tests/test_dubbing_cli_api.py` 新增“主后端 omnivoice + via_api=false 可启动”与“fallback omnivoice 不自动拉起”断言，锁定触发边界。
+- 校验通过：`uv run python -m py_compile src/subtitle_maker/dubbing_cli_api.py src/subtitle_maker/domains/dubbing/review.py src/subtitle_maker/manifests/schema.py src/subtitle_maker/manifests/readwrite.py src/subtitle_maker/jobs/models.py src/subtitle_maker/jobs/recovery.py tools/dub_pipeline.py tools/dub_long_video.py tests/test_command_builder.py tests/test_dubbing_cli_api.py tests/test_dubbing_runtime.py tests/test_manifest_contracts.py`。
+- 校验通过：`node --check src/subtitle_maker/static/app.js`、`node --check src/subtitle_maker/static/js/dubbingPanel.js`。
+- 回归通过：`uv run python -m unittest tests.test_command_builder tests.test_dubbing_runtime tests.test_manifest_contracts tests.test_dubbing_cli_api`，`Ran 69 tests ... OK`。
+
 ## 2026-04-20 ASR 智能分句（DeepSeek hybrid）
 
 - [x] Spec-1：审计 DeepSeek 可复用能力与 ASR 断句接入点（带代码出处）
@@ -554,9 +759,10 @@
 - [x] Spec-1：审计当前 TTS 接线点、失败回退点、OmniVoice 依赖约束与可接入边界（带代码出处）
 - [x] Spec-2：确认“第二备胎”的触发规则、隔离形态与精确改动范围
 - [x] Spec-3：确认风险、兼容性、验证方式与回退策略
-- [ ] HARD-GATE：等用户确认后实施
-- [ ] 实施：接入 OmniVoice 作为第二备胎
-- [ ] 验证：语法检查 + 定向回归 + 备胎触发样例复核
+- [x] HARD-GATE：等用户确认后实施
+- [x] 实施：接入 OmniVoice 作为第二备胎
+- [x] 验证：语法检查 + 定向回归 + 备胎触发样例复核
+- [x] 过程约束：实现进行中同步更新 `todo/lessons`，按阶段记录，不后补
 
 ## Review（2026-04-21 OmniVoice 第二备胎接入 Spec-2）
 - 触发规则已收敛：第一版只把 `OmniVoice` 作为 `index-tts` 的“硬失败备胎”，即仅在 `index-tts` 最终抛出 `E-TTS-001` 或产出无效音频时触发；纯时长偏差、manual_review、候选打分偏弱都不切到备胎，避免把主链路音色稳定性主动让给更弱约束的模型。
@@ -584,6 +790,17 @@
   2) 为 `tools/dub_pipeline.py` 增加定向单测，覆盖“主 backend 失败后触发 OmniVoice”、“无效音频触发备胎”、“非硬失败不触发备胎”、“备胎再次失败时错误聚合”；
   3) 保持现有 `py_compile` 与 `tests/test_dubbing_cli_api.py` 回归口径不退化；
   4) 最后做 1 条手工 smoke：使用可控坏输入或 mock forcing，让 `index-tts` 失败一次，确认 segment manifest / batch manifest / review redub 都能观测到备胎生效。
+
+## Review（2026-04-27 OmniVoice 第二备胎接入实施）
+- `src/subtitle_maker/backends/omni_voice.py` 已从占位实现升级为可运行 backend：通过外部 Python 进程执行 `python -m omnivoice.cli.infer`，支持 `model / ref_audio / ref_text / language / device` 参数，并统一报错为 `E-TTS-001` 语义。
+- `src/subtitle_maker/domains/dubbing/pipeline.py` 已接入主备调度：`synthesize_text_once()` 先跑主 backend，失败后按 `fallback_tts_backend` 切 `omnivoice`；若主备都失败会聚合错误摘要。逐句链路新增“无效音频后直切备胎一次”逻辑，grouped 链路在静音重试阶段会优先改用备胎 backend。
+- `tools/dub_pipeline.py` 已新增并校验参数：`--fallback-tts-backend`、`--omnivoice-root`、`--omnivoice-python-bin`、`--omnivoice-model`、`--omnivoice-device`；当 fallback=omnivoice 时会校验必填路径/模型。
+- `src/subtitle_maker/jobs/command_builder.py`、`src/subtitle_maker/dubbing_cli_api.py`、`src/subtitle_maker/domains/dubbing/review.py` 已打通启动与 review-redub 透传，`load-batch` 回填后可继续保持相同 fallback 配置。
+- `src/subtitle_maker/manifests/schema.py` 与 `src/subtitle_maker/manifests/readwrite.py` 已扩展 replay 字段：`fallback_tts_backend` + `omnivoice_*`，并在 batch/segment 成功与失败 manifest 都持久化。
+- `tools/dub_long_video.py` 已移除 `tts_backend="index-tts"` 硬编码，改为从透传参数写入 batch manifest（含 fallback 配置）。
+- 验证通过：
+  - `uv run python -m compileall -q src/subtitle_maker tools tests`
+  - `uv run python -m unittest tests.test_command_builder tests.test_manifest_contracts tests.test_dubbing_runtime tests.test_dubbing_cli_api`（`Ran 63 tests ... OK`）
 
 ## 2026-04-21 长视频上传字幕空分段崩溃修复
 
@@ -1509,3 +1726,1087 @@
 - 本轮验证：
   - `node --check src/subtitle_maker/static/app.js`：通过
   - 布局与可见性由用户在页面回归验证（Step 2 仅显示 transcribe，Step 3 仅显示 results）。
+
+## Review（2026-04-27 侧边栏 TTS 底座切换）
+- 已完成前端入口改造：在左侧 `DeepSeek API` 卡片下方新增 `TTS 底座模型` 下拉框（`index-tts` / `OmniVoice`），默认 `index-tts`。
+  - 模板变更： [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html)
+  - 样式变更： [src/subtitle_maker/static/style.css](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/style.css)
+- 已完成前端全局状态收口：
+  - `app.js` 新增 `global-tts-backend` 读取、`sm_globalTtsBackend` 本地持久化、`getGlobalTtsBackend()` 对外 getter。
+  - 通过依赖注入把 getter 传入 Auto Dubbing 子模块，避免 V1/V2 各自维护一套状态。
+  - 代码位置： [src/subtitle_maker/static/app.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js)
+- 已完成 Auto Dubbing 参数透传：
+  - `dubbingPanel.js::buildCommonStartFormData()` 统一追加 `tts_backend`，因此 V1/V2 两条启动链路都会带上当前全局底座模型。
+  - 代码位置： [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js)
+- 约束说明：
+  - 这轮只新增“前端切换与参数透传”，不改 OmniVoice 运行时配置输入；若后端未配置 OmniVoice 所需路径参数，切到 `OmniVoice` 启动任务仍会由后端返回配置错误。
+
+## Review（2026-04-27 OmniVoice 运行参数后端绑定）
+- 已完成 `tts_backend=omnivoice` 主后端链路打通：
+  - [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的请求归一化已放开 `omnivoice`，并在主后端或备胎后端任一使用 OmniVoice 时统一校验运行参数。
+  - 新增环境变量回退：`OMNIVOICE_ROOT`、`OMNIVOICE_PYTHON_BIN`、`OMNIVOICE_MODEL`、`OMNIVOICE_DEVICE`，用于前端未显式传参时的后端默认绑定。
+- 已完成命令透传修复：
+  - [src/subtitle_maker/jobs/command_builder.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/jobs/command_builder.py) 改为“主后端或备胎只要有 OmniVoice，就透传 `--omnivoice-*` 参数”，避免 `tts_backend=omnivoice` 时命令缺参。
+- 已完成 CLI 运行时对齐：
+  - [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 放开 `--tts-backend omnivoice` 校验；
+  - 同文件修复加载分支：主后端为 OmniVoice 时不再错误执行 index-tts 健康检查/模型预热。
+- 新增回归测试：
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 新增“主后端 OmniVoice + 环境变量绑定”成功用例，以及“缺少运行参数”失败用例。
+  - [tests/test_command_builder.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_command_builder.py) 新增“主后端 OmniVoice 仍透传运行参数”用例。
+- 验证结果：
+  - `uv run python -m py_compile src/subtitle_maker/dubbing_cli_api.py src/subtitle_maker/jobs/command_builder.py tools/dub_pipeline.py tests/test_dubbing_cli_api.py tests/test_command_builder.py`
+  - `uv run python -m unittest tests.test_command_builder`：`Ran 4 tests ... OK`
+  - `uv run python -m unittest tests.test_dubbing_cli_api`：`Ran 46 tests ... OK`
+
+## TODO（2026-04-27 字幕回写热修）
+- [x] 定位“save-and-redub 后 final 字幕仍旧版本”的根因，并给出最小改动修复方案
+- [x] 修复 `rebuild_batch_outputs` 的字幕重建条件，确保存在有效输入时就能刷新 `translated_full.srt` / `dubbed_final_full.srt`
+- [x] 补一条回归测试：存在跳过 segment 时，review 重配后 final 字幕仍应更新
+- [x] 跑最小验证（相关单测 + 语法检查），并回填 Review
+
+## Review（2026-04-27 字幕回写热修）
+- 根因 1（后端重建条件过严）：
+  - `tools/repair_bad_segments.py::rebuild_batch_outputs()` 之前要求 `translated_srt_inputs/source_srt_inputs` 数量必须等于 `segment_entries` 才重建 full 字幕。
+  - 当 batch 中存在“跳过段/空字幕段”时，这个条件永远不成立，导致 review 重配后 `final/translated_full.srt` 不刷新，播放器字幕仍是旧文案。
+- 根因 2（路径优先级错误）：
+  - 同函数之前优先使用 segment manifest 里的 `paths.translated_srt`/`paths.dubbed_final_srt`。
+  - 若这些路径仍指向历史文件且文件存在，会覆盖 `segment/subtitles/*.srt` 的最新文本，重建仍拿旧字幕。
+- 修复措施：
+  - 字幕重建改为“有有效输入就重建”，不再要求每个 segment 都有字幕输入。
+  - 段内字幕路径改为优先读取 `segment/subtitles/source.srt`、`translated.srt`、`dubbed_final.srt`，仅在不存在时回退 manifest 路径。
+  - 前端 `autoLoadAutoDubSubtitles()` 增加 cache bust，避免 review 重配后播放器读取到浏览器旧缓存字幕。
+- 回归测试：
+  - `tests/test_dubbing_cli_api.py::test_rebuild_batch_outputs_updates_final_subtitles_when_some_segments_are_skipped`
+  - 覆盖“一个有效 segment + 一个跳过 segment”场景，验证 `translated_full.srt` / `dubbed_final_full.srt` 会更新为新文本。
+- 验证证据：
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js`：通过
+  - `uv run python -m py_compile tools/repair_bad_segments.py tests/test_dubbing_cli_api.py`：通过
+  - `uv run python -m unittest tests.test_dubbing_cli_api`：`Ran 50 tests ... OK`
+
+## TODO（2026-04-27 断点续传覆盖旧音频修复）
+- [x] 定位“resume 从第 1 句重配并覆盖 seg_*.wav”的根因分支
+- [x] 修复 `synthesize_segments`：普通 resume 默认复用已有有效句子音频，只重配缺失/失败句
+- [x] 新增回归测试，确保 `redub_line_indices=None` 时不会再次调用 TTS
+- [x] 执行最小验证并记录结果
+
+## Review（2026-04-27 断点续传覆盖旧音频修复）
+- 根因：
+  - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的 `synthesize_segments()` 仅在 `redub_line_indices` 非空且当前行未选中时才复用旧记录。
+  - 普通 resume（`redub_line_indices=None`）会跳过复用分支，导致从第 1 句开始重新合成并覆盖原有 `seg_*.wav`。
+- 修复：
+  - 调整复用条件为：
+    - 局部 redub：保持旧语义（未选中行复用）；
+    - 普通 resume：若已有记录且音频存在，并且状态是 `done/manual_review`（兼容旧 manifest 缺失状态），则直接复用。
+  - 复用时写入 `attempt_history.action=resume_reuse_existing`，便于后续排查是否命中续跑复用。
+- 测试：
+  - 新增 [tests/test_dubbing_runtime.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_runtime.py) 用例 `test_synthesize_segments_resume_reuses_existing_record_without_redub_indices`，断言 resume 情况下不调用 `synthesize_text_once`。
+- 验证证据：
+  - `uv run python -m py_compile src/subtitle_maker/domains/dubbing/pipeline.py tests/test_dubbing_runtime.py`：通过
+  - `uv run python -m unittest tests.test_dubbing_runtime tests.test_dubbing_cli_api tests.test_command_builder`：`Ran 78 tests ... OK`
+
+## TODO（2026-04-27 本地媒体加载后播放器空白修复）
+- [x] 排查主上传链路与播放器 `src` 赋值路径，确认空白场景发生在流地址不可用时无回退
+- [x] 修复前端播放器源切换策略：本地 `ObjectURL` 先预览，上传成功后切到 `/stream/...`，失败自动回退本地源
+- [x] 增加播放器错误提示与占位恢复，避免黑屏无反馈
+- [x] 执行前端语法检查并记录结果
+
+## Review（2026-04-27 本地媒体加载后播放器空白修复）
+- 根因：
+  - [src/subtitle_maker/static/app.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js) 的 `handleMediaUpload()` 只在上传完成后把播放器切到后端 `/stream/...`，没有可用回退源。
+  - 一旦流地址加载失败（服务端临时不可达、浏览器对该容器/编码解析失败等），占位已被隐藏，用户只能看到“空黑播放器”。
+- 修复：
+  - 新增 `setVideoSourceWithFallback()`：统一设置主源与回退源；
+  - 新增 `setupVideoPlaybackFallback()`：监听 `video.error`，优先回退到本地 `ObjectURL`，并显示状态提示；
+  - 上传流程改为“先本地预览，再切后端流”，并在每次新上传前释放旧 `ObjectURL` 防止内存泄露。
+- 验证证据：
+  - `node --check src/subtitle_maker/static/app.js`：通过
+
+## TODO（2026-04-27 load-batch 播放器误载 segment 音频修复）
+- [x] 定位 `input_media` 解析链路，确认 `batch_manifest.input_media_path` 被写成 `segments/segment_0001.wav` 时会导致播放器只加载 8 分钟音频
+- [x] 修复 `resume` 输入媒体选择：优先回溯 `uploads/dubbing/<task_id>/` 原视频，分段音频仅作兜底
+- [x] 修复 `artifact/input_media` 下载解析：同样优先原视频，避免 load-batch 预览拿到 segment 音频
+- [x] 补回归测试并跑通 `tests.test_dubbing_cli_api`
+
+## Review（2026-04-27 load-batch 播放器误载 segment 音频修复）
+- 根因：
+  - 某些中断/续跑批次会把 `batch_manifest.input_media_path` 记录成 `segments/segment_0001.wav`。
+  - 前端 load-batch 的播放器依赖 `input_media_url`（后端 artifact `input_media`），因此会加载“仅 segment-1 的音频”而不是原视频。
+- 修复：
+  - [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 新增批次输入媒体优先级解析：
+    - 优先 `uploads/dubbing/<web任务id>/` 下的原始上传视频；
+    - 再用 manifest 中的 `input_media_path`；
+    - 分段音频只在无其他候选时兜底。
+  - 同步应用到 `resume`（`_resolve_resume_input_media`）和 artifact 下载（`_resolve_artifact` 的 `input_media`）。
+  - 中断批次参数推断（`_infer_incomplete_batch_task_fields`）也改为优先填充原视频路径。
+- 回归测试：
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 新增：
+    - `test_load_incomplete_batch_prefers_uploaded_video_over_segment_audio`
+    - `test_input_media_artifact_prefers_uploaded_video_when_manifest_points_segment_audio`
+- 验证证据：
+  - `uv run python -m py_compile src/subtitle_maker/dubbing_cli_api.py tests/test_dubbing_cli_api.py`：通过
+  - `uv run python -m unittest tests.test_dubbing_cli_api`：`Ran 59 tests ... OK`
+
+## TODO（2026-04-27 恢复任务误用 missing 音频修复）
+- [x] 定位“同一 seg 同时存在 `seg_xxxx.wav` 与 `seg_xxxx_missing.wav`，合并却选 missing”的路径
+- [x] 修复逐句复用逻辑：恢复时优先选 `seg_xxxx.wav`，避免 manifest 旧路径指向 missing
+- [x] 修复合并逻辑：`compose_vocals_master` 也优先选同 ID 正常 wav，防止 missing 抢占
+- [x] 补回归测试并跑相关单测
+
+## Review（2026-04-27 恢复任务误用 missing 音频修复）
+- 根因：
+  - 恢复时 `existing_records_by_id` 从旧 manifest 读取 `tts_audio_path`，若该字段已是 `seg_xxxx_missing.wav`，即便同目录存在 `seg_xxxx.wav`，复用仍会命中 missing。
+  - 混音阶段此前直接读取 `segment["tts_audio_path"]`，不会自动回退到同 ID 的正常 wav，导致最终合并继续吃 missing。
+- 修复：
+  - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py)
+    - 新增 `resolve_existing_audio_path()`，恢复复用时优先 `seg_xxxx.wav`；
+    - 当本轮 TTS 全失败（`best is None`）但历史有可用 `seg_xxxx.wav` 时，兜底复用旧音频，不再直接产出 missing 覆盖混音输入。
+    - 新增 `persist_single_segment_output()`，强制同一 `seg_id` 最终仅保留一种文件（`seg_xxxx.wav` 或 `seg_xxxx_missing.wav`），杜绝双文件并存。
+  - [src/subtitle_maker/domains/media/compose.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/media/compose.py)
+    - 新增 `resolve_compose_audio_path()`，混音时优先同 ID 正常 wav，避免 `*_missing.wav` 抢占。
+- 回归测试：
+  - [tests/test_dubbing_runtime.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_runtime.py)
+    - `test_compose_vocals_master_prefers_non_missing_audio_when_both_exist`
+    - `test_synthesize_segments_resume_prefers_real_audio_over_missing_record_path`
+- 验证证据：
+  - `uv run python -m py_compile src/subtitle_maker/domains/dubbing/pipeline.py src/subtitle_maker/domains/media/compose.py tests/test_dubbing_runtime.py`：通过
+  - `uv run python -m unittest tests.test_dubbing_cli_api tests.test_dubbing_runtime`：`Ran 77 tests ... OK`
+
+## TODO（2026-04-27 Auto Dubbing V2 OmniVoice 中途掉线导致 missing）
+- [x] 定位本次 `missing` 的真实来源，区分“误用 `*_missing.wav`”和“TTS 真失败”
+- [x] 修复 `src/subtitle_maker/backends/omni_voice.py::OmniVoiceBackend.synthesize()`：本地 API 掉线后自动拉起并重试
+- [x] 补回归测试，覆盖“首轮连接失败但本地恢复后二次成功”的路径
+- [x] 跑定向验证，确认相关测试通过
+
+## Review（2026-04-27 Auto Dubbing V2 OmniVoice 中途掉线导致 missing）
+- 根因：
+  - 实际产物日志 [outputs/dub_jobs/web_20260427_124857/longdub_20260427_204902/segment_jobs/segment_0001/logs/segment_0001.jsonl](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/web_20260427_124857/longdub_20260427_204902/segment_jobs/segment_0001/logs/segment_0001.jsonl) 显示，`seg_0001`~`seg_0006` 正常，`seg_0007` 起连续报 `E-TTS-001 omnivoice api connect failed` / `Remote end closed connection without response`，说明是 OmniVoice API 中途掉线，不是后处理误判。
+  - 当前实现 [src/subtitle_maker/backends/omni_voice.py::OmniVoiceBackend.synthesize()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py:334) 在 API 失败后只做“释放模型 + 同地址重试”，不会重新拉起本地 `127.0.0.1:8020` 服务，因此服务一旦掉线，后续句子会持续落入 missing。
+- 修复：
+  - [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py)
+    - 新增 `_should_attempt_local_omnivoice_recovery()` 与 `_recover_local_omnivoice_service()`，只对本地默认 OmniVoice URL 的断连症状触发恢复；
+    - 恢复流程优先执行 `start_omnivoice_api.sh`，必要时再 `stop/start` 一次，避免本地僵死 listener 让后续整串句子直接 missing；
+    - `OmniVoiceBackend.synthesize()` 第二次重试前接入上述恢复逻辑，并把恢复失败摘要带回最终异常，便于后续排障。
+- 回归测试：
+  - [tests/test_dubbing_runtime.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_runtime.py)
+    - 新增 `test_omnivoice_backend_api_restarts_local_service_after_connect_failure`
+- 验证证据：
+  - `uv run python -m py_compile src/subtitle_maker/backends/omni_voice.py tests/test_dubbing_runtime.py`：通过
+  - `uv run python -m unittest tests.test_dubbing_runtime`：`Ran 20 tests ... OK`
+
+## TODO（2026-04-27 translated 模式短句合并 UI 语义修复）
+- [x] 梳理 Auto Dubbing V1/V2 面板里短句合并开关与字幕模式的联动状态
+- [x] 修复 `translated` 模式下的控件禁用、提示文案与提交保护，避免 source-only 选项误导用户
+- [x] 跑前端语法验证，并补充 review 记录
+
+## Review（2026-04-27 translated 模式短句合并 UI 语义修复）
+- 根因：
+  - [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js) 的 `buildCommonStartFormData()` 之前无条件读取 `shortMergeEnabledCheckbox.checked`，因此在 `translated` 模式下也会继续提交 `short_merge_enabled=true/false`。
+  - 同文件的 `syncShortMergeControls()` 之前只负责显示/隐藏阈值输入，不感知当前是 `source` 还是 `translated`，因此 UI 允许用户在 `translated` 直通模式下继续勾选 source-only 选项。
+  - [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 的 `load_or_transcribe_subtitles()` 实际只在 `persist_input_srt_to_source=True` 时才会执行 source 侧短句合并，所以之前属于“前端可选、后端实际忽略”的误导状态。
+- 修复：
+  - [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js)
+    - 新增 `resolveShortMergeAvailability()`，按 `Current Project / Standalone` 与 `source / translated` 推断短句合并是否可用；
+    - `syncShortMergeControls()` 现在会在 `translated` 模式下禁用 checkbox、隐藏阈值输入、更新提示文案，并在切回 `source` 时恢复用户之前的勾选意图；
+    - `buildCommonStartFormData()` 改为忽略 disabled 状态下的短句合并选项，杜绝继续把 source-only 参数带给后端。
+  - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html)
+    - V1 / V2 面板都补充了短句合并提示文案，明确说明该能力只对 source 字幕 / ASR 结果生效。
+- 验证证据：
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js`：通过
+
+## TODO（2026-04-27 translated 字幕短句合并能力 Spec）
+- [x] Spec-1：核实 `translated` 直通链路、现有 source merge 生效点、review/redub 句级假设（带代码出处）
+- [x] Spec-2：定义 `translated` merge 的用户语义、参数与最小改动面
+- [x] Spec-3：确认 review/redub/resume 风险、映射策略与验证口径
+- [x] HARD-GATE：等用户确认 Spec 后再实施
+
+## Spec-1（2026-04-27 translated 字幕短句合并能力）
+- 现状 1：当前 `translated` 输入的主语义是“跳过翻译，直接把上传字幕当作最终配音文本”。
+  - 依据： [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 的主流程在 `input_srt_is_translated` 分支里，先通过 `load_or_transcribe_subtitles(... persist_input_srt_to_source=False ...)` 读取上传字幕，然后在同文件的“translation”阶段直接执行 `translation_skipped_input_translated_srt` / `translation_rewrite_disabled`，不再调用翻译与 rewrite。
+- 现状 2：当前实现会尽量保留上传译文的句级时间轴，而不是重新整理句边界。
+  - 依据： [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 在 `input_srt_is_translated` 分支里会把 `grouped_synthesis` 关闭、把 `force_fit_timing` 关闭；相关逻辑在主流程初始化处，注释明确写了“strict start-time alignment”和“disable hard end fitting”。
+- 现状 3：现有短句合并能力严格属于 source 侧整理，不会作用到 translated 输入。
+  - 依据： [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 的 `load_or_transcribe_subtitles()` 只有在 `persist_input_srt_to_source=True and asr_balance_lines=True` 时才调用 `rebalance_source_subtitles()`；而 `rebalance_source_subtitles()` 内部才会继续触发 `merge_short_source_subtitles()`。
+- 现状 4：Web API 当前只认识一组 source merge 参数，没有独立的 translated merge 配置。
+  - 依据： [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_normalize_auto_dubbing_request()` 只解析 `short_merge_enabled` / `short_merge_threshold`，并把结果落到 `source_short_merge_enabled` / `source_short_merge_threshold`。
+- 现状 5：review/redub 现在默认假设“最终字幕行数”和“segment manifest 行数”一一对应。
+  - 依据： [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_build_review_line_mapping()` 用 segment manifest 行号顺序建立 `global_index -> local_index` 映射；`_execute_review_redub()` 又要求 `translated.srt` 与 `source.srt` 行数相等后，才能按 `local_index` 写回并调用 `_rerun_segment_with_translated_srt()`。
+- 现状 6：如果后面要做 translated merge，真正的敏感点不在 TTS 本身，而在 review/redub 如何继续按句定位。
+  - 依据： [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_collect_review_lines()`、`_build_review_line_mapping()`、`_build_segment_review_redub_plan()`、`_execute_review_redub()` 都是按“现有逐句索引”运作，没有额外的“merged line -> original line set”映射层。
+
+## Spec-2（2026-04-27 translated 字幕短句合并能力）
+- 推荐产品语义：
+  - 新增独立开关 `Merge short translated lines`，只在“实际输入模式 = translated”时展示；不复用现有 source merge 开关。
+  - 默认关闭；文案明确说明“会调整你上传字幕的句边界，但不改文字内容，也不会触发翻译 rewrite”。
+  - 阈值仍沿用当前秒数模型，建议保持与 source merge 一致的取值区间与默认值，避免用户理解两套不同刻度。
+  - 一旦开启，系统把“并句后的 translated cues”视为本次任务后续 review/redub/resume 的 authoritative 句单元；不再保留“按原上传行号继续审阅”的承诺。
+- 推荐执行时机：
+  - translated merge 只在“长视频任务初始启动”时执行一次，不在 review redub 或 segment resume 时重复执行。
+  - 依据 1： [src/subtitle_maker/jobs/command_builder.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/jobs/command_builder.py) 的 `build_segment_redub_command()` 当前固定传 `--input-srt-kind translated` 给局部重配；如果把“凡是 translated 输入都自动并句”写死到 CLI，会让 review redub 再次重排句边界。
+  - 依据 2： [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_execute_review_redub()` / `_rerun_segment_with_translated_srt()` 已经把段内 `translated.srt` 当成当前 authoritative 文本继续重跑，因此初始任务完成后不需要再次做 translated merge。
+- 推荐最小实现策略：
+  - 在 [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 复用现有时间窗并句算法，而不是再造第二套 translated 专用算法。
+  - 依据：同文件的 `maybe_merge_translated_input_subtitles()` 直接复用了字幕领域的时间窗并句实现；它只依赖 `subtitles + target_seconds + gap_threshold`，没有 translated 专属外部状态。
+  - 建议把 translated merge 放在“长视频初始编排阶段、`clip_subtitles_for_segment()` 之后、写入每段 `_input_segment.srt` 之前”，并且只允许 `resume_batch_dir is None` 时触发。这样不会跨 segment 合并，也不会在 review redub / batch resume 时重复改边界。
+  - 依据： [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的主循环已经在 `clip_subtitles_for_segment()` 后构造 `segment_subtitles`；把并句落在这里，后续 `run_segment_job()` 读到的就是本段 authoritative translated cues。
+- 推荐参数与传输面：
+  - Web/API/manifest/task 统一新增独立字段：
+    - `translated_short_merge_enabled`
+    - `translated_short_merge_threshold`
+    - `translated_short_merge_threshold_mode="seconds"`
+  - 不建议复用现有 `short_merge_enabled`，因为 [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_normalize_auto_dubbing_request()`、任务持久化块、以及 [src/subtitle_maker/manifests/schema.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/schema.py) 的 `BatchReplayOptions` 当前都把这组字段视为 source merge 配置。
+- 推荐最小改动面：
+  - 前端：
+    - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html)：为 V1/V2 面板新增 translated merge 独立控件与提示文案；
+    - [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js)：按 `subtitle_mode` / `project-subtitle-mode` 控制 source merge 与 translated merge 的互斥显示，并在 `buildCommonStartFormData()` 里分别提交两组参数；`restoreLoadedBatchControls()` 也要能回填该状态。
+  - API：
+    - [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py)：扩展 `/start`、`/start-from-project` 的 `Form(...)` 字段与 `_normalize_auto_dubbing_request()` 校验，并把新字段写入 task store / resume defaults / load-batch payload。
+  - 命令透传：
+    - [src/subtitle_maker/jobs/command_builder.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/jobs/command_builder.py) 的 `AutoDubbingCommandConfig` / `build_auto_dubbing_command()` 需要新增 CLI 参数；
+    - `SegmentRedubCommandConfig` / `build_segment_redub_command()` 不建议透传这组参数，避免 review redub 二次并句。
+  - CLI + manifest：
+    - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py)：在长视频初始编排层新增一次性 translated merge，并把配置写入 batch replay options；
+    - [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py)：新增 CLI flags 与 replay 字段持久化，但不在 segment pipeline 内再次执行 translated merge；
+    - [src/subtitle_maker/manifests/schema.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/schema.py) 与 [src/subtitle_maker/manifests/readwrite.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/readwrite.py)：持久化与回放新字段，保证 load-batch / incomplete resume 能正确回填。
+- 推荐不做的事（v1 范围外）：
+  - 不做“merged line -> original uploaded line indices” 的额外映射文件。
+  - 原因：如果在初始启动时就把合并后的 cues 作为 authoritative 句单元，现有 [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_build_review_line_mapping()` / `_execute_review_redub()` 可以继续成立，不需要引入第二套索引系统。
+  - 可追溯性仍然保留最低限度保障：Current Project 入口会通过 [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_write_subtitles_json_to_srt()` 先把输入字幕落盘；Standalone 上传场景也天然保留原始字幕文件。
+
+## Spec-3（2026-04-27 translated 字幕短句合并能力）
+- 主要风险 1：如果 translated merge 在 review redub / resume-job 阶段重复触发，会把当前段内 `translated.srt` 再次改边界，直接破坏局部重配定位。
+  - 依据： [src/subtitle_maker/jobs/command_builder.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/jobs/command_builder.py) 的 `build_segment_redub_command()` 固定透传 `--input-srt-kind translated`；[src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_execute_review_redub()` / `_rerun_segment_with_translated_srt()` 直接把段内 `subtitles/translated.srt` 当作 authoritative 文本继续跑。
+  - 决策：translated merge 只允许在初始长视频任务启动时执行；`save-and-redub`、`redub-failed`、`resume-job-dir` 都不得再次执行 translated merge。
+- 主要风险 2：如果新参数没有进入 task store / batch manifest / segment manifest / load-batch 恢复层，会出现“首跑生效、刷新页面后丢配置”的状态裂缝。
+  - 依据： [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的任务创建块会把 `source_short_merge_*` 写入 `_tasks`；`_build_resume_options()`、`_infer_incomplete_batch_task_fields()`、`/load-batch` 也都依赖这些回放字段。
+  - 依据： [src/subtitle_maker/manifests/readwrite.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/readwrite.py) 的 `_build_batch_options()` / `_build_segment_options()` / `build_batch_manifest()` / `build_segment_manifest()` 当前只读写 `source_short_merge_*`。
+  - 决策：translated merge 新字段必须与 source merge 一样，完整进入 task、manifest、load-batch、resume recovery 链路；不接受“仅本次内存态可见”。
+- 主要风险 3：translated merge 与 V2 时间轴标准化的先后顺序如果不稳定，会导致最终句边界不可预期，测试难以冻结。
+  - 依据： [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 会先读取全局输入字幕，再在主循环里通过 `clip_subtitles_for_segment()` 产出每段 cues；segment pipeline 本身不会二次执行 translated merge。
+  - 决策：实现时固定顺序为“读取全局输入字幕 -> 按段裁切 -> per-segment translated merge -> 写入 `_input_segment.srt` -> segment job 继续处理”。这个顺序一旦确认，就要用单测冻结。
+- 主要风险 4：并句后 `source_full.srt` 与 `translated_full.srt` 行数可能不一致，双语字幕和 review 文案要接受这种语义。
+  - 依据： [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_collect_review_lines()` 优先从 final `translated_full.srt` / `source_full.srt` 覆盖文本；它按“现有最终字幕顺序”展示，不要求 source/translated 文本来自同一原始上传行号。
+  - 决策：v1 接受“并句后 translated cues 是新的最终单位”；不承诺 review 里继续回显“上传前逐行对应关系”。这是功能语义的一部分，不当作 bug。
+- 主要风险 5：Current Project 模式与 Standalone 模式必须表现一致，否则用户会在两条入口看到不同并句结果。
+  - 依据： [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js) 的 `buildCurrentProjectRequest()` 与 `buildStandaloneRequest()` 最终都复用 `buildCommonStartFormData()`；只要新参数在这里统一追加，就能维持两条入口一致。
+  - 决策：新 translated merge 参数只能在公共表单拼装处统一生成，不能分别在 project / standalone 分支里散写。
+- 不纳入本轮范围的风险：
+  - 不解决“用户想回看原始上传的 translated 行号映射”这个更强需求。
+  - 不解决“review 阶段再次开启/关闭 translated merge 并重算所有行号”的高级工作流。
+  - 不改现有 source merge 算法本身，只复用其时间窗策略。
+
+## Spec-3 验证口径
+- 命令与参数透传：
+  - 在 [tests/test_command_builder.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_command_builder.py) 增加：
+    - `build_auto_dubbing_command()` 会带上 `--translated-short-merge-enabled/threshold`；
+    - `build_segment_redub_command()` 默认不带这组参数，确保 review redub 不会二次并句。
+- API 与 task/load-batch/recovery：
+  - 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 增加：
+    - `/start` 与 `/start-from-project` 接受 translated merge 参数并写入 task；
+    - `/load-batch` 能回填 translated merge 配置；
+    - incomplete batch / `/resume/{task_id}` 续跑时会保留 translated merge 配置，但不会把它转成 segment redub 参数。
+  - 在 [tests/test_job_recovery.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_job_recovery.py) 增加：
+    - `build_batch_task_updates()` / `build_loaded_batch_task()` 会保留新的 replay 字段。
+- Manifest 合同：
+  - 在 [tests/test_manifest_contracts.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_manifest_contracts.py) 增加：
+    - batch/segment manifest 写入并读取 `translated_short_merge_*`；
+    - legacy manifest 缺失该字段时，reader 能稳定回落到默认值。
+- 编排层算法与顺序：
+  - 在 [tests/test_dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dub_long_video.py) 增加：
+    - translated 输入开启 merge 时，会在 `clip_subtitles_for_segment()` 之后、写入 `_input_segment.srt` 之前按时间窗合并；
+    - translated 输入关闭 merge 时，分段输入行数与文本保持不变；
+    - gap 超过阈值时不跨静默合并；
+    - review redub / segment resume 不会重复触发 translated merge。
+- 最小手工 smoke：
+  - 用一份 3 行碎 translated.srt 启动 `translated merge=true` 的任务，确认 final `translated_full.srt` 行数减少，review 面板按新行数展示；
+  - 对其中 1 行执行 `save-and-redub` 或 `redub-failed`，确认只按合并后的行号重配，不会再次重新并句。
+
+## HARD-GATE（2026-04-27 translated 字幕短句合并能力）
+- Spec 已完整：现状、方案、风险、验证口径都已给出。
+- 已在你明确确认后进入实现阶段，并按本节方案完成落地。
+
+## Review（2026-04-27 translated 字幕短句合并能力）
+- 实现结果：
+  - Web 端已新增独立的 `translated_short_merge_enabled / translated_short_merge_threshold` 配置，并在 `translated` 模式下显示独立控件；`source` merge 与 `translated` merge 现在按输入模式互斥展示。
+  - API / task store / load-batch / resume recovery / manifest replay 已完整保留 `translated_short_merge_*` 字段，避免刷新页面或续跑后丢配置。
+  - 长视频初始编排层已在 [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的 `clip_subtitles_for_segment()` 之后、写入每段 `_input_segment.srt` 之前执行一次 translated merge；segment pipeline 只解析并持久化 replay 字段，不在 review redub / segment resume 阶段再次并句。
+  - `build_segment_redub_command()` 仍不透传 translated merge 参数，保持局部重配只针对当前 authoritative `translated.srt` 重跑。
+- 反向同步：
+  - 本次实现与早期 Spec 的偏差已修正回文档：真实执行点不在 `tools/dub_pipeline.py` 主流程，而在 `tools/dub_long_video.py` 的 per-segment 编排阶段。
+- 验证证据：
+  - `uv run python -m unittest tests.test_dub_long_video`：`Ran 2 tests ... OK`
+  - `uv run python -m unittest tests.test_command_builder tests.test_job_recovery tests.test_manifest_contracts tests.test_dub_long_video tests.test_dubbing_cli_api`：`Ran 77 tests ... OK`
+
+## Review（2026-04-27 translated merge smoke）
+- CLI smoke 命令：
+  - `uv run python tools/dub_long_video.py --input-media yue-test.mp4 --input-srt yue-test.srt --input-srt-kind translated --target-lang Chinese --out-dir ./outputs/dub_jobs_smoke --tts-backend index-tts --index-tts-via-api true --index-tts-api-url http://127.0.0.1:8010 --api-key smoke-key --translated-short-merge-enabled true --translated-short-merge-threshold 10`
+- 结果拆分：
+  - `translated merge` 本身已命中：CLI 输出明确记录 `Segment 01 translated merge: 3 -> 1 cues (merged_pairs=2, target=10s)`。
+  - 分段输入字幕已被合并为 1 行，见 [outputs/dub_jobs_smoke/longdub_20260427_230959/segment_jobs/segment_0001/subtitles/_input_segment.srt](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs_smoke/longdub_20260427_230959/segment_jobs/segment_0001/subtitles/_input_segment.srt)。
+  - segment manifest 已持久化 `translated_short_merge_enabled=true`、`translated_short_merge_threshold=10`，并保留 `grouped_synthesis=false`、`force_fit_timing=false`，见 [outputs/dub_jobs_smoke/longdub_20260427_230959/segment_jobs/segment_0001/manifest.json](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs_smoke/longdub_20260427_230959/segment_jobs/segment_0001/manifest.json)。
+  - 本轮 smoke 未走到最终 `translated_full.srt`，失败原因是 `index-tts` 底座返回 `E-TTS-001 index-tts api http 503`；这属于独立的 TTS 可用性问题，不是 translated merge 逻辑失效。
+
+## Review（2026-04-27 index-tts 启动诊断）
+- 修复内容：
+  - [tools/index_tts_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/index_tts_fastapi_server.py) 的默认设备参数已从硬编码 `mps` 改为 `auto`，并新增 `_resolve_runtime_device()` 统一解析运行设备。
+  - [start_index_tts_api.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/start_index_tts_api.sh) 已新增 `INDEX_TTS_DEVICE` 环境变量，并显式透传 `--device` 给 API server。
+  - 已新增单测 [tests/test_index_tts_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_index_tts_fastapi_server.py) 覆盖 `auto -> cpu` 兜底与显式设备保持。
+- 验证证据：
+  - `uv run python -m py_compile tools/index_tts_fastapi_server.py tests/test_index_tts_fastapi_server.py`：通过
+  - `uv run python -m unittest tests.test_index_tts_fastapi_server`：`Ran 2 tests ... OK`
+  - 沙箱外前台启动 `index_tts_fastapi_server.py --load-on-startup` 已成功加载模型并打印 `Index-TTS API listening on http://127.0.0.1:8010`。
+  - 重新跑 translated merge smoke 时，segment 日志已出现 `index_tts_api_ready` 与 `segment_tts_started`，并生成 `dubbed_segments/seg_0001_a0.wav`、`seg_0001_a1.wav`，说明本轮已跨过之前的 `index-tts api http 503` 阶段。
+
+## TODO（2026-04-28 配音音量统一策略 Spec）
+- [x] Spec-1：审计当前 TTS 产物、段内混音、batch 合并与最终导出阶段的音量处理点（带代码出处）
+- [x] Spec-2：确认统一音量的产品语义、归一化策略与最小改动面
+- [x] Spec-3：确认风险、回退开关、验证口径与回归范围
+- [x] HARD-GATE：已确认并开始实现
+- [x] 实施：新增句级活动语音归一化 helper，并接到 canonical dubbed audio 落盘路径
+- [x] 实施：补齐 command / manifest / load-batch / resume recovery 的音量配置透传
+- [x] 验证：语法检查 + 目标回归单测
+
+## Spec-1（2026-04-28 配音音量统一策略）
+- 现状 1：TTS backend 产出的单句音频目前没有统一响度归一化，backend 只负责“生成 / 分片拼接”，不负责调音量。
+  - 依据 1： [src/subtitle_maker/backends/index_tts.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/index_tts.py) 的 `IndexTtsBackend.synthesize()` 只是把分片生成后交给 `concat_generated_wavs()` 拼接，没有任何 gain / loudness 处理。
+  - 依据 2： [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py) 的 `OmniVoiceBackend.synthesize()` 只调用 CLI / API 输出 wav，也没有后置音量标准化。
+- 现状 2：Index-TTS 分片拼接阶段是裸 `ffmpeg concat`，不会把同一句内部多个 part 的响度拉齐。
+  - 依据： [src/subtitle_maker/domains/media/compose.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/media/compose.py) 的 `concat_generated_wavs()` 只执行 `ffmpeg -f concat ... -ac 1 -ar 22050`，没有 `loudnorm`、`volume`、`dynaudnorm` 或 RMS/LUFS 计算。
+- 现状 3：段内“配音总轨”构建阶段只是按时间轴把 wav 覆盖回 master，唯一音量相关处理是“防爆音 peak clamp”，不是统一响度。
+  - 依据： [src/subtitle_maker/domains/media/compose.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/media/compose.py) 的 `compose_vocals_master()` 把每句 wav 直接写进 `master[start:end] = wav`；最后只在 `peak > 0.99` 时按峰值缩回 `0.99`，没有按 LUFS / RMS 对每句做补偿。
+- 现状 4：最终背景音混音阶段对人声和 BGM 都固定 `volume=1.0`，所以如果 TTS 原始句子响度不一致，最终 mix 会原样保留下来。
+  - 依据： [src/subtitle_maker/domains/media/compose.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/media/compose.py) 的 `mix_with_bgm()` 使用 `[0:a]volume=1.0[v];[1:a]volume=1.0[b];[v][b]amix=...`，没有任何人声响度标准化、BGM ducking 或自适应增益。
+- 现状 5：长视频 batch 合并阶段也是裸拼接，不会在 segment 之间再做一层响度统一。
+  - 依据： [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的 `main()` 在全时轴输出时，对 `dubbed_vocals_full.wav` / `source_bgm_full.wav` 使用 `concat_wav_files()` 或 `build_full_timeline_*()`；对应 [src/subtitle_maker/domains/media/compose.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/media/compose.py) 的 `concat_wav_files()` 也只是 `ffmpeg concat`，没有 loudness pass。
+- 现状 6：当前 review / retry 判定只看“时长拟合”，不看响度偏差，因此系统不会把“过大/过小”句子识别成可重试或可审阅问题。
+  - 依据： [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 的主流程在 `synthesize_segments()` / `compose_vocals_master()` 之后，只基于 `delta_sec / effective_delta_sec / duration_error_ratio` 决定 `done / manual_review`；最新 smoke 产物 [manifest.json](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs_smoke/longdub_20260427_232306/segment_jobs/segment_0001/manifest.json) 的 `attempt_history` 和 `manual_review` 也只有时长字段，没有任何 loudness 指标。
+- 现状 7：因此“配音音量忽大忽小”不是单一后端 bug，而是整条链路缺少一个明确的“统一响度基准”步骤。
+  - 依据：从 backend 生成、分片拼接、句级 master、最终 mix 到 batch concat 的各层实现都没有 LUFS / RMS 标准化入口；当前唯一的音量保护是 `compose_vocals_master()` 里的峰值防削波。
+
+## Spec-2（2026-04-28 配音音量统一策略）
+- 推荐产品语义：
+  - “统一配音音量”定义为：把每条最终用于拼轨的配音句子统一到同一个**语音响度目标**，而不是把所有波形简单拉到同一峰值。
+  - 这一步只作用在 dubbed vocals，不改 source BGM，不改原视频整体响度；最终 mixed audio 只是继承“更一致的人声”。
+  - v1 目标是先解决“句与句忽大忽小”，不解决“BGM 遮人声”或整片广播级母带响度一致性。
+- 推荐算法：
+  - 不推荐只做 peak normalize。原因是峰值一致不等于听感一致，气声/齿音/爆破音会把峰值抬高，但整句听感仍然偏小。
+  - 不推荐只在最终 `dubbed_mix_full.wav` 上做一次整体 loudnorm。原因是这只能统一整片平均电平，不能修复句间相对差异；并且 [mix_with_bgm()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/media/compose.py) 之后人声已经和 BGM 混在一起，会把问题耦合复杂化。
+  - 推荐在**最终选中的句级 `seg_xxxx.wav`** 上做“活动语音 RMS/短窗响度归一化 + 峰值上限保护”：
+    - 以“去掉前后静音后的活动语音窗口”测量响度；
+    - 把活动语音拉到统一目标；
+    - 再用峰值上限保护避免削波；
+    - 对极端小声/极端大声句子设置最大增益变化夹具，避免噪声底被硬抬上来。
+  - 原因 1： [src/subtitle_maker/domains/dubbing/alignment.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/alignment.py) 的 `fit_audio_to_duration()` 会在短句尾部补静音（`apad`），如果拿整条成品 wav 直接算 RMS，会把带静音的短句误判成“太小”并过度放大。
+  - 原因 2：同文件的 `trim_silence_edges()` 已经证明“活动语音窗口”和“整条 wav”是两个不同概念；统一音量也应该沿用“只看有效语音”的思路。
+- 推荐执行时机：
+  - 主执行点放在 [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 里，**在 best attempt 已选定、`persist_single_segment_output()` 已把它收敛成 canonical `seg_xxxx.wav` 之后、写 record 之前**。
+  - 依据：同文件当前就是在 `best is not None` 分支里先 `shutil.copy2(best["path"], output_path)`，再 `persist_single_segment_output(seg_id, output_path)`，然后把 `tts_audio_path` 写入 record。这里插入音量统一，后面的 review / compose / mix / batch concat 都能自动复用统一后的文件。
+  - 不建议放在 backend 内部。原因是 backend 层不知道最终哪个 attempt 会被保留，也不知道后面是否还会 `trim / fit / atempo`；太早做会被后续重试和时长拟合破坏。
+  - 不建议只放在 `compose_vocals_master()`。原因是那样只能统一 master vocals，不能让 review 面板、局部 redub、段内 `seg_xxxx.wav` 播放都受益。
+- 推荐 v1 范围：
+  - 先统一**句级 canonical dubbed audio**；
+  - 保留现有 `compose_vocals_master()` 的 peak clamp 作为第二道防线；
+  - 最终 `mix_with_bgm()` 先不改 BGM 比例，也不加 ducking；
+  - batch 级 `dubbed_vocals_full.wav` / `dubbed_mix_full.wav` 也先不额外再跑全片 loudnorm，避免把“句级统一”和“整片母带”两个问题混在一起。
+- 推荐最小改动面：
+  - 音频处理 helper：
+    - [src/subtitle_maker/domains/media/compose.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/media/compose.py) 或新增同域 helper：新增“测活动语音响度 + 应用增益 + 峰值保护”的纯 wav 处理函数，复用现有 `numpy + soundfile` 栈，不额外引入外部依赖。
+  - 句级主流程：
+    - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py)：在 `persist_single_segment_output()` 之后对最终 `seg_xxxx.wav` 执行一次 loudness leveling，并把测得值/应用增益写入 record。
+  - Manifest / replay：
+    - [src/subtitle_maker/manifests/schema.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/schema.py) 与 [src/subtitle_maker/manifests/readwrite.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/readwrite.py)：记录 `dub_audio_leveling_enabled` 以及目标参数，避免 resume/load-batch 后语义漂移。
+  - API / 任务配置：
+    - 首轮可只走“后端默认开启 + manifest 持久化”，不急着把它做成前端新控件；先把质量问题压住，再决定是否暴露高级开关。
+- 作为技术总监的推荐方案：
+  - v1 采用“**句级活动语音 RMS 归一化 + 峰值上限保护 + 增益夹具**”，执行点放在 `seg_xxxx.wav` canonical 化之后。
+  - 不选“最终整片 loudnorm”为主方案；那适合母带阶段，不适合修句间忽大忽小。
+
+## Spec-3（2026-04-28 配音音量统一策略）
+- 主要风险 1：如果把音量统一放在“复用已有音频”的分支也重复执行，resume / redub 会对同一条 `seg_xxxx.wav` 反复归一化，造成累计失真。
+  - 依据： [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的复用分支会在 `resume_reuse_allowed` 命中时直接 `persist_single_segment_output(seg_id, reused_audio)`，然后把该文件继续写回 record。
+  - 决策：句级音量统一只能作用在“本轮新选中的 best/rescue 输出”上；对 `resume_reuse_existing` 分支默认跳过，除非未来显式做离线 repair 工具。
+- 主要风险 2：如果使用“整条 wav RMS”而不是“活动语音 RMS”，短句尾部补静音会被误当成小音量，导致增益过度。
+  - 依据： [src/subtitle_maker/domains/dubbing/alignment.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/alignment.py) 的 `fit_audio_to_duration()` 会在短句场景追加 `apad`；`trim_silence_edges()` 已经证明边缘静音需要单独处理。
+  - 决策：测量窗口必须剔除前后静音，统一活动语音响度，不得直接拿整条成品 wav 算平均能量。
+- 主要风险 3：如果增益上限不设夹具，极端小声句子会把底噪一起抬高，反而更难听。
+  - 依据：当前 backend 和 compose 层都没有噪声门或降噪步骤；见 [src/subtitle_maker/backends/index_tts.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/index_tts.py) / [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py) / [src/subtitle_maker/domains/media/compose.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/media/compose.py)。
+  - 决策：v1 必须设置最大增益变化范围，只做“温和拉齐”，不追求每句完全同响。
+- 主要风险 4：如果只在最终 `dubbed_mix_full.wav` 上统一，会把 BGM 一起重标定，既修不好句间波动，也会改变现有项目的背景乐平衡。
+  - 依据： [src/subtitle_maker/domains/media/compose.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/media/compose.py) 的 `mix_with_bgm()` 直接把 vocals 和 bgm 用 `amix` 合成；一旦之后再整体处理，已无法只针对人声。
+  - 决策：v1 不在最终 mix 层做主归一化；统一音量只作用在 canonical dubbed vocals。
+- 主要风险 5：如果不把“音量统一开关/参数”进入 task / manifest / load-batch / resume，后续续跑会出现同批次前后音量策略不一致。
+  - 依据：当前 short-merge 和 translated-merge 的 replay 字段已经通过 [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_normalize_auto_dubbing_request()`、`_build_resume_options()`、`_infer_incomplete_batch_task_fields()`，以及 [src/subtitle_maker/manifests/readwrite.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/readwrite.py) 的 batch/segment manifest 读写完整回放。
+  - 决策：若 v1 默认开启该能力，也至少要把 `dub_audio_leveling_enabled` 和目标参数写进 manifest；否则历史 batch 无法解释“为什么这批和那批听感不同”。
+- 主要风险 6：如果统一音量发生在 `actual_duration_sec` 计算之前，任何限幅/微调都可能污染当前时长评估与 manual review 判定。
+  - 依据： [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 先根据 candidate wav 计算 `actual_duration_sec / duration_error_ratio / selection_score`，再选择 `best` 并落成最终 `seg_xxxx.wav`。
+  - 决策：音量统一必须放在 `best` 已选定之后，只改最终保留文件，不参与 candidate 选择和时长打分。
+- 不纳入本轮范围的风险：
+  - 不解决“BGM 过大盖住人声”的 ducking/sidechain 问题。
+  - 不做广播级两遍 `loudnorm` 或全片 LUFS 母带流程。
+  - 不引入新的第三方 DSP 依赖，先复用 `numpy + soundfile`。
+
+## Spec-3 验证口径
+- 单句音量统一 helper：
+  - 新增单测，覆盖：
+    - 纯静音或极短 wav 不应报错；
+    - 大小声两条活动语音归一化后，RMS 差距明显收敛；
+    - 过大增益请求会被夹具限制；
+    - 峰值保护后不出现超过 1.0 的削波。
+- 句级主流程：
+  - 在 [tests/test_dubbing_runtime.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_runtime.py) 增加：
+    - `best` 选中后会对最终 `seg_xxxx.wav` 执行一次音量统一；
+    - `resume_reuse_existing` 分支不会重复归一化既有音频；
+    - `manual_review` / `done` 状态判定仍只由时长逻辑决定，不被音量步骤改变。
+- Replay / manifest：
+  - 在 [tests/test_manifest_contracts.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_manifest_contracts.py)、[tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py)、[tests/test_job_recovery.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_job_recovery.py) 增加：
+    - 新的音量统一配置能进入 task / batch manifest / load-batch / resume recovery；
+    - legacy manifest 缺失该字段时回落到稳定默认值。
+- 最小 smoke：
+  - 选两句明显一大一小的 TTS 句子跑一轮，检查最终 `segment_jobs/segment_xxxx/seg_*.wav` 或 canonical `seg_xxxx.wav` 的活动语音 RMS 差异显著收敛；
+  - 再确认 [final/translated_full.srt](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs_smoke/longdub_20260427_232306/final/translated_full.srt) 这类文本产物完全不受影响；
+  - 再跑一次 resume/review redub，确认历史复用音频不会被二次放大或缩小。
+
+## Review（2026-04-28 配音音量统一）
+- 核心实现：
+  - [src/subtitle_maker/domains/media/compose.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/media/compose.py) 新增 `normalize_speech_audio_level()`，按短窗活动语音 RMS 做句级响度统一，并加峰值上限保护与最大增益夹具。
+  - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 在逐句 `best` 输出和 grouped 最终输出上接入归一化；`resume_reuse_existing` 与“失败后复用旧音频”分支只继承旧统计，不重复处理。
+  - segment record 现在会写入 `audio_leveling_*` 观测字段，方便后续从 manifest 回看某句是否被拉高/压低过。
+- 配置透传：
+  - [src/subtitle_maker/jobs/command_builder.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/jobs/command_builder.py)、[tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py)、[tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 已新增 `dub_audio_leveling_*` 参数并完整回放。
+  - [src/subtitle_maker/manifests/schema.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/schema.py)、[src/subtitle_maker/manifests/readwrite.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/readwrite.py)、[src/subtitle_maker/jobs/recovery.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/jobs/recovery.py)、[src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 已把这组 hidden config 持久化到 task / batch manifest / load-batch / resume recovery。
+- 验证证据：
+  - `uv run python -m py_compile src/subtitle_maker/domains/media/compose.py src/subtitle_maker/domains/media/__init__.py src/subtitle_maker/domains/dubbing/pipeline.py src/subtitle_maker/jobs/command_builder.py src/subtitle_maker/manifests/schema.py src/subtitle_maker/manifests/readwrite.py src/subtitle_maker/jobs/models.py src/subtitle_maker/jobs/recovery.py src/subtitle_maker/dubbing_cli_api.py tools/dub_pipeline.py tools/dub_long_video.py tests/test_command_builder.py tests/test_job_recovery.py tests/test_manifest_contracts.py tests/test_dubbing_cli_api.py tests/test_dubbing_runtime.py`：通过
+  - `uv run python -m unittest tests.test_command_builder tests.test_job_recovery tests.test_manifest_contracts tests.test_dubbing_cli_api tests.test_dubbing_runtime`：`Ran 99 tests ... OK`
+
+## TODO（2026-04-28 Index-TTS 内存回收 + OmniVoice 隔离治理）
+- [x] Spec-1：审计 `index-tts` API 生命周期、现有 release/restart 能力、`omnivoice` 质量/`missing` 观测缺口（带代码出处）
+- [x] Spec-2：确认 `index-tts` 的“50 次后自动重启”策略落点，以及 `omnivoice` 的隔离修复方案
+- [x] Spec-3：确认风险、隔离边界、验证口径与回归范围
+- [x] HARD-GATE：已确认完整 Spec 并按方案实施
+
+## Spec-1（2026-04-28 Index-TTS 内存回收 + OmniVoice 隔离治理）
+- 现状 1：`index-tts` 服务端现在只有“按请求即时 synthesize”和“手动 release 模型”能力，没有“累计 N 次请求后自动 stop/start 重启”的机制。
+  - 依据 1： [tools/index_tts_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/index_tts_fastapi_server.py) 的 `IndexTTSRequestHandler._handle_synthesize()` 只处理单次 `/synthesize`，没有请求计数、内存水位或重启阈值状态。
+  - 依据 2：同文件的 `ServerState.release()` 只做 `del self.tts -> empty_cache -> gc.collect()`，不会退出进程、不会重新 spawn 服务。
+- 现状 2：当前链路里已经有 `index-tts api release after job`，但这只是“任务结束后卸载模型”，不是“服务重启”。
+  - 依据 1： [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 的 `main()` 在 `finally` 里根据 `should_release_index_tts_api` 调 `release_index_tts_api_model()`。
+  - 依据 2： [src/subtitle_maker/backends/index_tts.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/index_tts.py) 的 `release_index_tts_api_model()` 只调用 `/model/release`，不会 stop 进程。
+- 现状 3：项目已经具备独立的 `index-tts` start/stop/release 管理面，所以“跑 50 次自动重启”不需要碰 `omnivoice` 链路，只需要在 `index-tts` 服务侧或调度侧新增计数与本地 restart 触发。
+  - 依据 1： [src/subtitle_maker/index_tts_service.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/index_tts_service.py) 暴露了 `start_index_tts_service()`、`stop_index_tts_service()`、`release_index_tts_model()`。
+  - 依据 2： [src/subtitle_maker/app/routes/jobs.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/app/routes/jobs.py) 已有 `/model/index-tts/start`、`/model/index-tts/release`、`/model/index-tts/stop` 路由。
+  - 依据 3： [start_index_tts_api.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/start_index_tts_api.sh) 当前只是单次拉起服务并等待 `/health`，没有 watchdog 或按请求轮换逻辑。
+- 现状 4：从现有日志看，`index-tts` 确实会长期常驻一个进程，但日志里没有请求级计数、耗时或内存观测，无法在代码内判断“第 50 次”或“内存已经上涨到该重启了”。
+  - 依据 1： [tools/index_tts_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/index_tts_fastapi_server.py) 只打印 `Index-TTS API listening ...`，没有结构化请求日志。
+  - 依据 2：最新 [outputs/index_tts_api.log](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/index_tts_api.log) 可见服务启动与模型加载，但没有每次 `/synthesize` 的独立记录，也没有 RSS/显存采样。
+- 现状 5：`omnivoice` 当前的问题不只是不稳定，更关键的是“内容质量差但产物存在”时，后端会把它当作成功，不会自动判坏。
+  - 依据 1： [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py) 的 `OmniVoiceBackend.synthesize()` 只在 transport/连接类异常时走 `_should_attempt_local_omnivoice_recovery()`；只要 API 返回 `ok` 且输出文件存在，就算成功。
+  - 依据 2： [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的 `synthesize_segments()` 里，对音频有效性的判定仅是 `_audio_is_effectively_silent(raw_path) or actual < min_valid_duration`。也就是说，“说得很快、内容乱、但不静音”的音频会直接通过。
+- 现状 6：`omnivoice` 服务端当前的可观测性只能看“请求有没有完成、时长是多少”，看不到“内容是不是胡说”“语速是不是异常”。
+  - 依据 1： [tools/omnivoice_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/omnivoice_fastapi_server.py) 的 `OmniVoiceRequestHandler._handle_synthesize()` 只记录 `request_id/output_path/language/duration/text_preview/elapsed_ms/sample_rate`。
+  - 依据 2：最新 [outputs/omnivoice_api.log](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/omnivoice_api.log) 里，`synthesize_started` 与 `synthesize_finished` 各 `83` 条、`synthesize_failed` 为 `0`；这说明 transport 层都成功了，但日志本身无法解释“音频内容烂”。
+- 现状 7：`omnivoice` 的生成参数目前基本是固定默认值，没有按句长、目标时长、语言类型做更细粒度约束，因此“语速异常快”在服务层没有第二道保护。
+  - 依据： [tools/omnivoice_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/omnivoice_fastapi_server.py) 的 `ServerState.synthesize()` 直接把 `num_step/guidance_scale/speed/t_shift/denoise/postprocess_output/...` 从固定 cfg 或请求透传给 `model.generate()`；当前主链路只稳定透传了 `duration/language/ref_audio/ref_text`。
+- 现状 8：`missing` 在现有实现里主要还是“连接失败 / 空文件 / 静音 / 过短”的结果，不是“内容差”的结果；所以你感知到的“又烂又 occasionally missing”实际上是两类问题。
+  - 依据 1： [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py) 会把连接失败、HTTP 错误、输出缺失统一抛成 `E-TTS-001`。
+  - 依据 2： [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 会把静音/过短识别成 `tts_invalid_audio -> E-TTS-002`，并最终落到 `manual_review` 或 `seg_xxxx_missing.wav`。
+  - 依据 3：真实运行日志 [segment_0001.jsonl](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/web_20260427_135229/longdub_20260427_215234/segment_jobs/segment_0001/logs/segment_0001.jsonl) 已出现 `seg_0073 marked manual review`，错误码是 `E-TTS-002`，说明当前只会抓“无效音频”，不会抓“可播放但不可懂”。
+- 现状 9：可以把 `omnivoice` 修复严格隔离在 `omnivoice` 专属代码路径里，不影响当前 `index-tts` 逻辑链路。
+  - 依据 1： [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的 `synthesize_text_once()` 先按 `tts_backend` 分发，`index-tts` 和 `omnivoice` 是两条独立 backend 路径。
+  - 依据 2： [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 的 `main()` 在 `args.tts_backend == "index-tts"` 时走 `check_index_tts_service()`，在 `else` 分支只打印 `omnivoice_backend_selected`，说明预热/服务检查已经分离。
+  - 结论：如果后续只改 [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py)、[tools/omnivoice_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/omnivoice_fastapi_server.py) 以及 `omnivoice` 专属测试，不会碰 `index-tts` 的主合成链路。
+
+## Spec-2（2026-04-28 Index-TTS 内存回收 + OmniVoice 隔离治理）
+- `index-tts` 方案选项 A：继续沿用当前“每个 job 结束后 `/model/release`”策略，只是把 release 条件改成更频繁。
+  - 优点：改动最小，几乎只动 [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 和 [src/subtitle_maker/backends/index_tts.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/index_tts.py)。
+  - 不足：这不是进程重启，只是释放模型； [tools/index_tts_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/index_tts_fastapi_server.py) 的 `ServerState.release()` 仍留在同一个 Python 进程里，无法满足“跑 50 次后真正重启 API 服务”这个目标。
+- `index-tts` 方案选项 B：把“累计 50 次后 stop/start”放到 dubbing 调度层或 Web 路由层，由调用方计数后触发 `/stop -> /start`。
+  - 优点：不需要动 `index-tts` 服务内部。
+  - 不足 1：请求计数会散落在 CLI / Web / resume / review redub 多条调用链上，容易丢状态。
+  - 不足 2：这会把 `index-tts` 的服务生命周期逻辑混进 [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 或 [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py)，不符合“底座问题落在底座层”的边界。
+- `index-tts` 方案选项 C：在 `index-tts` 服务进程内维护请求计数，到阈值后以“特殊退出码”自愿退出；启动脚本改成监督模式，看到该退出码后自动拉起新进程。
+  - 优点 1：真正实现“进程级重启”，最接近你的目标。
+  - 优点 2：计数只存在 [tools/index_tts_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/index_tts_fastapi_server.py) 一处；调用方完全无感，不需要改主配音链路。
+  - 优点 3： [start_index_tts_api.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/start_index_tts_api.sh) 本来就是唯一官方启动入口；把监督循环放这里最自然。
+  - 代价：要同步调整 [stop_index_tts_api.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/stop_index_tts_api.sh) 的 PID 管理，确保停掉的是监督进程而不是只停子进程。
+- 我对 `index-tts` 的推荐：选 C。
+  - 服务侧：
+    - 在 [tools/index_tts_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/index_tts_fastapi_server.py) 给 `ServerState` 增加 `requests_served`、`restart_after_requests`、`restart_pending`；
+    - 每次 `/synthesize` 成功后递增计数，到阈值时先 `release()`，再以专用退出码（例如 `75`）结束进程；
+    - `/health` 返回里追加 `requests_served`、`restart_after_requests`、`restart_pending`，方便排障。
+  - 启动脚本侧：
+    - [start_index_tts_api.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/start_index_tts_api.sh) 改成监督循环；
+    - 当子进程以“自动轮换退出码”结束时自动重启，其他非 0 退出仍视为异常；
+    - 新增可配置阈值环境变量，例如 `INDEX_TTS_AUTO_RESTART_REQUESTS=50`，设为 `0` 则关闭。
+  - 这样不会碰 `index-tts` 的调用方，也不会影响 `omnivoice`。
+
+- `omnivoice` 方案选项 A：只补日志和观测，不改变合成策略。
+  - 优点：风险最低，只动 [tools/omnivoice_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/omnivoice_fastapi_server.py)。
+  - 不足：只能更容易证明“它生成了烂音频”，不能减少烂音频和 `missing`。
+- `omnivoice` 方案选项 B：把“异常快 / 内容异常”的判坏逻辑做进通用 pipeline。
+  - 优点：可以复用 [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 已有的 `actual_duration_sec / duration_error_ratio` 统计。
+  - 不足：这会直接触碰当前 `index-tts` 的主合成链路，不符合你明确要求的隔离边界。
+- `omnivoice` 方案选项 C：只在 `omnivoice` 服务端和 `OmniVoiceBackend` 增加“质量可观测 + 保守重试 + 本地恢复增强”，不改通用 `pipeline` 判定逻辑。
+  - 优点 1：改动面严格收敛在 [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py) 与 [tools/omnivoice_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/omnivoice_fastapi_server.py)。
+  - 优点 2：当前 `TtsSynthesisRequest` 已经带了 `ref_text / language / target_duration_sec`，见 [src/subtitle_maker/backends/base.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/base.py)；`OmniVoiceBackend` 可以在不改 pipeline 的前提下，依据“目标时长 vs 实际时长”做本地质量门控。
+  - 优点 3： [tools/omnivoice_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/omnivoice_fastapi_server.py) 已支持 per-request `num_step/guidance_scale/speed/postprocess_output/...` 覆盖，因此 backend 可以在首轮异常时切到更保守的第二套参数重试。
+  - 不足：它仍然不能真正“理解内容是不是胡说”；v1 主要能抓住“异常快、异常短、异常像坏样本”的那一类烂音频。
+- 我对 `omnivoice` 的推荐：选 C，并拆成两步。
+  - 第 1 步：先把服务端观测补齐。
+    - 在 [tools/omnivoice_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/omnivoice_fastapi_server.py) 的 `synthesize_started/finished/failed` 日志中增加：
+      - `target_duration_sec`
+      - `actual_duration_sec`
+      - `duration_ratio`
+      - 本次使用的 `speed/num_step/guidance_scale/postprocess_output`
+      - 是否属于 `retry_profile`
+    - 这样后台日志才能直接回答“它是不是快得离谱”。
+  - 第 2 步：在 [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py) 做 backend 自治。
+    - 首轮仍按当前默认 profile 请求；
+    - 若 API 成功但 `actual_duration_sec` 明显小于 `target_duration_sec`（例如低于某个可配比值），则触发一次“保守 profile”重试：
+      - 更低 `speed`
+      - 更高 `num_step`
+      - 强制 `postprocess_output=true`
+      - 必要时 `denoise=true`
+    - 若保守重试仍明显异常，再把错误抛回上游，并在错误文本里明确标注 `omnivoice quality gate failed` 与两次参数摘要。
+  - 对 `missing` 的补充：
+    - 当前本地恢复只对连接/断连类错误触发，见 [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py) 的 `_should_attempt_local_omnivoice_recovery()`；
+    - 推荐把“HTTP 成功但输出缺失/0 字节/采样信息异常”的恢复也继续收在这个 backend 里，不把逻辑外溢到通用 pipeline。
+
+- 最小改动面建议：
+  - `index-tts`：
+    - [tools/index_tts_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/index_tts_fastapi_server.py)
+    - [start_index_tts_api.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/start_index_tts_api.sh)
+    - [stop_index_tts_api.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/stop_index_tts_api.sh)
+  - `omnivoice`：
+    - [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py)
+    - [tools/omnivoice_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/omnivoice_fastapi_server.py)
+- 不建议在本轮触碰：
+  - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的通用判坏逻辑
+  - `index-tts` / `omnivoice` 以外的 backend 分发代码
+
+## Spec-3（2026-04-28 Index-TTS 内存回收 + OmniVoice 隔离治理）
+- `index-tts` 主要风险 1：自动轮换不能在当前请求返回前把进程杀掉，否则调用方会把“本次本来成功的合成”误判成 `E-TTS-001`。
+  - 依据： [tools/index_tts_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/index_tts_fastapi_server.py) 的 `_handle_synthesize()` 现在是“先 `tts.infer()`，再检查文件，再 `self._send_json(...)`”；如果在发送响应前直接退出，请求方只能看到连接断开。
+  - 决策：轮换必须是“当前请求成功返回 -> 标记 `restart_pending` -> 进程自愿退出”；不能在 `infer()` 后立刻粗暴 `os._exit()`。
+- `index-tts` 主要风险 2：监督重启脚本如果 PID 管理不清，会出现 `stop` 只停子进程、监督进程又自动拉起的反效果。
+  - 依据 1： [start_index_tts_api.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/start_index_tts_api.sh) 现在把后台 PID 写进 `index_tts_api.pid`。
+  - 依据 2： [stop_index_tts_api.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/stop_index_tts_api.sh) 当前是“读 PID -> `kill $PID` -> 端口清理”；如果未来 `PID_FILE` 存的是子进程而不是监督进程，行为会错。
+  - 决策：监督模式上线后，`PID_FILE` 必须明确记录监督进程 PID；停止脚本只对监督进程负责，端口清理保留兜底。
+- `index-tts` 主要风险 3：自动轮换不能改变现有 `release-after-job`、`health`、手动 `/model/release` 的语义，否则会让现有 Web 控制面失真。
+  - 依据： [tools/index_tts_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/index_tts_fastapi_server.py) 已有 `/health`、`/model/release`；[src/subtitle_maker/app/routes/jobs.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/app/routes/jobs.py) 已暴露对应控制入口。
+  - 决策：自动轮换只增不改：
+    - `/health` 追加计数字段，但保留现有 `status/service_state/loaded`
+    - `/model/release` 继续只做模型释放，不触发重启
+    - `INDEX_TTS_AUTO_RESTART_REQUESTS=0` 时应完全退化为当前行为
+
+- `omnivoice` 主要风险 1：质量门控如果放进通用 `pipeline`，会直接污染 `index-tts` 的主链路，违背隔离边界。
+  - 依据： [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的 `synthesize_text_once()` 与 `synthesize_segments()` 是所有 backend 共用的主循环。
+  - 决策：本轮所有“异常快/质量差”的特殊逻辑都只能收在 [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py) 与 [tools/omnivoice_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/omnivoice_fastapi_server.py)。
+- `omnivoice` 主要风险 2：仅凭“目标时长明显偏短”做质量门控，会误杀某些本来就该很短的自然句。
+  - 依据 1： [src/subtitle_maker/backends/base.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/base.py) 的 `TtsSynthesisRequest` 里 `target_duration_sec` 是可选值，不是每次都严格存在。
+  - 依据 2： [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 对 `omnivoice` 已有“自然收尾更宽松”的容忍，例如 `omnivoice_keep_natural_no_atempo` 分支。
+  - 决策：v1 质量门控只拦“明显异常”的样本：
+    - 仅当 `target_duration_sec` 存在时启用
+    - 使用偏保守的最小比值阈值
+    - 只触发一次保守 profile 重试，不在 backend 内做无限循环
+- `omnivoice` 主要风险 3：如果把“质量差”直接伪装成 `missing`，会混淆两类问题，后续排障更难。
+  - 依据：当前 [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py) 已把连接/HTTP/输出缺失统一映射到 `E-TTS-001`；而 [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 把静音/过短映射到 `E-TTS-002`。
+  - 决策：新增的 `omnivoice quality gate failed` 必须在错误文本里显式带上“quality gate”字样和两次 profile 摘要，不能伪装成普通 connect failed。
+- `omnivoice` 主要风险 4：服务端日志如果只记最终 `finished`，看不到 retry profile 和时长比值，事后还是无法解释“为什么听起来很快”。
+  - 依据：当前 [tools/omnivoice_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/omnivoice_fastapi_server.py) 的 `synthesize_finished` 只记 `elapsed_ms/duration_sec/sample_rate`。
+  - 决策：日志字段必须同时覆盖请求目标和生成结果：
+    - `target_duration_sec`
+    - `actual_duration_sec`
+    - `duration_ratio`
+    - `speed/num_step/guidance_scale/postprocess_output`
+    - `retry_profile`
+
+- 验证口径：
+  - `index-tts` 服务层：
+    - 扩展 [tests/test_index_tts_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_index_tts_fastapi_server.py)：
+      - `auto restart requests=0` 时不触发轮换
+      - 达到阈值前，`requests_served` 按请求递增
+      - 达到阈值后，只在当前请求成功完成后标记 `restart_pending`
+      - `/health` 返回新增计数字段
+    - 若把“退出码判定”抽成 helper，优先单测 helper；不要求在单测里真的 `fork` 监督进程。
+  - `index-tts` 启动脚本：
+    - 至少做一条脚本级最小验证：
+      - 设低阈值（如 `INDEX_TTS_AUTO_RESTART_REQUESTS=1`）
+      - 连续打两次 `/synthesize`
+      - 确认第二次前服务仍可用，且日志/健康检查能看出一次自动轮换
+    - 这条更适合手工 smoke，不要求进 Python 单测。
+  - `omnivoice` backend：
+    - 在 [tests/test_dubbing_runtime.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_runtime.py) 扩展 `OmniVoiceBackend` 回归：
+      - 现有 `test_omnivoice_backend_api_passes_duration()` 继续通过，证明没有改坏目标时长透传
+      - 新增“首轮返回明显过短 -> 自动切保守 profile 重试一次”的断言
+      - 新增“保守重试后仍异常 -> 抛出带 `quality gate failed` 的错误”断言
+      - 现有 `test_omnivoice_backend_api_restarts_local_service_after_connect_failure()` 继续通过，证明连接恢复逻辑不退化
+  - `omnivoice` 服务端日志：
+    - 可通过单测或轻量 mock 验证日志 payload 至少包含 `target_duration_sec/actual_duration_sec/duration_ratio/retry_profile`
+    - 不要求单测真正跑 OmniVoice 模型
+  - 回归保护：
+    - [tests/test_dubbing_runtime.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_runtime.py) 里现有 `omnivoice_keep_natural_no_atempo` 相关回归必须继续通过，证明这次没有把自然收尾策略误伤。
+    - 这轮不新增也不修改 `index-tts` 主配音 pipeline 的判坏标准；若有任何现有 `index-tts` runtime 测试失败，视为越界。
+
+- 最小 smoke：
+  - `index-tts`：
+    - 本地把阈值设成 `1` 或 `2`，快速发几次短句合成；
+    - 观察 [outputs/index_tts_api.log](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/index_tts_api.log) 与 `/health`，确认请求成功、计数递增、到阈值后发生一次自动轮换。
+  - `omnivoice`：
+    - 选一条过去容易“说得很快”的句子跑一次；
+    - 检查 [outputs/omnivoice_api.log](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/omnivoice_api.log) 是否能直接看出 `target_duration_sec -> actual_duration_sec -> duration_ratio -> retry_profile`；
+    - 若仍失败，错误应明确区分“connect failure/missing”还是“quality gate failed”。
+
+## Review（2026-04-28 Index-TTS 内存回收 + OmniVoice 隔离治理）
+- 核心实现：
+  - [tools/index_tts_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/index_tts_fastapi_server.py) 新增 `requests_served / restart_after_requests / restart_pending`，`/health` 会暴露计数字段；达到阈值后不打断当前请求，而是在响应成功返回后异步 `shutdown()`，主进程以专用退出码 `75` 退出。
+  - [start_index_tts_api.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/start_index_tts_api.sh) 改成监督模式：子进程若以自动轮换退出码结束，就自动拉起新进程；[stop_index_tts_api.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/stop_index_tts_api.sh) 继续通过 `PID_FILE` 停监督进程并保留端口清理兜底。
+  - [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py) 新增 `quality gate`：首轮 API 成功但相对 `target_duration_sec` 明显过短时，自动切保守 profile（更低 `speed`、更高 `num_step/guidance_scale`）重试一次；若仍异常，抛出带 `omnivoice quality gate failed` 的明确错误。
+  - [tools/omnivoice_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/omnivoice_fastapi_server.py) 现在会把 `target_duration_sec / actual_duration_sec / duration_ratio / retry_profile / speed / num_step / guidance_scale / denoise / postprocess_output` 带进结果与日志，便于直接从后台日志判断“是不是说得过快”。
+- 回归覆盖：
+  - [tests/test_index_tts_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_index_tts_fastapi_server.py) 新增自动轮换阈值、`restart_pending` 与健康字段断言。
+  - [tests/test_dubbing_runtime.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_runtime.py) 新增 `OmniVoiceBackend` 的“明显过快 -> 保守 profile 重试”和“保守重试后仍异常 -> quality gate failed”回归，同时保留现有连接恢复测试。
+  - [tests/test_omnivoice_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_omnivoice_fastapi_server.py) 新增服务端运行参数解析与 `duration_ratio / retry_profile` 元数据测试。
+- 验证证据：
+  - `uv run python -m py_compile tools/index_tts_fastapi_server.py src/subtitle_maker/backends/omni_voice.py tools/omnivoice_fastapi_server.py tests/test_index_tts_fastapi_server.py tests/test_dubbing_runtime.py tests/test_omnivoice_fastapi_server.py`：通过
+  - `bash -n start_index_tts_api.sh stop_index_tts_api.sh`：通过
+  - `uv run python -m unittest tests.test_index_tts_fastapi_server tests.test_dubbing_runtime tests.test_omnivoice_fastapi_server`：`Ran 33 tests ... OK`
+  - 这轮还没有做服务级 smoke，原因是你当前还在跑本地测试；我没有去主动重启现有 `index-tts` / `omnivoice` 进程。
+
+## TODO（2026-04-28 review redub 后 final 字幕被旧译文覆盖）
+- [x] Spec-1：审计 `review/redub -> batch rebuild -> 长视频最终 merge` 三段链路，定位为何任务结束后又回到旧字幕
+- [x] Spec-2：确认修复落点、最小改动面，以及为何昨天的修复没有覆盖这次场景
+- [x] Spec-3：确认风险、验证口径与回归范围
+- [x] HARD-GATE：已确认完整 Spec 并按方案实施
+
+## Spec-1（2026-04-28 review redub 后 final 字幕被旧译文覆盖）
+- 现状 1：`save-and-redub` 修改的 authoritative 文本，实际落点是每个 segment 自己目录下的 `subtitles/translated.srt` 和 `subtitles/dubbed_final.srt`，不是 segment manifest 里的历史 `paths.translated_srt`。
+  - 依据 1： [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_execute_review_redub()` 先读取 `segment_job_dir / "subtitles" / "translated.srt"` 与 `source.srt`，然后把改动直接写回 `translated_srt_path.write_text(...)` 和 `dubbed_final_srt_path.write_text(...)`。
+  - 依据 2：同函数只同步更新了 `segment_manifest.raw["segments"][...]["translated_text"]`，并没有同步改 `segment_manifest.raw["paths"]["translated_srt"]` / `["dubbed_final_srt"]` 指向。
+- 现状 2：昨天修过的 `_rebuild_batch_outputs()` 只负责“事后重拼 batch final 产物”，它已经优先读取 `segment/subtitles/*.srt`，但这条修复并没有覆盖“长视频任务自然结束时的主流程 merge”。
+  - 依据 1： [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_execute_review_redub()` 在局部重配后显式调用 `_rebuild_batch_outputs(batch_dir)`。
+  - 依据 2： [tools/repair_bad_segments.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/repair_bad_segments.py) 的 `rebuild_batch_outputs()` 现在对 `translated_srt` / `dubbed_final_srt` 的策略是“只要 `segment/subtitles/*.srt` 存在，就优先用它；manifest 路径只作为回退”。
+  - 依据 3： [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 的 `test_rebuild_batch_outputs_updates_final_subtitles_when_some_segments_are_skipped()` 也只锁住了 `_rebuild_batch_outputs()` 这条路径。
+- 现状 3：真正把你“中途改好的译文”覆盖回旧文案的，更可能是任务结束时 [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的主流程 `Step 5/5: merge outputs`。
+  - 依据 1： [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的主函数在所有 segment 完成后，统一执行 `merge outputs`，并直接生成 `final/translated_full.srt` 与 `final/dubbed_final_full.srt`。
+  - 依据 2：同文件当前对 `translated_srt` / `dubbed_final_srt` 的策略仍是“先读 `item.manifest["paths"]`，只有 manifest 路径缺失或文件不存在时，才回退 `segment/subtitles/*.srt`”。
+  - 结论：如果 `save-and-redub` 期间只是更新了 `segment/subtitles/*.srt`，但 manifest 里的旧路径文件仍存在，那么任务最终自然收尾时，`dub_long_video.py` 会再次把旧字幕拼回 `final/*_full.srt`。
+- 现状 4：这解释了“昨天说修了，但今天你还是复现”的原因。昨天那次修复挡住的是“review redub 完成后立即手动/自动 rebuild batch final”的场景，没有挡住“主任务仍在跑，最后由 `dub_long_video.py` 再 merge 一次”的场景。
+  - 依据 1： [tasks/lessons.md](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tasks/lessons.md) 已记录“batch 重建字幕时，必须优先读取 `segment/subtitles/*.srt` 最新文件”。
+  - 依据 2：但当前 [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的最终 merge 逻辑还没有同步同样的优先级修复，因此 lessons 落地是不完整的。
+- 现状 5：review 面板本身读到的文字并不是问题源头；前端看到你改后的文本，和最终文件又被覆盖，是两回事。
+  - 依据 1： [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_collect_review_lines()` 明确优先用 `final/translated_full.srt` 覆盖 `translated_text`，注释里也写了“用户真正看到和修改的文本”。
+  - 依据 2：同文件的 `_persist_review_lines()` 会先把全局 `translated_full.srt` / `dubbed_final_full.srt` 写成你修改后的内容，再进入 `_execute_review_redub()`。
+  - 结论：你看到“改动成功”，说明 review 编辑链路本身没丢；问题出在后面的段级重配写回和最终 batch merge 重新收口时。
+- 现状 6：当前测试缺口也和这个场景吻合。仓库里已经有“rebuild 后 final 不该读旧字幕”的回归，但还没有“任务仍在进行，最终由 `dub_long_video.py` 收尾 merge 时也不能回退旧字幕”的回归。
+  - 依据： [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 现有相关回归都集中在 `_rebuild_batch_outputs()`、`save-and-redub` 回滚、`load-batch` 元数据恢复；没有直接覆盖 [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的 `merge outputs` 字幕输入优先级。
+
+## Spec-2（2026-04-28 review redub 后 final 字幕被旧译文覆盖）
+- 方案选项 A：只在 `save-and-redub` 时把 segment manifest 的 `paths.translated_srt/dubbed_final_srt` 改成最新文件，其他读取方不动。
+  - 优点：改动面小，表面上能减少“路径还指向旧文件”的概率。
+  - 不足 1：不能解决 [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 已经把 manifest 提前读进 `results` 内存快照的问题。依据：同文件在构建 `SegmentResult` 时，把 `manifest = load_segment_manifest(manifest_path).raw` 直接塞进 `results.append(... manifest=manifest)`，之后 `merge outputs` 读取的是 `item.manifest`，不是重新读磁盘。
+  - 不足 2：这只是“写侧补救”，无法防住其他地方未来再读旧优先级。
+- 方案选项 B：只修 [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的最终 `merge outputs`，让它在收尾时对字幕文件一律优先使用 `job_dir/subtitles/*.srt`，并尽量重新读取最新 manifest/路径。
+  - 优点：直击这次 bug 的收尾覆盖点，能覆盖“任务仍在跑，最终自然完成”的真实场景。
+  - 不足：如果其他链路未来还存在“优先信旧 manifest 路径”的读取逻辑，仍可能留下同类隐患。
+- 方案选项 C：做一个统一的“段内最新字幕路径解析”策略，最小范围内同时用于 `dub_long_video.py` 主 merge 和已有的 `repair_bad_segments.py` rebuild；必要时再把 `save-and-redub` 写侧同步到 canonical 路径。
+  - 优点：读侧语义统一，避免“一处修了，另一处忘了”的重复回归。
+  - 不足：比只补 `dub_long_video.py` 多一点改动面，需要补 2 类回归测试。
+
+- 我的推荐：选 C，但实现强度按“最小可交付”控制，不做大重构。
+  - 第 1 步：修 [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的 `Step 5/5: merge outputs`。
+    - 决策 1：对 `source_srt/translated_srt/dubbed_final_srt`，优先读 `item.job_dir / "subtitles" / *.srt`，只有这些文件不存在时才回退 manifest 路径。
+    - 决策 2：不要再完全信任 `results` 里缓存的 `item.manifest` 字幕路径；收尾 merge 时要以 segment 当前磁盘状态为准。
+    - 原因：这次 bug 的关键不是 review 没写进去，而是“主流程晚于 review 收尾，并且拿着旧快照重新拼了一次”。
+  - 第 2 步：把同一套解析顺序收敛成一个小 helper，给 [tools/repair_bad_segments.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/repair_bad_segments.py) 和 [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 共用，避免两边再次漂移。
+    - 依据：两边现在都在手写 `resolve_output_path(...) + fallback subtitles/*.srt`，只是优先级不同，重复逻辑本身就是回归源。
+  - 第 3 步：作为硬化项，在 [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_execute_review_redub()` 里，文本有改动时同步把 segment manifest 的 `paths.translated_srt/dubbed_final_srt` 回写到 canonical `segment/subtitles/*.srt`。
+    - 这不是主修复，但能降低其他旧读取方继续踩 stale path 的概率。
+
+- 最小改动面建议：
+  - 主修复文件： [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py)
+  - 共享 helper 落点：优先放在 [tools/repair_bad_segments.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/repair_bad_segments.py) 和 `dub_long_video.py` 都能低成本调用的位置；如果需要进 `src/`，也只抽“解析最新 segment subtitle 路径”的纯函数，不动现有命令/manifest 协议。
+  - 次级硬化： [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py)
+
+- 为什么昨天那次修复没成功，这次方案能补上：
+  - 昨天修的是“review 结束后调用 `_rebuild_batch_outputs()` 时，不要再从 stale manifest path 读旧字幕”。
+  - 这次要补的是“就算主任务后来继续跑完，也不能在 `dub_long_video.py` 的最终 merge 再次覆盖回旧字幕”。
+  - 两者不是同一条链路，所以必须分别修。
+
+## Spec-3（2026-04-28 review redub 后 final 字幕被旧译文覆盖）
+- 主要风险 1：如果修复范围扩得太大，把 `paths.*` 的所有读取都一起改掉，容易误伤音频复用和 segment 可复用判定。
+  - 依据： [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的 `is_segment_job_reusable()` 除了看 `translated_srt/dubbed_final_srt`，还看 `dubbed_vocals`；`collect_reusable_jobs_by_segment()` 又依赖这个判定决定 resume 时是否跳过重跑。
+  - 决策：v1 主修复只收敛在“字幕文件路径解析”层，不碰音频路径解析和可复用统计语义；必要时仅把 `translated_srt/dubbed_final_srt` 的存在性检查改成同一 helper，避免字幕路径逻辑再次分叉。
+- 主要风险 2：如果只修 `merge outputs` 读取顺序，不补写侧 canonical path，同类 stale path 以后仍可能在其他读点复发。
+  - 依据： [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_execute_review_redub()` 当前只更新 `segments[].translated_text`，不更新 `manifest.paths.translated_srt/dubbed_final_srt`。
+  - 决策：本轮把“写侧同步 canonical subtitle paths”作为次级硬化一并做掉，但不把它当主修复依赖。
+- 主要风险 3：如果 helper 设计成“永远忽略 manifest path，只看 `subtitles/*.srt`”，会影响某些历史/异常任务的容错。
+  - 依据： [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 和 [tools/repair_bad_segments.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/repair_bad_segments.py) 现在都保留了 `resolve_output_path(paths.get(...))` 作为回退，说明历史任务里确实可能存在只靠 manifest path 才能找到文件的情况。
+  - 决策：helper 语义固定为“优先 canonical `segment/subtitles/*.srt`，不存在时回退 manifest path”，不能改成只认一种来源。
+- 主要风险 4：如果修复只覆盖 `translated_full.srt`，漏掉 `dubbed_final_full.srt`，前端仍会出现“字幕文本和双语字幕不一致”。
+  - 依据： [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的最终 merge 同时维护 `translated_srt_inputs` 和 `dubbed_final_srt_inputs`；[src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_collect_written_batch_paths()` 也同时向前端暴露 `translated_full_srt` 与 `dubbed_final_full_srt`。
+  - 决策：两条字幕产物必须同时修，同一 helper、同一优先级、同一回归。
+- 主要风险 5：如果只补 `dub_long_video.py` 主 merge，不给它加独立回归，后续很容易再次被 `repair_bad_segments.py` 和主流程漂移带回来。
+  - 依据：当前 [tests/test_dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dub_long_video.py) 还没有覆盖“manifest 路径是旧字幕，但 `segment/subtitles/*.srt` 是新字幕，最终 full 字幕必须选新字幕”这个场景。
+  - 决策：必须新增 `tests/test_dub_long_video.py` 回归，直接锁住主流程 `merge outputs` 的字幕优先级。
+- 主要风险 6：如果主流程 merge 重新读取磁盘最新字幕，不能顺手改变 translated merge、grouped synthesis、review redub 的既有语义。
+  - 依据： [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 当前除了字幕 merge，还负责 translated merge 的初始编排与最终音频合成；[tests/test_dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dub_long_video.py) 已锁住 translated merge 的执行时机。
+  - 决策：本轮只改字幕输入文件的解析优先级，不动 segment 切分、translated merge、生成功能参数和音频合并逻辑。
+
+- 验证口径：
+  - 单元/模块级：
+    - 在 [tests/test_dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dub_long_video.py) 新增回归：
+      - 构造 segment manifest 的 `paths.translated_srt/dubbed_final_srt` 指向旧文件；
+      - 同时在 `segment/subtitles/translated.srt`、`dubbed_final.srt` 写入新文本；
+      - 断言主流程 `main()` 最终生成的 `final/translated_full.srt` 与 `final/dubbed_final_full.srt` 都使用新文本。
+    - 若抽 helper，再给 helper 单测或通过上述场景覆盖其“canonical 优先、manifest 回退”语义。
+  - HTTP/review 级：
+    - 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 增加一条“`save-and-redub` 改完后，segment manifest 的 `paths.translated_srt/dubbed_final_srt` 会同步到 canonical 字幕路径”的断言；这条用于锁写侧硬化。
+  - 回归保护：
+    - 现有 `test_rebuild_batch_outputs_updates_final_subtitles_when_some_segments_are_skipped()` 必须继续通过，确保昨天修过的 `_rebuild_batch_outputs()` 不回退。
+    - 现有 translated merge 回归必须继续通过，确保这次不误伤 [tests/test_dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dub_long_video.py) 已有的 “translated merge 只在初始编排执行一次” 语义。
+- 最小 smoke：
+  - 选一个正在跑或可快速复现的 translated 输入任务，在 segment 跑完但 batch 未结束前执行一次 `save-and-redub`；
+  - 任务自然结束后，核对 `segment/subtitles/translated.srt`、`final/translated_full.srt`、`final/dubbed_final_full.srt` 三者文本一致，不再出现“配音是新文案、final 字幕是旧文案”。
+
+## Review（2026-04-28 review redub 后 final 字幕被旧译文覆盖）
+- 核心实现：
+  - [src/subtitle_maker/manifests/readwrite.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/readwrite.py) 新增 `resolve_output_path()` 与 `resolve_preferred_segment_subtitle_path()`，把“优先 canonical `segment/subtitles/*.srt`、缺失时回退 manifest path”的语义收敛成一处。
+  - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的 `is_segment_job_reusable()` 与最终 `merge outputs` 已接入同一 helper；主任务自然结束时不再因为内存里的旧 manifest 路径把 `final/translated_full.srt` / `dubbed_final_full.srt` 覆盖回旧文案。
+  - [tools/repair_bad_segments.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/repair_bad_segments.py) 改为复用同一 helper，保持“事后 rebuild”与“主流程收尾 merge”一致。
+  - [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_execute_review_redub()` 在文本改动时同步回写 segment manifest 的 `paths.translated_srt` / `paths.dubbed_final_srt` 到 canonical 字幕文件，降低其他旧读取方继续踩 stale path 的概率。
+- 回归覆盖：
+  - [tests/test_dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dub_long_video.py) 新增“manifest 指向旧字幕、segment/subtitles 是新字幕时，主流程 final merge 必须选新字幕”的回归。
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 增加 `save-and-redub` 后 segment manifest 字幕路径回写 canonical 的断言。
+- 验证证据：
+  - `uv run python -m py_compile src/subtitle_maker/manifests/readwrite.py src/subtitle_maker/manifests/__init__.py src/subtitle_maker/dubbing_cli_api.py tools/dub_long_video.py tools/repair_bad_segments.py tests/test_dub_long_video.py tests/test_dubbing_cli_api.py`：通过
+  - `uv run python -m unittest tests.test_dub_long_video tests.test_dubbing_cli_api`：`Ran 65 tests ... OK`
+  - `uv run python -m unittest tests.test_manifest_contracts tests.test_job_recovery`：`Ran 8 tests ... OK`
+
+## Spec-1（2026-04-28 OmniVoice 配音质量调参调研）
+- [x] 调研 `/Users/tim/Documents/vibe-coding/MVP/OmniVoice` 源码与现有文档，定位推理入口、生成参数、音色参考、语言映射、时长控制、批量推理能力。
+- [x] 基于源码证据整理“配音最佳参数建议”，写入 OmniVoice repo 的 `docs/` 下，明确适用于字幕配音场景。
+- [x] 回到 subtitle-maker 接入链路，解释当前 OmniVoice 效果差的根因，所有结论标注文件路径 + 函数名。
+- [x] 明确下一步改造建议，但在没有新的 HARD-GATE 前不修改 subtitle-maker 的 OmniVoice 代码链路。
+
+## Review（2026-04-28 OmniVoice 配音质量调参调研）
+- 已写入调研文档：`/Users/tim/Documents/vibe-coding/MVP/OmniVoice/docs/dubbing-parameter-tuning.md`。
+- 核心结论：当前效果差不是单纯参数问题，而是“逐句极短参考音 + 固定字幕时长 + 跨语言 voice clone + 默认随机 position sampling”的组合把 OmniVoice 放进了高失败率工作区间。
+- 本轮未修改 subtitle-maker 的 OmniVoice 代码链路；只更新 `tasks/todo.md`、`tasks/lessons.md` 和 OmniVoice repo 的调研文档。
+- 验证证据：
+  - `wc -l docs/dubbing-parameter-tuning.md`：132 行
+  - 本地数据统计：`outputs/dub_jobs/web_20260427_135229/longdub_20260427_215234` 有 303 个逐句 reference，其中 17 个短于 1.2s、11 个短于 0.8s；同任务 target duration 最短 0.119s，`seg_0073` 在 0.156s 目标时长下进入 manual review/missing。
+
+## Spec-4（2026-04-28 translated short merge 实际执行链复核）
+- 现状 1：`translated_short_merge` 不是“只有参数、没有执行”；它已经在长视频编排层执行。
+  - 依据： [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的 `maybe_merge_translated_input_subtitles()` 会在开关开启时复用 `merge_short_source_subtitles(...)` 做一次性并句；主流程 `main()` 在 `clip_subtitles_for_segment()` 之后、`run_segment_job()` 之前调用它。
+- 现状 2：这个并句只在“上传字幕且 `input_srt_kind=translated` 且 `resume_batch_dir is None`”时执行，不会在 review redub / resume 阶段再次改边界。
+  - 依据： [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的 `main()` 里，translated merge 的触发条件是 `segment_subtitles and args.input_srt_kind == "translated" and resume_batch_dir is None`。
+- 现状 3：前端和 API 已经区分了两套开关，`Merge short source lines` 与 `Merge short translated lines` 不是同一个东西。
+  - 依据 1： [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 同时定义了 `auto-dub-short-merge-enabled` 与 `auto-dub-translated-short-merge-enabled` 两套控件，并分别给出“只对 source 生效”与“只对 translated 直通模式生效”的提示文案。
+  - 依据 2： [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js) 的 `buildCommonStartFormData()` 会同时提交 `short_merge_enabled/threshold` 与 `translated_short_merge_enabled/threshold`。
+  - 依据 3： [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `start_auto_dubbing()`、`start_auto_dubbing_from_project()` 与 `_normalize_auto_dubbing_request()` 会分别接收、校验并持久化这两组字段。
+- 现状 4：`translated_short_merge` 的算法能力和边界与 source merge 基本一致，它不是“无条件大并句”。
+  - 依据： [src/subtitle_maker/domains/subtitles/short_merge.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/subtitles/short_merge.py) 的 `merge_short_source_subtitles()` 只会在相邻字幕静默间隔不超过阈值时合并；默认 15s 目标会推导出 `round(target / 3)` 的容差，且单条候选若已明显过长就不会继续并。
+- 现状 5：如果用户上传 translated 字幕，却勾的是 `Merge short source lines`，那条开关确实不会作用到 TTS 输入；要生效必须使用 `Merge short translated lines`。
+  - 依据： [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 的 source merge 提示文案已明确写明“仅对 source 字幕 / ASR 结果生效”；真正的 translated merge 在 [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的 `main()` 中单独走分支。
+
+## Review（2026-04-28 translated short merge 实际执行链复核）
+- 纠偏结论：前面“`translated_short_merge` 只有参数透传、没有真实执行逻辑”的判断不成立；真实执行点在长视频编排层 [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py)，不是 segment CLI [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py)。
+- 当前更准确的结论应该是：
+  - 上传 translated 字幕后，如果勾的是 `Merge short source lines`，不会生效。
+  - 如果勾的是 `Merge short translated lines`，会在每个 segment 裁切后做一次性并句。
+  - 该并句不会跨 segment，也不会跨越大于 1.5s 的静默间隔，更不会在 review redub / resume 阶段再次改边界。
+- 本轮未改业务代码；只修正分析基线，避免后续基于错误前提继续设计或实现。
+
+## TODO（2026-04-28 translated merge 意图同步 + 可观测性）
+- [x] 前端：当用户已开启 source merge 又切到 translated 模式时，自动迁移一次“想合并短句”的意图到 translated merge，避免隐藏 source 开关后配置看似丢失
+- [x] 编排层：为每个 segment 补充 translated merge 决策日志，输出 enabled/before/after/merged_pairs/threshold，便于直接排查“到底有没有并句”
+- [x] 回归测试：补一条长视频编排测试，锁住 translated merge 日志与一次性执行语义
+- [x] 最小验证：`node --check` + `uv run python -m unittest tests.test_dub_long_video`
+
+## Review（2026-04-28 translated merge 意图同步 + 可观测性）
+- 前端交互：
+  - [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js) 新增“短句合并意图同步”逻辑：
+    - 当用户先勾了 source merge，再切到 translated 模式，且 translated merge 还没有被用户显式配置过时，会自动开启 translated merge，并复制当前阈值；
+    - translated merge 提示文案会明确说明这是沿用刚才的 source merge 意图，减少“我明明开了 merge，怎么没生效”的错觉。
+  - 这次没有改动 source/translated 两套开关的后端协议，也没有改变 `index-tts` / `omnivoice` 的任何合成参数。
+- 编排层可观测性：
+  - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 现在会在 translated 输入的每个 segment 上稳定打印 merge 决策：
+    - `status=applied|skipped_resume`
+    - `enabled=...`
+    - `before=... after=...`
+    - `merged_pairs=...`
+    - `target=...s`
+  - 这样后续看后台日志时，可以直接判断“有没有并句”和“为什么没有并句”，不再只能靠最后的 SRT 结果反推。
+- 回归与验证：
+  - [tests/test_dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dub_long_video.py) 现有 translated merge 回归已补充 stdout 断言，锁住一次性执行语义和日志内容。
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js`：通过
+  - `uv run python -m py_compile tools/dub_long_video.py tests/test_dub_long_video.py`：通过
+  - `uv run python -m unittest tests.test_dub_long_video`：`Ran 3 tests ... OK`
+
+## TODO（2026-04-28 OmniVoice 过短目标时长保护）
+- [x] 仅在 OmniVoice backend 增加最短 target duration 校验，过短句子直接拒绝并给出明确错误
+- [x] 保持 `index-tts` 与现有 fallback 语义不变，不改其他底座链路
+- [x] 回归测试：补 OmniVoice backend 的短时长拒绝用例
+- [x] 最小验证：`py_compile` + `tests.test_dubbing_runtime`
+
+## Review（2026-04-28 OmniVoice 过短目标时长保护）
+- 代码改动：
+  - [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py) 新增 `_validate_request()`，在 OmniVoice 真正发起 API/CLI 合成前先检查 `target_duration_sec`；
+  - 当 `0 < target_duration_sec < 1.2s` 时，直接抛出 `E-TTS-001 omnivoice target duration below safe floor`，避免把明显不适合的极短句继续送进 OmniVoice 生成阶段。
+- 影响边界：
+  - 这条 guard 只作用于 OmniVoice backend，不影响 [src/subtitle_maker/backends/index_tts.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/index_tts.py)；
+  - 也没有修改现有 fallback 语义，只是让 OmniVoice 在已知高失败率区间尽早失败、进入现有 manual review / 错误处理路径。
+- 回归测试：
+  - [tests/test_dubbing_runtime.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_runtime.py) 新增短时长拒绝用例，断言 backend 在 `target_duration_sec=0.8` 时会直接报错，且不会真的发 HTTP 请求。
+- 验证证据：
+  - `uv run python -m py_compile src/subtitle_maker/backends/omni_voice.py tests/test_dubbing_runtime.py`：通过
+  - `uv run python -m unittest tests.test_dubbing_runtime`：`Ran 27 tests ... OK`
+
+## TODO（2026-04-28 OmniVoice 共享参考音优先）
+- [x] 仅在 `tts_backend=omnivoice` 时，把参考音 selector 改为“共享参考音优先，逐句 reference 达到最短时长门槛才启用”
+- [x] 保持 `index-tts` 现有逐句 reference 逻辑不变，不影响当前主链路
+- [x] 编排日志补充 OmniVoice reference 命中统计，便于直接看 shared/subtitle 各用了多少条
+- [x] 回归测试：补 `dub_pipeline` 的 reference selector 用例
+- [x] 最小验证：`py_compile` + `tests.test_dub_pipeline_asr_layout`
+
+## Review（2026-04-28 OmniVoice 共享参考音优先）
+- 代码改动：
+  - [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 新增 `build_backend_reference_selector()`，把参考音选择策略收敛成一处；
+  - 当 `tts_backend != omnivoice` 时，维持原有 `sentence_original_audio_per_subtitle` 逻辑；
+  - 当 `tts_backend == omnivoice` 时，改为 `shared_reference_preferred_for_omnivoice`：默认优先使用共享 `single_speaker_ref.wav`，只有逐句 reference 时长 `>= 1.2s` 才会真正启用逐句 reference。
+- 现有链路影响：
+  - 这次没有修改 [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的合成行为，只改了传给它的 `ref_audio_selector`；
+  - [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 的 `reference_ready` / `sentence_reference_mode_enabled` 日志现在会输出：
+    - `reference_strategy`
+    - `reference_count`
+    - `shared_reference_count`
+    - `subtitle_reference_count`
+    - `subtitle_reference_min_sec`
+  - 因此你直接看后台日志就能知道 OmniVoice 这批句子到底用了多少 shared ref、多少 subtitle ref。
+- 回归测试：
+  - [tests/test_dub_pipeline_asr_layout.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dub_pipeline_asr_layout.py) 新增两条 selector 用例：
+    - `omnivoice` 会把 `<1.2s` 的逐句 reference 回退到 shared ref；
+    - `index-tts` 会继续保留原有逐句 reference，不受新策略影响。
+- 验证证据：
+  - `uv run python -m py_compile tools/dub_pipeline.py tests/test_dub_pipeline_asr_layout.py`：通过
+  - `uv run python -m unittest tests.test_dub_pipeline_asr_layout`：`Ran 13 tests ... OK`
+
+## Spec-5（2026-04-28 OmniVoice 链路强制短句合并）
+- 现状 1：`source short merge` 与 `translated short merge` 都还是“用户请求态”开关，不会因为 `tts_backend=omnivoice` 自动强制。
+  - 依据 1： [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 的 `rebalance_source_subtitles()` 只有在 `source_short_merge_enabled=True` 时才调用 `merge_short_source_subtitles(...)`。
+  - 依据 2： [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的 `maybe_merge_translated_input_subtitles()` 只有在 `translated_short_merge_enabled=True` 时才执行。
+- 现状 2：这两组请求态开关会被持久化进任务、命令和 manifest，当前语义是“用户勾没勾”，不是“运行时最终是否生效”。
+  - 依据 1： [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_normalize_auto_dubbing_request()` 会分别保存 `source_short_merge_*` 与 `translated_short_merge_*`。
+  - 依据 2： [src/subtitle_maker/manifests/schema.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/schema.py) 的 `BatchReplayOptions` 当前只有请求态字段，没有 `effective_*` 字段。
+  - 依据 3： [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 构造 `BatchReplayOptions` 时，直接把 `source_short_merge_enabled` / `translated_short_merge_enabled` 原值写入 batch manifest。
+- 现状 3：`translated short merge` 只允许在长视频初始编排执行一次；review redub / resume 不会重复并句，这个边界不能破。
+  - 依据： [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的主循环只在 `args.input_srt_kind == "translated" and resume_batch_dir is None` 时执行 `maybe_merge_translated_input_subtitles(...)`。
+- 现状 4：前端当前会根据字幕模式隐藏/显示两套 merge 开关，但不会因为 `tts_backend=omnivoice` 自动把“请求态 false”改成 true。
+  - 依据： [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js) 的 `syncShortMergeControls()` 只按 `effectiveSubtitleMode` 切换 source/translated 两套控件，不读 `tts_backend`。
+
+## Spec-5 方案建议
+- 推荐实现语义：
+  - 保留现有 `source_short_merge_enabled` / `translated_short_merge_enabled` 作为“用户请求态”；
+  - 运行时新增“OmniVoice 策略态”：
+    - `effective_source_short_merge_enabled = requested_source_short_merge_enabled or (tts_backend == "omnivoice")`
+    - `effective_translated_short_merge_enabled = requested_translated_short_merge_enabled or (tts_backend == "omnivoice")`
+  - 这样用户配置仍然真实可回显，但 OmniVoice 链路会被强制套上短句合并策略。
+- 推荐落点：
+  - `source/ASR` 链路：在 [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 的 `main()` / `load_or_transcribe_subtitles()` 调用 `rebalance_source_subtitles()` 前计算 `effective_source_short_merge_enabled`，只把生效值传入运行时，不改 manifest 原字段。
+  - `translated 上传字幕` 链路：在 [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的 segment 初始编排里，计算 `effective_translated_short_merge_enabled`，但仍保持“只在初始任务执行一次，不在 resume/review 重并句”。
+- 推荐日志：
+  - source 链路的 `source_layout_rebalanced` 日志里增加：
+    - `short_merge_requested`
+    - `short_merge_effective`
+    - `short_merge_effective_reason`
+  - translated 链路的 segment 日志增加：
+    - `requested=...`
+    - `effective=...`
+    - `reason=user|omnivoice_policy|resume_skipped`
+  - 这样用户看到“没勾开关但日志显示合并生效”时，可以明确知道是 OmniVoice 策略强制。
+
+## Spec-5 风险与边界
+- 风险 1：如果直接把 manifest/task 里的 `source_short_merge_enabled`、`translated_short_merge_enabled` 覆盖成 `true`，会污染用户真实请求态，导致 Restore/Load Batch 时 UI 看起来像用户自己打开了开关。
+  - 决策：保留 manifest 原字段为请求态；本轮不改 schema，不新增 `effective_*` 永久字段，先通过运行时日志体现策略生效。
+- 风险 2：如果把 `translated short merge` 也强制到 review redub / resume，句边界会再次漂移，破坏已存在的 segment 定位。
+  - 决策：OmniVoice 强制 translated merge 只作用于长视频初始编排；`resume_batch_dir is not None` 时仍然跳过。
+- 风险 3：如果前端因为 `tts_backend=omnivoice` 直接把 checkbox 视觉上改成勾选，会把“请求态”和“策略态”混在一起，用户下次切回 `index-tts` 时会误以为自己永久打开了开关。
+  - 决策：前端本轮不改 checkbox 真值，只补提示文案或任务日志；真正的强制只放在运行时。
+- 风险 4：如果 source/translated 两边都无差别强制合并，但不保留当前算法边界，容易把用户担心的“停顿被吃掉”重新引入。
+  - 决策：只强制“现有算法是否执行”，不改现有边界条件：
+    - 目标阈值仍是 `6~20s`
+    - 容差仍是 `round(target / 3)`
+    - `>1.5s` 静默不跨
+    - 单条已过长不并
+    - translated 不跨 segment
+
+## Spec-5 验证口径
+- [tests/test_dub_pipeline_asr_layout.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dub_pipeline_asr_layout.py)
+  - 新增 `tts_backend=omnivoice` 时，即使 `source_short_merge_enabled=False`，运行时仍会触发 source merge 的用例。
+- [tests/test_dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dub_long_video.py)
+  - 新增 `tts_backend=omnivoice` + `translated_short_merge_enabled=False` 时，初始编排仍会执行 translated merge；
+  - 同时断言 `resume_batch_dir` 场景仍然 `skipped_resume`，避免重复并句。
+- 最小验证：
+  - `uv run python -m py_compile tools/dub_pipeline.py tools/dub_long_video.py tests/test_dub_pipeline_asr_layout.py tests/test_dub_long_video.py`
+  - `uv run python -m unittest tests.test_dub_pipeline_asr_layout tests.test_dub_long_video`
+
+## Spec-5 Review（2026-04-28）
+- 已实现：
+  - [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 新增 `resolve_source_short_merge_policy()` 并在 `validate_args()`、`main()`、`load_or_transcribe_subtitles()` 之间透传 `requested/effective/reason`，确保 `tts_backend=omnivoice` 时 source short merge 在运行时强制生效，同时不污染 manifest 的请求态字段。
+  - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 新增 `resolve_translated_short_merge_policy()`，确保 translated 上传字幕在 `omnivoice` 初始编排阶段强制并句，而 `resume_batch_dir` 仍明确跳过并输出 `reason=resume_skipped`。
+  - translated merge 的 segment 日志已扩展为 `requested/effective/reason` 三元信息，source merge 的 logger 也会记录 `short_merge_requested / short_merge_effective / short_merge_effective_reason`。
+- 回归测试：
+  - [tests/test_dub_pipeline_asr_layout.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dub_pipeline_asr_layout.py) 已新增 OmniVoice source merge 策略态用例，并补齐 `load_or_transcribe_subtitles()` 新签名参数。
+  - [tests/test_dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dub_long_video.py) 已新增 OmniVoice translated merge 强制生效用例，以及 `resume_skipped` 策略函数用例；原 translated merge 日志断言已同步到新格式。
+- 验证证据：
+  - `uv run python -m py_compile tools/dub_pipeline.py tools/dub_long_video.py tests/test_dub_pipeline_asr_layout.py tests/test_dub_long_video.py`：通过
+  - `uv run python -m unittest tests.test_dub_pipeline_asr_layout tests.test_dub_long_video`：`Ran 20 tests ... OK`
+
+## Spec-6（2026-04-28 OmniVoice merge 后仍过短句子的前置拦截）
+- [x] Spec-1：现状分析（带代码出处）
+- [x] Spec-2：确认前置拦截语义、记录字段与精确改动范围
+- [x] Spec-3：确认 grouped/逐句两条路径的风险与验证口径
+
+### Spec-1 现状分析
+- 现状 1：`OmniVoice` 的 `<1.2s` 安全下限目前只在 backend 合成入口校验，不在编排层预判。
+  - 依据： [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py) 的 `_validate_request()` 会在 `0 < target_duration_sec < 1.2s` 时直接抛出 `E-TTS-001 omnivoice target duration below safe floor`；`synthesize()` 一开始就执行这条校验。
+- 现状 2：即使 source/translated short merge 已被 `omnivoice` 运行时强制开启，合并逻辑也只负责“是否并句”，不会在合并后对剩余短句做二次筛查。
+  - 依据 1： [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 的 `resolve_source_short_merge_policy()` 只决定 `effective_source_short_merge_enabled`。
+  - 依据 2： [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的 `resolve_translated_short_merge_policy()` 只决定 `effective_translated_short_merge_enabled`。
+- 现状 3：逐句主循环里，`effective_target_duration` 仍会原样传给 `synthesize_text_once()`；如果这时仍 `<1.2s`，失败会在 TTS 阶段才暴露。
+  - 依据： [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的 `synthesize_segments()` 在逐句循环中直接把 `effective_target_duration` 传给 `synthesize_text_once(...)`。
+- 现状 4：当前这类失败在 manifest / manual review 里会被记录成通用 `tts_failed`，还没有一个专门的“OmniVoice 安全下限命中”原因码。
+  - 依据 1： [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的异常分支会把 `failure_reason_code` 设成 `tts_failed`、`failure_error_code` 设成 `E-TTS-001`。
+  - 依据 2： 同文件后续 `record["status"] != "done"` 时追加的 `manual_review` 也只会继承这个通用 reason code。
+- 现状 5：即便是失败路径，当前 pipeline 也已经有稳定的缺失音频占位与最终混音保护，所以如果要前置拦截，不需要改混音层协议。
+  - 依据： [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 在逐句失败时会生成 `seg_xxxx_missing.wav` 占位；[src/subtitle_maker/domains/media/compose.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/media/compose.py) 的 `compose_vocals_master()` 已显式兼容 `*_missing.wav`。
+- 结论：下一步最值钱的不是再改 merge 算法，而是把“merge 后仍低于 OmniVoice 安全下限的句子”在 `pipeline` 里前置标记出来，给出专用 reason code / 日志，并直接走现有 missing/manual review 协议，避免把明显不适合的句子送到 backend 再失败一次。
+
+### Spec-2 功能点与精确改动范围
+- 推荐实现语义：
+  - 只在 `tts_backend=omnivoice` 的运行时路径启用“过短目标时长前置拦截”。
+  - 判定标准先保持和 backend 一致：`0 < effective_target_duration_sec < 1.2s`。
+  - 命中后不再调用 `synthesize_text_once()`，而是直接进入现有 missing/manual review 协议。
+  - 不切换底座，不尝试自动 fallback，不改现有 short merge 算法。
+- 推荐新增的运行时表达：
+  - 新增一个专用判定 helper，例如 `is_omnivoice_target_duration_unsafe(...)`，只负责回答“当前句/组是否低于 OmniVoice 安全下限”。
+  - 新增一个统一 reason code：
+    - `reason_code = "omnivoice_target_duration_below_safe_floor"`
+    - `error_code = "E-TTS-001"`
+    - `error_stage = "tts_precheck"`
+  - `reason_detail` 明确带上：
+    - `effective_target_duration_sec`
+    - `safe_floor_sec=1.2`
+    - `tts_backend=omnivoice`
+- 逐句路径改动范围：
+  - 落点： [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的 `synthesize_segments()`。
+  - 插入位置：在每句已经算出 `effective_target_duration`、但还没进入 `for attempt_no in range(...)` 重试循环之前。
+  - 命中后的动作：
+    - 直接生成 `seg_xxxx_missing.wav`
+    - 直接构造 `record`
+    - 直接追加 `manual_review`
+    - `attempt_history` 只记一条 `action="omnivoice_duration_precheck"`，不要伪装成真实 TTS 失败
+    - `audio_leveling_*` 字段保持 missing 协议的现状，不做 leveling
+  - 这样可以跳过：
+    - `synthesize_text_once()`
+    - `invalid_audio` 检测
+    - `fit_timing/atempo/retranslate`
+    - 也不会再把它记成通用 `tts_failed`
+- grouped 路径改动范围：
+  - 落点： [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的 grouped 合成主循环（`build_synthesis_groups()` 之后、真正调用 `synthesize_text_once()` 之前）。
+  - 判定对象不是单句 `target_duration_sec`，而是组级 `group_effective_target_duration`。
+  - 命中后的动作：
+    - 不跑组级 TTS
+    - 直接给组内每一条 `seg_xxxx` 写 `*_missing.wav`
+    - `attempt_history` 只记 `action="group_omnivoice_duration_precheck"`
+    - `manual_review` 统一使用新的专用 reason code，而不是通用 `tts_failed`
+  - 这样 grouped/legacy 路径与逐句路径的失败语义能对齐。
+- 日志范围：
+  - 逐句路径新增一个明确事件，例如：
+    - `segment_tts_precheck_rejected`
+  - grouped 路径新增一个明确事件，例如：
+    - `group_tts_precheck_rejected`
+  - 两者日志数据都至少带：
+    - `segment_id` 或 `group_id`
+    - `effective_target_duration_sec`
+    - `safe_floor_sec`
+    - `requested_target_duration_sec`
+    - `borrowed_gap_sec`
+- 明确不改的范围：
+  - 不改 [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py) 现有 backend guard；它继续保留，作为最后一道保护。
+  - 不改 [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) / [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的 short merge 规则、阈值和 UI 语义。
+  - 不改 `index-tts` 路径，不把这条 precheck 推广到其他底座。
+
+### Spec-3 风险、决策与验证口径
+- 风险 1：如果 precheck 用的是原始 `target_duration_sec`，而不是已经借后续静默后的 `effective_target_duration_sec`，会误杀本来可以靠 borrowed gap 安全落地的句子。
+  - 依据： [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的逐句/组级路径都会先调用 `compute_effective_target_duration(...)`，并把 `effective_target_duration_sec`、`borrowed_gap_sec` 记入 record。
+  - 决策：precheck 统一只看 `effective_target_duration_sec`，并把 `requested_target_duration_sec` 作为日志附加信息，而不是判定主条件。
+- 风险 2：如果把 precheck 直接套到 grouped 的非语音组，会破坏当前“非语音直接生成静音片段”的特例路径。
+  - 依据： grouped 路径里当前先判 `non_speech_group`，命中时直接写 `group_id_silent.wav`，不会进入真实 TTS。
+  - 决策：precheck 只对“有可说内容”的句/组生效；`non_speech_group` 和逐句 `segment_type=non_speech` 保持现状，不走这条拦截。
+- 风险 3：如果 grouped 路径只给 anchor 行打 `manual_review`，不把组内每条都写入专用 reason code，会导致 review 列表、最终 merge 统计和用户感知不一致。
+  - 依据：当前 grouped 失败时， [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 会把组内每个 `seg_xxxx` 都写进 `records_by_index` 和 `manual_review`。
+  - 决策：前置拦截沿用现有 grouped 失败语义，组内每一条都生成 `*_missing.wav`、每一条都追加 `manual_review`。
+- 风险 4：如果 precheck 放在“复用已有音频”之前，会把普通 resume / 非 redub 行重新打成 missing，破坏你已经修好的恢复语义。
+  - 依据：逐句路径当前先走 `resolve_existing_audio_path()` 和 `resume_reuse_allowed`，满足条件就直接复用历史音频并 `continue`。
+  - 决策：precheck 必须放在“已有音频复用”之后、真实 TTS 重试循环之前；也就是说普通 resume 不重判，只有这次真正要重配的句子才会命中 precheck。
+- 风险 5：如果把这条 precheck 泛化到“主底座不是 OmniVoice、但 fallback=omnivoice”的场景，会把 `index-tts` 主链路也污染进来，违背你要求的隔离边界。
+  - 依据：当前逐句路径支持 `fallback_tts_backend=omnivoice`，但用户已经明确不建议中途切底座。
+  - 决策：本轮 precheck 只看主 backend：`tts_backend == "omnivoice"` 才启用；不根据 fallback backend 触发。
+- 风险 6：如果删掉 backend 层已有 guard，只靠 pipeline precheck，会让未来别的入口直接调用 `OmniVoiceBackend` 时失去最后一道保护。
+  - 依据： [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py) 的 `_validate_request()` 当前已经稳定工作，并有独立回归。
+  - 决策：保留 backend guard；pipeline precheck 只是“更早、更清楚地失败”，不是替换 backend 校验。
+
+### Spec-6 验证口径
+- 单测主集：
+  - [tests/test_dubbing_runtime.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_runtime.py)
+    - 新增逐句路径用例：`tts_backend=omnivoice` 且 `effective_target_duration_sec < 1.2s` 时，直接进入 `manual_review`，`synthesize_text_once()` 不会被调用，`reason_code` 为 `omnivoice_target_duration_below_safe_floor`。
+    - 新增 grouped 路径用例：`group_effective_target_duration_sec < 1.2s` 时，组内每条都写 `*_missing.wav`，并且 `manual_review` 对每条都记录专用 reason code。
+    - 新增非语音组用例：grouped `non_speech_group` 仍走静音片段逻辑，不应被 precheck 误杀。
+    - 现有 `resume reuse` 用例继续通过，证明 precheck 没有插错顺序。
+    - 现有 `omnivoice_keep_natural_no_atempo` / `skips_fit_when_within_threshold` 用例继续通过，证明这次没有误伤 OmniVoice 其它时长对齐策略。
+- backend 保护回归：
+  - [tests/test_dubbing_runtime.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_runtime.py) 里现有 `test_omnivoice_backend_rejects_too_short_target_duration_before_request()` 继续通过，证明 backend guard 仍保留。
+- 最小验证命令：
+  - `uv run python -m py_compile src/subtitle_maker/domains/dubbing/pipeline.py tests/test_dubbing_runtime.py`
+  - `uv run python -m unittest tests.test_dubbing_runtime`
+- 非目标：
+  - 这轮不要求真实跑 OmniVoice 服务级 smoke；重点是把“是否前置拦截、是否保留 resume/非语音/现有对齐行为”用本地回归锁住。
+
+## Spec-6 Review（2026-04-28）
+- 已实现：
+  - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 新增 OmniVoice 前置拦截 helper：
+    - `_is_omnivoice_target_duration_unsafe()`
+    - `_build_omnivoice_duration_precheck_reason_detail()`
+    - `_write_missing_audio_placeholder()`
+  - grouped 路径在真正调用 `synthesize_text_once()` 之前，若 `group_effective_target_duration_sec < 1.2s`，会直接打 `group_tts_precheck_rejected`，为组内每条写 `*_missing.wav`，并记录 `reason_code=omnivoice_target_duration_below_safe_floor`。
+  - 逐句路径在“已有音频复用”之后、真实 TTS 重试循环之前，若 `effective_target_duration_sec < 1.2s`，会直接打 `segment_tts_precheck_rejected`，写 `seg_xxxx_missing.wav`，并记录同样的专用 reason code / `tts_precheck` stage。
+  - backend 层 [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py) 的 `_validate_request()` 未删除，仍作为最后一道保护保留。
+- 回归测试：
+  - [tests/test_dubbing_runtime.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_runtime.py) 新增：
+    - 逐句 OmniVoice precheck 不触发真实 TTS 的用例；
+    - grouped OmniVoice precheck 组内多条同时标记 manual review 的用例；
+    - OmniVoice 非语音 grouped 仍走静音片段、不会被 precheck 误杀的用例。
+  - 同时把原有两条 OmniVoice 时长对齐回归的目标时长调整到 `1.25s` 以上，确保它们继续验证“跳过 fit / 避免 atempo”本身，而不是被新的 precheck 提前拦截。
+- 验证证据：
+  - `uv run python -m py_compile src/subtitle_maker/domains/dubbing/pipeline.py tests/test_dubbing_runtime.py`：通过
+  - `uv run python -m unittest tests.test_dubbing_runtime`：`Ran 30 tests ... OK`
+
+## TODO（2026-04-28 OmniVoice 实测结果文档同步）
+- [x] 汇总最新前端实测任务的 segment 日志、manifest 和 OmniVoice 服务日志
+- [x] 新增 `docs/auto-dubbing-v2-omnivoice-status.md`，沉淀当前已落地策略与最新验证结果
+- [x] 记录当前剩余待观察项：音量上限、最终视频封装层、听感持续回归
+
+## Review（2026-04-28 OmniVoice 实测结果文档同步）
+- 文档新增：
+  - [docs/auto-dubbing-v2-omnivoice-status.md](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/docs/auto-dubbing-v2-omnivoice-status.md)
+- 本次文档只记录已验证事实，不再写“预期上会更好”这类无证据表述。
+- 文档里的关键证据来自：
+  - [segment_0001.jsonl](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/web_20260428_015019/longdub_20260428_095022/segment_jobs/segment_0001/logs/segment_0001.jsonl)
+  - [segment manifest](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/web_20260428_015019/longdub_20260428_095022/segment_jobs/segment_0001/manifest.json)
+  - [batch_manifest.json](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/web_20260428_015019/longdub_20260428_095022/batch_manifest.json)
+  - [outputs/omnivoice_api.log](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/omnivoice_api.log)
+- 当前结论已同步进文档：
+  - 强制短句合并、reference 策略收紧、`<1.2s` 前置拦截、段级音量归一已经共同进入生产路径；
+  - 最新实测任务 `done=3 failed=0 manual_review=0`，用户听感反馈“效果好多了”与日志结果一致；
+  - 下一阶段应优先盯音量上限是否偏紧，以及最终视频封装层是否完整落盘。

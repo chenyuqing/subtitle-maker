@@ -24,3 +24,30 @@
 - 2026-04-27（强制验证清单，未完成不得提交）：前端面板布局修复后必须执行 5 项最小验证：1）点击 Step 2 只出现 `#panel-transcribe`；2）点击 Step 3 只出现 `#panel-results`；3）两个面板互切 3 次不出现叠层；4）面板内部滚动生效且播放器/侧栏不滚；5）右下交互控件可点击。任一失败，先回滚“最近一条覆盖规则”再继续定位。
 - 2026-04-27（排障流程升级）：用户已给出明确根因或修复点时（例如 `data-sm-custom-select`），优先验证并实现该点，不得先堆叠新补丁；连续 2 次修复仍未解决时，必须停下来输出“根因假设 -> 证据 -> 下一刀改动”的三列表，再动代码，避免重复消耗 token。
 - 2026-04-27（范围控制规则）：处理 Flex 滚动问题优先局部状态类（如 `body.panel-internal-scroll-active`）+ 精确选择器（`.active`）+ 最小 `!important`，禁止把“临时救火规则”扩散为全局结构覆盖，尤其禁止同时改 `main-content`、`dynamic-content-section`、`panel` 可见性三层语义而不做逐步验证。
+- 2026-04-27：实现过程中要同步更新 `tasks/todo.md` 与 `tasks/lessons.md`，不要等全部代码完成后再一次性补写；每个阶段完成后立刻记录已做项与验证证据。
+- 2026-04-27：新增全局侧边栏配置（如 TTS backend）时，必须走“`app.js` 单一状态源 + 子模块 getter 注入”模式，不要在 V1/V2 面板里各自保存，避免参数漂移和 restore 时语义不一致。
+- 2026-04-27：前端新增 backend 选项必须同步校验后端白名单和 CLI 白名单；若只改前端不改后端校验，会出现“UI 可选但请求必失败”的假可用状态。提交前至少补一条“前端参数 -> API normalize -> command builder -> CLI validate”链路测试。
+- 2026-04-27：OmniVoice 运行参数必须按模式校验：`via_api=true` 只强依赖 `api_url`，`via_api=false` 才强依赖 `omnivoice_root/python/model`；否则会把“服务化模式”错误拦截成配置缺失。
+- 2026-04-27：当用户要求“切换某个底座自动启动”时，自动启动触发应绑定主底座选择（`tts_backend`），不要默认绑定 fallback 备用链路，避免无关场景频繁拉起模型服务。
+- 2026-04-27：侧边栏新增底座运行参数后，必须把“可见性状态”和“请求透传”一起做；只做 UI 展示不透传，或只透传不做显示边界，都会造成“用户以为生效但实际没生效”的隐性故障。
+- 2026-04-27：左侧栏“配置拆分”需求要同时处理信息架构与空间占用：把低频设置（DeepSeek key）做成可折叠，把高频切换（TTS 底座）独立为单卡片，避免把两类任务混在一块导致操作路径变长。
+- 2026-04-27：若两个底座都依赖本地默认 URL（index-tts/omnivoice），前端应保持一致的“零配置”体验；调试级 URL 参数默认隐藏，优先走后端默认与环境变量，避免把实现细节暴露给日常使用路径。
+- 2026-04-27：启动脚本默认体验必须支持“前端自由切换底座”，不要要求用户先理解多脚本启动顺序；`./start.sh` 应优先走双底座可用的自动模式，单底座模式作为显式高级选项。
+- 2026-04-27：当本地资源不足以双模型并驻时，默认策略应改为“懒汉式单模型驻留”：请求到来时先停旧底座再起新底座；切换慢可以接受，但不能要求用户手动管理多个服务。
+- 2026-04-27：OmniVoice 若使用 HF repo id（`k2-fsa/OmniVoice`）在离线/受限网络环境会直接触发 `E-TTS-001` 并回退 `seg_xxxx_missing.wav`；本地部署默认必须指向已下载的 `omnivoice/checkpoints` 本地路径，避免运行时再拉 HF。
+- 2026-04-27：支持原生时长控制的 TTS（如 OmniVoice）不能只靠后处理 `fit_audio_to_duration` 对齐；必须优先把目标时长透传到模型生成阶段，并在阈值内跳过二次 fit，避免 `atrim` 截断句尾。
+- 2026-04-27：`save-and-redub` 后重建 full 字幕时，不能要求“所有 segment 都有字幕输入”；有跳过段时也要按有效输入重建，否则会出现“音频已更新但 final 字幕仍旧版本”。
+- 2026-04-27：batch 重建字幕时，segment manifest 里的 `paths.translated_srt/dubbed_final_srt` 可能指向历史文件；必须优先读取 `segment/subtitles/*.srt` 最新文件，否则会把用户刚改的译文覆盖回旧文案。
+- 2026-04-28：修复“final 字幕被旧译文覆盖”时，不能只改 `repair_bad_segments.py` 的事后 rebuild；`tools/dub_long_video.py` 的主流程最终 merge 也必须同步使用同一套 `segment/subtitles/*.srt` 优先级，否则任务自然结束时会再次把旧字幕拼回去。
+- 2026-04-27：TTS 自动拉起不能用固定短超时（如 120s）硬等脚本结束；OmniVoice 冷启动波动较大，后端应使用可配置超时并在“脚本非 0/超时”后追加健康探活，服务已就绪时不得误报失败。
+- 2026-04-27：启动脚本里的健康轮询必须给 `curl` 设置单次超时（`--max-time`），否则单次探活阻塞会放大总等待时间，诱发父进程超时误杀后台服务。
+- 2026-04-27：Restore 批次列表不能只依赖 `batch_manifest.json`；中断任务常常只有 `longdub_*` 目录与 `segment_jobs/*/manifest.json`，前端列表必须把这类 `incomplete` 批次展示出来，并允许加载后续跑。
+- 2026-04-27：`resume` 语义必须是“复用已成功分句结果 + 仅继续缺失/失败部分”，不能默认从第 1 句重新合成；否则会覆盖历史 `seg_*.wav` 并破坏断点续传价值。回归测试至少覆盖 `redub_line_indices=None` 时不触发 `synthesize_text_once`。
+- 2026-04-27：本地媒体上传的播放器链路不能只依赖后端 `/stream/...`；正确顺序是“先本地 ObjectURL 预览，再切服务端流”，并在 `video.error` 时自动回退本地源，否则用户会看到空黑播放器且无提示。
+- 2026-04-27：`load-batch/resume` 的输入媒体不能盲信 `batch_manifest.input_media_path`；若该字段指向 `segments/segment_0001.wav`，必须优先回溯 `uploads/dubbing/<web任务id>/` 原视频，否则播放器会误播“8分钟 segment 音频”。
+- 2026-04-27：恢复任务时如果同一行同时存在 `seg_xxxx.wav` 和 `seg_xxxx_missing.wav`，复用与混音都必须优先正常 wav；不能只按 manifest 里的 `tts_audio_path` 生搬硬套，否则最终合并会误用 missing。
+- 2026-04-27：对每个 `seg_id` 必须维护“单输出不变量”：成功态只留 `seg_xxxx.wav`，失败态只留 `seg_xxxx_missing.wav`。任何阶段如果出现双文件并存，视为实现缺陷而不是“可容忍状态”。
+- 2026-04-28：分析某个外部 TTS 底座效果差时，必须先回到底座原 repo（如 `/Users/tim/Documents/vibe-coding/MVP/OmniVoice`）读源码、示例和参数文档，形成调参依据后再评价 subtitle-maker 接入链路；不能只看封装层日志就下质量结论。
+- 2026-04-28：讨论“配音 TTS 底座”时，先和用户对齐实际在用的底座范围；本项目当前用户语境下只分析 `index-tts` 与 `omnivoice`，不要把 `qwen` 混进配音链路判断。
+- 2026-04-28：核对“某开关是否真的执行”时，不能只 grep `tools/dub_pipeline.py` 或 API 透传层；长视频任务还要检查 `tools/dub_long_video.py` 这类编排层的一次性预处理逻辑，否则会把“执行在 orchestration 层”的能力误判成未接线。
+- 2026-04-28：用户不接受同一任务中途切换 TTS 底座；短句与失败句问题必须优先在前置编排层解决（短句合并、参考音策略、时长门槛、人工复审），不要用运行时切到另一套 TTS 来兜底，否则会引入速度差和音色不一致。

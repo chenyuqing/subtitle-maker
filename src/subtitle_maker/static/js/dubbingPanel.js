@@ -51,6 +51,7 @@ function setupAutoDubbing(config, deps) {
         normalizeShortMergeTargetSeconds,
         applyAutoDubSubtitleItems,
         getDeepSeekApiKey,
+        getGlobalTtsBackend,
         getProjectDubbingContext,
     } = deps;
 
@@ -75,12 +76,20 @@ function setupAutoDubbing(config, deps) {
     const sourceLangSelect = byId('source');
     const targetLangSelect = byId('target');
     const groupingStrategySelect = byId('grouping-strategy');
+    const shortMergeCardEl = byId('short-merge-card');
     const shortMergeEnabledCheckbox = byId('short-merge-enabled');
     const shortMergeSettingsEl = byId('short-merge-settings');
+    const shortMergeHintEl = byId('short-merge-hint');
     const shortMergeThresholdInput = byId('short-merge-threshold');
+    const translatedShortMergeCardEl = byId('translated-short-merge-card');
+    const translatedShortMergeEnabledCheckbox = byId('translated-short-merge-enabled');
+    const translatedShortMergeSettingsEl = byId('translated-short-merge-settings');
+    const translatedShortMergeHintEl = byId('translated-short-merge-hint');
+    const translatedShortMergeThresholdInput = byId('translated-short-merge-threshold');
     const autoPickRangesCheckbox = byId('auto-pick-ranges');
     const rewriteTranslationCheckbox = byId('rewrite-translation');
     const startBtn = document.getElementById(config?.startButtonId || '');
+    const resumeBtn = byId('resume-btn');
     const statusContainer = byId('status-container');
     const autoProgressFill = byId('progress-fill');
     const statusText = byId('status-text');
@@ -88,6 +97,7 @@ function setupAutoDubbing(config, deps) {
     const reviewPanel = byId('review-panel');
     const reviewLoadBtn = byId('review-load-btn');
     const reviewSaveRedubBtn = byId('review-save-redub-btn');
+    const reviewForceRedubBtn = byId('review-force-redub-btn');
     const reviewListEl = byId('review-list');
     const taskLabel = byId('task-id');
     const lineProgressEl = byId('line-progress');
@@ -95,6 +105,7 @@ function setupAutoDubbing(config, deps) {
     const loadBatchSelect = byId('load-batch-select');
     const refreshBatchesBtn = byId('refresh-batches-btn');
     const loadBatchBtn = byId('load-batch-btn');
+    const batchHintEl = byId('batch-hint');
     const audioTrackSwitcher = document.getElementById('audio-track-switcher');
     const audioTrackModeSelect = document.getElementById('audio-track-mode');
     const autoDubRangesList = byId('time-ranges-list');
@@ -115,6 +126,14 @@ function setupAutoDubbing(config, deps) {
     let currentAutoDubTaskId = '';
     let reviewLinesCache = [];
     let startMode = 'project';
+    let shortMergeRememberedChecked = shortMergeEnabledCheckbox ? !!shortMergeEnabledCheckbox.checked : false;
+    let translatedShortMergeRememberedChecked = translatedShortMergeEnabledCheckbox
+        ? !!translatedShortMergeEnabledCheckbox.checked
+        : false;
+    let sourceShortMergeConfiguredByUser = false;
+    let translatedShortMergeConfiguredByUser = false;
+    let translatedShortMergeHintOverride = '';
+    let lastEffectiveSubtitleMode = 'media_only';
     const dubbedAudioPlayer = new Audio();
     dubbedAudioPlayer.preload = 'metadata';
     let dubbedAudioUrl = null;
@@ -214,6 +233,42 @@ function setupAutoDubbing(config, deps) {
         if (!mediaName && !selectedFile && startMode !== 'standalone') {
             setStartMode('standalone');
         }
+        syncShortMergeControls();
+    }
+
+    /**
+     * 解析当前面板实际使用的字幕输入模式，统一驱动 source/translated 两套并句控件。
+     */
+    function resolveEffectiveSubtitleMode() {
+        if (startMode === 'project') {
+            return projectSubtitleModeSelect ? projectSubtitleModeSelect.value : 'media_only';
+        }
+        if (selectedSubtitleFile) {
+            return subtitleModeSelect ? subtitleModeSelect.value : 'source';
+        }
+        return 'media_only';
+    }
+
+    /**
+     * 将“想合并短句”的用户意图从 source 模式平滑迁移到 translated 模式，避免切模式后配置看似丢失。
+     */
+    function maybeCarryShortMergeIntent(nextSubtitleMode) {
+        if (nextSubtitleMode !== 'translated') {
+            translatedShortMergeHintOverride = '';
+            return;
+        }
+        const sourceMergeEnabled = shortMergeEnabledCheckbox ? !!shortMergeEnabledCheckbox.checked : false;
+        if (!sourceMergeEnabled || translatedShortMergeConfiguredByUser) {
+            return;
+        }
+        if (translatedShortMergeEnabledCheckbox && !translatedShortMergeEnabledCheckbox.checked) {
+            translatedShortMergeEnabledCheckbox.checked = true;
+        }
+        translatedShortMergeRememberedChecked = true;
+        if (shortMergeThresholdInput && translatedShortMergeThresholdInput) {
+            translatedShortMergeThresholdInput.value = shortMergeThresholdInput.value || translatedShortMergeThresholdInput.value;
+        }
+        translatedShortMergeHintOverride = '已沿用你刚才的 source merge 意图，自动开启 translated merge。会调整你上传译文的句边界，但不改文字内容，也不会触发翻译 rewrite。';
     }
 
     /**
@@ -237,15 +292,96 @@ function setupAutoDubbing(config, deps) {
                 ? `Start ${config?.pipelineVersion === 'v2' ? 'Auto Dubbing V2' : 'Auto Dubbing'} From Current Project`
                 : `Start ${config?.pipelineVersion === 'v2' ? 'Auto Dubbing V2' : 'Auto Dubbing'}`;
         }
+        syncShortMergeControls();
+    }
+
+    /**
+     * 控制“从失败处继续”按钮显示；只在任务失败/取消时暴露续跑入口。
+     */
+    function setResumeButtonVisible(visible) {
+        if (!resumeBtn) return;
+        resumeBtn.disabled = !visible;
+        resumeBtn.title = visible ? '从上一次失败/取消任务继续执行' : '当前没有可续跑的失败任务';
     }
 
     /**
      * 同步“短句合并”开关与阈值面板显示，避免默认关闭时仍暴露无效参数。
      */
     function syncShortMergeControls() {
-        if (!shortMergeSettingsEl) return;
-        const shortMergeEnabled = shortMergeEnabledCheckbox ? !!shortMergeEnabledCheckbox.checked : false;
-        shortMergeSettingsEl.style.display = shortMergeEnabled ? 'flex' : 'none';
+        const effectiveSubtitleMode = resolveEffectiveSubtitleMode();
+        if (effectiveSubtitleMode !== lastEffectiveSubtitleMode) {
+            maybeCarryShortMergeIntent(effectiveSubtitleMode);
+        }
+        const sourceMergeVisible = effectiveSubtitleMode !== 'translated';
+        const translatedMergeVisible = effectiveSubtitleMode === 'translated';
+
+        if (shortMergeCardEl) {
+            shortMergeCardEl.style.display = sourceMergeVisible ? '' : 'none';
+        }
+        if (shortMergeHintEl) {
+            shortMergeHintEl.style.display = sourceMergeVisible ? 'block' : 'none';
+            shortMergeHintEl.textContent = '仅对 source 字幕 / ASR 结果生效。若上传 translated 字幕，系统会严格遵循你提供的句级时间轴。';
+        }
+        if (shortMergeEnabledCheckbox) {
+            if (!sourceMergeVisible) {
+                if (shortMergeEnabledCheckbox.checked) {
+                    shortMergeRememberedChecked = true;
+                }
+                shortMergeEnabledCheckbox.checked = false;
+                shortMergeEnabledCheckbox.disabled = true;
+                shortMergeEnabledCheckbox.title = 'translated 模式下不会执行 source 短句合并';
+            } else {
+                shortMergeEnabledCheckbox.disabled = false;
+                shortMergeEnabledCheckbox.title = '';
+                if (!shortMergeEnabledCheckbox.checked && shortMergeRememberedChecked) {
+                    shortMergeEnabledCheckbox.checked = true;
+                }
+            }
+        }
+        const shortMergeEnabled = shortMergeEnabledCheckbox
+            ? (!!shortMergeEnabledCheckbox.checked && !shortMergeEnabledCheckbox.disabled)
+            : false;
+        if (shortMergeThresholdInput) {
+            shortMergeThresholdInput.disabled = !shortMergeEnabled;
+        }
+        if (shortMergeSettingsEl) {
+            shortMergeSettingsEl.style.display = shortMergeEnabled ? 'flex' : 'none';
+        }
+
+        if (translatedShortMergeCardEl) {
+            translatedShortMergeCardEl.style.display = translatedMergeVisible ? '' : 'none';
+        }
+        if (translatedShortMergeHintEl) {
+            translatedShortMergeHintEl.style.display = translatedMergeVisible ? 'block' : 'none';
+            translatedShortMergeHintEl.textContent = translatedShortMergeHintOverride
+                || '只在 translated 直通模式生效。会调整你上传译文的句边界，但不改文字内容，也不会触发翻译 rewrite。';
+        }
+        if (translatedShortMergeEnabledCheckbox) {
+            if (!translatedMergeVisible) {
+                if (translatedShortMergeEnabledCheckbox.checked) {
+                    translatedShortMergeRememberedChecked = true;
+                }
+                translatedShortMergeEnabledCheckbox.checked = false;
+                translatedShortMergeEnabledCheckbox.disabled = true;
+                translatedShortMergeEnabledCheckbox.title = '仅在 translated 模式下可用';
+            } else {
+                translatedShortMergeEnabledCheckbox.disabled = false;
+                translatedShortMergeEnabledCheckbox.title = '';
+                if (!translatedShortMergeEnabledCheckbox.checked && translatedShortMergeRememberedChecked) {
+                    translatedShortMergeEnabledCheckbox.checked = true;
+                }
+            }
+        }
+        const translatedShortMergeEnabled = translatedShortMergeEnabledCheckbox
+            ? (!!translatedShortMergeEnabledCheckbox.checked && !translatedShortMergeEnabledCheckbox.disabled)
+            : false;
+        if (translatedShortMergeThresholdInput) {
+            translatedShortMergeThresholdInput.disabled = !translatedShortMergeEnabled;
+        }
+        if (translatedShortMergeSettingsEl) {
+            translatedShortMergeSettingsEl.style.display = translatedShortMergeEnabled ? 'flex' : 'none';
+        }
+        lastEffectiveSubtitleMode = effectiveSubtitleMode;
     }
 
     /**
@@ -585,6 +721,30 @@ function setupAutoDubbing(config, deps) {
     }
 
     /**
+     * 不改字幕文本，只对 missing/manual_review 句触发局部重配。
+     */
+    async function forceRedubFailedReviewLines() {
+        if (!currentAutoDubTaskId) {
+            throw new Error('当前没有可重配任务');
+        }
+        const res = await fetch(`/dubbing/auto/review/${currentAutoDubTaskId}/redub-failed`, {
+            method: 'POST',
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || `HTTP ${res.status}`);
+        }
+        const payload = await res.json();
+        await loadReviewLines();
+        const statusRes = await fetch(`/dubbing/auto/status/${currentAutoDubTaskId}`);
+        if (statusRes.ok) {
+            const taskData = await statusRes.json();
+            renderResults(taskData);
+        }
+        return payload;
+    }
+
+    /**
      * 从任务结果中选择可自动加载的字幕文件。
      */
     function pickAutoDubSrtUrl(data) {
@@ -643,7 +803,8 @@ function setupAutoDubbing(config, deps) {
         const srtUrl = pickAutoDubSrtUrl(data);
         if (!srtUrl) return;
         try {
-            const response = await fetch(srtUrl);
+            // review 重配后字幕文件路径通常不变，追加版本戳避免浏览器拿到旧缓存。
+            const response = await fetch(withCacheBust(srtUrl));
             if (!response.ok) {
                 throw new Error(`HTTP ${response.status}`);
             }
@@ -702,11 +863,17 @@ function setupAutoDubbing(config, deps) {
     if (standaloneModeBtn) {
         standaloneModeBtn.addEventListener('click', () => setStartMode('standalone'));
     }
+    if (projectSubtitleModeSelect) {
+        projectSubtitleModeSelect.addEventListener('change', () => {
+            syncShortMergeControls();
+        });
+    }
     window.addEventListener('subtitle-maker:project-context-changed', () => {
         renderProjectContextSummary();
     });
     renderProjectContextSummary();
     setStartMode('project');
+    setResumeButtonVisible(false);
 
     // File Upload Logic.
     if (uploadArea && fileInput) {
@@ -760,13 +927,16 @@ function setupAutoDubbing(config, deps) {
                 const modeHint = mode === 'translated' ? '将跳过 ASR 与翻译' : '将跳过 ASR';
                 subtitleNameDisplay.textContent = `已选择：${file.name}（${modeHint}）`;
             }
+            syncShortMergeControls();
         });
     }
     if (subtitleModeSelect) {
         subtitleModeSelect.addEventListener('change', () => {
-            if (!selectedSubtitleFile || !subtitleNameDisplay) return;
-            const modeHint = subtitleModeSelect.value === 'translated' ? '将跳过 ASR 与翻译' : '将跳过 ASR';
-            subtitleNameDisplay.textContent = `已选择：${selectedSubtitleFile.name}（${modeHint}）`;
+            if (selectedSubtitleFile && subtitleNameDisplay) {
+                const modeHint = subtitleModeSelect.value === 'translated' ? '将跳过 ASR 与翻译' : '将跳过 ASR';
+                subtitleNameDisplay.textContent = `已选择：${selectedSubtitleFile.name}（${modeHint}）`;
+            }
+            syncShortMergeControls();
         });
     }
 
@@ -780,6 +950,7 @@ function setupAutoDubbing(config, deps) {
         if (subtitleInput) subtitleInput.value = '';
         if (subtitleNameDisplay) subtitleNameDisplay.textContent = '未选择字幕文件（默认自动识别）';
         if (subtitleModeSelect) subtitleModeSelect.value = 'source';
+        syncShortMergeControls();
         autoDubTimeRanges = [];
         renderAutoDubTimeRanges();
         if (autoDubRangeError) autoDubRangeError.style.display = 'none';
@@ -827,12 +998,25 @@ function setupAutoDubbing(config, deps) {
 
         if (shortMergeEnabledCheckbox) {
             shortMergeEnabledCheckbox.checked = !!payload.source_short_merge_enabled;
+            shortMergeRememberedChecked = !!payload.source_short_merge_enabled;
+            sourceShortMergeConfiguredByUser = true;
         }
         if (shortMergeThresholdInput) {
             shortMergeThresholdInput.value = String(
                 normalizeShortMergeTargetSeconds(payload.source_short_merge_threshold)
             );
         }
+        if (translatedShortMergeEnabledCheckbox) {
+            translatedShortMergeEnabledCheckbox.checked = !!payload.translated_short_merge_enabled;
+            translatedShortMergeRememberedChecked = !!payload.translated_short_merge_enabled;
+            translatedShortMergeConfiguredByUser = true;
+        }
+        if (translatedShortMergeThresholdInput) {
+            translatedShortMergeThresholdInput.value = String(
+                normalizeShortMergeTargetSeconds(payload.translated_short_merge_threshold)
+            );
+        }
+        translatedShortMergeHintOverride = '';
         if (autoPickRangesCheckbox && typeof payload.auto_pick_ranges === 'boolean') {
             autoPickRangesCheckbox.checked = payload.auto_pick_ranges;
         }
@@ -844,7 +1028,28 @@ function setupAutoDubbing(config, deps) {
 
     if (shortMergeEnabledCheckbox) {
         shortMergeEnabledCheckbox.addEventListener('change', () => {
+            sourceShortMergeConfiguredByUser = true;
+            shortMergeRememberedChecked = !!shortMergeEnabledCheckbox.checked;
             syncShortMergeControls();
+        });
+    }
+    if (translatedShortMergeEnabledCheckbox) {
+        translatedShortMergeEnabledCheckbox.addEventListener('change', () => {
+            translatedShortMergeConfiguredByUser = true;
+            translatedShortMergeHintOverride = '';
+            translatedShortMergeRememberedChecked = !!translatedShortMergeEnabledCheckbox.checked;
+            syncShortMergeControls();
+        });
+    }
+    if (shortMergeThresholdInput) {
+        shortMergeThresholdInput.addEventListener('input', () => {
+            sourceShortMergeConfiguredByUser = true;
+        });
+    }
+    if (translatedShortMergeThresholdInput) {
+        translatedShortMergeThresholdInput.addEventListener('input', () => {
+            translatedShortMergeConfiguredByUser = true;
+            translatedShortMergeHintOverride = '';
         });
     }
     syncShortMergeControls();
@@ -856,10 +1061,21 @@ function setupAutoDubbing(config, deps) {
         const formData = new FormData();
         const sourceLang = sourceLangSelect?.value || 'auto';
         const targetLang = targetLangSelect?.value || 'Chinese';
+        // 统一使用左侧全局 TTS backend，避免 V1/V2 面板出现配置漂移。
+        const ttsBackend = typeof getGlobalTtsBackend === 'function' ? getGlobalTtsBackend() : 'index-tts';
         const groupingStrategy = groupingStrategySelect ? groupingStrategySelect.value : 'sentence';
-        const shortMergeEnabled = shortMergeEnabledCheckbox ? !!shortMergeEnabledCheckbox.checked : false;
+        const shortMergeEnabled = shortMergeEnabledCheckbox
+            ? (!!shortMergeEnabledCheckbox.checked && !shortMergeEnabledCheckbox.disabled)
+            : false;
         const shortMergeThreshold = Number.parseInt(
             shortMergeThresholdInput?.value || String(shortMergeTargetDefault),
+            10,
+        );
+        const translatedShortMergeEnabled = translatedShortMergeEnabledCheckbox
+            ? (!!translatedShortMergeEnabledCheckbox.checked && !translatedShortMergeEnabledCheckbox.disabled)
+            : false;
+        const translatedShortMergeThreshold = Number.parseInt(
+            translatedShortMergeThresholdInput?.value || String(shortMergeTargetDefault),
             10,
         );
         const autoPickRanges = autoPickRangesCheckbox ? !!autoPickRangesCheckbox.checked : false;
@@ -874,11 +1090,24 @@ function setupAutoDubbing(config, deps) {
         ) {
             throw new Error(`Short merge target must be an integer between ${shortMergeTargetMin} and ${shortMergeTargetMax} seconds.`);
         }
+        if (
+            translatedShortMergeEnabled
+            && (
+                !Number.isInteger(translatedShortMergeThreshold)
+                || translatedShortMergeThreshold < shortMergeTargetMin
+                || translatedShortMergeThreshold > shortMergeTargetMax
+            )
+        ) {
+            throw new Error(`Translated short merge target must be an integer between ${shortMergeTargetMin} and ${shortMergeTargetMax} seconds.`);
+        }
         formData.append('source_lang', sourceLang);
         formData.append('target_lang', targetLang);
+        formData.append('tts_backend', ttsBackend);
         formData.append('grouping_strategy', groupingStrategy);
         formData.append('short_merge_enabled', shortMergeEnabled ? 'true' : 'false');
         formData.append('short_merge_threshold', String(shortMergeThreshold));
+        formData.append('translated_short_merge_enabled', translatedShortMergeEnabled ? 'true' : 'false');
+        formData.append('translated_short_merge_threshold', String(translatedShortMergeThreshold));
         formData.append('api_key', apiKey || '');
         formData.append('auto_pick_ranges', autoPickRanges ? 'true' : 'false');
         formData.append('pipeline_version', config?.pipelineVersion || 'v1');
@@ -964,12 +1193,35 @@ function setupAutoDubbing(config, deps) {
         };
     }
 
+    /**
+     * 对失败/取消任务发起断点续跑，后端会复用原 batch 的 segment 进度。
+     */
+    async function resumeFromFailure() {
+        if (!currentAutoDubTaskId) {
+            throw new Error('当前没有可续跑任务');
+        }
+        const apiKey = typeof getDeepSeekApiKey === 'function' ? getDeepSeekApiKey() : '';
+        const formData = new FormData();
+        formData.append('api_key', apiKey || '');
+        const res = await fetch(`/dubbing/auto/resume/${currentAutoDubTaskId}`, {
+            method: 'POST',
+            body: formData,
+        });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            throw new Error(err.detail || 'Failed to resume dubbing task');
+        }
+        return res.json();
+    }
+
     if (startBtn) {
         startBtn.addEventListener('click', async () => {
             const apiKey = typeof getDeepSeekApiKey === 'function' ? getDeepSeekApiKey() : '';
             autoDubStartedAtMs = Date.now();
 
             startBtn.disabled = true;
+            if (resumeBtn) resumeBtn.disabled = true;
+            setResumeButtonVisible(false);
             statusContainer.style.display = 'block';
             resultsContainer.style.display = 'none';
             if (autoProgressFill) {
@@ -1011,6 +1263,40 @@ function setupAutoDubbing(config, deps) {
                 statusText.textContent = 'Error: ' + e.message;
                 statusText.className = 'status-text error';
                 startBtn.disabled = false;
+                if (resumeBtn) resumeBtn.disabled = false;
+            }
+        });
+    }
+
+    if (resumeBtn) {
+        resumeBtn.addEventListener('click', async () => {
+            resumeBtn.disabled = true;
+            if (startBtn) startBtn.disabled = true;
+            setResumeButtonVisible(false);
+            try {
+                if (statusContainer) statusContainer.style.display = 'block';
+                if (resultsContainer) resultsContainer.style.display = 'none';
+                if (autoProgressFill) autoProgressFill.style.width = '5%';
+                if (statusText) {
+                    statusText.textContent = 'Resuming from failed segment...';
+                    statusText.className = 'status-text';
+                }
+                autoDubStartedAtMs = Date.now();
+                const data = await resumeFromFailure();
+                const resumedTaskId = data.task_id;
+                currentAutoDubTaskId = resumedTaskId;
+                if (taskLabel && resumedTaskId) {
+                    taskLabel.textContent = `Task · ${resumedTaskId.split('-')[0].toUpperCase()}`;
+                }
+                pollAutoDubStatus(resumedTaskId);
+            } catch (error) {
+                if (statusText) {
+                    statusText.textContent = `Resume Error: ${error.message}`;
+                    statusText.className = 'status-text error';
+                }
+                if (startBtn) startBtn.disabled = false;
+                resumeBtn.disabled = false;
+                setResumeButtonVisible(true);
             }
         });
     }
@@ -1038,9 +1324,17 @@ function setupAutoDubbing(config, deps) {
                 loadBatchSelect.appendChild(option);
             }
             if (previous) loadBatchSelect.value = previous;
+            if (batchHintEl) {
+                batchHintEl.textContent = batches.length
+                    ? `已检测到 ${batches.length} 个可加载结果文件夹`
+                    : '未检测到可加载结果（仅包含已生成 batch_manifest.json 的任务）';
+            }
         } catch (error) {
             console.warn('Load batch list failed:', error);
             loadBatchSelect.innerHTML = '<option value="">列表加载失败（可点击“加载结果”手动输入）</option>';
+            if (batchHintEl) {
+                batchHintEl.textContent = `列表加载失败：${error?.message || '未知错误'}`;
+            }
         }
     }
 
@@ -1080,6 +1374,8 @@ function setupAutoDubbing(config, deps) {
                     statusText.textContent = data.status === 'failed' ? 'Loaded · Failed' : 'Loaded · Completed';
                     statusText.className = data.status === 'failed' ? 'status-text error' : 'status-text success';
                 }
+                setResumeButtonVisible(data.status === 'failed' || data.status === 'cancelled');
+                if (resumeBtn) resumeBtn.disabled = false;
                 updateStepHighlights('dubbing:completed');
                 restoreLoadedBatchControls(data);
                 loadInputMediaToPlayer(data);
@@ -1151,6 +1447,54 @@ function setupAutoDubbing(config, deps) {
         });
     }
 
+    if (reviewForceRedubBtn) {
+        reviewForceRedubBtn.addEventListener('click', async () => {
+            reviewForceRedubBtn.disabled = true;
+            let redubProgressTimer = null;
+            try {
+                if (statusContainer) statusContainer.style.display = 'block';
+                if (statusText) {
+                    statusText.textContent = '正在重配失败句并重建 final...';
+                    statusText.className = 'status-text';
+                }
+                if (autoProgressFill) autoProgressFill.style.width = '20%';
+                redubProgressTimer = setInterval(() => {
+                    if (!autoProgressFill) return;
+                    const current = Number(String(autoProgressFill.style.width || '0').replace('%', '')) || 0;
+                    const next = Math.min(92, current + (current < 60 ? 6 : 2));
+                    autoProgressFill.style.width = `${next}%`;
+                }, 900);
+
+                const payload = await forceRedubFailedReviewLines();
+                if (redubProgressTimer) {
+                    clearInterval(redubProgressTimer);
+                    redubProgressTimer = null;
+                }
+                if (autoProgressFill) autoProgressFill.style.width = '100%';
+                if (statusText) {
+                    if (payload?.status === 'no_candidates') {
+                        statusText.textContent = '没有需要强制重配的失败句。';
+                        statusText.className = 'status-text';
+                    } else {
+                        statusText.textContent = `已重配失败句 · 行数 ${payload?.forced_line_count ?? 0} · 影响段数 ${payload?.redubbed_segments ?? 0}`;
+                        statusText.className = 'status-text success';
+                    }
+                }
+            } catch (error) {
+                if (redubProgressTimer) {
+                    clearInterval(redubProgressTimer);
+                    redubProgressTimer = null;
+                }
+                if (statusText) {
+                    statusText.textContent = `Force Re-dub Error: ${error.message}`;
+                    statusText.className = 'status-text error';
+                }
+            } finally {
+                reviewForceRedubBtn.disabled = false;
+            }
+        });
+    }
+
     /**
      * 轮询 Auto Dubbing 任务状态，并更新当前面板的进度与结果。
      */
@@ -1199,6 +1543,8 @@ function setupAutoDubbing(config, deps) {
                 if (data.status === 'completed') {
                     clearInterval(interval);
                     startBtn.disabled = false;
+                    if (resumeBtn) resumeBtn.disabled = false;
+                    setResumeButtonVisible(false);
                     const elapsedLabel = buildAutoDubElapsedLabel(data, autoDubStartedAtMs);
                     statusText.textContent = elapsedLabel ? `Process Complete · ${elapsedLabel}` : 'Process Complete';
                     statusText.className = 'status-text success';
@@ -1206,14 +1552,19 @@ function setupAutoDubbing(config, deps) {
                 } else if (data.status === 'failed') {
                     clearInterval(interval);
                     startBtn.disabled = false;
+                    if (resumeBtn) resumeBtn.disabled = false;
+                    setResumeButtonVisible(true);
                     statusText.textContent = 'Failed: ' + data.error;
                     statusText.className = 'status-text error';
+                } else {
+                    setResumeButtonVisible(false);
                 }
             } catch (e) {
                 console.error(e);
                 clearInterval(interval);
                 statusText.textContent = 'Polling Error: ' + e.message;
                 startBtn.disabled = false;
+                if (resumeBtn) resumeBtn.disabled = false;
             }
         }, 1200);
     }
@@ -1251,6 +1602,7 @@ function setupAutoDubbing(config, deps) {
      */
     function renderResults(data) {
         resultsContainer.style.display = 'block';
+        setResumeButtonVisible(data?.status === 'failed' || data?.status === 'cancelled');
         if (reviewPanel) reviewPanel.style.display = 'block';
         const links = resultsContainer.querySelector('.download-links');
         if (!links) return;

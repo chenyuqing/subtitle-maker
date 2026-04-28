@@ -96,10 +96,26 @@ DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC = 15
 MIN_SOURCE_SHORT_MERGE_TARGET_SEC = 6
 MAX_SOURCE_SHORT_MERGE_TARGET_SEC = 20
 DEFAULT_SOURCE_SHORT_MERGE_GAP_SEC = 1.5
+DEFAULT_OMNIVOICE_MIN_SUBTITLE_REF_SEC = 1.2
+DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS = 0.12
+DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB = -35.0
+DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB = 8.0
+DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING = 0.95
 
 
 def iso_now() -> str:
     return datetime.utcnow().isoformat()
+
+
+def resolve_source_short_merge_policy(*, requested_enabled: bool, tts_backend: str) -> Tuple[bool, str]:
+    """解析 source short merge 的最终生效态，OmniVoice 链路强制开启。"""
+
+    normalized_backend = (tts_backend or "").strip().lower()
+    if requested_enabled:
+        return True, "user"
+    if normalized_backend == "omnivoice":
+        return True, "omnivoice_policy"
+    return False, "disabled"
 
 
 def build_readable_run_id(*, root_dir: Path, time_tag: str) -> str:
@@ -697,6 +713,8 @@ def load_or_transcribe_subtitles(
     source_layout_llm_max_cues: int,
     source_short_merge_enabled: bool,
     source_short_merge_threshold: int,
+    source_short_merge_requested: Optional[bool],
+    source_short_merge_effective_reason: str,
     translator_factory: Optional[Callable[[], Translator]],
     logger: JsonlLogger,
 ) -> List[Dict[str, Any]]:
@@ -723,6 +741,8 @@ def load_or_transcribe_subtitles(
                 source_layout_llm_max_cues=source_layout_llm_max_cues,
                 source_short_merge_enabled=source_short_merge_enabled,
                 source_short_merge_threshold=source_short_merge_threshold,
+                source_short_merge_requested=source_short_merge_requested,
+                source_short_merge_effective_reason=source_short_merge_effective_reason,
                 translator_factory=translator_factory,
                 logger=logger,
             )
@@ -795,6 +815,8 @@ def load_or_transcribe_subtitles(
                 source_layout_llm_max_cues=source_layout_llm_max_cues,
                 source_short_merge_enabled=source_short_merge_enabled,
                 source_short_merge_threshold=source_short_merge_threshold,
+                source_short_merge_requested=source_short_merge_requested,
+                source_short_merge_effective_reason=source_short_merge_effective_reason,
                 translator_factory=translator_factory,
                 logger=logger,
             )
@@ -833,6 +855,22 @@ def is_cjk_target_lang(target_lang: str) -> bool:
     lowered = (target_lang or "").strip().lower()
     markers = ["chinese", "中文", "mandarin", "cantonese", "zh", "japanese", "korean", "日文", "韩文"]
     return any(marker in lowered for marker in markers)
+
+
+def is_cantonese_target_lang(target_lang: str) -> bool:
+    lowered = (target_lang or "").strip().lower()
+    markers = ["cantonese", "粤语", "廣東話", "广东话", "yue"]
+    return any(marker in lowered for marker in markers)
+
+
+def _build_cantonese_prompt_constraints() -> str:
+    return (
+        "Cantonese constraints:\n"
+        "- Use natural spoken Cantonese (Hong Kong style), not written Mandarin.\n"
+        "- Prefer Traditional Chinese characters for output.\n"
+        "- Keep colloquial Cantonese function words natural (e.g. 佢/我哋/你哋/喺/咗/嘅/唔/咩/呀/喇/啦).\n"
+        "- Avoid stiff Mandarin book-style wording when a Cantonese alternative exists.\n"
+    )
 
 
 def is_sentence_end(text: str) -> bool:
@@ -1857,6 +1895,8 @@ def reflow_cluster_with_llm(
         "Input:\n"
         + "\n\n".join(rows)
     )
+    if is_cantonese_target_lang(target_lang):
+        prompt += "\n\n" + _build_cantonese_prompt_constraints()
 
     response = translator.client.chat.completions.create(
         model=translator.model,
@@ -2024,6 +2064,8 @@ def rebalance_source_subtitles(
     source_layout_llm_max_cues: int = 12,
     source_short_merge_enabled: bool = False,
     source_short_merge_threshold: int = DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC,
+    source_short_merge_requested: Optional[bool] = None,
+    source_short_merge_effective_reason: str = "user",
     translator_factory: Optional[Callable[[], Translator]] = None,
     logger: JsonlLogger,
 ) -> List[Dict[str, Any]]:
@@ -2068,6 +2110,9 @@ def rebalance_source_subtitles(
             short_merge_target_seconds=source_short_merge_threshold,
             gap_threshold_sec=DEFAULT_SOURCE_SHORT_MERGE_GAP_SEC,
         )
+    requested_short_merge = bool(source_short_merge_enabled) if source_short_merge_requested is None else bool(
+        source_short_merge_requested
+    )
 
     before_signature = [
         (round(float(item["start"]), 3), round(float(item["end"]), 3), (item.get("text") or "").strip())
@@ -2089,7 +2134,31 @@ def rebalance_source_subtitles(
                 "gap_clusters": len(clusters),
                 "sentence_blocks": sentence_blocks,
                 "oversized_splits": oversized_splits,
+                "short_merge_requested": requested_short_merge,
                 "short_merge_enabled": bool(source_short_merge_enabled),
+                "short_merge_effective": bool(source_short_merge_enabled),
+                "short_merge_effective_reason": str(source_short_merge_effective_reason or "user"),
+                "short_sentence_merges": short_sentence_merges,
+                "short_merge_target_seconds": int(source_short_merge_threshold),
+                "short_merge_tolerance_seconds": source_short_merge_tolerance_seconds(
+                    int(source_short_merge_threshold)
+                ),
+                "short_merge_gap_seconds": DEFAULT_SOURCE_SHORT_MERGE_GAP_SEC,
+            },
+        )
+    elif bool(source_short_merge_enabled) and str(source_short_merge_effective_reason or "") == "omnivoice_policy":
+        logger.log(
+            "INFO",
+            "asr_align",
+            "source_short_merge_policy_applied",
+            "omnivoice source short merge policy evaluated with no boundary change",
+            data={
+                "before_count": len(subtitles),
+                "after_count": len(output),
+                "short_merge_requested": requested_short_merge,
+                "short_merge_enabled": bool(source_short_merge_enabled),
+                "short_merge_effective": bool(source_short_merge_enabled),
+                "short_merge_effective_reason": "omnivoice_policy",
                 "short_sentence_merges": short_sentence_merges,
                 "short_merge_target_seconds": int(source_short_merge_threshold),
                 "short_merge_tolerance_seconds": source_short_merge_tolerance_seconds(
@@ -2166,7 +2235,7 @@ def build_translation_prompt(lines: List[str], durations: List[float], target_la
     for idx, (text, dur) in enumerate(zip(lines, durations), start=1):
         rows.append(f"{idx}. [{dur:.2f}s] {text}")
     packed = "\n".join(rows)
-    return (
+    prompt = (
         f"Translate each subtitle line into {target_lang}.\n"
         "Rules:\n"
         "1) Keep line count exactly the same.\n"
@@ -2174,8 +2243,11 @@ def build_translation_prompt(lines: List[str], durations: List[float], target_la
         "3) Keep the translation concise so it can be spoken within the target duration.\n"
         "4) Do NOT output timestamps or bracketed durations.\n"
         "5) Return ONLY numbered translated lines.\n\n"
-        f"Input:\n{packed}\n"
     )
+    if is_cantonese_target_lang(target_lang):
+        prompt += _build_cantonese_prompt_constraints() + "\n"
+    prompt += f"Input:\n{packed}\n"
+    return prompt
 
 
 def translate_batch_with_budget(
@@ -2232,6 +2304,13 @@ def retranslate_single_line(
         f"Current translation: {current_translation}\n\n"
         "Return ONE line only. No numbering. No explanations."
     )
+    if is_cantonese_target_lang(target_lang):
+        prompt = (
+            prompt
+            + "\n\n"
+            + _build_cantonese_prompt_constraints()
+            + "Do not switch to Mandarin written style."
+        )
     response = translator.client.chat.completions.create(
         model=translator.model,
         messages=[
@@ -2308,6 +2387,72 @@ def build_subtitle_reference_map(
         out_dir=out_dir,
         default_ref=default_ref,
     )
+
+
+def read_reference_duration_sec(path: Path) -> float:
+    """读取参考音频时长；失败时返回 0，避免 reference 策略因坏文件中断。"""
+
+    try:
+        info = sf.info(str(path))
+        return max(0.0, float(info.duration or 0.0))
+    except Exception:
+        return 0.0
+
+
+def build_backend_reference_selector(
+    *,
+    tts_backend: str,
+    subtitles: List[Dict[str, Any]],
+    subtitle_ref_map: Dict[int, Path],
+    default_ref: Path,
+    omnivoice_min_subtitle_ref_sec: float = DEFAULT_OMNIVOICE_MIN_SUBTITLE_REF_SEC,
+) -> Tuple[Callable[[int], Path], Dict[str, Any]]:
+    """按底座选择参考音策略，避免 OmniVoice 默认吃到过短逐句参考音。"""
+
+    normalized_backend = (tts_backend or "").strip().lower()
+    if normalized_backend != "omnivoice":
+        def _selector(index: int) -> Path:
+            return subtitle_ref_map.get(index, default_ref)
+
+        return _selector, {
+            "reference_strategy": "sentence_original_audio_per_subtitle",
+            "reference_count": len(subtitle_ref_map),
+            "shared_reference_count": 0,
+            "subtitle_reference_count": len(subtitle_ref_map),
+            "subtitle_reference_min_sec": None,
+        }
+
+    selected_map: Dict[int, Path] = {}
+    shared_reference_count = 0
+    subtitle_reference_count = 0
+    safe_min_sec = max(0.2, float(omnivoice_min_subtitle_ref_sec))
+    for index, _subtitle in enumerate(subtitles):
+        candidate = subtitle_ref_map.get(index, default_ref)
+        use_subtitle_reference = False
+        if candidate != default_ref and candidate.exists():
+            candidate_duration_sec = read_reference_duration_sec(candidate)
+            use_subtitle_reference = candidate_duration_sec >= safe_min_sec
+        selected_path = candidate if use_subtitle_reference else default_ref
+        selected_map[index] = selected_path
+        if selected_path == default_ref:
+            shared_reference_count += 1
+        else:
+            subtitle_reference_count += 1
+
+    if not selected_map:
+        selected_map[0] = default_ref
+        shared_reference_count = 1
+
+    def _selector(index: int) -> Path:
+        return selected_map.get(index, default_ref)
+
+    return _selector, {
+        "reference_strategy": "shared_reference_preferred_for_omnivoice",
+        "reference_count": len(selected_map),
+        "shared_reference_count": int(shared_reference_count),
+        "subtitle_reference_count": int(subtitle_reference_count),
+        "subtitle_reference_min_sec": round(float(safe_min_sec), 3),
+    }
 
 
 def apply_atempo(
@@ -2601,6 +2746,16 @@ def synthesize_text_once(
     index_max_text_tokens: int,
     text: str,
     output_path: Path,
+    target_duration_sec: Optional[float] = None,
+    fallback_tts_backend: str = "none",
+    omnivoice_root: str = "",
+    omnivoice_python_bin: str = "",
+    omnivoice_model: str = "",
+    omnivoice_device: str = "auto",
+    omnivoice_via_api: bool = True,
+    omnivoice_api_url: str = "",
+    ref_text: Optional[str] = None,
+    target_lang: str = "",
 ) -> None:
     """兼容旧入口：执行一次单句 TTS 合成。"""
     return synthesize_text_once_impl(
@@ -2622,6 +2777,16 @@ def synthesize_text_once(
         index_max_text_tokens=index_max_text_tokens,
         text=text,
         output_path=output_path,
+        target_duration_sec=target_duration_sec,
+        fallback_tts_backend=fallback_tts_backend,
+        omnivoice_root=omnivoice_root,
+        omnivoice_python_bin=omnivoice_python_bin,
+        omnivoice_model=omnivoice_model,
+        omnivoice_device=omnivoice_device,
+        omnivoice_via_api=omnivoice_via_api,
+        omnivoice_api_url=omnivoice_api_url,
+        ref_text=ref_text,
+        target_lang=target_lang,
     )
 
 
@@ -2738,6 +2903,18 @@ def synthesize_segments_grouped(
     grouping_strategy: str,
     logger: JsonlLogger,
     target_lang: str,
+    fallback_tts_backend: str = "none",
+    omnivoice_root: str = "",
+    omnivoice_python_bin: str = "",
+    omnivoice_model: str = "",
+    omnivoice_device: str = "auto",
+    omnivoice_via_api: bool = True,
+    omnivoice_api_url: str = "",
+    dub_audio_leveling_enabled: bool = True,
+    dub_audio_leveling_target_rms: float = DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS,
+    dub_audio_leveling_activity_threshold_db: float = DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB,
+    dub_audio_leveling_max_gain_db: float = DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB,
+    dub_audio_leveling_peak_ceiling: float = DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """兼容旧入口：grouped / legacy 主循环转调到新的 dubbing pipeline。"""
     return synthesize_segments_grouped_impl(
@@ -2773,6 +2950,18 @@ def synthesize_segments_grouped(
         grouping_strategy=grouping_strategy,
         logger=logger,
         target_lang=target_lang,
+        fallback_tts_backend=fallback_tts_backend,
+        omnivoice_root=omnivoice_root,
+        omnivoice_python_bin=omnivoice_python_bin,
+        omnivoice_model=omnivoice_model,
+        omnivoice_device=omnivoice_device,
+        omnivoice_via_api=omnivoice_via_api,
+        omnivoice_api_url=omnivoice_api_url,
+        dub_audio_leveling_enabled=dub_audio_leveling_enabled,
+        dub_audio_leveling_target_rms=dub_audio_leveling_target_rms,
+        dub_audio_leveling_activity_threshold_db=dub_audio_leveling_activity_threshold_db,
+        dub_audio_leveling_max_gain_db=dub_audio_leveling_max_gain_db,
+        dub_audio_leveling_peak_ceiling=dub_audio_leveling_peak_ceiling,
     )
 
 
@@ -2814,6 +3003,18 @@ def synthesize_segments(
     redub_line_indices: Optional[set[int]],
     v2_mode: bool,
     logger: JsonlLogger,
+    fallback_tts_backend: str = "none",
+    omnivoice_root: str = "",
+    omnivoice_python_bin: str = "",
+    omnivoice_model: str = "",
+    omnivoice_device: str = "auto",
+    omnivoice_via_api: bool = True,
+    omnivoice_api_url: str = "",
+    dub_audio_leveling_enabled: bool = True,
+    dub_audio_leveling_target_rms: float = DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS,
+    dub_audio_leveling_activity_threshold_db: float = DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB,
+    dub_audio_leveling_max_gain_db: float = DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB,
+    dub_audio_leveling_peak_ceiling: float = DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """兼容旧入口：逐句主循环转调到新的 dubbing pipeline。"""
     return synthesize_segments_impl(
@@ -2853,6 +3054,18 @@ def synthesize_segments(
         redub_line_indices=redub_line_indices,
         v2_mode=v2_mode,
         logger=logger,
+        fallback_tts_backend=fallback_tts_backend,
+        omnivoice_root=omnivoice_root,
+        omnivoice_python_bin=omnivoice_python_bin,
+        omnivoice_model=omnivoice_model,
+        omnivoice_device=omnivoice_device,
+        omnivoice_via_api=omnivoice_via_api,
+        omnivoice_api_url=omnivoice_api_url,
+        dub_audio_leveling_enabled=dub_audio_leveling_enabled,
+        dub_audio_leveling_target_rms=dub_audio_leveling_target_rms,
+        dub_audio_leveling_activity_threshold_db=dub_audio_leveling_activity_threshold_db,
+        dub_audio_leveling_max_gain_db=dub_audio_leveling_max_gain_db,
+        dub_audio_leveling_peak_ceiling=dub_audio_leveling_peak_ceiling,
     )
 
 
@@ -2990,6 +3203,29 @@ def _build_manifest_replay_options(args: argparse.Namespace) -> BatchReplayOptio
             or DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC
         ),
         source_short_merge_threshold_mode="seconds",
+        translated_short_merge_enabled=read_bool(str(getattr(args, "translated_short_merge_enabled", "false"))),
+        translated_short_merge_threshold=int(
+            getattr(args, "translated_short_merge_threshold", DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC)
+            or DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC
+        ),
+        translated_short_merge_threshold_mode="seconds",
+        dub_audio_leveling_enabled=read_bool(str(getattr(args, "dub_audio_leveling_enabled", "true"))),
+        dub_audio_leveling_target_rms=float(
+            getattr(args, "dub_audio_leveling_target_rms", DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS)
+            or DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS
+        ),
+        dub_audio_leveling_activity_threshold_db=float(
+            getattr(args, "dub_audio_leveling_activity_threshold_db", DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB)
+            or DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB
+        ),
+        dub_audio_leveling_max_gain_db=float(
+            getattr(args, "dub_audio_leveling_max_gain_db", DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB)
+            or DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB
+        ),
+        dub_audio_leveling_peak_ceiling=float(
+            getattr(args, "dub_audio_leveling_peak_ceiling", DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING)
+            or DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING
+        ),
         grouped_synthesis=bool(
             getattr(args, "grouped_synthesis_effective", read_bool(str(getattr(args, "grouped_synthesis", "true"))))
         ),
@@ -2997,6 +3233,13 @@ def _build_manifest_replay_options(args: argparse.Namespace) -> BatchReplayOptio
             getattr(args, "force_fit_timing_effective", read_bool(str(getattr(args, "force_fit_timing", "true"))))
         ),
         tts_backend=args.tts_backend,
+        fallback_tts_backend=getattr(args, "fallback_tts_backend", "none"),
+        omnivoice_root=str(getattr(args, "omnivoice_root", "") or ""),
+        omnivoice_python_bin=str(getattr(args, "omnivoice_python_bin", "") or ""),
+        omnivoice_model=str(getattr(args, "omnivoice_model", "") or ""),
+        omnivoice_device=str(getattr(args, "omnivoice_device", "auto") or "auto"),
+        omnivoice_via_api=read_bool(str(getattr(args, "omnivoice_via_api", "true"))),
+        omnivoice_api_url=str(getattr(args, "omnivoice_api_url", "http://127.0.0.1:8020") or "http://127.0.0.1:8020"),
     )
 
 
@@ -3109,6 +3352,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-layout-llm-max-cues", type=int, default=12)
     parser.add_argument("--source-short-merge-enabled", default="false")
     parser.add_argument("--source-short-merge-threshold", type=int, default=DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC)
+    parser.add_argument("--translated-short-merge-enabled", default="false")
+    parser.add_argument("--translated-short-merge-threshold", type=int, default=DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC)
+    parser.add_argument("--dub-audio-leveling-enabled", default="true")
+    parser.add_argument("--dub-audio-leveling-target-rms", type=float, default=DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS)
+    parser.add_argument(
+        "--dub-audio-leveling-activity-threshold-db",
+        type=float,
+        default=DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB,
+    )
+    parser.add_argument("--dub-audio-leveling-max-gain-db", type=float, default=DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB)
+    parser.add_argument("--dub-audio-leveling-peak-ceiling", type=float, default=DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING)
     parser.add_argument("--time-ranges-json", default=None, help="Optional JSON list of {start_sec,end_sec} for dubbing")
     parser.add_argument(
         "--redub-line-indices-json",
@@ -3122,7 +3376,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v2-rewrite-translation", default="true")
 
     parser.add_argument("--translate-base-url", default="https://api.deepseek.com")
-    parser.add_argument("--translate-model", default="deepseek-chat")
+    parser.add_argument("--translate-model", default="deepseek-v4-flash")
     parser.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--translate-system-prompt", default=None)
@@ -3133,7 +3387,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--display-merge-fragments", default="false")
     parser.add_argument("--display-merge-gap-sec", type=float, default=0.35)
 
-    parser.add_argument("--tts-backend", default="qwen", choices=["qwen", "index-tts"])
+    parser.add_argument("--tts-backend", default="qwen", choices=["qwen", "index-tts", "omnivoice"])
+    parser.add_argument("--fallback-tts-backend", default="none", choices=["none", "omnivoice"])
     parser.add_argument("--tts-model-path", default=str(REPO_ROOT / "models/Qwen3-TTS-12Hz-0.6B-Base"))
     parser.add_argument("--tts-device", default="mps")
     parser.add_argument("--tts-dtype", default="float16", choices=["float16", "bfloat16", "float32"])
@@ -3156,11 +3411,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--index-top-k", type=int, default=30)
     parser.add_argument("--index-temperature", type=float, default=0.8)
     parser.add_argument("--index-max-text-tokens", type=int, default=120)
+    parser.add_argument("--omnivoice-root", default=os.environ.get("OMNIVOICE_ROOT", ""))
+    parser.add_argument("--omnivoice-python-bin", default=os.environ.get("OMNIVOICE_PYTHON_BIN", ""))
+    parser.add_argument("--omnivoice-model", default=os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice"))
+    parser.add_argument("--omnivoice-device", default=os.environ.get("OMNIVOICE_DEVICE", "auto"))
+    parser.add_argument("--omnivoice-via-api", default=os.environ.get("OMNIVOICE_VIA_API", "true"))
+    parser.add_argument("--omnivoice-api-url", default=os.environ.get("OMNIVOICE_API_URL", "http://127.0.0.1:8020"))
     parser.add_argument("--resume-job-dir", default=None, help="Reuse an existing job directory and continue processing")
     return parser.parse_args()
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    # source short merge 的持久化字段保留“用户请求态”，但 OmniVoice 运行时会强制开启。
+    requested_source_short_merge_enabled = read_bool(str(args.source_short_merge_enabled))
+    effective_source_short_merge_enabled, _ = resolve_source_short_merge_policy(
+        requested_enabled=requested_source_short_merge_enabled,
+        tts_backend=str(args.tts_backend or ""),
+    )
+
     if not (0 < args.single_speaker_ref_seconds <= 20):
         raise ValueError("--single-speaker-ref-seconds must be in (0, 20]")
     if not (0.8 <= args.atempo_min < 1.0):
@@ -3187,8 +3455,36 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--balanced-max-tempo-shift must be in [0.0, 0.3]")
     if not (0.05 <= args.balanced_min_line_sec <= 2.0):
         raise ValueError("--balanced-min-line-sec must be in [0.05, 2.0]")
-    if args.tts_backend not in {"qwen", "index-tts"}:
-        raise ValueError("--tts-backend must be one of: qwen, index-tts")
+    if args.tts_backend not in {"qwen", "index-tts", "omnivoice"}:
+        raise ValueError("--tts-backend must be one of: qwen, index-tts, omnivoice")
+    if args.fallback_tts_backend not in {"none", "omnivoice"}:
+        raise ValueError("--fallback-tts-backend must be one of: none, omnivoice")
+    if args.fallback_tts_backend == "omnivoice" or args.tts_backend == "omnivoice":
+        omnivoice_via_api = read_bool(str(args.omnivoice_via_api))
+        if omnivoice_via_api:
+            if not str(args.omnivoice_api_url or "").strip():
+                raise ValueError(
+                    "--omnivoice-api-url must not be empty when --omnivoice-via-api true "
+                    "and OmniVoice is selected"
+                )
+        else:
+            omnivoice_root = Path(str(args.omnivoice_root or "")).expanduser()
+            if not args.omnivoice_root or not omnivoice_root.exists():
+                raise ValueError(
+                    "--omnivoice-root is required and must exist when --tts-backend omnivoice "
+                    "or --fallback-tts-backend omnivoice"
+                )
+            omnivoice_python_bin = Path(str(args.omnivoice_python_bin or "")).expanduser()
+            if not args.omnivoice_python_bin or not omnivoice_python_bin.exists():
+                raise ValueError(
+                    "--omnivoice-python-bin is required and must exist when --tts-backend omnivoice "
+                    "or --fallback-tts-backend omnivoice"
+                )
+            if not (args.omnivoice_model or "").strip():
+                raise ValueError(
+                    "--omnivoice-model must not be empty when --tts-backend omnivoice "
+                    "or --fallback-tts-backend omnivoice"
+                )
     if not (0.0 <= args.index_emo_alpha <= 1.0):
         raise ValueError("--index-emo-alpha must be in [0.0, 1.0]")
     if not (0.1 <= args.index_top_p <= 1.0):
@@ -3217,13 +3513,28 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--source-layout-llm-min-text-units must be in [20, 400]")
     if not (2 <= args.source_layout_llm_max_cues <= 40):
         raise ValueError("--source-layout-llm-max-cues must be in [2, 40]")
-    if read_bool(str(args.source_short_merge_enabled)) and not (
+    if effective_source_short_merge_enabled and not (
         MIN_SOURCE_SHORT_MERGE_TARGET_SEC <= args.source_short_merge_threshold <= MAX_SOURCE_SHORT_MERGE_TARGET_SEC
     ):
         raise ValueError(
             f"--source-short-merge-threshold must be in "
             f"[{MIN_SOURCE_SHORT_MERGE_TARGET_SEC}, {MAX_SOURCE_SHORT_MERGE_TARGET_SEC}]"
         )
+    if read_bool(str(args.translated_short_merge_enabled)) and not (
+        MIN_SOURCE_SHORT_MERGE_TARGET_SEC <= args.translated_short_merge_threshold <= MAX_SOURCE_SHORT_MERGE_TARGET_SEC
+    ):
+        raise ValueError(
+            f"--translated-short-merge-threshold must be in "
+            f"[{MIN_SOURCE_SHORT_MERGE_TARGET_SEC}, {MAX_SOURCE_SHORT_MERGE_TARGET_SEC}]"
+        )
+    if args.dub_audio_leveling_target_rms <= 0.0 or args.dub_audio_leveling_target_rms > 0.5:
+        raise ValueError("--dub-audio-leveling-target-rms must be in (0.0, 0.5]")
+    if args.dub_audio_leveling_activity_threshold_db > -5.0 or args.dub_audio_leveling_activity_threshold_db < -80.0:
+        raise ValueError("--dub-audio-leveling-activity-threshold-db must be in [-80.0, -5.0]")
+    if args.dub_audio_leveling_max_gain_db < 0.0 or args.dub_audio_leveling_max_gain_db > 24.0:
+        raise ValueError("--dub-audio-leveling-max-gain-db must be in [0.0, 24.0]")
+    if args.dub_audio_leveling_peak_ceiling <= 0.0 or args.dub_audio_leveling_peak_ceiling > 0.99:
+        raise ValueError("--dub-audio-leveling-peak-ceiling must be in (0.0, 0.99]")
     if not (10 <= args.cjk_wrap_chars <= 40):
         raise ValueError("--cjk-wrap-chars must be in [10, 40]")
     if args.auto_pick_min_silence_sec < 0.1 or args.auto_pick_min_silence_sec > 10.0:
@@ -3299,6 +3610,11 @@ def main() -> int:
     source_layout_mode = (args.source_layout_mode or "hybrid").strip().lower() or "hybrid"
     force_fit_timing = read_bool(args.force_fit_timing)
     grouped_synthesis = read_bool(args.grouped_synthesis)
+    requested_source_short_merge_enabled = read_bool(str(args.source_short_merge_enabled))
+    effective_source_short_merge_enabled, source_short_merge_effective_reason = resolve_source_short_merge_policy(
+        requested_enabled=requested_source_short_merge_enabled,
+        tts_backend=str(args.tts_backend or ""),
+    )
     translated_input_preserve_synthesis_mode = read_bool(args.translated_input_preserve_synthesis_mode)
     if v2_mode:
         # V2 主链路：默认逐句合成，避免分组合成导致的节奏撕裂。
@@ -3497,8 +3813,10 @@ def main() -> int:
                     source_layout_llm_min_duration_sec=args.source_layout_llm_min_duration_sec,
                     source_layout_llm_min_text_units=args.source_layout_llm_min_text_units,
                     source_layout_llm_max_cues=args.source_layout_llm_max_cues,
-                    source_short_merge_enabled=read_bool(str(args.source_short_merge_enabled)),
+                    source_short_merge_enabled=effective_source_short_merge_enabled,
                     source_short_merge_threshold=args.source_short_merge_threshold,
+                    source_short_merge_requested=requested_source_short_merge_enabled,
+                    source_short_merge_effective_reason=source_short_merge_effective_reason,
                     translator_factory=get_or_create_translator,
                     logger=logger,
                 )
@@ -3557,8 +3875,10 @@ def main() -> int:
                 source_layout_llm_min_duration_sec=args.source_layout_llm_min_duration_sec,
                 source_layout_llm_min_text_units=args.source_layout_llm_min_text_units,
                 source_layout_llm_max_cues=args.source_layout_llm_max_cues,
-                source_short_merge_enabled=read_bool(str(args.source_short_merge_enabled)),
+                source_short_merge_enabled=effective_source_short_merge_enabled,
                 source_short_merge_threshold=args.source_short_merge_threshold,
+                source_short_merge_requested=requested_source_short_merge_enabled,
+                source_short_merge_effective_reason=source_short_merge_effective_reason,
                 translator_factory=get_or_create_translator,
                 logger=logger,
             )
@@ -3781,17 +4101,19 @@ def main() -> int:
             out_dir=job_dir / "refs" / "subtitles",
             default_ref=ref_audio_path,
         )
-
-        def _selector(index: int) -> Path:
-            return subtitle_ref_map.get(index, ref_audio_path)
-
-        ref_audio_selector: Optional[Callable[[int], Path]] = _selector
+        selector, reference_strategy_stats = build_backend_reference_selector(
+            tts_backend=args.tts_backend,
+            subtitles=subtitles,
+            subtitle_ref_map=subtitle_ref_map,
+            default_ref=ref_audio_path,
+        )
+        ref_audio_selector: Optional[Callable[[int], Path]] = selector
         logger.log(
             "INFO",
             "ref_extract",
             "sentence_reference_mode_enabled",
-            "using per-subtitle original-audio references",
-            data={"reference_count": len(subtitle_ref_map)},
+            "reference selector ready",
+            data=reference_strategy_stats,
         )
 
         logger.log(
@@ -3800,10 +4122,7 @@ def main() -> int:
             "reference_ready",
             "reference audio ready",
             progress=63,
-            data={
-                "reference_strategy": "sentence_original_audio_per_subtitle",
-                "reference_count": len(subtitle_ref_map),
-            },
+            data=reference_strategy_stats,
         )
 
         logger.log("INFO", "tts", "tts_model_loading", "loading tts model")
@@ -3815,7 +4134,7 @@ def main() -> int:
                 ref_text=None,
                 x_vector_only_mode=True,
             )
-        else:
+        elif args.tts_backend == "index-tts":
             if index_tts_via_api:
                 check_index_tts_service(
                     api_url=args.index_tts_api_url,
@@ -3838,6 +4157,15 @@ def main() -> int:
                     use_accel=index_use_accel,
                     use_torch_compile=index_use_torch_compile,
                 )
+        else:
+            # OmniVoice 由独立服务或 CLI 路径处理，这里不需要 index-tts 预热。
+            logger.log(
+                "INFO",
+                "tts",
+                "omnivoice_backend_selected",
+                "using OmniVoice backend without index-tts preflight",
+                data={"tts_backend": args.tts_backend},
+            )
 
         index_emo_audio_prompt_path: Optional[Path] = None
         if args.index_emo_audio_prompt:
@@ -3848,6 +4176,7 @@ def main() -> int:
         if grouped_synthesis:
             records, segment_manual = synthesize_segments_grouped(
                 tts_backend=args.tts_backend,
+                fallback_tts_backend=args.fallback_tts_backend,
                 index_tts_via_api=index_tts_via_api,
                 index_tts_api_url=args.index_tts_api_url,
                 index_tts_api_timeout_sec=args.index_tts_api_timeout_sec,
@@ -3879,6 +4208,17 @@ def main() -> int:
                 delta_pass_ms=args.delta_pass_ms,
                 logger=logger,
                 target_lang=args.target_lang,
+                omnivoice_root=args.omnivoice_root,
+                omnivoice_python_bin=args.omnivoice_python_bin,
+                omnivoice_model=args.omnivoice_model,
+                omnivoice_device=args.omnivoice_device,
+                omnivoice_via_api=read_bool(str(args.omnivoice_via_api)),
+                omnivoice_api_url=args.omnivoice_api_url,
+                dub_audio_leveling_enabled=read_bool(str(args.dub_audio_leveling_enabled)),
+                dub_audio_leveling_target_rms=args.dub_audio_leveling_target_rms,
+                dub_audio_leveling_activity_threshold_db=args.dub_audio_leveling_activity_threshold_db,
+                dub_audio_leveling_max_gain_db=args.dub_audio_leveling_max_gain_db,
+                dub_audio_leveling_peak_ceiling=args.dub_audio_leveling_peak_ceiling,
             )
         else:
             # 关键逻辑：翻译字幕直通链路（input_srt_kind=translated）默认禁用改写。
@@ -3893,6 +4233,7 @@ def main() -> int:
                 )
             records, segment_manual = synthesize_segments(
                 tts_backend=args.tts_backend,
+                fallback_tts_backend=args.fallback_tts_backend,
                 index_tts_via_api=index_tts_via_api,
                 index_tts_api_url=args.index_tts_api_url,
                 index_tts_api_timeout_sec=args.index_tts_api_timeout_sec,
@@ -3928,6 +4269,17 @@ def main() -> int:
                 redub_line_indices=redub_line_indices,
                 v2_mode=v2_mode,
                 logger=logger,
+                omnivoice_root=args.omnivoice_root,
+                omnivoice_python_bin=args.omnivoice_python_bin,
+                omnivoice_model=args.omnivoice_model,
+                omnivoice_device=args.omnivoice_device,
+                omnivoice_via_api=read_bool(str(args.omnivoice_via_api)),
+                omnivoice_api_url=args.omnivoice_api_url,
+                dub_audio_leveling_enabled=read_bool(str(args.dub_audio_leveling_enabled)),
+                dub_audio_leveling_target_rms=args.dub_audio_leveling_target_rms,
+                dub_audio_leveling_activity_threshold_db=args.dub_audio_leveling_activity_threshold_db,
+                dub_audio_leveling_max_gain_db=args.dub_audio_leveling_max_gain_db,
+                dub_audio_leveling_peak_ceiling=args.dub_audio_leveling_peak_ceiling,
             )
         manual_review.extend(segment_manual)
         for record in records:

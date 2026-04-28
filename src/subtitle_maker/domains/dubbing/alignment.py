@@ -171,8 +171,15 @@ def compute_effective_target_duration(
     end_sec: float,
     next_start_sec: Optional[float],
     gap_guard_sec: float = 0.10,
+    max_borrow_ratio: float = 1.0,
+    max_borrow_sec: float = 2.0,
 ) -> Tuple[float, float]:
-    """计算可借后续静音后的有效目标时长。"""
+    """计算可借后续静音后的有效目标时长。
+
+    为了避免短句因为后续长静音被放大到异常时长，借时长同时受两道上限约束：
+    1) 不超过原句时长的 `max_borrow_ratio` 倍；
+    2) 不超过绝对秒数 `max_borrow_sec`。
+    """
 
     base_target_sec = max(0.05, float(end_sec) - float(start_sec))
     if next_start_sec is None:
@@ -182,8 +189,20 @@ def compute_effective_target_duration(
     if gap_sec <= 0:
         return base_target_sec, 0.0
 
-    borrow_sec = max(0.0, gap_sec - max(0.0, float(gap_guard_sec)))
-    effective_target_sec = max(base_target_sec, base_target_sec + borrow_sec)
+    borrow_sec_raw = max(0.0, gap_sec - max(0.0, float(gap_guard_sec)))
+    if borrow_sec_raw <= 0:
+        return base_target_sec, 0.0
+
+    # 借时长上限：相对比例 + 绝对秒数双重限制，防止短句被长静音“拉爆”。
+    ratio_cap = max(0.0, float(max_borrow_ratio)) * base_target_sec
+    sec_cap = max(0.0, float(max_borrow_sec))
+    if ratio_cap <= 0.0 or sec_cap <= 0.0:
+        return base_target_sec, 0.0
+    borrow_sec = min(borrow_sec_raw, ratio_cap, sec_cap)
+    if borrow_sec <= 0:
+        return base_target_sec, 0.0
+
+    effective_target_sec = base_target_sec + borrow_sec
     return effective_target_sec, borrow_sec
 
 

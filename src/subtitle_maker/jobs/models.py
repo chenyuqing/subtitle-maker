@@ -49,12 +49,28 @@ class JobRecord(TypedDict, total=False):
     grouping_strategy: str
     source_short_merge_enabled: bool
     source_short_merge_threshold: int
+    translated_short_merge_enabled: bool
+    translated_short_merge_threshold: int
+    dub_audio_leveling_enabled: bool
+    dub_audio_leveling_target_rms: float
+    dub_audio_leveling_activity_threshold_db: float
+    dub_audio_leveling_max_gain_db: float
+    dub_audio_leveling_peak_ceiling: float
+    segment_minutes: float
+    min_segment_minutes: float
     subtitle_mode: str
     index_tts_api_url: str
     auto_pick_ranges: bool
     grouped_synthesis: bool
     force_fit_timing: bool
     tts_backend: str
+    fallback_tts_backend: str
+    omnivoice_root: str
+    omnivoice_python_bin: str
+    omnivoice_model: str
+    omnivoice_device: str
+    omnivoice_via_api: bool
+    omnivoice_api_url: str
     input_media_url: str | None
     result_audio: str | None
     result_srt: str | None
@@ -85,12 +101,28 @@ class PublicJobRecord(TypedDict, total=False):
     grouping_strategy: str
     source_short_merge_enabled: bool
     source_short_merge_threshold: int
+    translated_short_merge_enabled: bool
+    translated_short_merge_threshold: int
+    dub_audio_leveling_enabled: bool
+    dub_audio_leveling_target_rms: float
+    dub_audio_leveling_activity_threshold_db: float
+    dub_audio_leveling_max_gain_db: float
+    dub_audio_leveling_peak_ceiling: float
+    segment_minutes: float
+    min_segment_minutes: float
     subtitle_mode: str
     index_tts_api_url: str
     auto_pick_ranges: bool
     grouped_synthesis: bool
     force_fit_timing: bool
     tts_backend: str
+    fallback_tts_backend: str
+    omnivoice_root: str
+    omnivoice_python_bin: str
+    omnivoice_model: str
+    omnivoice_device: str
+    omnivoice_via_api: bool
+    omnivoice_api_url: str
     input_media_url: str | None
     result_audio: str | None
     result_srt: str | None

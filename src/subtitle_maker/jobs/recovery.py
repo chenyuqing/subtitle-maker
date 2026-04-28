@@ -8,13 +8,21 @@ from subtitle_maker.manifests import load_batch_manifest
 from .models import JobArtifact, TaskPayload
 
 
-def find_batch_manifest_by_name(*, output_root: Path, batch_id: str) -> Optional[Path]:
-    """根据 longdub 批次目录名回查 batch manifest。"""
+def _normalize_batch_id(batch_id: str) -> str:
+    """统一 longdub 批次目录名。"""
 
     raw = (batch_id or "").strip()
     if not raw:
+        return ""
+    return raw if raw.startswith("longdub_") else f"longdub_{raw}"
+
+
+def find_batch_manifest_by_name(*, output_root: Path, batch_id: str) -> Optional[Path]:
+    """根据 longdub 批次目录名回查 batch manifest。"""
+
+    normalized = _normalize_batch_id(batch_id)
+    if not normalized:
         return None
-    normalized = raw if raw.startswith("longdub_") else f"longdub_{raw}"
     candidates = sorted(
         output_root.glob(f"web_*/{normalized}/batch_manifest.json"),
         key=lambda item: item.stat().st_mtime,
@@ -23,23 +31,38 @@ def find_batch_manifest_by_name(*, output_root: Path, batch_id: str) -> Optional
     return candidates[0] if candidates else None
 
 
-def list_available_batches(*, output_root: Path, limit: int = 200) -> List[Dict[str, Any]]:
-    """列出当前可加载的 longdub 批次目录。"""
+def find_batch_dir_by_name(*, output_root: Path, batch_id: str) -> Optional[Path]:
+    """根据批次目录名回查 longdub 目录（允许无 batch manifest）。"""
 
-    manifests = sorted(
-        output_root.glob("web_*/longdub_*/batch_manifest.json"),
+    normalized = _normalize_batch_id(batch_id)
+    if not normalized:
+        return None
+    candidates = sorted(
+        (item for item in output_root.glob(f"web_*/{normalized}") if item.is_dir()),
         key=lambda item: item.stat().st_mtime,
         reverse=True,
     )
+    return candidates[0] if candidates else None
+
+
+def list_available_batches(*, output_root: Path, limit: int = 200) -> List[Dict[str, Any]]:
+    """列出当前可加载的 longdub 批次目录（含中断批次）。"""
+
+    batch_dirs = [item for item in output_root.glob("web_*/longdub_*") if item.is_dir()]
+    batch_dirs.sort(key=lambda item: item.stat().st_mtime, reverse=True)
     results: List[Dict[str, Any]] = []
-    for manifest_path in manifests[: max(1, int(limit))]:
-        batch_dir = manifest_path.parent
+    for batch_dir in batch_dirs[: max(1, int(limit))]:
+        manifest_path = batch_dir / "batch_manifest.json"
+        has_manifest = manifest_path.exists()
+        updated_at = int(manifest_path.stat().st_mtime if has_manifest else batch_dir.stat().st_mtime)
         results.append(
             {
                 "batch_id": batch_dir.name,
                 "web_dir": batch_dir.parent.name,
-                "updated_at": int(manifest_path.stat().st_mtime),
-                "manifest_path": str(manifest_path),
+                "updated_at": updated_at,
+                "manifest_path": str(manifest_path) if has_manifest else None,
+                "has_manifest": has_manifest,
+                "status": "completed" if has_manifest else "incomplete",
             }
         )
     return results
@@ -132,6 +155,15 @@ def build_batch_task_updates(
         "grouping_strategy": options.grouping_strategy,
         "source_short_merge_enabled": options.source_short_merge_enabled,
         "source_short_merge_threshold": options.source_short_merge_threshold,
+        "translated_short_merge_enabled": options.translated_short_merge_enabled,
+        "translated_short_merge_threshold": options.translated_short_merge_threshold,
+        "dub_audio_leveling_enabled": options.dub_audio_leveling_enabled,
+        "dub_audio_leveling_target_rms": options.dub_audio_leveling_target_rms,
+        "dub_audio_leveling_activity_threshold_db": options.dub_audio_leveling_activity_threshold_db,
+        "dub_audio_leveling_max_gain_db": options.dub_audio_leveling_max_gain_db,
+        "dub_audio_leveling_peak_ceiling": options.dub_audio_leveling_peak_ceiling,
+        "segment_minutes": float(manifest.raw.get("segment_minutes", 8.0) or 8.0),
+        "min_segment_minutes": float(manifest.raw.get("min_segment_minutes", 4.0) or 4.0),
         "subtitle_mode": options.input_srt_kind,
         "index_tts_api_url": options.index_tts_api_url,
         "auto_pick_ranges": options.auto_pick_ranges,
@@ -139,6 +171,13 @@ def build_batch_task_updates(
         "grouped_synthesis": options.grouped_synthesis,
         "force_fit_timing": options.force_fit_timing,
         "tts_backend": options.tts_backend,
+        "fallback_tts_backend": options.fallback_tts_backend,
+        "omnivoice_root": options.omnivoice_root,
+        "omnivoice_python_bin": options.omnivoice_python_bin,
+        "omnivoice_model": options.omnivoice_model,
+        "omnivoice_device": options.omnivoice_device,
+        "omnivoice_via_api": options.omnivoice_via_api,
+        "omnivoice_api_url": options.omnivoice_api_url,
     }
 
     # 当所有片段都掉进 manual_review 且没有任何成功 TTS 时，应标记为失败而不是完成。
@@ -199,11 +238,26 @@ def build_loaded_batch_task(
         "grouping_strategy": "sentence",
         "source_short_merge_enabled": False,
         "source_short_merge_threshold": default_short_merge_threshold,
+        "translated_short_merge_enabled": False,
+        "translated_short_merge_threshold": default_short_merge_threshold,
+        "dub_audio_leveling_enabled": True,
+        "dub_audio_leveling_target_rms": 0.12,
+        "dub_audio_leveling_activity_threshold_db": -35.0,
+        "dub_audio_leveling_max_gain_db": 8.0,
+        "dub_audio_leveling_peak_ceiling": 0.95,
         "subtitle_mode": "source",
         "pipeline_version": "v1",
         "rewrite_translation": True,
         "index_tts_api_url": default_index_tts_api_url,
         "auto_pick_ranges": False,
+        "tts_backend": "index-tts",
+        "fallback_tts_backend": "none",
+        "omnivoice_root": "",
+        "omnivoice_python_bin": "",
+        "omnivoice_model": "",
+        "omnivoice_device": "auto",
+        "omnivoice_via_api": True,
+        "omnivoice_api_url": "http://127.0.0.1:8020",
         "processed_segments": 0,
         "total_segments": None,
         "manual_review_segments": 0,

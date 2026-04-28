@@ -1,6 +1,10 @@
 """媒体领域模块导出。"""
 
 from .compose import (
+    DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB,
+    DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB,
+    DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING,
+    DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS,
     build_full_timeline_bgm,
     build_full_timeline_mix,
     build_full_timeline_vocals,
@@ -11,6 +15,7 @@ from .compose import (
     merge_srt_files,
     mix_vocals_with_bgm,
     mix_with_bgm,
+    normalize_speech_audio_level,
 )
 from .probe import audio_duration, ffprobe_duration, load_mono_audio, resample_mono_audio
 from .segment import (
@@ -35,6 +40,10 @@ __all__ = [
     "extract_source_audio",
     "map_global_ranges_to_segment",
     "normalize_time_ranges",
+    "DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB",
+    "DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB",
+    "DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING",
+    "DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS",
     "build_full_timeline_bgm",
     "build_full_timeline_mix",
     "build_full_timeline_vocals",
@@ -45,5 +54,5 @@ __all__ = [
     "merge_srt_files",
     "mix_vocals_with_bgm",
     "mix_with_bgm",
+    "normalize_speech_audio_level",
 ]
-

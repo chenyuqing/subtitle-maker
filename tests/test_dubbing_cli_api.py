@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -109,6 +111,13 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(task["grouping_strategy"], "sentence")
         self.assertFalse(task["source_short_merge_enabled"])
         self.assertEqual(task["source_short_merge_threshold"], 15)
+        self.assertFalse(task["translated_short_merge_enabled"])
+        self.assertEqual(task["translated_short_merge_threshold"], 15)
+        self.assertTrue(task["dub_audio_leveling_enabled"])
+        self.assertEqual(task["dub_audio_leveling_target_rms"], 0.12)
+        self.assertEqual(task["dub_audio_leveling_activity_threshold_db"], -35.0)
+        self.assertEqual(task["dub_audio_leveling_max_gain_db"], 8.0)
+        self.assertEqual(task["dub_audio_leveling_peak_ceiling"], 0.95)
         self.assertIn("--asr-language", task["command"])
         self.assertIn("--timing-mode", task["command"])
         self.assertIn("strict", task["command"])
@@ -119,6 +128,17 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(task["command"][enabled_flag_index + 1], "false")
         self.assertIn("--source-short-merge-threshold", task["command"])
         self.assertIn("15", task["command"])
+        self.assertIn("--translated-short-merge-enabled", task["command"])
+        translated_enabled_index = task["command"].index("--translated-short-merge-enabled")
+        self.assertEqual(task["command"][translated_enabled_index + 1], "false")
+        self.assertIn("--translated-short-merge-threshold", task["command"])
+        self.assertIn("--dub-audio-leveling-enabled", task["command"])
+        leveling_flag_index = task["command"].index("--dub-audio-leveling-enabled")
+        self.assertEqual(task["command"][leveling_flag_index + 1], "true")
+        self.assertIn("--dub-audio-leveling-target-rms", task["command"])
+        self.assertIn("--fallback-tts-backend", task["command"])
+        fallback_index = task["command"].index("--fallback-tts-backend")
+        self.assertEqual(task["command"][fallback_index + 1], "none")
         self.assertIn("--auto-pick-ranges", task["command"])
         self.assertIn("false", task["command"])
         self.assertTrue(FakeThread.instances)
@@ -235,6 +255,171 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(task["command"][enabled_flag_index + 1], "true")
         flag_index = task["command"].index("--source-short-merge-threshold")
         self.assertEqual(task["command"][flag_index + 1], "12")
+
+    def test_start_auto_dubbing_accepts_translated_short_merge_settings(self):
+        with patch.object(dubbing_cli_api.threading, "Thread", FakeThread), patch.object(
+            dubbing_cli_api, "_check_index_tts_service", return_value=None
+        ):
+            response = self.client.post(
+                "/dubbing/auto/start",
+                files={
+                    "video": ("demo.mp4", b"video-data", "video/mp4"),
+                    "subtitle_file": (
+                        "manual.srt",
+                        "1\n00:00:00,000 --> 00:00:01,000\n你好\n".encode("utf-8"),
+                        "application/x-subrip",
+                    ),
+                },
+                data={
+                    "target_lang": "Chinese",
+                    "subtitle_mode": "translated",
+                    "translated_short_merge_enabled": "true",
+                    "translated_short_merge_threshold": "11",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        task = self.client.get(f"/dubbing/auto/status/{payload['task_id']}").json()
+        self.assertTrue(task["translated_short_merge_enabled"])
+        self.assertEqual(task["translated_short_merge_threshold"], 11)
+        enabled_flag_index = task["command"].index("--translated-short-merge-enabled")
+        self.assertEqual(task["command"][enabled_flag_index + 1], "true")
+        flag_index = task["command"].index("--translated-short-merge-threshold")
+        self.assertEqual(task["command"][flag_index + 1], "11")
+
+    def test_start_auto_dubbing_accepts_omnivoice_fallback_options(self):
+        with patch.object(dubbing_cli_api.threading, "Thread", FakeThread), patch.object(
+            dubbing_cli_api, "_check_index_tts_service", return_value=None
+        ), patch.object(
+            dubbing_cli_api,
+            "_ensure_omnivoice_service",
+            side_effect=AssertionError("fallback omnivoice should not auto-start"),
+        ):
+            response = self.client.post(
+                "/dubbing/auto/start",
+                files={"video": ("demo.mp4", b"video-data", "video/mp4")},
+                data={
+                    "target_lang": "Chinese",
+                    "api_key": "secret-key",
+                    "fallback_tts_backend": "omnivoice",
+                    "omnivoice_root": "/opt/omnivoice",
+                    "omnivoice_python_bin": "/opt/omnivoice/.venv/bin/python",
+                    "omnivoice_model": "k2-fsa/OmniVoice",
+                    "omnivoice_device": "mps",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        task = self.client.get(f"/dubbing/auto/status/{payload['task_id']}").json()
+        self.assertEqual(task["fallback_tts_backend"], "omnivoice")
+        self.assertEqual(task["omnivoice_model"], "k2-fsa/OmniVoice")
+        self.assertIn("--omnivoice-root", task["command"])
+        omni_root_index = task["command"].index("--omnivoice-root")
+        self.assertEqual(task["command"][omni_root_index + 1], "/opt/omnivoice")
+
+    def test_start_auto_dubbing_accepts_omnivoice_primary_without_api_mode(self):
+        with patch.object(dubbing_cli_api.threading, "Thread", FakeThread), patch.object(
+            dubbing_cli_api,
+            "_ensure_omnivoice_service",
+            side_effect=AssertionError("omnivoice service should not be checked when api mode disabled"),
+        ):
+            response = self.client.post(
+                "/dubbing/auto/start",
+                files={"video": ("demo.mp4", b"video-data", "video/mp4")},
+                data={
+                    "target_lang": "Chinese",
+                    "api_key": "secret-key",
+                    "tts_backend": "omnivoice",
+                    "omnivoice_via_api": "false",
+                    "omnivoice_root": "/opt/omnivoice",
+                    "omnivoice_python_bin": "/opt/omnivoice/.venv/bin/python",
+                    "omnivoice_model": "k2-fsa/OmniVoice",
+                    "omnivoice_device": "mps",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        task = self.client.get(f"/dubbing/auto/status/{payload['task_id']}").json()
+        self.assertEqual(task["tts_backend"], "omnivoice")
+        self.assertFalse(task["omnivoice_via_api"])
+        self.assertIn("--omnivoice-via-api", task["command"])
+        via_api_index = task["command"].index("--omnivoice-via-api")
+        self.assertEqual(task["command"][via_api_index + 1], "false")
+
+    def test_start_auto_dubbing_accepts_omnivoice_primary_with_env_runtime(self):
+        env_patch = {
+            "OMNIVOICE_ROOT": "/opt/omnivoice",
+            "OMNIVOICE_PYTHON_BIN": "/opt/omnivoice/.venv/bin/python",
+            "OMNIVOICE_MODEL": "k2-fsa/OmniVoice",
+            "OMNIVOICE_DEVICE": "mps",
+        }
+        with patch.dict(os.environ, env_patch, clear=False), patch.object(
+            dubbing_cli_api.threading, "Thread", FakeThread
+        ), patch.object(
+            dubbing_cli_api,
+            "_check_index_tts_service",
+            side_effect=AssertionError("index-tts health check should not run for omnivoice"),
+        ), patch.object(
+            dubbing_cli_api,
+            "_ensure_omnivoice_service",
+            return_value=None,
+        ) as ensure_omnivoice_mock:
+            response = self.client.post(
+                "/dubbing/auto/start",
+                files={"video": ("demo.mp4", b"video-data", "video/mp4")},
+                data={
+                    "target_lang": "Chinese",
+                    "api_key": "secret-key",
+                    "tts_backend": "omnivoice",
+                    "omnivoice_root": "",
+                    "omnivoice_python_bin": "",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        task = self.client.get(f"/dubbing/auto/status/{payload['task_id']}").json()
+        self.assertEqual(task["tts_backend"], "omnivoice")
+        self.assertEqual(task["omnivoice_root"], "/opt/omnivoice")
+        self.assertEqual(task["omnivoice_python_bin"], "/opt/omnivoice/.venv/bin/python")
+        self.assertTrue(task["omnivoice_via_api"])
+        self.assertEqual(task["omnivoice_api_url"], dubbing_cli_api.DEFAULT_OMNIVOICE_API_URL)
+        self.assertIn("--omnivoice-root", task["command"])
+        self.assertIn("--omnivoice-python-bin", task["command"])
+        self.assertIn("--omnivoice-via-api", task["command"])
+        self.assertIn("--omnivoice-api-url", task["command"])
+        ensure_omnivoice_mock.assert_called_once_with(dubbing_cli_api.DEFAULT_OMNIVOICE_API_URL)
+
+    def test_start_auto_dubbing_rejects_omnivoice_primary_without_runtime_when_api_disabled(self):
+        with patch.dict(
+            os.environ,
+            {
+                "OMNIVOICE_ROOT": "",
+                "OMNIVOICE_PYTHON_BIN": "",
+                "OMNIVOICE_MODEL": "",
+                "OMNIVOICE_DEVICE": "",
+            },
+            clear=False,
+        ):
+            response = self.client.post(
+                "/dubbing/auto/start",
+                files={"video": ("demo.mp4", b"video-data", "video/mp4")},
+                data={
+                    "target_lang": "Chinese",
+                    "api_key": "secret-key",
+                    "tts_backend": "omnivoice",
+                    "omnivoice_via_api": "false",
+                    "omnivoice_root": "",
+                    "omnivoice_python_bin": "",
+                    "omnivoice_api_url": "",
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("omnivoice_root", response.json()["detail"])
 
     def test_start_auto_dubbing_rejects_invalid_short_merge_threshold(self):
         with patch.object(dubbing_cli_api, "_check_index_tts_service", return_value=None):
@@ -622,6 +807,89 @@ class DubbingCliApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 409)
 
+    def test_resume_auto_dubbing_requeues_failed_task_with_resume_batch_dir(self):
+        media_path = self.upload_root / "resume-demo.mp4"
+        media_path.write_bytes(b"video-data")
+        out_root = self.output_root / "web_failed_demo"
+        resume_batch_dir = out_root / "longdub_20260427_100000"
+        (resume_batch_dir / "segment_jobs").mkdir(parents=True, exist_ok=True)
+        out_root.mkdir(parents=True, exist_ok=True)
+
+        dubbing_cli_api._tasks["failed-task"] = {
+            "id": "failed-task",
+            "status": "failed",
+            "filename": "resume-demo.mp4",
+            "input_path": str(media_path),
+            "input_srt": None,
+            "upload_dir": str(self.upload_root),
+            "out_root": str(out_root),
+            "target_lang": "Chinese",
+            "source_lang": "auto",
+            "subtitle_mode": "source",
+            "segment_minutes": 8.0,
+            "min_segment_minutes": 4.0,
+            "translate_base_url": dubbing_cli_api.DEFAULT_TRANSLATE_BASE_URL,
+            "translate_model": dubbing_cli_api.DEFAULT_TRANSLATE_MODEL,
+            "tts_backend": "index-tts",
+            "fallback_tts_backend": "none",
+            "omnivoice_root": "",
+            "omnivoice_python_bin": "",
+            "omnivoice_model": dubbing_cli_api.DEFAULT_OMNIVOICE_MODEL,
+            "omnivoice_device": "auto",
+            "omnivoice_via_api": True,
+            "omnivoice_api_url": dubbing_cli_api.DEFAULT_OMNIVOICE_API_URL,
+            "index_tts_api_url": dubbing_cli_api.DEFAULT_INDEX_TTS_API_URL,
+            "timing_mode": "strict",
+            "grouping_strategy": "sentence",
+            "source_short_merge_enabled": False,
+            "source_short_merge_threshold": 15,
+            "time_ranges": [],
+            "auto_pick_ranges": False,
+            "auto_pick_min_silence_sec": 0.8,
+            "auto_pick_min_speech_sec": 1.0,
+            "pipeline_version": "v1",
+            "rewrite_translation": True,
+            "process": None,
+        }
+
+        with patch.object(dubbing_cli_api.threading, "Thread", FakeThread), patch.object(
+            dubbing_cli_api, "_check_index_tts_service", return_value=None
+        ):
+            response = self.client.post(
+                "/dubbing/auto/resume/failed-task",
+                data={"api_key": "secret-key"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["resumed_from_task_id"], "failed-task")
+        self.assertEqual(payload["resume_batch_id"], "longdub_20260427_100000")
+        resumed_task_id = payload["task_id"]
+        self.assertNotEqual(resumed_task_id, "failed-task")
+        task = self.client.get(f"/dubbing/auto/status/{resumed_task_id}").json()
+        self.assertIn("--resume-batch-dir", task["command"])
+        resume_index = task["command"].index("--resume-batch-dir")
+        self.assertEqual(task["command"][resume_index + 1], str(resume_batch_dir.resolve()))
+        self.assertEqual(dubbing_cli_api._tasks[resumed_task_id]["out_root"], str(out_root.resolve()))
+        self.assertTrue(FakeThread.instances)
+        self.assertEqual(FakeThread.instances[-1].args[2]["DEEPSEEK_API_KEY"], "secret-key")
+
+    def test_resume_auto_dubbing_rejects_non_failed_task(self):
+        dubbing_cli_api._tasks["done-task"] = {"id": "done-task", "status": "completed"}
+        response = self.client.post("/dubbing/auto/resume/done-task")
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("Only failed/cancelled tasks", response.json()["detail"])
+
+    def test_resume_auto_dubbing_requires_existing_batch_dir(self):
+        dubbing_cli_api._tasks["failed-missing-batch"] = {
+            "id": "failed-missing-batch",
+            "status": "failed",
+            "out_root": str(self.output_root / "web_missing"),
+        }
+        response = self.client.post("/dubbing/auto/resume/failed-missing-batch")
+        self.assertEqual(response.status_code, 404)
+        self.assertIn("Resume batch directory not found", response.json()["detail"])
+
     def test_load_auto_dubbing_batch_restores_completed_task(self):
         batch_dir = self.output_root / "web_20260419_123000" / "longdub_20260419_102927"
         upload_dir = self.upload_root / "20260419_abc"
@@ -648,7 +916,21 @@ class DubbingCliApiTests(unittest.TestCase):
                     "source_short_merge_enabled": True,
                     "source_short_merge_threshold": 12,
                     "source_short_merge_threshold_mode": "seconds",
+                    "translated_short_merge_enabled": True,
+                    "translated_short_merge_threshold": 10,
+                    "translated_short_merge_threshold_mode": "seconds",
+                    "dub_audio_leveling_enabled": True,
+                    "dub_audio_leveling_target_rms": 0.12,
+                    "dub_audio_leveling_activity_threshold_db": -35.0,
+                    "dub_audio_leveling_max_gain_db": 8.0,
+                    "dub_audio_leveling_peak_ceiling": 0.95,
                     "input_srt_kind": "translated",
+                    "tts_backend": "index-tts",
+                    "fallback_tts_backend": "omnivoice",
+                    "omnivoice_root": "/opt/omnivoice",
+                    "omnivoice_python_bin": "/opt/omnivoice/.venv/bin/python",
+                    "omnivoice_model": "k2-fsa/OmniVoice",
+                    "omnivoice_device": "mps",
                     "index_tts_api_url": "http://127.0.0.1:8011",
                     "auto_pick_ranges": True,
                     "segments": [{"summary": {"total": 1, "done": 1, "manual_review": 0}}],
@@ -676,12 +958,122 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(payload["grouping_strategy"], "legacy")
         self.assertTrue(payload["source_short_merge_enabled"])
         self.assertEqual(payload["source_short_merge_threshold"], 12)
+        self.assertTrue(payload["translated_short_merge_enabled"])
+        self.assertEqual(payload["translated_short_merge_threshold"], 10)
+        self.assertTrue(payload["dub_audio_leveling_enabled"])
+        self.assertEqual(payload["dub_audio_leveling_target_rms"], 0.12)
         self.assertNotIn("speaker_mode", payload)
         self.assertEqual(payload["subtitle_mode"], "translated")
+        self.assertEqual(payload["tts_backend"], "index-tts")
+        self.assertEqual(payload["fallback_tts_backend"], "omnivoice")
+        self.assertEqual(payload["omnivoice_model"], "k2-fsa/OmniVoice")
         self.assertEqual(payload["index_tts_api_url"], "http://127.0.0.1:8011")
         self.assertTrue(payload["auto_pick_ranges"])
         self.assertTrue(payload.get("artifacts"))
         self.assertTrue(payload.get("input_media_url"))
+
+    def test_list_auto_dubbing_batches_includes_incomplete_batch_dir(self):
+        batch_dir = self.output_root / "web_20260427_111111" / "longdub_20260427_211111"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+
+        response = self.client.get("/dubbing/auto/batches")
+        self.assertEqual(response.status_code, 200)
+        batches = response.json().get("batches", [])
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(batches[0]["batch_id"], "longdub_20260427_211111")
+        self.assertFalse(batches[0]["has_manifest"])
+        self.assertEqual(batches[0]["status"], "incomplete")
+
+    def test_load_auto_dubbing_batch_loads_incomplete_batch_for_resume(self):
+        batch_dir = self.output_root / "web_20260427_121212" / "longdub_20260427_221212"
+        segment_dir = batch_dir / "segment_jobs" / "segment_0001"
+        segment_dir.mkdir(parents=True, exist_ok=True)
+        media_path = self.upload_root / "resume_incomplete.mp4"
+        media_path.write_bytes(b"video-data")
+        (segment_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "target_lang": "Chinese",
+                    "pipeline_version": "v1",
+                    "input_srt_kind": "source",
+                    "input_media_path": str(media_path),
+                    "translated_short_merge_enabled": True,
+                    "translated_short_merge_threshold": 9,
+                    "dub_audio_leveling_enabled": True,
+                    "dub_audio_leveling_target_rms": 0.14,
+                    "tts_backend": "index-tts",
+                    "fallback_tts_backend": "none",
+                    "segments": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = self.client.post(
+            "/dubbing/auto/load-batch",
+            data={"batch_id": "longdub_20260427_221212"},
+        )
+        self.assertEqual(loaded.status_code, 200)
+        payload = loaded.json()
+        self.assertEqual(payload["status"], "failed")
+        self.assertIn("interrupted job", payload.get("error", ""))
+        self.assertTrue(payload["translated_short_merge_enabled"])
+        self.assertEqual(payload["translated_short_merge_threshold"], 9)
+        self.assertTrue(payload["dub_audio_leveling_enabled"])
+        self.assertEqual(payload["dub_audio_leveling_target_rms"], 0.14)
+
+        with patch.object(dubbing_cli_api.threading, "Thread", FakeThread), patch.object(
+            dubbing_cli_api, "_check_index_tts_service", return_value=None
+        ):
+            resumed = self.client.post(f"/dubbing/auto/resume/{payload['id']}", data={"api_key": "secret-key"})
+        self.assertEqual(resumed.status_code, 200)
+        resumed_task = self.client.get(f"/dubbing/auto/status/{resumed.json()['task_id']}").json()
+        self.assertIn("--resume-batch-dir", resumed_task["command"])
+        resume_index = resumed_task["command"].index("--resume-batch-dir")
+        self.assertEqual(resumed_task["command"][resume_index + 1], str(batch_dir.resolve()))
+
+    def test_load_incomplete_batch_prefers_uploaded_video_over_segment_audio(self):
+        batch_dir = self.output_root / "web_20260427_093752" / "longdub_20260427_173755"
+        segment_dir = batch_dir / "segment_jobs" / "segment_0001"
+        raw_segments_dir = batch_dir / "segments"
+        segment_dir.mkdir(parents=True, exist_ok=True)
+        raw_segments_dir.mkdir(parents=True, exist_ok=True)
+        # 模拟错误写入：segment manifest 记录的是切片音频而不是原视频。
+        segment_audio = raw_segments_dir / "segment_0001.wav"
+        segment_audio.write_bytes(b"segment-audio")
+        upload_dir = self.upload_root / "20260427_093752"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        uploaded_video = upload_dir / "demo.mp4"
+        uploaded_video.write_bytes(b"uploaded-video")
+        (segment_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "target_lang": "Chinese",
+                    "pipeline_version": "v1",
+                    "input_srt_kind": "source",
+                    "input_media_path": str(segment_audio),
+                    "segments": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = self.client.post(
+            "/dubbing/auto/load-batch",
+            data={"batch_id": "longdub_20260427_173755"},
+        )
+        self.assertEqual(loaded.status_code, 200)
+        payload = loaded.json()
+        self.assertEqual(payload["status"], "failed")
+        # 关键断言：续跑命令应优先使用 uploads 里的原视频，而不是 segment 切片音频。
+        with patch.object(dubbing_cli_api.threading, "Thread", FakeThread), patch.object(
+            dubbing_cli_api, "_check_index_tts_service", return_value=None
+        ):
+            resumed = self.client.post(f"/dubbing/auto/resume/{payload['id']}", data={"api_key": "secret-key"})
+        self.assertEqual(resumed.status_code, 200)
+        resumed_task = self.client.get(f"/dubbing/auto/status/{resumed.json()['task_id']}").json()
+        self.assertIn(str(uploaded_video.resolve()), resumed_task["command"])
+        self.assertNotIn(str(segment_audio.resolve()), resumed_task["command"])
 
     def test_load_auto_dubbing_batch_falls_back_from_legacy_short_merge_units(self):
         batch_dir = self.output_root / "web_20260419_123001" / "longdub_20260419_102928"
@@ -872,12 +1264,20 @@ class DubbingCliApiTests(unittest.TestCase):
         (segment_dir / "subtitles" / "source.srt").write_text(source_srt.read_text(encoding="utf-8"), encoding="utf-8")
         (segment_dir / "subtitles" / "translated.srt").write_text(translated_srt.read_text(encoding="utf-8"), encoding="utf-8")
         (segment_dir / "subtitles" / "dubbed_final.srt").write_text(bilingual_srt.read_text(encoding="utf-8"), encoding="utf-8")
+        stale_translated_srt = segment_dir / "translated_stale.srt"
+        stale_dubbed_final_srt = segment_dir / "dubbed_final_stale.srt"
+        stale_translated_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\n你好（旧）\n", encoding="utf-8")
+        stale_dubbed_final_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\n你好（旧）\nHello\n", encoding="utf-8")
         (segment_dir / "manifest.json").write_text(
             json.dumps(
                 {
                     "input_media_path": str(self.upload_root / "in.mp4"),
                     "segments": [{"id": "seg_0001", "start_sec": 0.0, "end_sec": 2.0, "translated_text": "你好", "status": "done"}],
-                    "paths": {"source_srt": str(segment_dir / "subtitles" / "source.srt"), "translated_srt": str(segment_dir / "subtitles" / "translated.srt")},
+                    "paths": {
+                        "source_srt": str(segment_dir / "subtitles" / "source.srt"),
+                        "translated_srt": str(stale_translated_srt),
+                        "dubbed_final_srt": str(stale_dubbed_final_srt),
+                    },
                 }
             ),
             encoding="utf-8",
@@ -912,6 +1312,232 @@ class DubbingCliApiTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["status"], "saved_and_redubbed")
         self.assertEqual(payload["redubbed_segments"], 1)
+        updated_manifest = json.loads((segment_dir / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            updated_manifest["paths"]["translated_srt"],
+            str((segment_dir / "subtitles" / "translated.srt").resolve()),
+        )
+        self.assertEqual(
+            updated_manifest["paths"]["dubbed_final_srt"],
+            str((segment_dir / "subtitles" / "dubbed_final.srt").resolve()),
+        )
+
+    def test_review_redub_failed_reuses_existing_translated_text(self):
+        batch_dir = self.output_root / "web_20260427_220000" / "longdub_20260427_220000"
+        final_dir = batch_dir / "final"
+        segment_dir = batch_dir / "segment_jobs" / "segment_0001"
+        dubbed_segments_dir = segment_dir / "dubbed_segments"
+        subtitles_dir = segment_dir / "subtitles"
+        subtitles_dir.mkdir(parents=True, exist_ok=True)
+        dubbed_segments_dir.mkdir(parents=True, exist_ok=True)
+        final_dir.mkdir(parents=True, exist_ok=True)
+
+        source_srt = final_dir / "source_full.srt"
+        translated_srt = final_dir / "translated_full.srt"
+        bilingual_srt = final_dir / "dubbed_final_full.srt"
+        source_srt.write_text(
+            "1\n00:00:00,000 --> 00:00:02,000\nHello\n\n"
+            "2\n00:00:02,000 --> 00:00:04,000\nWorld\n",
+            encoding="utf-8",
+        )
+        translated_srt.write_text(
+            "1\n00:00:00,000 --> 00:00:02,000\n你好\n\n"
+            "2\n00:00:02,000 --> 00:00:04,000\n世界\n",
+            encoding="utf-8",
+        )
+        bilingual_srt.write_text(
+            "1\n00:00:00,000 --> 00:00:02,000\n你好\nHello\n\n"
+            "2\n00:00:02,000 --> 00:00:04,000\n世界\nWorld\n",
+            encoding="utf-8",
+        )
+        (subtitles_dir / "source.srt").write_text(source_srt.read_text(encoding="utf-8"), encoding="utf-8")
+        (subtitles_dir / "translated.srt").write_text(translated_srt.read_text(encoding="utf-8"), encoding="utf-8")
+        (subtitles_dir / "dubbed_final.srt").write_text(bilingual_srt.read_text(encoding="utf-8"), encoding="utf-8")
+        real_audio = dubbed_segments_dir / "seg_0001.wav"
+        missing_audio = dubbed_segments_dir / "seg_0002_missing.wav"
+        real_audio.write_bytes(b"real")
+        missing_audio.write_bytes(b"missing")
+        (segment_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "input_media_path": str(self.upload_root / "in.mp4"),
+                    "segments": [
+                        {
+                            "id": "seg_0001",
+                            "start_sec": 0.0,
+                            "end_sec": 2.0,
+                            "translated_text": "你好",
+                            "status": "done",
+                            "tts_audio_path": str(real_audio),
+                        },
+                        {
+                            "id": "seg_0002",
+                            "start_sec": 2.0,
+                            "end_sec": 4.0,
+                            "translated_text": "世界",
+                            "status": "manual_review",
+                            "tts_audio_path": str(missing_audio),
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (batch_dir / "batch_manifest.json").write_text(
+            json.dumps(
+                {
+                    "segments_total": 1,
+                    "segments": [{"index": 1, "start_sec": 0.0, "summary": {"total": 2, "done": 1, "manual_review": 1}, "job_dir": str(segment_dir)}],
+                    "paths": {
+                        "translated_full_srt": str(translated_srt),
+                        "dubbed_final_full_srt": str(bilingual_srt),
+                        "source_full_srt": str(source_srt),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = self.client.post("/dubbing/auto/load-batch", data={"batch_id": "longdub_20260427_220000"})
+        self.assertEqual(loaded.status_code, 200)
+        task_id = loaded.json()["id"]
+
+        with patch.object(dubbing_cli_api, "_rerun_segment_with_translated_srt", return_value=None) as rerun_mock, patch.object(
+            dubbing_cli_api, "_rebuild_batch_outputs", return_value={"batch_rebuilt": True}
+        ):
+            response = self.client.post(f"/dubbing/auto/review/{task_id}/redub-failed")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "forced_redubbed")
+        self.assertEqual(payload["forced_line_count"], 1)
+        self.assertEqual(payload["redubbed_segments"], 1)
+        rerun_mock.assert_called_once()
+        self.assertEqual(rerun_mock.call_args.kwargs["redub_local_indices"], [2])
+        self.assertIn("世界", translated_srt.read_text(encoding="utf-8"))
+
+    def test_review_redub_failed_no_candidates_keeps_task_completed(self):
+        batch_dir = self.output_root / "web_20260427_220010" / "longdub_20260427_220010"
+        final_dir = batch_dir / "final"
+        segment_dir = batch_dir / "segment_jobs" / "segment_0001"
+        subtitles_dir = segment_dir / "subtitles"
+        subtitles_dir.mkdir(parents=True, exist_ok=True)
+        final_dir.mkdir(parents=True, exist_ok=True)
+
+        source_srt = final_dir / "source_full.srt"
+        translated_srt = final_dir / "translated_full.srt"
+        bilingual_srt = final_dir / "dubbed_final_full.srt"
+        source_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\nHello\n", encoding="utf-8")
+        translated_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\n你好\n", encoding="utf-8")
+        bilingual_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\n你好\nHello\n", encoding="utf-8")
+        (subtitles_dir / "source.srt").write_text(source_srt.read_text(encoding="utf-8"), encoding="utf-8")
+        (subtitles_dir / "translated.srt").write_text(translated_srt.read_text(encoding="utf-8"), encoding="utf-8")
+        (subtitles_dir / "dubbed_final.srt").write_text(bilingual_srt.read_text(encoding="utf-8"), encoding="utf-8")
+        audio_path = segment_dir / "dubbed_segments" / "seg_0001.wav"
+        audio_path.parent.mkdir(parents=True, exist_ok=True)
+        audio_path.write_bytes(b"real")
+        (segment_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "input_media_path": str(self.upload_root / "in.mp4"),
+                    "segments": [{"id": "seg_0001", "start_sec": 0.0, "end_sec": 2.0, "translated_text": "你好", "status": "done", "tts_audio_path": str(audio_path)}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        (batch_dir / "batch_manifest.json").write_text(
+            json.dumps(
+                {
+                    "segments_total": 1,
+                    "segments": [{"index": 1, "start_sec": 0.0, "summary": {"total": 1, "done": 1, "manual_review": 0}, "job_dir": str(segment_dir)}],
+                    "paths": {
+                        "translated_full_srt": str(translated_srt),
+                        "dubbed_final_full_srt": str(bilingual_srt),
+                        "source_full_srt": str(source_srt),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        loaded = self.client.post("/dubbing/auto/load-batch", data={"batch_id": "longdub_20260427_220010"})
+        self.assertEqual(loaded.status_code, 200)
+        task_id = loaded.json()["id"]
+
+        with patch.object(dubbing_cli_api, "_rerun_segment_with_translated_srt", return_value=None) as rerun_mock:
+            response = self.client.post(f"/dubbing/auto/review/{task_id}/redub-failed")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "no_candidates")
+        rerun_mock.assert_not_called()
+        status = self.client.get(f"/dubbing/auto/status/{task_id}")
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["status"], "completed")
+
+    def test_rebuild_batch_outputs_updates_final_subtitles_when_some_segments_are_skipped(self):
+        batch_dir = self.output_root / "web_20260427_100000" / "longdub_20260427_100000"
+        final_dir = batch_dir / "final"
+        segment_1_dir = batch_dir / "segment_jobs" / "segment_0001"
+        segment_2_dir = batch_dir / "segment_jobs" / "segment_0002"
+        (segment_1_dir / "subtitles").mkdir(parents=True, exist_ok=True)
+        segment_2_dir.mkdir(parents=True, exist_ok=True)
+        final_dir.mkdir(parents=True, exist_ok=True)
+
+        source_srt = segment_1_dir / "subtitles" / "source.srt"
+        translated_srt = segment_1_dir / "subtitles" / "translated.srt"
+        dubbed_final_srt = segment_1_dir / "subtitles" / "dubbed_final.srt"
+        stale_translated_srt = segment_1_dir / "translated_stale.srt"
+        stale_dubbed_final_srt = segment_1_dir / "dubbed_final_stale.srt"
+        source_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\nHello\n", encoding="utf-8")
+        translated_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\n你好（新）\n", encoding="utf-8")
+        dubbed_final_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\n你好（新）\nHello\n", encoding="utf-8")
+        stale_translated_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\n你好（旧）\n", encoding="utf-8")
+        stale_dubbed_final_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\n你好（旧）\nHello\n", encoding="utf-8")
+
+        (segment_1_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "paths": {
+                        "source_srt": str(source_srt),
+                        "translated_srt": str(stale_translated_srt),
+                        "dubbed_final_srt": str(stale_dubbed_final_srt),
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        # segment_0002 模拟“跳过段”：存在 manifest 但没有字幕文件。
+        (segment_2_dir / "manifest.json").write_text(json.dumps({"paths": {}}), encoding="utf-8")
+
+        translated_full_srt = final_dir / "translated_full.srt"
+        dubbed_final_full_srt = final_dir / "dubbed_final_full.srt"
+        translated_full_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\n你好（旧）\n", encoding="utf-8")
+        dubbed_final_full_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\n你好（旧）\nHello\n", encoding="utf-8")
+
+        (batch_dir / "batch_manifest.json").write_text(
+            json.dumps(
+                {
+                    "segments": [
+                        {"index": 1, "start_sec": 0.0, "end_sec": 10.0, "job_dir": str(segment_1_dir)},
+                        {"index": 2, "start_sec": 10.0, "end_sec": 20.0, "job_dir": str(segment_2_dir)},
+                    ],
+                    "paths": {
+                        "source_full_srt": str(final_dir / "source_full.srt"),
+                        "translated_full_srt": str(translated_full_srt),
+                        "dubbed_final_full_srt": str(dubbed_final_full_srt),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        rebuild = dubbing_cli_api._rebuild_batch_outputs(batch_dir)
+
+        self.assertTrue(rebuild["batch_rebuilt"])
+        self.assertEqual(rebuild["translated_srt_inputs"], 1)
+        self.assertEqual(rebuild["dubbed_final_srt_inputs"], 1)
+        self.assertIn("你好（新）", translated_full_srt.read_text(encoding="utf-8"))
+        self.assertIn("你好（新）", dubbed_final_full_srt.read_text(encoding="utf-8"))
 
     def test_review_save_and_redub_no_changes_skips_rerun(self):
         batch_dir = self.output_root / "web_20260419_223010" / "longdub_20260419_202928"
@@ -965,6 +1591,9 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "no_changes")
         rerun_mock.assert_not_called()
+        status = self.client.get(f"/dubbing/auto/status/{task_id}")
+        self.assertEqual(status.status_code, 200)
+        self.assertEqual(status.json()["status"], "completed")
 
     def test_review_save_and_redub_failure_sets_task_failed_and_returns_detail(self):
         batch_dir = self.output_root / "web_20260419_224000" / "longdub_20260419_203000"
@@ -1054,7 +1683,9 @@ class DubbingCliApiTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with patch.object(dubbing_cli_api.subprocess, "run") as run_mock:
+        with patch.object(dubbing_cli_api, "_switch_tts_runtime_on_demand", return_value=None), patch.object(
+            dubbing_cli_api.subprocess, "run"
+        ) as run_mock:
             run_mock.return_value.returncode = 0
             run_mock.return_value.stdout = ""
             run_mock.return_value.stderr = ""
@@ -1078,6 +1709,7 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertIn("--translated-input-preserve-synthesis-mode", cmd)
         preserve_index = cmd.index("--translated-input-preserve-synthesis-mode")
         self.assertEqual(cmd[preserve_index + 1], "true")
+        self.assertIn("--fallback-tts-backend", cmd)
         self.assertNotIn("--redub-line-indices-json", cmd)
 
     def test_rerun_segment_with_translated_srt_prefers_manifest_backend_and_api_url(self):
@@ -1093,6 +1725,11 @@ class DubbingCliApiTests(unittest.TestCase):
                 {
                     "input_media_path": str(input_media),
                     "tts_backend": "qwen-tts",
+                    "fallback_tts_backend": "omnivoice",
+                    "omnivoice_root": "/opt/omnivoice",
+                    "omnivoice_python_bin": "/opt/omnivoice/.venv/bin/python",
+                    "omnivoice_model": "k2-fsa/OmniVoice",
+                    "omnivoice_device": "mps",
                     "index_tts_api_url": "http://127.0.0.1:19010",
                     "segments": [
                         {"id": "seg_0001", "translated_text": "你好"},
@@ -1102,7 +1739,9 @@ class DubbingCliApiTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-        with patch.object(dubbing_cli_api.subprocess, "run") as run_mock:
+        with patch.object(dubbing_cli_api, "_switch_tts_runtime_on_demand", return_value=None), patch.object(
+            dubbing_cli_api.subprocess, "run"
+        ) as run_mock:
             run_mock.return_value.returncode = 0
             run_mock.return_value.stdout = ""
             run_mock.return_value.stderr = ""
@@ -1121,6 +1760,16 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(cmd[backend_index + 1], "qwen-tts")
         api_url_index = cmd.index("--index-tts-api-url")
         self.assertEqual(cmd[api_url_index + 1], "http://127.0.0.1:19010")
+        fallback_index = cmd.index("--fallback-tts-backend")
+        self.assertEqual(cmd[fallback_index + 1], "omnivoice")
+        omnivoice_model_index = cmd.index("--omnivoice-model")
+        self.assertEqual(cmd[omnivoice_model_index + 1], "k2-fsa/OmniVoice")
+        self.assertIn("--omnivoice-via-api", cmd)
+        via_api_index = cmd.index("--omnivoice-via-api")
+        self.assertEqual(cmd[via_api_index + 1], "true")
+        self.assertIn("--omnivoice-api-url", cmd)
+        api_url_index = cmd.index("--omnivoice-api-url")
+        self.assertEqual(cmd[api_url_index + 1], "http://127.0.0.1:8020")
 
     def test_compact_process_error_output_filters_flash_attn_noise(self):
         stdout = "[INFO] init:job_started - dubbing job started\nPipeline failed: DeepSeek API Key is required."
@@ -1193,6 +1842,68 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 503)
         self.assertIn("auto-start failed", ctx.exception.detail)
 
+    def test_ensure_omnivoice_service_autostarts_local_launcher(self):
+        with patch.object(
+            dubbing_cli_api,
+            "_check_omnivoice_service",
+            side_effect=[
+                web.HTTPException(status_code=503, detail="down"),
+                None,
+            ],
+        ) as check_mock, patch.object(dubbing_cli_api, "OMNIVOICE_START_SCRIPT", self.tool_path), patch.object(
+            dubbing_cli_api.subprocess, "run"
+        ) as run_mock:
+            run_mock.return_value.returncode = 0
+            run_mock.return_value.stdout = "started"
+            run_mock.return_value.stderr = ""
+
+            dubbing_cli_api._ensure_omnivoice_service(dubbing_cli_api.DEFAULT_OMNIVOICE_API_URL)
+
+        self.assertEqual(check_mock.call_count, 2)
+        run_mock.assert_called_once()
+
+    def test_ensure_omnivoice_service_raises_when_autostart_fails(self):
+        with patch.object(
+            dubbing_cli_api,
+            "_check_omnivoice_service",
+            side_effect=web.HTTPException(status_code=503, detail="down"),
+        ), patch.object(dubbing_cli_api, "OMNIVOICE_START_SCRIPT", self.tool_path), patch.object(
+            dubbing_cli_api.subprocess, "run"
+        ) as run_mock:
+            run_mock.return_value.returncode = 1
+            run_mock.return_value.stdout = ""
+            run_mock.return_value.stderr = "boom"
+
+            with self.assertRaises(web.HTTPException) as ctx:
+                dubbing_cli_api._ensure_omnivoice_service(dubbing_cli_api.DEFAULT_OMNIVOICE_API_URL)
+
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertIn("auto-start failed", ctx.exception.detail)
+
+    def test_auto_start_local_omnivoice_tolerates_nonzero_when_service_is_ready(self):
+        with patch.object(dubbing_cli_api, "OMNIVOICE_START_SCRIPT", self.tool_path), patch.object(
+            dubbing_cli_api.subprocess, "run"
+        ) as run_mock, patch.object(dubbing_cli_api, "_check_omnivoice_service", return_value=None) as health_mock:
+            run_mock.return_value.returncode = 1
+            run_mock.return_value.stdout = ""
+            run_mock.return_value.stderr = "script aborted"
+
+            dubbing_cli_api._auto_start_local_omnivoice(dubbing_cli_api.DEFAULT_OMNIVOICE_API_URL)
+
+        run_mock.assert_called_once()
+        health_mock.assert_called_once()
+
+    def test_auto_start_local_omnivoice_tolerates_timeout_when_service_is_ready(self):
+        with patch.object(dubbing_cli_api, "OMNIVOICE_START_SCRIPT", self.tool_path), patch.object(
+            dubbing_cli_api.subprocess, "run"
+        ) as run_mock, patch.object(dubbing_cli_api, "_check_omnivoice_service", return_value=None) as health_mock:
+            run_mock.side_effect = subprocess.TimeoutExpired(cmd=str(self.tool_path), timeout=420)
+
+            dubbing_cli_api._auto_start_local_omnivoice(dubbing_cli_api.DEFAULT_OMNIVOICE_API_URL)
+
+        run_mock.assert_called_once()
+        health_mock.assert_called_once()
+
     def test_completed_task_exposes_artifacts_and_download(self):
         task_id = "task-artifacts"
         out_root = self.output_root / f"web_{task_id}"
@@ -1245,6 +1956,56 @@ class DubbingCliApiTests(unittest.TestCase):
         download = self.client.get(f"/dubbing/auto/artifact/{task_id}/preferred_audio")
         self.assertEqual(download.status_code, 200)
         self.assertEqual(download.content, b"mix-bytes")
+
+    def test_input_media_artifact_prefers_uploaded_video_when_manifest_points_segment_audio(self):
+        task_id = "task-input-media"
+        out_root = self.output_root / "web_20260427_093752"
+        batch_dir = out_root / "longdub_20260427_173755"
+        final_dir = batch_dir / "final"
+        segments_dir = batch_dir / "segments"
+        final_dir.mkdir(parents=True, exist_ok=True)
+        segments_dir.mkdir(parents=True, exist_ok=True)
+
+        segment_audio = segments_dir / "segment_0001.wav"
+        segment_audio.write_bytes(b"segment-audio")
+        upload_dir = self.upload_root / "20260427_093752"
+        upload_dir.mkdir(parents=True, exist_ok=True)
+        uploaded_video = upload_dir / "source.mp4"
+        uploaded_video.write_bytes(b"source-video")
+        mix_path = final_dir / "dubbed_mix_full.wav"
+        mix_path.write_bytes(b"mix-bytes")
+        bilingual_srt_path = final_dir / "dubbed_final_full.srt"
+        bilingual_srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nhello\n", encoding="utf-8")
+        manifest_path = batch_dir / "batch_manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "batch_id": "demo",
+                    "input_media_path": str(segment_audio),
+                    "segments_total": 1,
+                    "paths": {
+                        "batch_dir": str(batch_dir),
+                        "preferred_audio": str(mix_path),
+                        "dubbed_mix_full": str(mix_path),
+                        "dubbed_final_full_srt": str(bilingual_srt_path),
+                    },
+                    "segments": [{"summary": {"manual_review": 0}}],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        dubbing_cli_api._tasks[task_id] = {
+            "id": task_id,
+            "status": "running",
+            "out_root": str(out_root),
+            "artifacts": [],
+        }
+        dubbing_cli_api._complete_task_from_manifest(task_id, manifest_path)
+
+        download = self.client.get(f"/dubbing/auto/artifact/{task_id}/input_media")
+        self.assertEqual(download.status_code, 200)
+        self.assertEqual(download.content, b"source-video")
 
     def test_run_cli_task_surfaces_downstream_failure_detail(self):
         task_id = "task-failed-detail"

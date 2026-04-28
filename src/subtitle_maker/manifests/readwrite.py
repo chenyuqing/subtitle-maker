@@ -75,6 +75,46 @@ def _write_json(path: Path, payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def resolve_output_path(path_text: Any, *, repo_root: Optional[Path] = None) -> Optional[Path]:
+    """解析 manifest 中的产物路径，兼容相对仓库根目录的旧写法。"""
+
+    if not path_text:
+        return None
+    raw = Path(str(path_text)).expanduser()
+    if raw.is_absolute():
+        return raw.resolve()
+    if repo_root is None:
+        return raw.resolve()
+    return (repo_root.expanduser().resolve() / raw).resolve()
+
+
+def resolve_preferred_segment_subtitle_path(
+    *,
+    job_dir: Path,
+    paths: Dict[str, Any],
+    subtitle_key: str,
+    repo_root: Optional[Path] = None,
+) -> Optional[Path]:
+    """优先返回 segment/subtitles 下的最新字幕；缺失时再回退 manifest 历史路径。"""
+
+    normalized_job_dir = job_dir.expanduser().resolve()
+    subtitle_name_by_key = {
+        "source_srt": "source.srt",
+        "translated_srt": "translated.srt",
+        "dubbed_final_srt": "dubbed_final.srt",
+    }
+    subtitle_name = subtitle_name_by_key.get(str(subtitle_key or "").strip())
+    if not subtitle_name:
+        raise ValueError(f"unsupported subtitle key: {subtitle_key}")
+    canonical_path = normalized_job_dir / "subtitles" / subtitle_name
+    if canonical_path.exists():
+        return canonical_path
+    manifest_path = resolve_output_path(paths.get(subtitle_key), repo_root=repo_root)
+    if manifest_path and manifest_path.exists():
+        return manifest_path
+    return None
+
+
 def _normalize_range_pairs(ranges: Sequence[Tuple[float, float]]) -> List[Dict[str, float]]:
     """把 `(start, end)` 区间列表转换为 manifest 统一字典结构。"""
 
@@ -119,9 +159,27 @@ def _build_batch_options(raw: Dict[str, Any]) -> BatchReplayOptions:
             mode=str(raw.get("source_short_merge_threshold_mode") or ""),
         ),
         source_short_merge_threshold_mode="seconds",
+        translated_short_merge_enabled=_coerce_bool(raw.get("translated_short_merge_enabled"), default=False),
+        translated_short_merge_threshold=_normalize_short_merge_target_seconds(
+            raw.get("translated_short_merge_threshold"),
+            mode=str(raw.get("translated_short_merge_threshold_mode") or ""),
+        ),
+        translated_short_merge_threshold_mode="seconds",
+        dub_audio_leveling_enabled=_coerce_bool(raw.get("dub_audio_leveling_enabled"), default=True),
+        dub_audio_leveling_target_rms=float(raw.get("dub_audio_leveling_target_rms") or 0.12),
+        dub_audio_leveling_activity_threshold_db=float(raw.get("dub_audio_leveling_activity_threshold_db") or -35.0),
+        dub_audio_leveling_max_gain_db=float(raw.get("dub_audio_leveling_max_gain_db") or 8.0),
+        dub_audio_leveling_peak_ceiling=float(raw.get("dub_audio_leveling_peak_ceiling") or 0.95),
         grouped_synthesis=_coerce_bool(raw.get("grouped_synthesis"), default=False),
         force_fit_timing=_coerce_bool(raw.get("force_fit_timing"), default=False),
         tts_backend=str(raw.get("tts_backend") or "index-tts"),
+        fallback_tts_backend=str(raw.get("fallback_tts_backend") or "none"),
+        omnivoice_root=str(raw.get("omnivoice_root") or ""),
+        omnivoice_python_bin=str(raw.get("omnivoice_python_bin") or ""),
+        omnivoice_model=str(raw.get("omnivoice_model") or ""),
+        omnivoice_device=str(raw.get("omnivoice_device") or "auto"),
+        omnivoice_via_api=_coerce_bool(raw.get("omnivoice_via_api"), default=True),
+        omnivoice_api_url=str(raw.get("omnivoice_api_url") or "http://127.0.0.1:8020"),
         legacy_inferred=legacy_inferred,
     )
 
@@ -156,9 +214,27 @@ def _build_segment_options(raw: Dict[str, Any]) -> BatchReplayOptions:
             mode=str(raw.get("source_short_merge_threshold_mode") or ""),
         ),
         source_short_merge_threshold_mode="seconds",
+        translated_short_merge_enabled=_coerce_bool(raw.get("translated_short_merge_enabled"), default=False),
+        translated_short_merge_threshold=_normalize_short_merge_target_seconds(
+            raw.get("translated_short_merge_threshold"),
+            mode=str(raw.get("translated_short_merge_threshold_mode") or ""),
+        ),
+        translated_short_merge_threshold_mode="seconds",
+        dub_audio_leveling_enabled=_coerce_bool(raw.get("dub_audio_leveling_enabled"), default=True),
+        dub_audio_leveling_target_rms=float(raw.get("dub_audio_leveling_target_rms") or 0.12),
+        dub_audio_leveling_activity_threshold_db=float(raw.get("dub_audio_leveling_activity_threshold_db") or -35.0),
+        dub_audio_leveling_max_gain_db=float(raw.get("dub_audio_leveling_max_gain_db") or 8.0),
+        dub_audio_leveling_peak_ceiling=float(raw.get("dub_audio_leveling_peak_ceiling") or 0.95),
         grouped_synthesis=_coerce_bool(raw.get("grouped_synthesis"), default=inferred_grouped_synthesis),
         force_fit_timing=force_fit_timing,
         tts_backend=str(raw.get("tts_backend") or "index-tts"),
+        fallback_tts_backend=str(raw.get("fallback_tts_backend") or "none"),
+        omnivoice_root=str(raw.get("omnivoice_root") or ""),
+        omnivoice_python_bin=str(raw.get("omnivoice_python_bin") or ""),
+        omnivoice_model=str(raw.get("omnivoice_model") or ""),
+        omnivoice_device=str(raw.get("omnivoice_device") or "auto"),
+        omnivoice_via_api=_coerce_bool(raw.get("omnivoice_via_api"), default=True),
+        omnivoice_api_url=str(raw.get("omnivoice_api_url") or "http://127.0.0.1:8020"),
         legacy_inferred={},
     )
 
@@ -274,10 +350,26 @@ def build_batch_manifest(
         "source_short_merge_enabled": bool(options.source_short_merge_enabled),
         "source_short_merge_threshold": int(options.source_short_merge_threshold),
         "source_short_merge_threshold_mode": options.source_short_merge_threshold_mode or "seconds",
+        "translated_short_merge_enabled": bool(options.translated_short_merge_enabled),
+        "translated_short_merge_threshold": int(options.translated_short_merge_threshold),
+        "translated_short_merge_threshold_mode": options.translated_short_merge_threshold_mode or "seconds",
+        "dub_audio_leveling_enabled": bool(options.dub_audio_leveling_enabled),
+        "dub_audio_leveling_target_rms": float(options.dub_audio_leveling_target_rms),
+        "dub_audio_leveling_activity_threshold_db": float(options.dub_audio_leveling_activity_threshold_db),
+        "dub_audio_leveling_max_gain_db": float(options.dub_audio_leveling_max_gain_db),
+        "dub_audio_leveling_peak_ceiling": float(options.dub_audio_leveling_peak_ceiling),
         "grouped_synthesis": bool(options.grouped_synthesis),
         "force_fit_timing": bool(options.force_fit_timing),
         "input_srt_kind": options.input_srt_kind,
         "index_tts_api_url": options.index_tts_api_url,
+        "tts_backend": options.tts_backend,
+        "fallback_tts_backend": options.fallback_tts_backend,
+        "omnivoice_root": options.omnivoice_root,
+        "omnivoice_python_bin": options.omnivoice_python_bin,
+        "omnivoice_model": options.omnivoice_model,
+        "omnivoice_device": options.omnivoice_device,
+        "omnivoice_via_api": bool(options.omnivoice_via_api),
+        "omnivoice_api_url": options.omnivoice_api_url,
         "auto_pick_ranges": bool(options.auto_pick_ranges),
         "input_srt": str(input_srt_path) if input_srt_path else None,
         "segment_minutes": segment_minutes,
@@ -337,12 +429,27 @@ def build_segment_manifest(
         "rewrite_translation": bool(options.rewrite_translation),
         "input_srt_kind": options.input_srt_kind,
         "tts_backend": options.tts_backend,
+        "fallback_tts_backend": options.fallback_tts_backend,
         "index_tts_api_url": options.index_tts_api_url,
+        "omnivoice_root": options.omnivoice_root,
+        "omnivoice_python_bin": options.omnivoice_python_bin,
+        "omnivoice_model": options.omnivoice_model,
+        "omnivoice_device": options.omnivoice_device,
+        "omnivoice_via_api": bool(options.omnivoice_via_api),
+        "omnivoice_api_url": options.omnivoice_api_url,
         "timing_mode": options.timing_mode,
         "grouping_strategy": options.grouping_strategy,
         "source_short_merge_enabled": bool(options.source_short_merge_enabled),
         "source_short_merge_threshold": int(options.source_short_merge_threshold),
         "source_short_merge_threshold_mode": options.source_short_merge_threshold_mode or "seconds",
+        "translated_short_merge_enabled": bool(options.translated_short_merge_enabled),
+        "translated_short_merge_threshold": int(options.translated_short_merge_threshold),
+        "translated_short_merge_threshold_mode": options.translated_short_merge_threshold_mode or "seconds",
+        "dub_audio_leveling_enabled": bool(options.dub_audio_leveling_enabled),
+        "dub_audio_leveling_target_rms": float(options.dub_audio_leveling_target_rms),
+        "dub_audio_leveling_activity_threshold_db": float(options.dub_audio_leveling_activity_threshold_db),
+        "dub_audio_leveling_max_gain_db": float(options.dub_audio_leveling_max_gain_db),
+        "dub_audio_leveling_peak_ceiling": float(options.dub_audio_leveling_peak_ceiling),
         "grouped_synthesis": bool(options.grouped_synthesis),
         "force_fit_timing": bool(options.force_fit_timing),
         "auto_pick_ranges": bool(options.auto_pick_ranges),
@@ -394,12 +501,27 @@ def build_failed_segment_manifest(
         "rewrite_translation": bool(options.rewrite_translation),
         "input_srt_kind": options.input_srt_kind,
         "tts_backend": options.tts_backend,
+        "fallback_tts_backend": options.fallback_tts_backend,
         "index_tts_api_url": options.index_tts_api_url,
+        "omnivoice_root": options.omnivoice_root,
+        "omnivoice_python_bin": options.omnivoice_python_bin,
+        "omnivoice_model": options.omnivoice_model,
+        "omnivoice_device": options.omnivoice_device,
+        "omnivoice_via_api": bool(options.omnivoice_via_api),
+        "omnivoice_api_url": options.omnivoice_api_url,
         "timing_mode": options.timing_mode,
         "grouping_strategy": options.grouping_strategy,
         "source_short_merge_enabled": bool(options.source_short_merge_enabled),
         "source_short_merge_threshold": int(options.source_short_merge_threshold),
         "source_short_merge_threshold_mode": options.source_short_merge_threshold_mode or "seconds",
+        "translated_short_merge_enabled": bool(options.translated_short_merge_enabled),
+        "translated_short_merge_threshold": int(options.translated_short_merge_threshold),
+        "translated_short_merge_threshold_mode": options.translated_short_merge_threshold_mode or "seconds",
+        "dub_audio_leveling_enabled": bool(options.dub_audio_leveling_enabled),
+        "dub_audio_leveling_target_rms": float(options.dub_audio_leveling_target_rms),
+        "dub_audio_leveling_activity_threshold_db": float(options.dub_audio_leveling_activity_threshold_db),
+        "dub_audio_leveling_max_gain_db": float(options.dub_audio_leveling_max_gain_db),
+        "dub_audio_leveling_peak_ceiling": float(options.dub_audio_leveling_peak_ceiling),
         "grouped_synthesis": bool(options.grouped_synthesis),
         "force_fit_timing": bool(options.force_fit_timing),
         "auto_pick_ranges": bool(options.auto_pick_ranges),

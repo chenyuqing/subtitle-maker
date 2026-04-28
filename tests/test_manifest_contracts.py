@@ -47,11 +47,25 @@ class ManifestContractsTests(unittest.TestCase):
             v2_rewrite_translation="false",
             input_srt_kind="translated",
             tts_backend="index-tts",
+            fallback_tts_backend="omnivoice",
+            omnivoice_root="/opt/omnivoice",
+            omnivoice_python_bin="/opt/omnivoice/.venv/bin/python",
+            omnivoice_model="k2-fsa/OmniVoice",
+            omnivoice_device="mps",
+            omnivoice_via_api="true",
+            omnivoice_api_url="http://127.0.0.1:8020",
             index_tts_api_url="http://127.0.0.1:8010",
             timing_mode="balanced",
             grouping_strategy="sentence",
             source_short_merge_enabled="true",
             source_short_merge_threshold=12,
+            translated_short_merge_enabled="true",
+            translated_short_merge_threshold=10,
+            dub_audio_leveling_enabled="true",
+            dub_audio_leveling_target_rms=0.12,
+            dub_audio_leveling_activity_threshold_db=-35.0,
+            dub_audio_leveling_max_gain_db=8.0,
+            dub_audio_leveling_peak_ceiling=0.95,
             grouped_synthesis="true",
             grouped_synthesis_effective=False,
             force_fit_timing="true",
@@ -119,12 +133,27 @@ class ManifestContractsTests(unittest.TestCase):
         self.assertFalse(manifest["rewrite_translation"])
         self.assertEqual(manifest["input_srt_kind"], "translated")
         self.assertEqual(manifest["tts_backend"], "index-tts")
+        self.assertEqual(manifest["fallback_tts_backend"], "omnivoice")
+        self.assertEqual(manifest["omnivoice_root"], "/opt/omnivoice")
+        self.assertEqual(manifest["omnivoice_python_bin"], "/opt/omnivoice/.venv/bin/python")
+        self.assertEqual(manifest["omnivoice_model"], "k2-fsa/OmniVoice")
+        self.assertEqual(manifest["omnivoice_device"], "mps")
+        self.assertTrue(manifest["omnivoice_via_api"])
+        self.assertEqual(manifest["omnivoice_api_url"], "http://127.0.0.1:8020")
         self.assertEqual(manifest["index_tts_api_url"], "http://127.0.0.1:8010")
         self.assertEqual(manifest["timing_mode"], "balanced")
         self.assertEqual(manifest["grouping_strategy"], "sentence")
         self.assertTrue(manifest["source_short_merge_enabled"])
         self.assertEqual(manifest["source_short_merge_threshold"], 12)
         self.assertEqual(manifest["source_short_merge_threshold_mode"], "seconds")
+        self.assertTrue(manifest["translated_short_merge_enabled"])
+        self.assertEqual(manifest["translated_short_merge_threshold"], 10)
+        self.assertEqual(manifest["translated_short_merge_threshold_mode"], "seconds")
+        self.assertTrue(manifest["dub_audio_leveling_enabled"])
+        self.assertEqual(manifest["dub_audio_leveling_target_rms"], 0.12)
+        self.assertEqual(manifest["dub_audio_leveling_activity_threshold_db"], -35.0)
+        self.assertEqual(manifest["dub_audio_leveling_max_gain_db"], 8.0)
+        self.assertEqual(manifest["dub_audio_leveling_peak_ceiling"], 0.95)
         self.assertFalse(manifest["grouped_synthesis"])
         self.assertFalse(manifest["force_fit_timing"])
         self.assertTrue(manifest["auto_pick_ranges"])
@@ -177,8 +206,20 @@ class ManifestContractsTests(unittest.TestCase):
         self.assertEqual(manifest["pipeline_version"], "v2")
         self.assertEqual(manifest["input_srt_kind"], "translated")
         self.assertEqual(manifest["tts_backend"], "index-tts")
+        self.assertEqual(manifest["fallback_tts_backend"], "omnivoice")
+        self.assertEqual(manifest["omnivoice_model"], "k2-fsa/OmniVoice")
+        self.assertTrue(manifest["omnivoice_via_api"])
+        self.assertEqual(manifest["omnivoice_api_url"], "http://127.0.0.1:8020")
         self.assertTrue(manifest["source_short_merge_enabled"])
         self.assertEqual(manifest["source_short_merge_threshold_mode"], "seconds")
+        self.assertTrue(manifest["translated_short_merge_enabled"])
+        self.assertEqual(manifest["translated_short_merge_threshold"], 10)
+        self.assertEqual(manifest["translated_short_merge_threshold_mode"], "seconds")
+        self.assertTrue(manifest["dub_audio_leveling_enabled"])
+        self.assertEqual(manifest["dub_audio_leveling_target_rms"], 0.12)
+        self.assertEqual(manifest["dub_audio_leveling_activity_threshold_db"], -35.0)
+        self.assertEqual(manifest["dub_audio_leveling_max_gain_db"], 8.0)
+        self.assertEqual(manifest["dub_audio_leveling_peak_ceiling"], 0.95)
         self.assertFalse(manifest["grouped_synthesis"])
         self.assertFalse(manifest["force_fit_timing"])
         self.assertEqual(manifest["stats"]["done"], 1)
@@ -247,6 +288,10 @@ class ManifestContractsTests(unittest.TestCase):
         self.assertEqual(manifest.options.pipeline_version, "v1")
         self.assertTrue(manifest.options.source_short_merge_enabled)
         self.assertEqual(manifest.options.source_short_merge_threshold, 15)
+        self.assertFalse(manifest.options.translated_short_merge_enabled)
+        self.assertEqual(manifest.options.translated_short_merge_threshold, 15)
+        self.assertTrue(manifest.options.dub_audio_leveling_enabled)
+        self.assertEqual(manifest.options.dub_audio_leveling_target_rms, 0.12)
         self.assertEqual(manifest.options.time_ranges, [{"start_sec": 1.0, "end_sec": 9.0}])
         self.assertEqual(manifest.paths["preferred_audio"], "/tmp/final.wav")
 
@@ -284,6 +329,11 @@ class ManifestContractsTests(unittest.TestCase):
         self.assertFalse(manifest.options.rewrite_translation)
         self.assertTrue(manifest.options.grouped_synthesis)
         self.assertFalse(manifest.options.force_fit_timing)
+        self.assertFalse(manifest.options.translated_short_merge_enabled)
+        self.assertEqual(manifest.options.translated_short_merge_threshold, 15)
+        self.assertTrue(manifest.options.dub_audio_leveling_enabled)
+        self.assertEqual(manifest.options.dub_audio_leveling_target_rms, 0.12)
+        self.assertEqual(manifest.options.fallback_tts_backend, "none")
         self.assertEqual(len(manifest.segment_rows), 2)
 
     def test_build_batch_manifest_writes_legacy_and_normalized_range_keys(self) -> None:
@@ -326,6 +376,11 @@ class ManifestContractsTests(unittest.TestCase):
         self.assertEqual(manifest["requested_time_ranges"], manifest["requested_ranges"])
         self.assertEqual(manifest["effective_ranges"], [{"start_sec": 1.5, "end_sec": 8.5}])
         self.assertEqual(manifest["effective_time_ranges"], manifest["effective_ranges"])
+        self.assertFalse(manifest["translated_short_merge_enabled"])
+        self.assertEqual(manifest["translated_short_merge_threshold"], 15)
+        self.assertEqual(manifest["translated_short_merge_threshold_mode"], "seconds")
+        self.assertTrue(manifest["dub_audio_leveling_enabled"])
+        self.assertEqual(manifest["dub_audio_leveling_target_rms"], 0.12)
 
 
 if __name__ == "__main__":

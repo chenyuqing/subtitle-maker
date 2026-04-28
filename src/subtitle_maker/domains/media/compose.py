@@ -13,6 +13,140 @@ from subtitle_maker.transcriber import format_srt, parse_srt
 
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
+DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS = 0.12
+DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB = -35.0
+DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB = 8.0
+DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING = 0.95
+
+
+def _to_mono_float32(wav: np.ndarray) -> np.ndarray:
+    """把任意 shape 的波形统一成单声道 float32，供分析使用。"""
+
+    audio = np.asarray(wav, dtype=np.float32)
+    if audio.ndim > 1:
+        return np.mean(audio, axis=1, dtype=np.float32)
+    return audio
+
+
+def _build_active_sample_mask(
+    *,
+    mono_audio: np.ndarray,
+    sample_rate: int,
+    threshold_db: float,
+    frame_sec: float = 0.05,
+    hop_sec: float = 0.01,
+) -> np.ndarray:
+    """基于短窗 RMS 估计活动语音区域，避免整条静音把 RMS 拉低。"""
+
+    if mono_audio.size == 0 or sample_rate <= 0:
+        return np.zeros(0, dtype=bool)
+
+    frame_samples = max(1, int(sample_rate * max(0.005, frame_sec)))
+    hop_samples = max(1, int(sample_rate * max(0.005, hop_sec)))
+    threshold_rms = float(10 ** (float(threshold_db) / 20.0))
+    mask = np.zeros(mono_audio.shape[0], dtype=bool)
+    last_start = max(0, mono_audio.shape[0] - frame_samples)
+
+    for start in range(0, last_start + 1, hop_samples):
+        frame = mono_audio[start : start + frame_samples]
+        if frame.size == 0:
+            continue
+        frame_rms = float(np.sqrt(np.mean(np.square(frame), dtype=np.float64)))
+        if frame_rms >= threshold_rms:
+            mask[start : start + frame_samples] = True
+
+    if mask.any():
+        return mask
+
+    # 极短句可能凑不满有效窗，这里退回逐样本阈值，避免误判为全静音。
+    return np.abs(mono_audio) >= threshold_rms
+
+
+def normalize_speech_audio_level(
+    *,
+    input_path: Path,
+    output_path: Optional[Path] = None,
+    target_rms: float = DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS,
+    activity_threshold_db: float = DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB,
+    max_gain_db: float = DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB,
+    peak_ceiling: float = DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING,
+) -> Dict[str, Any]:
+    """按活动语音 RMS 统一句级音量，并返回归一化统计。"""
+
+    source_path = Path(input_path).expanduser()
+    target_path = Path(output_path).expanduser() if output_path is not None else source_path
+    wav, sample_rate = sf.read(str(source_path))
+    mono_audio = _to_mono_float32(wav)
+    peak_before = float(np.max(np.abs(mono_audio))) if mono_audio.size > 0 else 0.0
+
+    result: Dict[str, Any] = {
+        "applied": False,
+        "input_active_rms": None,
+        "output_active_rms": None,
+        "applied_gain_db": 0.0,
+        "peak_before": round(peak_before, 6),
+        "peak_after": round(peak_before, 6),
+        "active_duration_sec": 0.0,
+        "peak_limited": False,
+    }
+    if mono_audio.size == 0 or sample_rate <= 0:
+        if target_path != source_path:
+            shutil.copy2(source_path, target_path)
+        return result
+
+    active_mask = _build_active_sample_mask(
+        mono_audio=mono_audio,
+        sample_rate=sample_rate,
+        threshold_db=activity_threshold_db,
+    )
+    if active_mask.size == 0 or not active_mask.any():
+        if target_path != source_path:
+            shutil.copy2(source_path, target_path)
+        return result
+
+    active_audio = mono_audio[active_mask]
+    active_rms = float(np.sqrt(np.mean(np.square(active_audio), dtype=np.float64)))
+    result["input_active_rms"] = round(active_rms, 6)
+    result["active_duration_sec"] = round(float(active_audio.size / sample_rate), 6)
+    if active_rms <= 1e-6:
+        if target_path != source_path:
+            shutil.copy2(source_path, target_path)
+        return result
+
+    safe_target_rms = max(1e-4, float(target_rms))
+    safe_peak_ceiling = max(0.05, min(0.99, float(peak_ceiling)))
+    linear_gain = safe_target_rms / active_rms
+    gain_db = 20.0 * float(np.log10(max(linear_gain, 1e-8)))
+    if gain_db > float(max_gain_db):
+        gain_db = float(max_gain_db)
+        linear_gain = float(10 ** (gain_db / 20.0))
+
+    scaled = np.asarray(wav, dtype=np.float32) * linear_gain
+    peak_after_gain = float(np.max(np.abs(scaled))) if scaled.size > 0 else 0.0
+    peak_limited = False
+    if peak_after_gain > safe_peak_ceiling:
+        peak_limited = True
+        peak_ratio = safe_peak_ceiling / max(peak_after_gain, 1e-8)
+        scaled *= peak_ratio
+        linear_gain *= peak_ratio
+        gain_db = 20.0 * float(np.log10(max(linear_gain, 1e-8)))
+
+    peak_after = float(np.max(np.abs(scaled))) if scaled.size > 0 else 0.0
+    result["output_active_rms"] = round(active_rms * linear_gain, 6)
+    result["applied_gain_db"] = round(gain_db, 4)
+    result["peak_after"] = round(peak_after, 6)
+    result["peak_limited"] = peak_limited
+
+    needs_write = abs(gain_db) >= 0.1 or peak_limited or target_path != source_path
+    if not needs_write:
+        if target_path != source_path:
+            shutil.copy2(source_path, target_path)
+        return result
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(target_path), scaled, sample_rate)
+    result["applied"] = True
+    return result
 
 
 def _resolve_output_path(path_text: Optional[str]) -> Optional[Path]:
@@ -162,11 +296,34 @@ def compose_vocals_master(
     source_audio_fallback: Optional[Path] = None,
 ) -> Tuple[Path, int]:
     """把逐句或逐段配音按时间轴回填为一条 master vocals。"""
-    valid_segments = [
-        segment
-        for segment in segments
-        if Path(segment["tts_audio_path"]).exists() and not bool(segment.get("skip_compose", False))
-    ]
+
+    def resolve_compose_audio_path(segment: Dict[str, Any]) -> Optional[Path]:
+        """解析用于混音的音频路径，优先 `seg_xxxx.wav`，避免误用 `*_missing.wav`。"""
+
+        raw_text = str(segment.get("tts_audio_path") or "").strip()
+        if not raw_text:
+            return None
+        raw_path = Path(raw_text).expanduser()
+        seg_id = str(segment.get("id") or "").strip()
+        if seg_id:
+            canonical_path = raw_path.parent / f"{seg_id}.wav"
+            if canonical_path.exists():
+                return canonical_path
+        if raw_path.exists():
+            return raw_path
+        return None
+
+    valid_segments: List[Dict[str, Any]] = []
+    for segment in segments:
+        if bool(segment.get("skip_compose", False)):
+            continue
+        resolved_audio = resolve_compose_audio_path(segment)
+        if resolved_audio is None:
+            continue
+        segment_for_compose = dict(segment)
+        segment_for_compose["_compose_audio_path"] = str(resolved_audio)
+        valid_segments.append(segment_for_compose)
+
     if not valid_segments:
         if source_audio_fallback is None:
             raise RuntimeError("E-TTS-001 no segment audio produced")
@@ -179,18 +336,19 @@ def compose_vocals_master(
         return output_path, sr
 
     valid_segments.sort(key=lambda item: float(item["start_sec"]))
-    first_audio, sr = sf.read(valid_segments[0]["tts_audio_path"])
+    first_audio, sr = sf.read(valid_segments[0]["_compose_audio_path"])
     if isinstance(first_audio, np.ndarray) and first_audio.ndim > 1:
         first_audio = first_audio.mean(axis=1)
 
     max_len = 0
     cached: List[Tuple[Dict[str, Any], np.ndarray]] = []
     for index, segment in enumerate(valid_segments):
-        wav, cur_sr = sf.read(segment["tts_audio_path"])
+        wav, cur_sr = sf.read(segment["_compose_audio_path"])
         if isinstance(wav, np.ndarray) and wav.ndim > 1:
             wav = wav.mean(axis=1)
         if cur_sr != sr:
-            raise RuntimeError("E-MIX-001 inconsistent segment sample rates")
+            # 容错：不同后端或失败占位音频可能出现采样率不一致，这里统一重采样到首段采样率再拼接。
+            wav = resample_mono_audio(np.asarray(wav, dtype=np.float32), cur_sr, sr)
 
         start_sample = int(float(segment["start_sec"]) * sr)
         # 若存在“借静音后”的有效目标时长，合成窗口也要同步扩展，

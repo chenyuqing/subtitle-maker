@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import patch
 
+import numpy as np
+import soundfile as sf
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DUB_PIPELINE_PATH = REPO_ROOT / "tools" / "dub_pipeline.py"
@@ -372,6 +375,63 @@ class DubPipelineAsrLayoutTests(unittest.TestCase):
             "Tail piece. Tail close.",
         ])
 
+    def test_build_backend_reference_selector_prefers_shared_ref_for_short_omnivoice_refs(self) -> None:
+        """OmniVoice 应优先使用共享参考音，仅在逐句参考音足够长时才启用。"""
+
+        subtitles = [
+            {"start": 0.000, "end": 0.600, "text": "短句一"},
+            {"start": 0.600, "end": 2.600, "text": "短句二"},
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            default_ref = tmp_path / "shared.wav"
+            short_ref = tmp_path / "subtitle_0001_ref.wav"
+            long_ref = tmp_path / "subtitle_0002_ref.wav"
+            sf.write(str(default_ref), np.zeros(32000, dtype=np.float32), 16000)
+            sf.write(str(short_ref), np.zeros(9600, dtype=np.float32), 16000)
+            sf.write(str(long_ref), np.zeros(24000, dtype=np.float32), 16000)
+
+            selector, stats = dub_pipeline.build_backend_reference_selector(
+                tts_backend="omnivoice",
+                subtitles=subtitles,
+                subtitle_ref_map={0: short_ref, 1: long_ref},
+                default_ref=default_ref,
+                omnivoice_min_subtitle_ref_sec=1.2,
+            )
+
+        self.assertEqual(selector(0), default_ref)
+        self.assertEqual(selector(1), long_ref)
+        self.assertEqual(stats["reference_strategy"], "shared_reference_preferred_for_omnivoice")
+        self.assertEqual(stats["shared_reference_count"], 1)
+        self.assertEqual(stats["subtitle_reference_count"], 1)
+        self.assertEqual(stats["subtitle_reference_min_sec"], 1.2)
+
+    def test_build_backend_reference_selector_keeps_per_subtitle_refs_for_index_tts(self) -> None:
+        """非 OmniVoice 底座应保持现有逐句 reference 行为，不受新策略影响。"""
+
+        subtitles = [{"start": 0.000, "end": 0.600, "text": "短句一"}]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            default_ref = tmp_path / "shared.wav"
+            short_ref = tmp_path / "subtitle_0001_ref.wav"
+            sf.write(str(default_ref), np.zeros(32000, dtype=np.float32), 16000)
+            sf.write(str(short_ref), np.zeros(9600, dtype=np.float32), 16000)
+
+            selector, stats = dub_pipeline.build_backend_reference_selector(
+                tts_backend="index-tts",
+                subtitles=subtitles,
+                subtitle_ref_map={0: short_ref},
+                default_ref=default_ref,
+                omnivoice_min_subtitle_ref_sec=1.2,
+            )
+
+        self.assertEqual(selector(0), short_ref)
+        self.assertEqual(stats["reference_strategy"], "sentence_original_audio_per_subtitle")
+        self.assertEqual(stats["shared_reference_count"], 0)
+        self.assertEqual(stats["subtitle_reference_count"], 1)
+
     def test_rebalance_source_subtitles_skips_short_merge_by_default(self) -> None:
         """默认关闭短句合并时，第二阶段不应自动并邻句。"""
         subtitles = [
@@ -390,6 +450,66 @@ class DubPipelineAsrLayoutTests(unittest.TestCase):
         )
 
         self.assertEqual([item["text"] for item in result], [item["text"] for item in subtitles])
+
+    def test_resolve_source_short_merge_policy_forces_omnivoice_when_user_disabled(self) -> None:
+        """OmniVoice 链路即使未请求 source merge，也应在运行时强制开启。"""
+
+        effective, reason = dub_pipeline.resolve_source_short_merge_policy(
+            requested_enabled=False,
+            tts_backend="omnivoice",
+        )
+
+        self.assertTrue(effective)
+        self.assertEqual(reason, "omnivoice_policy")
+
+    def test_load_or_transcribe_subtitles_applies_omnivoice_source_short_merge_policy_for_uploaded_source_srt(self) -> None:
+        """上传 source.srt 时，OmniVoice 策略态也应触发短句合并并写出日志原因。"""
+
+        subtitles = [
+            {"start": 0.000, "end": 2.000, "text": "First short sentence."},
+            {"start": 2.000, "end": 5.000, "text": "Second short sentence."},
+            {"start": 5.000, "end": 9.000, "text": "Third line closes cleanly."},
+        ]
+        logger = DummyLogger()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            input_srt = tmp_path / "input.srt"
+            source_srt = tmp_path / "source.srt"
+            fake_audio = tmp_path / "audio.wav"
+            input_srt.write_text(dub_pipeline.format_srt(subtitles), encoding="utf-8")
+
+            with patch.object(dub_pipeline, "audio_duration", return_value=30.0):
+                result = dub_pipeline.load_or_transcribe_subtitles(
+                    input_srt=input_srt,
+                    asr_audio=fake_audio,
+                    source_srt_path=source_srt,
+                    persist_input_srt_to_source=True,
+                    asr_model_path="unused",
+                    aligner_path="unused",
+                    device="cpu",
+                    language=None,
+                    max_width=40,
+                    asr_balance_lines=True,
+                    asr_balance_gap_sec=0.5,
+                    source_layout_mode="rule",
+                    source_layout_llm_min_duration_sec=6.0,
+                    source_layout_llm_min_text_units=85,
+                    source_layout_llm_max_cues=12,
+                    source_short_merge_enabled=True,
+                    source_short_merge_threshold=10,
+                    source_short_merge_requested=False,
+                    source_short_merge_effective_reason="omnivoice_policy",
+                    translator_factory=None,
+                    logger=logger,
+                )
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["text"], "First short sentence. Second short sentence. Third line closes cleanly.")
+        rebalanced_record = next(record for record in logger.records if record["event"] == "source_layout_rebalanced")
+        self.assertFalse(rebalanced_record["data"]["short_merge_requested"])
+        self.assertTrue(rebalanced_record["data"]["short_merge_effective"])
+        self.assertEqual(rebalanced_record["data"]["short_merge_effective_reason"], "omnivoice_policy")
 
     def test_load_or_transcribe_subtitles_merges_uploaded_source_srt_by_time_window(self) -> None:
         """上传 source.srt 时，也应复用第 2 步时间窗合并逻辑。"""
@@ -426,6 +546,8 @@ class DubPipelineAsrLayoutTests(unittest.TestCase):
                     source_layout_llm_max_cues=12,
                     source_short_merge_enabled=True,
                     source_short_merge_threshold=10,
+                    source_short_merge_requested=True,
+                    source_short_merge_effective_reason="user",
                     translator_factory=None,
                     logger=logger,
                 )

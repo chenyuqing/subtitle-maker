@@ -4,8 +4,24 @@ from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
+
+def _is_cantonese_target_lang(target_lang: str) -> bool:
+    lowered = (target_lang or "").strip().lower()
+    markers = ["cantonese", "粤语", "廣東話", "广东话", "yue"]
+    return any(marker in lowered for marker in markers)
+
+
+def _cantonese_prompt_constraints() -> str:
+    return (
+        "Cantonese constraints:\n"
+        "- Use natural spoken Cantonese (Hong Kong style), not written Mandarin.\n"
+        "- Prefer Traditional Chinese characters for output.\n"
+        "- Keep colloquial Cantonese function words natural (e.g. 佢/我哋/你哋/喺/咗/嘅/唔/咩/呀/喇/啦).\n"
+        "- Avoid stiff Mandarin book-style wording when a Cantonese alternative exists.\n\n"
+    )
+
 class Translator:
-    def __init__(self, api_key=None, base_url="https://api.deepseek.com", model="deepseek-chat"):
+    def __init__(self, api_key=None, base_url="https://api.deepseek.com", model="deepseek-v4-flash"):
         self.base_url = base_url
         self.model = model
 
@@ -20,13 +36,22 @@ class Translator:
 
     def _build_prompt(self, subtitles, target_lang):
         input_text = "\n".join([f"{i+1}. {text}" for i, text in enumerate(subtitles)])
-        return f"""Translate the following lines into {target_lang}.
+        prompt = f"""Translate the following lines into {target_lang}.
 Maintain the tone and meaning. Output format must correspond line by line.
 Return ONLY the translated lines, numbered as in the input.
 
 Input:
 {input_text}
 """
+        if _is_cantonese_target_lang(target_lang):
+            prompt = (
+                f"Translate the following lines into {target_lang}.\n"
+                + _cantonese_prompt_constraints()
+                + "Maintain the tone and meaning. Output format must correspond line by line.\n"
+                + "Return ONLY the translated lines, numbered as in the input.\n\n"
+                + f"Input:\n{input_text}\n"
+            )
+        return prompt
 
     def _parse_translated_lines(self, content: str, expected_len: int):
         translated_lines = []

@@ -49,14 +49,23 @@ from subtitle_maker.manifests import (
     build_batch_manifest,
     build_skipped_segment_manifest,
     load_segment_manifest,
+    resolve_preferred_segment_subtitle_path,
     write_manifest_json,
 )
+from subtitle_maker.domains.subtitles import merge_short_source_subtitles
 
 # Exit-code contract from tools/dub_pipeline.py
 SEGMENT_EXIT_OK = 0
 SEGMENT_EXIT_FAILED = 1
 SEGMENT_EXIT_OK_WITH_MANUAL_REVIEW = 2
 DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC = 15
+MIN_SOURCE_SHORT_MERGE_TARGET_SEC = 6
+MAX_SOURCE_SHORT_MERGE_TARGET_SEC = 20
+DEFAULT_SOURCE_SHORT_MERGE_GAP_SEC = 1.5
+DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS = 0.12
+DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB = -35.0
+DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB = 8.0
+DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING = 0.95
 
 
 def iso_now() -> str:
@@ -448,15 +457,37 @@ def _manifest_output_exists(path_text: Optional[str]) -> bool:
     return bool(path and path.exists())
 
 
-def is_segment_job_reusable(manifest: Dict[str, Any]) -> bool:
+def is_segment_job_reusable(manifest: Dict[str, Any], *, job_dir: Optional[Path] = None) -> bool:
+    """判断 segment 任务是否可直接复用，字幕路径优先取段目录下的最新版本。"""
+
     stats = manifest.get("stats", {})
     total = int(stats.get("total", 0) or 0)
     done = int(stats.get("done", 0) or 0)
     failed = int(stats.get("failed", 0) or 0)
     paths = manifest.get("paths", {})
+    translated_srt = (
+        resolve_preferred_segment_subtitle_path(
+            job_dir=job_dir,
+            paths=paths,
+            subtitle_key="translated_srt",
+            repo_root=REPO_ROOT,
+        )
+        if job_dir is not None
+        else resolve_output_path(paths.get("translated_srt"))
+    )
+    dubbed_final_srt = (
+        resolve_preferred_segment_subtitle_path(
+            job_dir=job_dir,
+            paths=paths,
+            subtitle_key="dubbed_final_srt",
+            repo_root=REPO_ROOT,
+        )
+        if job_dir is not None
+        else resolve_output_path(paths.get("dubbed_final_srt"))
+    )
     required_ok = (
-        _manifest_output_exists(paths.get("translated_srt"))
-        and _manifest_output_exists(paths.get("dubbed_final_srt"))
+        bool(translated_srt and translated_srt.exists())
+        and bool(dubbed_final_srt and dubbed_final_srt.exists())
         and _manifest_output_exists(paths.get("dubbed_vocals"))
     )
     if total > 0:
@@ -493,7 +524,7 @@ def collect_reusable_jobs_by_segment(
         seg_index = segment_path_to_index.get(segment_audio)
         if seg_index is None:
             continue
-        if not is_segment_job_reusable(manifest):
+        if not is_segment_job_reusable(manifest, job_dir=job_dir):
             continue
         mtime = manifest_path.stat().st_mtime
         old = candidates.get(seg_index)
@@ -674,6 +705,42 @@ def normalize_input_subtitles_for_segments(
     return output
 
 
+def maybe_merge_translated_input_subtitles(
+    *,
+    subtitles: List[Dict[str, Any]],
+    translated_short_merge_enabled: bool,
+    translated_short_merge_threshold: int,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """按运行时生效态对 uploaded translated 字幕做一次性并句。"""
+
+    if not translated_short_merge_enabled or len(subtitles) <= 1:
+        return [dict(item) for item in subtitles], 0
+    merged_subtitles, merged_pairs = merge_short_source_subtitles(
+        subtitles=subtitles,
+        short_merge_target_seconds=translated_short_merge_threshold,
+        gap_threshold_sec=DEFAULT_SOURCE_SHORT_MERGE_GAP_SEC,
+    )
+    return merged_subtitles, merged_pairs
+
+
+def resolve_translated_short_merge_policy(
+    *,
+    requested_enabled: bool,
+    tts_backend: str,
+    resume_batch_dir: Optional[Path],
+) -> Tuple[bool, str]:
+    """解析 translated short merge 的最终生效态，OmniVoice 初始任务强制开启。"""
+
+    if resume_batch_dir is not None:
+        return False, "resume_skipped"
+    normalized_backend = (tts_backend or "").strip().lower()
+    if requested_enabled:
+        return True, "user"
+    if normalized_backend == "omnivoice":
+        return True, "omnivoice_policy"
+    return False, "disabled"
+
+
 def has_flag_enabled(extra_args: List[str], flag_name: str) -> bool:
     # 解析 parse_known_args 剩余参数中的布尔开关（例如 --v2-mode true）。
     for index, value in enumerate(extra_args):
@@ -718,7 +785,47 @@ def main(argv: Optional[List[str]] = None) -> int:
     source_short_merge_threshold = int(
         find_flag_value(extra_args, "--source-short-merge-threshold") or DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC
     )
+    translated_short_merge_enabled = (
+        has_flag_enabled(extra_args, "--translated-short-merge-enabled")
+        if any(item == "--translated-short-merge-enabled" for item in extra_args)
+        else False
+    )
+    translated_short_merge_threshold = int(
+        find_flag_value(extra_args, "--translated-short-merge-threshold") or DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC
+    )
+    dub_audio_leveling_enabled = (
+        has_flag_enabled(extra_args, "--dub-audio-leveling-enabled")
+        if any(item == "--dub-audio-leveling-enabled" for item in extra_args)
+        else True
+    )
+    dub_audio_leveling_target_rms = float(
+        find_flag_value(extra_args, "--dub-audio-leveling-target-rms") or DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS
+    )
+    dub_audio_leveling_activity_threshold_db = float(
+        find_flag_value(extra_args, "--dub-audio-leveling-activity-threshold-db")
+        or DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB
+    )
+    dub_audio_leveling_max_gain_db = float(
+        find_flag_value(extra_args, "--dub-audio-leveling-max-gain-db") or DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB
+    )
+    dub_audio_leveling_peak_ceiling = float(
+        find_flag_value(extra_args, "--dub-audio-leveling-peak-ceiling") or DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING
+    )
     index_tts_api_url = find_flag_value(extra_args, "--index-tts-api-url")
+    tts_backend = (find_flag_value(extra_args, "--tts-backend") or "index-tts").strip() or "index-tts"
+    fallback_tts_backend = (find_flag_value(extra_args, "--fallback-tts-backend") or "none").strip() or "none"
+    omnivoice_root = (find_flag_value(extra_args, "--omnivoice-root") or "").strip()
+    omnivoice_python_bin = (find_flag_value(extra_args, "--omnivoice-python-bin") or "").strip()
+    omnivoice_model = (find_flag_value(extra_args, "--omnivoice-model") or "").strip()
+    omnivoice_device = (find_flag_value(extra_args, "--omnivoice-device") or "auto").strip() or "auto"
+    omnivoice_via_api = (
+        has_flag_enabled(extra_args, "--omnivoice-via-api")
+        if any(item == "--omnivoice-via-api" for item in extra_args)
+        else True
+    )
+    omnivoice_api_url = (
+        find_flag_value(extra_args, "--omnivoice-api-url") or "http://127.0.0.1:8020"
+    ).strip() or "http://127.0.0.1:8020"
     grouped_synthesis = (
         has_flag_enabled(extra_args, "--grouped-synthesis")
         if any(item == "--grouped-synthesis" for item in extra_args)
@@ -749,6 +856,34 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise ValueError("--auto-pick-min-silence-sec must be in [0.1, 10.0]")
     if args.auto_pick_min_speech_sec < 0.1 or args.auto_pick_min_speech_sec > 30.0:
         raise ValueError("--auto-pick-min-speech-sec must be in [0.1, 30.0]")
+    omnivoice_primary_selected = (tts_backend or "").strip().lower() == "omnivoice"
+    effective_translated_short_merge_enabled, _ = resolve_translated_short_merge_policy(
+        requested_enabled=bool(translated_short_merge_enabled),
+        tts_backend=tts_backend,
+        resume_batch_dir=Path(args.resume_batch_dir).expanduser().resolve() if args.resume_batch_dir else None,
+    )
+    if (source_short_merge_enabled or omnivoice_primary_selected) and not (
+        MIN_SOURCE_SHORT_MERGE_TARGET_SEC <= source_short_merge_threshold <= MAX_SOURCE_SHORT_MERGE_TARGET_SEC
+    ):
+        raise ValueError(
+            f"--source-short-merge-threshold must be in "
+            f"[{MIN_SOURCE_SHORT_MERGE_TARGET_SEC}, {MAX_SOURCE_SHORT_MERGE_TARGET_SEC}]"
+        )
+    if effective_translated_short_merge_enabled and not (
+        MIN_SOURCE_SHORT_MERGE_TARGET_SEC <= translated_short_merge_threshold <= MAX_SOURCE_SHORT_MERGE_TARGET_SEC
+    ):
+        raise ValueError(
+            f"--translated-short-merge-threshold must be in "
+            f"[{MIN_SOURCE_SHORT_MERGE_TARGET_SEC}, {MAX_SOURCE_SHORT_MERGE_TARGET_SEC}]"
+        )
+    if dub_audio_leveling_target_rms <= 0.0 or dub_audio_leveling_target_rms > 0.5:
+        raise ValueError("--dub-audio-leveling-target-rms must be in (0.0, 0.5]")
+    if dub_audio_leveling_activity_threshold_db > -5.0 or dub_audio_leveling_activity_threshold_db < -80.0:
+        raise ValueError("--dub-audio-leveling-activity-threshold-db must be in [-80.0, -5.0]")
+    if dub_audio_leveling_max_gain_db < 0.0 or dub_audio_leveling_max_gain_db > 24.0:
+        raise ValueError("--dub-audio-leveling-max-gain-db must be in [0.0, 24.0]")
+    if dub_audio_leveling_peak_ceiling <= 0.0 or dub_audio_leveling_peak_ceiling > 0.99:
+        raise ValueError("--dub-audio-leveling-peak-ceiling must be in (0.0, 0.99]")
 
     out_root = Path(args.out_dir).expanduser().resolve()
     resume_batch_dir = Path(args.resume_batch_dir).expanduser().resolve() if args.resume_batch_dir else None
@@ -761,6 +896,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             time_tag=datetime.now().strftime("%Y%m%d_%H%M%S"),
         )
         batch_dir = out_root / f"longdub_{batch_id}"
+    effective_translated_short_merge_enabled, translated_short_merge_effective_reason = (
+        resolve_translated_short_merge_policy(
+            requested_enabled=bool(translated_short_merge_enabled),
+            tts_backend=tts_backend,
+            resume_batch_dir=resume_batch_dir,
+        )
+    )
     segments_dir = batch_dir / "segments"
     segment_jobs_dir = batch_dir / "segment_jobs"
     final_dir = batch_dir / "final"
@@ -784,7 +926,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             subtitles=input_subtitles,
             media_duration_sec=total_duration_sec,
         )
-
     if requested_ranges:
         effective_ranges = normalize_time_ranges(
             [
@@ -902,6 +1043,31 @@ def main(argv: Optional[List[str]] = None) -> int:
                 segment_start_sec=start_sec,
                 segment_end_sec=end_sec,
             )
+            # translated 并句只允许在长视频初始启动阶段执行，且必须以 segment 为边界，避免跨段重复文本。
+            if segment_subtitles and args.input_srt_kind == "translated" and resume_batch_dir is None:
+                before_count = len(segment_subtitles)
+                segment_subtitles, merged_pairs = maybe_merge_translated_input_subtitles(
+                    subtitles=segment_subtitles,
+                    translated_short_merge_enabled=bool(effective_translated_short_merge_enabled),
+                    translated_short_merge_threshold=int(translated_short_merge_threshold),
+                )
+                print(
+                    f"===== Segment {seg_index:02d} translated merge: "
+                    f"status=applied requested={bool(translated_short_merge_enabled)} "
+                    f"effective={bool(effective_translated_short_merge_enabled)} "
+                    f"reason={translated_short_merge_effective_reason} "
+                    f"before={before_count} after={len(segment_subtitles)} "
+                    f"merged_pairs={merged_pairs} target={translated_short_merge_threshold}s ====="
+                )
+            elif segment_subtitles and args.input_srt_kind == "translated":
+                print(
+                    f"===== Segment {seg_index:02d} translated merge: "
+                    f"status=skipped_resume requested={bool(translated_short_merge_enabled)} "
+                    f"effective={bool(effective_translated_short_merge_enabled)} "
+                    f"reason={translated_short_merge_effective_reason} "
+                    f"before={len(segment_subtitles)} after={len(segment_subtitles)} "
+                    f"merged_pairs=0 target={translated_short_merge_threshold}s ====="
+                )
             if not segment_subtitles:
                 print(f"===== Segment {seg_index:02d} skip: no clipped subtitles =====")
                 manifest = write_skipped_segment_manifest(
@@ -979,19 +1145,25 @@ def main(argv: Optional[List[str]] = None) -> int:
         paths = item.manifest.get("paths", {})
         vocals_path = resolve_output_path(paths.get("dubbed_vocals"))
         bgm_path = resolve_output_path(paths.get("source_bgm"))
-        source_srt = resolve_output_path(paths.get("source_srt"))
-        translated_srt = resolve_output_path(paths.get("translated_srt"))
-        dubbed_final_srt = resolve_output_path(paths.get("dubbed_final_srt"))
-
-        fallback_source_srt = item.job_dir / "subtitles" / "source.srt"
-        fallback_translated_srt = item.job_dir / "subtitles" / "translated.srt"
-        fallback_dubbed_final_srt = item.job_dir / "subtitles" / "dubbed_final.srt"
-        if (source_srt is None or not source_srt.exists()) and fallback_source_srt.exists():
-            source_srt = fallback_source_srt
-        if (translated_srt is None or not translated_srt.exists()) and fallback_translated_srt.exists():
-            translated_srt = fallback_translated_srt
-        if (dubbed_final_srt is None or not dubbed_final_srt.exists()) and fallback_dubbed_final_srt.exists():
-            dubbed_final_srt = fallback_dubbed_final_srt
+        # 最终 merge 必须优先读取段目录下的最新字幕，避免 review/redub 后又被旧 manifest 路径覆盖回去。
+        source_srt = resolve_preferred_segment_subtitle_path(
+            job_dir=item.job_dir,
+            paths=paths,
+            subtitle_key="source_srt",
+            repo_root=REPO_ROOT,
+        )
+        translated_srt = resolve_preferred_segment_subtitle_path(
+            job_dir=item.job_dir,
+            paths=paths,
+            subtitle_key="translated_srt",
+            repo_root=REPO_ROOT,
+        )
+        dubbed_final_srt = resolve_preferred_segment_subtitle_path(
+            job_dir=item.job_dir,
+            paths=paths,
+            subtitle_key="dubbed_final_srt",
+            repo_root=REPO_ROOT,
+        )
 
         if vocals_path and vocals_path.exists():
             all_vocals.append(vocals_path)
@@ -1092,9 +1264,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         source_short_merge_enabled=bool(source_short_merge_enabled),
         source_short_merge_threshold=source_short_merge_threshold,
         source_short_merge_threshold_mode="seconds",
+        translated_short_merge_enabled=bool(translated_short_merge_enabled),
+        translated_short_merge_threshold=translated_short_merge_threshold,
+        translated_short_merge_threshold_mode="seconds",
+        dub_audio_leveling_enabled=bool(dub_audio_leveling_enabled),
+        dub_audio_leveling_target_rms=float(dub_audio_leveling_target_rms),
+        dub_audio_leveling_activity_threshold_db=float(dub_audio_leveling_activity_threshold_db),
+        dub_audio_leveling_max_gain_db=float(dub_audio_leveling_max_gain_db),
+        dub_audio_leveling_peak_ceiling=float(dub_audio_leveling_peak_ceiling),
         grouped_synthesis=bool(grouped_synthesis),
         force_fit_timing=bool(force_fit_timing),
-        tts_backend="index-tts",
+        tts_backend=tts_backend,
+        fallback_tts_backend=fallback_tts_backend,
+        omnivoice_root=omnivoice_root,
+        omnivoice_python_bin=omnivoice_python_bin,
+        omnivoice_model=omnivoice_model,
+        omnivoice_device=omnivoice_device,
+        omnivoice_via_api=bool(omnivoice_via_api),
+        omnivoice_api_url=omnivoice_api_url,
     )
     batch_manifest = build_batch_manifest(
         batch_id=batch_id,

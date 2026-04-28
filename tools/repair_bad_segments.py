@@ -26,6 +26,7 @@ from subtitle_maker.backends import (
     check_index_tts_service as check_index_tts_service_impl,
     synthesize_via_index_tts_api as synthesize_via_index_tts_api_impl,
 )
+from subtitle_maker.manifests import resolve_preferred_segment_subtitle_path
 from subtitle_maker.core.ffmpeg import (
     run_cmd as run_cmd_impl,
     run_cmd_checked as run_cmd_checked_impl,
@@ -538,19 +539,26 @@ def rebuild_batch_outputs(batch_dir: Path) -> Dict[str, Any]:
         vocals = resolve_output_path(paths.get("dubbed_vocals"))
         mix = resolve_output_path(paths.get("dubbed_mix"))
         bgm = resolve_output_path(paths.get("source_bgm"))
-        source_srt = resolve_output_path(paths.get("source_srt"))
-        translated_srt = resolve_output_path(paths.get("translated_srt"))
-        dubbed_final_srt = resolve_output_path(paths.get("dubbed_final_srt"))
-
-        fallback_source_srt = job_dir / "subtitles" / "source.srt"
-        fallback_translated_srt = job_dir / "subtitles" / "translated.srt"
-        fallback_dubbed_final_srt = job_dir / "subtitles" / "dubbed_final.srt"
-        if (source_srt is None or not source_srt.exists()) and fallback_source_srt.exists():
-            source_srt = fallback_source_srt
-        if (translated_srt is None or not translated_srt.exists()) and fallback_translated_srt.exists():
-            translated_srt = fallback_translated_srt
-        if (dubbed_final_srt is None or not dubbed_final_srt.exists()) and fallback_dubbed_final_srt.exists():
-            dubbed_final_srt = fallback_dubbed_final_srt
+        # review/save-and-redub 会直接更新 segment/subtitles 下的文件；
+        # 这里与主流程统一：优先读段目录最新字幕，不存在时才回退 manifest 历史路径。
+        source_srt = resolve_preferred_segment_subtitle_path(
+            job_dir=job_dir,
+            paths=paths,
+            subtitle_key="source_srt",
+            repo_root=REPO_ROOT,
+        )
+        translated_srt = resolve_preferred_segment_subtitle_path(
+            job_dir=job_dir,
+            paths=paths,
+            subtitle_key="translated_srt",
+            repo_root=REPO_ROOT,
+        )
+        dubbed_final_srt = resolve_preferred_segment_subtitle_path(
+            job_dir=job_dir,
+            paths=paths,
+            subtitle_key="dubbed_final_srt",
+            repo_root=REPO_ROOT,
+        )
 
         if vocals and vocals.exists():
             vocals_inputs.append(vocals)
@@ -636,17 +644,27 @@ def rebuild_batch_outputs(batch_dir: Path) -> Dict[str, Any]:
     if out_bgm and len(bgm_inputs) == len(segment_entries):
         concat_wav_files(bgm_inputs, out_bgm)
         bgm_rebuilt = True
-    if out_source_srt and len(source_srt_inputs) == len(segment_entries):
+    # 字幕重建不能强依赖“所有 segment 都有字幕”：
+    # 在区间任务或空段跳过场景，部分 segment 本来就不会产出字幕。
+    # 只要存在有效输入，就应该重建 full 字幕，避免 review 重配后仍显示旧文本。
+    if out_source_srt and source_srt_inputs:
         merge_srt_files(inputs=source_srt_inputs, output_srt=out_source_srt)
         source_srt_rebuilt = True
-    if out_translated_srt and len(translated_srt_inputs) == len(segment_entries):
+    if out_translated_srt and translated_srt_inputs:
         merge_srt_files(inputs=translated_srt_inputs, output_srt=out_translated_srt)
         translated_srt_rebuilt = True
+    # 双语重建优先使用段内 dubbed_final（已包含行级最终文本）；
+    # 若数量对不上，再回退 translated 输入。
     bilingual_translated_inputs = (
-        dubbed_final_srt_inputs if len(dubbed_final_srt_inputs) == len(segment_entries) else translated_srt_inputs
+        dubbed_final_srt_inputs
+        if dubbed_final_srt_inputs and len(dubbed_final_srt_inputs) == len(source_srt_inputs)
+        else translated_srt_inputs
     )
-    if out_dubbed_final_srt and len(source_srt_inputs) == len(segment_entries) and len(bilingual_translated_inputs) == len(
-        segment_entries
+    if (
+        out_dubbed_final_srt
+        and source_srt_inputs
+        and bilingual_translated_inputs
+        and len(source_srt_inputs) == len(bilingual_translated_inputs)
     ):
         merge_bilingual_srt_files(
             translated_inputs=bilingual_translated_inputs,
@@ -734,7 +752,7 @@ def main() -> int:
     parser.add_argument("--segment-indexes", required=True, help="Comma-separated segment indexes, e.g. 1,2")
     parser.add_argument("--target-lang", default="Chinese")
     parser.add_argument("--translate-base-url", default="https://api.deepseek.com")
-    parser.add_argument("--translate-model", default="deepseek-chat")
+    parser.add_argument("--translate-model", default="deepseek-v4-flash")
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
     parser.add_argument("--index-tts-api-url", default="http://127.0.0.1:8010")

@@ -181,7 +181,7 @@ class TranslationOptions:
 |---|---|
 | `provider` | `deepseek` |
 | `base_url` | `https://api.deepseek.com` |
-| `model` | `deepseek-chat` |
+| `model` | `deepseek-v4-flash` |
 | `rewrite_translation` | `true` |
 | `api_key_env` | `DEEPSEEK_API_KEY` |
 

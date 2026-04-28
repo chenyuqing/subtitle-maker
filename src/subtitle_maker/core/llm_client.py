@@ -32,7 +32,7 @@ class OpenAICompatibleChatClient:
         api_key: Optional[str],
         api_key_env: str = "DEEPSEEK_API_KEY",
         base_url: str = "https://api.deepseek.com",
-        model: str = "deepseek-chat",
+        model: str = "deepseek-v4-flash",
         timeout: float = 30.0,
     ) -> None:
         # API key 只在内存中使用；调用方不得把它写入日志或 manifest。

@@ -21,6 +21,9 @@ const globalDeepSeekApiKeyInput = document.getElementById('global-deepseek-api-k
 const globalDeepSeekSaveKeyCheckbox = document.getElementById('global-deepseek-save-key');
 const globalDeepSeekHint = document.getElementById('global-deepseek-hint');
 const deepSeekKeySourceBadge = document.getElementById('deepseek-key-source');
+const globalDeepSeekCard = document.querySelector('.sidebar-deepseek-card');
+const globalDeepSeekToggleBtn = document.getElementById('global-deepseek-toggle');
+const globalTtsBackendSelect = document.getElementById('global-tts-backend');
 
 const originalDisplay = document.getElementById('original-subtitles');
 const translatedDisplay = document.getElementById('translated-subtitles');
@@ -43,12 +46,86 @@ const THEME_KEY = 'sm_theme';
 const SIDEBAR_COLLAPSED_KEY = 'sm_sidebarCollapsed';
 const DEEPSEEK_API_KEY = 'sm_deepseekApiKey';
 const SAVE_DEEPSEEK_API_KEY = 'sm_saveDeepseekApiKey';
+const DEEPSEEK_COLLAPSED_KEY = 'sm_deepseekCollapsed';
+const GLOBAL_TTS_BACKEND_KEY = 'sm_globalTtsBackend';
 const PROJECT_MEDIA_FILENAME_KEY = 'sm_projectMediaFilename';
 const PROJECT_MEDIA_ORIGINAL_FILENAME_KEY = 'sm_projectMediaOriginalFilename';
 const SHORT_MERGE_TARGET_DEFAULT = 15;
 const SHORT_MERGE_TARGET_MIN = 6;
 const SHORT_MERGE_TARGET_MAX = 20;
+const DEFAULT_GLOBAL_TTS_BACKEND = 'index-tts';
 let isAudioMode = false;
+let localMediaPreviewUrl = null;
+
+// 释放上一次本地预览 URL，避免反复上传后累积内存占用。
+function revokeLocalMediaPreviewUrl() {
+    if (!localMediaPreviewUrl) return;
+    try {
+        URL.revokeObjectURL(localMediaPreviewUrl);
+    } catch (error) {
+        console.debug('revoke local preview url failed', error);
+    }
+    localMediaPreviewUrl = null;
+}
+
+// 统一设置播放器源，并在需要时记录一个回退源（例如本地 ObjectURL）。
+function setVideoSourceWithFallback(primaryUrl, fallbackUrl = '') {
+    if (!videoPlayer) return;
+    const nextPrimary = String(primaryUrl || '').trim();
+    const nextFallback = String(fallbackUrl || '').trim();
+    if (!nextPrimary) return;
+    videoPlayer.dataset.smFallbackSrc = nextFallback;
+    videoPlayer.dataset.smFallbackTried = 'false';
+    videoPlayer.src = nextPrimary;
+    videoPlayer.style.display = 'block';
+    videoPlayer.load();
+    if (videoPlaceholder) {
+        videoPlaceholder.style.display = 'none';
+    }
+}
+
+// 处理播放器加载失败：先尝试回退到本地源，仍失败时明确提示用户。
+function setupVideoPlaybackFallback() {
+    if (!videoPlayer) return;
+    videoPlayer.addEventListener('error', () => {
+        const fallbackSrc = String(videoPlayer.dataset.smFallbackSrc || '').trim();
+        const triedFallback = String(videoPlayer.dataset.smFallbackTried || '').toLowerCase() === 'true';
+        const currentSrc = String(videoPlayer.currentSrc || videoPlayer.src || '').trim();
+        const fromBackendStream = currentSrc.includes('/stream/');
+        if (fromBackendStream && fallbackSrc && !triedFallback && currentSrc !== fallbackSrc) {
+            videoPlayer.dataset.smFallbackTried = 'true';
+            videoPlayer.src = fallbackSrc;
+            videoPlayer.style.display = 'block';
+            videoPlayer.load();
+            if (uploadStatus) {
+                uploadStatus.textContent = '预览回退：已切回本地文件源';
+            }
+            if (videoPlaceholder) {
+                videoPlaceholder.style.display = 'none';
+            }
+            return;
+        }
+        if (uploadStatus) {
+            uploadStatus.textContent = '视频预览失败：请检查文件编码或重新上传';
+        }
+        if (videoPlaceholder) {
+            videoPlaceholder.style.display = 'flex';
+        }
+    });
+}
+
+setupVideoPlaybackFallback();
+
+// 控制 DeepSeek 卡片折叠态，默认收起以节省侧边栏空间。
+function applyDeepSeekCollapsed(collapsed, persist = true) {
+    if (!globalDeepSeekCard || !globalDeepSeekToggleBtn) return;
+    const nextCollapsed = collapsed === true;
+    globalDeepSeekCard.classList.toggle('collapsed', nextCollapsed);
+    globalDeepSeekToggleBtn.setAttribute('aria-expanded', nextCollapsed ? 'false' : 'true');
+    if (persist) {
+        localStorage.setItem(DEEPSEEK_COLLAPSED_KEY, nextCollapsed ? 'true' : 'false');
+    }
+}
 
 // 保留 `/static/app.js?v=...` 作为单入口，并把同一版本号透传给子模块，避免半刷新缓存。
 // 这里改动也会刷新子模块导入 URL，防止浏览器继续复用旧的 `dubbingPanel.js`。
@@ -81,6 +158,20 @@ function loadFrontendModule(modulePath) {
 // 统一读取左侧侧边栏中的 DeepSeek key；翻译、Auto Dubbing、Agent 共用这一处状态。
 function getDeepSeekApiKey() {
     return globalDeepSeekApiKeyInput ? globalDeepSeekApiKeyInput.value.trim() : '';
+}
+
+// 统一约束侧边栏 TTS backend 值，防止本地存储脏值污染请求参数。
+function normalizeGlobalTtsBackend(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (normalized === 'omnivoice') {
+        return 'omnivoice';
+    }
+    return DEFAULT_GLOBAL_TTS_BACKEND;
+}
+
+// 统一读取侧边栏 TTS backend，Auto Dubbing V1/V2 共用这一处状态。
+function getGlobalTtsBackend() {
+    return normalizeGlobalTtsBackend(globalTtsBackendSelect ? globalTtsBackendSelect.value : DEFAULT_GLOBAL_TTS_BACKEND);
 }
 
 // 统一发布“当前项目上下文已变化”，由 Auto Dubbing 面板按需重新读取详情。
@@ -164,7 +255,28 @@ function initDeepSeekSettings() {
         syncDeepSeekSettingsUi();
         notifyDeepSeekConfigChanged();
     });
+    if (globalDeepSeekToggleBtn) {
+        globalDeepSeekToggleBtn.addEventListener('click', () => {
+            const isCollapsed = globalDeepSeekCard ? globalDeepSeekCard.classList.contains('collapsed') : false;
+            applyDeepSeekCollapsed(!isCollapsed);
+        });
+    }
+    const savedCollapsed = localStorage.getItem(DEEPSEEK_COLLAPSED_KEY);
+    applyDeepSeekCollapsed(savedCollapsed === null ? true : savedCollapsed === 'true', false);
     syncDeepSeekSettingsUi();
+}
+
+// 初始化全局 TTS backend 选择器，并持久化用户偏好。
+function initGlobalTtsBackendSetting() {
+    if (!globalTtsBackendSelect) return;
+    const savedBackend = normalizeGlobalTtsBackend(localStorage.getItem(GLOBAL_TTS_BACKEND_KEY));
+    globalTtsBackendSelect.value = savedBackend;
+    globalTtsBackendSelect.addEventListener('change', () => {
+        const normalized = getGlobalTtsBackend();
+        globalTtsBackendSelect.value = normalized;
+        localStorage.setItem(GLOBAL_TTS_BACKEND_KEY, normalized);
+        notifyDeepSeekConfigChanged();
+    });
 }
 
 function seekVideo(deltaSeconds) {
@@ -912,10 +1024,8 @@ function loadState() {
         if (videoPlayer && currentProjectMediaFilename) {
             // Note: If server restarted, this URL might be invalid if it was a temp file? 
             // We'll try. 
-            videoPlayer.src = `/stream/${currentProjectMediaFilename}`;
-            videoPlayer.style.display = 'block';
+            setVideoSourceWithFallback(`/stream/${currentProjectMediaFilename}`);
         }
-        if (videoPlaceholder && currentProjectMediaFilename) videoPlaceholder.style.display = 'none';
 
         // Poll to see if task is still alive/running on server
         pollStatus();
@@ -923,11 +1033,7 @@ function loadState() {
         currentProjectMediaFilename = savedProjectMediaFilename || null;
         currentProjectMediaOriginalFilename = savedProjectMediaOriginalFilename || null;
         if (videoPlayer && currentProjectMediaFilename) {
-            videoPlayer.src = `/stream/${currentProjectMediaFilename}`;
-            videoPlayer.style.display = 'block';
-        }
-        if (videoPlaceholder && currentProjectMediaFilename) {
-            videoPlaceholder.style.display = 'none';
+            setVideoSourceWithFallback(`/stream/${currentProjectMediaFilename}`);
         }
     }
 
@@ -1039,6 +1145,7 @@ if (themeToggleBtn) {
 // 初始化共享前端状态：先恢复全局 DeepSeek 配置，再恢复项目上下文。
 window.addEventListener('DOMContentLoaded', () => {
     initDeepSeekSettings();
+    initGlobalTtsBackendSetting();
     loadState();
 });
 
@@ -1165,6 +1272,11 @@ async function handleMediaUpload(file) {
         if (progressText) progressText.textContent = "Uploading Media...";
     }
 
+    // 上传期间先用本地源预览，避免等待后端返回前播放器为空。
+    revokeLocalMediaPreviewUrl();
+    localMediaPreviewUrl = URL.createObjectURL(file);
+    setVideoSourceWithFallback(localMediaPreviewUrl);
+
     try {
         const res = await fetch('/upload', { method: 'POST', body: formData });
         if (!res.ok) throw new Error("Upload failed");
@@ -1189,11 +1301,7 @@ async function handleMediaUpload(file) {
         saveState();
 
         // Setup Video
-        if (videoPlayer) {
-            videoPlayer.src = data.url;
-            videoPlayer.style.display = 'block';
-        }
-        if (videoPlaceholder) videoPlaceholder.style.display = 'none';
+        setVideoSourceWithFallback(data.url, localMediaPreviewUrl || '');
 
         const isAudioFile = (file.type && file.type.startsWith('audio/')) ||
             /\.(mp3|wav|m4a|aac|flac|ogg)$/i.test(file.name || '');
@@ -1914,6 +2022,7 @@ document.addEventListener('DOMContentLoaded', () => {
             normalizeShortMergeTargetSeconds,
             applyAutoDubSubtitleItems,
             getDeepSeekApiKey,
+            getGlobalTtsBackend,
             getProjectDubbingContext,
         });
         agentDrawerModule.setupAgentDrawer({

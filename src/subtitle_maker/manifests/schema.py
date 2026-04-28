@@ -21,9 +21,24 @@ class BatchReplayOptions:
     source_short_merge_enabled: bool = False
     source_short_merge_threshold: int = 15
     source_short_merge_threshold_mode: str = "seconds"
+    translated_short_merge_enabled: bool = False
+    translated_short_merge_threshold: int = 15
+    translated_short_merge_threshold_mode: str = "seconds"
+    dub_audio_leveling_enabled: bool = True
+    dub_audio_leveling_target_rms: float = 0.12
+    dub_audio_leveling_activity_threshold_db: float = -35.0
+    dub_audio_leveling_max_gain_db: float = 8.0
+    dub_audio_leveling_peak_ceiling: float = 0.95
     grouped_synthesis: bool = False
     force_fit_timing: bool = False
     tts_backend: str = "index-tts"
+    fallback_tts_backend: str = "none"
+    omnivoice_root: str = ""
+    omnivoice_python_bin: str = ""
+    omnivoice_model: str = ""
+    omnivoice_device: str = "auto"
+    omnivoice_via_api: bool = True
+    omnivoice_api_url: str = "http://127.0.0.1:8020"
     legacy_inferred: Dict[str, bool] = field(default_factory=dict)
 
 

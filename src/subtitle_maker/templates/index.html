@@ -67,19 +67,45 @@
                             <div class="sidebar-deepseek-kicker">DeepSeek</div>
                             <div class="sidebar-deepseek-title">全局 API Key</div>
                         </div>
-                        <span id="deepseek-key-source" class="sidebar-deepseek-badge">Env</span>
+                        <div class="sidebar-deepseek-head-actions">
+                            <span id="deepseek-key-source" class="sidebar-deepseek-badge">Env</span>
+                            <button
+                                id="global-deepseek-toggle"
+                                type="button"
+                                class="sidebar-deepseek-toggle"
+                                aria-expanded="false"
+                                title="展开或收起 DeepSeek 设置"
+                            >
+                                ▾
+                            </button>
+                        </div>
                     </div>
-                    <input
-                        type="password"
-                        id="global-deepseek-api-key"
-                        autocomplete="off"
-                        placeholder="翻译 / Auto Dubbing / Agent 共用"
-                    >
-                    <div class="checkbox-row sidebar-deepseek-check">
-                        <input type="checkbox" id="global-deepseek-save-key">
-                        <label for="global-deepseek-save-key">记住当前浏览器</label>
+                    <div id="global-deepseek-body" class="sidebar-deepseek-body">
+                        <input
+                            type="password"
+                            id="global-deepseek-api-key"
+                            autocomplete="off"
+                            placeholder="翻译 / Auto Dubbing / Agent 共用"
+                        >
+                        <div class="checkbox-row sidebar-deepseek-check">
+                            <input type="checkbox" id="global-deepseek-save-key">
+                            <label for="global-deepseek-save-key">记住当前浏览器</label>
+                        </div>
+                        <p id="global-deepseek-hint" class="sidebar-deepseek-hint">留空时，Agent 与 Auto Dubbing 仍可使用后端环境变量；翻译接口需要这里提供 key。</p>
                     </div>
-                    <p id="global-deepseek-hint" class="sidebar-deepseek-hint">留空时，Agent 与 Auto Dubbing 仍可使用后端环境变量；翻译接口需要这里提供 key。</p>
+                </div>
+                <div class="sidebar-tts-card">
+                    <div class="sidebar-tts-card-head">
+                        <div class="sidebar-tts-kicker">TTS</div>
+                        <div class="sidebar-tts-title">底座模型</div>
+                    </div>
+                    <div class="sidebar-tts-field">
+                        <label for="global-tts-backend">TTS 底座模型</label>
+                        <select id="global-tts-backend">
+                            <option value="index-tts" selected>index-tts</option>
+                            <option value="omnivoice">OmniVoice</option>
+                        </select>
+                    </div>
                 </div>
                 <button id="theme-toggle-btn" class="secondary-btn">Light Theme</button>
                 <button id="new-project-btn" class="secondary-btn">New Project</button>
@@ -302,14 +328,21 @@
                                         </div>
                                     </div>
                                     <div class="auto-dub-toggle-grid">
-                                        <div class="checkbox-row auto-dub-toggle-card">
+                                        <div id="auto-dub-short-merge-card" class="checkbox-row auto-dub-toggle-card">
                                             <input type="checkbox" id="auto-dub-short-merge-enabled">
                                             <label for="auto-dub-short-merge-enabled">Merge short source lines</label>
+                                        </div>
+                                        <div id="auto-dub-translated-short-merge-card" class="checkbox-row auto-dub-toggle-card" style="display: none;">
+                                            <input type="checkbox" id="auto-dub-translated-short-merge-enabled">
+                                            <label for="auto-dub-translated-short-merge-enabled">Merge short translated lines</label>
                                         </div>
                                         <div class="checkbox-row auto-dub-toggle-card">
                                             <input type="checkbox" id="auto-dub-auto-pick-ranges">
                                             <label for="auto-dub-auto-pick-ranges">Auto pick dubbing ranges</label>
                                         </div>
+                                    </div>
+                                    <div id="auto-dub-short-merge-hint" class="auto-dub-inline-note">
+                                        仅对 source 字幕 / ASR 结果生效。若上传 translated 字幕，系统会严格遵循你提供的句级时间轴。
                                     </div>
                                     <div id="auto-dub-short-merge-settings" class="auto-dub-inline-settings" style="display: none;">
                                         <div class="input-group auto-dub-threshold-group">
@@ -325,6 +358,25 @@
                                         </div>
                                         <div class="auto-dub-inline-note">
                                             Step 2 only merges adjacent source lines by original timing. Tolerance is `round(target / 3)`, and a 1.5s silence gap forces a split.
+                                        </div>
+                                    </div>
+                                    <div id="auto-dub-translated-short-merge-hint" class="auto-dub-inline-note" style="display: none;">
+                                        只在 translated 直通模式生效。会调整你上传译文的句边界，但不改文字内容，也不会触发翻译 rewrite。
+                                    </div>
+                                    <div id="auto-dub-translated-short-merge-settings" class="auto-dub-inline-settings" style="display: none;">
+                                        <div class="input-group auto-dub-threshold-group">
+                                            <label for="auto-dub-translated-short-merge-threshold">Translated Merge Target (sec)</label>
+                                            <input
+                                                type="number"
+                                                id="auto-dub-translated-short-merge-threshold"
+                                                min="6"
+                                                max="20"
+                                                step="1"
+                                                value="15"
+                                            >
+                                        </div>
+                                        <div class="auto-dub-inline-note">
+                                            仅在任务初始启动时对相邻 translated cues 做一次性并句；review redub / resume 不会再次改边界。
                                         </div>
                                     </div>
                                 </div>
@@ -372,6 +424,14 @@
                                         <span id="step-dub">Clone, align & mix</span>
                                     </div>
                                     <button id="start-auto-dub-btn" class="primary-btn auto-dub-start-btn" type="button">Start Auto Dubbing</button>
+                                    <button
+                                        id="auto-dub-resume-btn"
+                                        class="ghost-btn auto-dub-resume-btn"
+                                        type="button"
+                                        disabled
+                                    >
+                                        从失败处继续
+                                    </button>
                                 </div>
 
                                 <div class="auto-dub-section-card auto-dub-secondary-card auto-dub-restore-card">
@@ -390,6 +450,7 @@
                                             <button id="auto-dub-load-batch-btn" class="ghost-btn" type="button">加载结果</button>
                                         </div>
                                     </div>
+                                    <p id="auto-dub-batch-hint" class="auto-dub-secondary-note">正在加载结果文件夹列表...</p>
                                 </div>
                             </div>
 
@@ -412,6 +473,7 @@
                                     <div class="auto-dub-review-toolbar">
                                         <button id="auto-dub-review-load-btn" class="ghost-btn" type="button">加载逐句审阅</button>
                                         <button id="auto-dub-review-save-redub-btn" class="ghost-btn" type="button">保存并重配改动句</button>
+                                        <button id="auto-dub-review-force-redub-btn" class="ghost-btn" type="button">重配失败句</button>
                                     </div>
                                     <div id="auto-dub-review-list" class="auto-dub-review-list"></div>
                                 </div>
@@ -554,9 +616,13 @@
                                         </div>
                                     </div>
                                     <div class="auto-dub-toggle-grid">
-                                        <div class="checkbox-row auto-dub-toggle-card">
+                                        <div id="auto-dub-v2-short-merge-card" class="checkbox-row auto-dub-toggle-card">
                                             <input type="checkbox" id="auto-dub-v2-short-merge-enabled">
                                             <label for="auto-dub-v2-short-merge-enabled">Merge short source lines</label>
+                                        </div>
+                                        <div id="auto-dub-v2-translated-short-merge-card" class="checkbox-row auto-dub-toggle-card" style="display: none;">
+                                            <input type="checkbox" id="auto-dub-v2-translated-short-merge-enabled">
+                                            <label for="auto-dub-v2-translated-short-merge-enabled">Merge short translated lines</label>
                                         </div>
                                         <div class="checkbox-row auto-dub-toggle-card">
                                             <input type="checkbox" id="auto-dub-v2-auto-pick-ranges">
@@ -566,6 +632,9 @@
                                             <input type="checkbox" id="auto-dub-v2-rewrite-translation" checked>
                                             <label for="auto-dub-v2-rewrite-translation">Rewrite translation for timing fit</label>
                                         </div>
+                                    </div>
+                                    <div id="auto-dub-v2-short-merge-hint" class="auto-dub-inline-note">
+                                        仅对 source 字幕 / ASR 结果生效。若上传 translated 字幕，系统会严格遵循你提供的句级时间轴。
                                     </div>
                                     <div id="auto-dub-v2-short-merge-settings" class="auto-dub-inline-settings" style="display: none;">
                                         <div class="input-group auto-dub-threshold-group">
@@ -581,6 +650,25 @@
                                         </div>
                                         <div class="auto-dub-inline-note">
                                             Step 2 only merges adjacent source lines by original timing. Tolerance is `round(target / 3)`, and a 1.5s silence gap forces a split.
+                                        </div>
+                                    </div>
+                                    <div id="auto-dub-v2-translated-short-merge-hint" class="auto-dub-inline-note" style="display: none;">
+                                        只在 translated 直通模式生效。会调整你上传译文的句边界，但不改文字内容，也不会触发翻译 rewrite。
+                                    </div>
+                                    <div id="auto-dub-v2-translated-short-merge-settings" class="auto-dub-inline-settings" style="display: none;">
+                                        <div class="input-group auto-dub-threshold-group">
+                                            <label for="auto-dub-v2-translated-short-merge-threshold">Translated Merge Target (sec)</label>
+                                            <input
+                                                type="number"
+                                                id="auto-dub-v2-translated-short-merge-threshold"
+                                                min="6"
+                                                max="20"
+                                                step="1"
+                                                value="15"
+                                            >
+                                        </div>
+                                        <div class="auto-dub-inline-note">
+                                            仅在任务初始启动时对相邻 translated cues 做一次性并句；review redub / resume 不会再次改边界。
                                         </div>
                                     </div>
                                 </div>
@@ -628,6 +716,14 @@
                                         <span id="step-v2-dub">Clone, align & mix</span>
                                     </div>
                                     <button id="start-auto-dub-v2-btn" class="primary-btn auto-dub-start-btn" type="button">Start Auto Dubbing V2</button>
+                                    <button
+                                        id="auto-dub-v2-resume-btn"
+                                        class="ghost-btn auto-dub-resume-btn"
+                                        type="button"
+                                        disabled
+                                    >
+                                        从失败处继续
+                                    </button>
                                 </div>
 
                                 <div class="auto-dub-section-card auto-dub-secondary-card auto-dub-restore-card">
@@ -646,6 +742,7 @@
                                             <button id="auto-dub-v2-load-batch-btn" class="ghost-btn" type="button">加载结果</button>
                                         </div>
                                     </div>
+                                    <p id="auto-dub-v2-batch-hint" class="auto-dub-secondary-note">正在加载结果文件夹列表...</p>
                                 </div>
                             </div>
 
@@ -668,6 +765,7 @@
                                     <div class="auto-dub-review-toolbar">
                                         <button id="auto-dub-v2-review-load-btn" class="ghost-btn" type="button">加载逐句审阅</button>
                                         <button id="auto-dub-v2-review-save-redub-btn" class="ghost-btn" type="button">保存并重配改动句</button>
+                                        <button id="auto-dub-v2-review-force-redub-btn" class="ghost-btn" type="button">重配失败句</button>
                                     </div>
                                     <div id="auto-dub-v2-review-list" class="auto-dub-review-list"></div>
                                 </div>

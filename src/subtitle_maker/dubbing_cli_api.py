@@ -38,10 +38,11 @@ from subtitle_maker.jobs import (
     build_auto_dubbing_command,
     build_loaded_batch_task,
     build_segment_redub_command,
+    find_batch_dir_by_name,
     find_batch_manifest_by_name,
     list_available_batches,
 )
-from subtitle_maker.manifests import load_batch_manifest, load_segment_manifest
+from subtitle_maker.manifests import load_batch_manifest, load_segment_manifest, write_manifest_json
 from subtitle_maker.transcriber import format_srt, parse_srt
 
 router = APIRouter(prefix="/dubbing/auto", tags=["dubbing"])
@@ -51,6 +52,9 @@ UPLOAD_ROOT = REPO_ROOT / "uploads" / "dubbing"
 OUTPUT_ROOT = REPO_ROOT / "outputs" / "dub_jobs"
 TOOL_PATH = REPO_ROOT / "tools" / "dub_long_video.py"
 INDEX_TTS_START_SCRIPT = REPO_ROOT / "start_index_tts_api.sh"
+INDEX_TTS_STOP_SCRIPT = REPO_ROOT / "stop_index_tts_api.sh"
+OMNIVOICE_START_SCRIPT = REPO_ROOT / "start_omnivoice_api.sh"
+OMNIVOICE_STOP_SCRIPT = REPO_ROOT / "stop_omnivoice_api.sh"
 
 UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -60,11 +64,26 @@ _task_store = TaskStore()
 _tasks: Dict[str, TaskPayload] = _task_store.items
 _lock = _task_store.lock
 DEFAULT_TRANSLATE_BASE_URL = "https://api.deepseek.com"
-DEFAULT_TRANSLATE_MODEL = "deepseek-chat"
+DEFAULT_TRANSLATE_MODEL = "deepseek-v4-flash"
 DEFAULT_INDEX_TTS_API_URL = "http://127.0.0.1:8010"
+DEFAULT_OMNIVOICE_API_URL = "http://127.0.0.1:8020"
+DEFAULT_OMNIVOICE_MODEL = "k2-fsa/OmniVoice"
+DEFAULT_OMNIVOICE_DEVICE = "auto"
+OMNIVOICE_ROOT_ENV = "OMNIVOICE_ROOT"
+OMNIVOICE_PYTHON_BIN_ENV = "OMNIVOICE_PYTHON_BIN"
+OMNIVOICE_MODEL_ENV = "OMNIVOICE_MODEL"
+OMNIVOICE_DEVICE_ENV = "OMNIVOICE_DEVICE"
+OMNIVOICE_VIA_API_ENV = "OMNIVOICE_VIA_API"
+OMNIVOICE_API_URL_ENV = "OMNIVOICE_API_URL"
 DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC = 15
 MIN_SOURCE_SHORT_MERGE_TARGET_SEC = 6
 MAX_SOURCE_SHORT_MERGE_TARGET_SEC = 20
+DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS = 0.12
+DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB = -35.0
+DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB = 8.0
+DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING = 0.95
+DEFAULT_SEGMENT_MINUTES = 8.0
+DEFAULT_MIN_SEGMENT_MINUTES = 4.0
 
 
 def _index_tts_target_lang_supported(target_lang: str) -> bool:
@@ -88,6 +107,49 @@ def _index_tts_target_lang_supported(target_lang: str) -> bool:
 
 def _iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _read_omnivoice_runtime_from_request_or_env(
+    *,
+    omnivoice_root: str,
+    omnivoice_python_bin: str,
+    omnivoice_model: str,
+    omnivoice_device: str,
+    omnivoice_via_api: str,
+    omnivoice_api_url: str,
+) -> Dict[str, Any]:
+    """解析 OmniVoice 运行参数：优先请求值，缺失时回退环境变量。"""
+
+    normalized_omnivoice_root = (omnivoice_root or "").strip() or os.environ.get(OMNIVOICE_ROOT_ENV, "").strip()
+    normalized_omnivoice_python_bin = (omnivoice_python_bin or "").strip() or os.environ.get(
+        OMNIVOICE_PYTHON_BIN_ENV,
+        "",
+    ).strip()
+    normalized_omnivoice_model = (omnivoice_model or "").strip() or os.environ.get(
+        OMNIVOICE_MODEL_ENV,
+        DEFAULT_OMNIVOICE_MODEL,
+    ).strip()
+    normalized_omnivoice_device = (omnivoice_device or "").strip() or os.environ.get(
+        OMNIVOICE_DEVICE_ENV,
+        DEFAULT_OMNIVOICE_DEVICE,
+    ).strip()
+    normalized_omnivoice_via_api = _read_bool_form(
+        (omnivoice_via_api or "").strip() or os.environ.get(OMNIVOICE_VIA_API_ENV, "true"),
+        field_name="omnivoice_via_api",
+    )
+    normalized_omnivoice_api_url = (
+        (omnivoice_api_url or "").strip()
+        or os.environ.get(OMNIVOICE_API_URL_ENV, DEFAULT_OMNIVOICE_API_URL).strip()
+        or DEFAULT_OMNIVOICE_API_URL
+    )
+    return {
+        "omnivoice_root": normalized_omnivoice_root,
+        "omnivoice_python_bin": normalized_omnivoice_python_bin,
+        "omnivoice_model": normalized_omnivoice_model,
+        "omnivoice_device": normalized_omnivoice_device or DEFAULT_OMNIVOICE_DEVICE,
+        "omnivoice_via_api": normalized_omnivoice_via_api,
+        "omnivoice_api_url": normalized_omnivoice_api_url,
+    }
 
 
 def _normalize_short_merge_target_seconds_for_display(
@@ -415,6 +477,14 @@ def _normalize_auto_dubbing_request(
     api_key: str,
     translate_base_url: str,
     translate_model: str,
+    tts_backend: str,
+    fallback_tts_backend: str,
+    omnivoice_root: str,
+    omnivoice_python_bin: str,
+    omnivoice_model: str,
+    omnivoice_device: str,
+    omnivoice_via_api: str,
+    omnivoice_api_url: str,
     index_tts_api_url: str,
     segment_minutes: float,
     min_segment_minutes: float,
@@ -422,6 +492,8 @@ def _normalize_auto_dubbing_request(
     grouping_strategy: str,
     short_merge_enabled: str,
     short_merge_threshold: int,
+    translated_short_merge_enabled: str,
+    translated_short_merge_threshold: int,
     time_ranges: str,
     auto_pick_ranges: str,
     auto_pick_min_silence_sec: float,
@@ -429,6 +501,11 @@ def _normalize_auto_dubbing_request(
     pipeline_version: str,
     rewrite_translation: str,
     has_subtitle_input: bool,
+    dub_audio_leveling_enabled: bool = True,
+    dub_audio_leveling_target_rms: float = DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS,
+    dub_audio_leveling_activity_threshold_db: float = DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB,
+    dub_audio_leveling_max_gain_db: float = DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB,
+    dub_audio_leveling_peak_ceiling: float = DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING,
 ) -> Dict[str, Any]:
     """统一解析两条启动入口的公共参数，避免 Current Project / Standalone 语义漂移。"""
 
@@ -438,7 +515,7 @@ def _normalize_auto_dubbing_request(
         raise HTTPException(status_code=400, detail="Invalid segment duration settings")
     if not target_lang.strip():
         raise HTTPException(status_code=400, detail="target_lang is required")
-    if not _index_tts_target_lang_supported(target_lang):
+    if (tts_backend or "").strip().lower() in {"", "index-tts"} and not _index_tts_target_lang_supported(target_lang):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -458,14 +535,36 @@ def _normalize_auto_dubbing_request(
         MIN_SOURCE_SHORT_MERGE_TARGET_SEC <= short_merge_threshold <= MAX_SOURCE_SHORT_MERGE_TARGET_SEC
     ):
         raise HTTPException(status_code=400, detail="Invalid short_merge_threshold")
+    translated_short_merge_enabled_value = _read_bool_form(
+        translated_short_merge_enabled,
+        field_name="translated_short_merge_enabled",
+    )
+    if translated_short_merge_enabled_value and not (
+        MIN_SOURCE_SHORT_MERGE_TARGET_SEC <= translated_short_merge_threshold <= MAX_SOURCE_SHORT_MERGE_TARGET_SEC
+    ):
+        raise HTTPException(status_code=400, detail="Invalid translated_short_merge_threshold")
     if auto_pick_min_silence_sec < 0.1 or auto_pick_min_silence_sec > 10.0:
         raise HTTPException(status_code=400, detail="Invalid auto_pick_min_silence_sec")
     if auto_pick_min_speech_sec < 0.1 or auto_pick_min_speech_sec > 30.0:
         raise HTTPException(status_code=400, detail="Invalid auto_pick_min_speech_sec")
+    if dub_audio_leveling_target_rms <= 0.0 or dub_audio_leveling_target_rms > 0.5:
+        raise HTTPException(status_code=400, detail="Invalid dub_audio_leveling_target_rms")
+    if dub_audio_leveling_activity_threshold_db > -5.0 or dub_audio_leveling_activity_threshold_db < -80.0:
+        raise HTTPException(status_code=400, detail="Invalid dub_audio_leveling_activity_threshold_db")
+    if dub_audio_leveling_max_gain_db < 0.0 or dub_audio_leveling_max_gain_db > 24.0:
+        raise HTTPException(status_code=400, detail="Invalid dub_audio_leveling_max_gain_db")
+    if dub_audio_leveling_peak_ceiling <= 0.0 or dub_audio_leveling_peak_ceiling > 0.99:
+        raise HTTPException(status_code=400, detail="Invalid dub_audio_leveling_peak_ceiling")
 
     normalized_subtitle_mode = (subtitle_mode or "").strip().lower() or "source"
     if normalized_subtitle_mode not in {"source", "translated"}:
         raise HTTPException(status_code=400, detail="Invalid subtitle_mode")
+    normalized_tts_backend = (tts_backend or "").strip().lower() or "index-tts"
+    if normalized_tts_backend not in {"index-tts", "qwen", "omnivoice"}:
+        raise HTTPException(status_code=400, detail="Invalid tts_backend")
+    normalized_fallback_tts_backend = (fallback_tts_backend or "").strip().lower() or "none"
+    if normalized_fallback_tts_backend not in {"none", "omnivoice"}:
+        raise HTTPException(status_code=400, detail="Invalid fallback_tts_backend")
     normalized_pipeline_version = (pipeline_version or "").strip().lower() or "v1"
     if normalized_pipeline_version not in {"v1", "v2"}:
         raise HTTPException(status_code=400, detail="Invalid pipeline_version")
@@ -476,6 +575,49 @@ def _normalize_auto_dubbing_request(
     normalized_translate_base_url = (translate_base_url or "").strip() or DEFAULT_TRANSLATE_BASE_URL
     normalized_translate_model = (translate_model or "").strip() or DEFAULT_TRANSLATE_MODEL
     normalized_index_tts_api_url = (index_tts_api_url or "").strip() or DEFAULT_INDEX_TTS_API_URL
+    omnivoice_runtime_options = _read_omnivoice_runtime_from_request_or_env(
+        omnivoice_root=omnivoice_root,
+        omnivoice_python_bin=omnivoice_python_bin,
+        omnivoice_model=omnivoice_model,
+        omnivoice_device=omnivoice_device,
+        omnivoice_via_api=omnivoice_via_api,
+        omnivoice_api_url=omnivoice_api_url,
+    )
+    normalized_omnivoice_root = omnivoice_runtime_options["omnivoice_root"]
+    normalized_omnivoice_python_bin = omnivoice_runtime_options["omnivoice_python_bin"]
+    normalized_omnivoice_model = omnivoice_runtime_options["omnivoice_model"]
+    normalized_omnivoice_device = omnivoice_runtime_options["omnivoice_device"]
+    normalized_omnivoice_via_api = bool(omnivoice_runtime_options["omnivoice_via_api"])
+    normalized_omnivoice_api_url = str(omnivoice_runtime_options["omnivoice_api_url"] or "").strip() or DEFAULT_OMNIVOICE_API_URL
+    if normalized_fallback_tts_backend == "omnivoice" or normalized_tts_backend == "omnivoice":
+        if normalized_omnivoice_via_api:
+            if not normalized_omnivoice_api_url:
+                raise HTTPException(status_code=400, detail="omnivoice_api_url is required when omnivoice_via_api=true")
+        else:
+            if not normalized_omnivoice_root:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "omnivoice_root is required when tts_backend=omnivoice or fallback_tts_backend=omnivoice. "
+                        f"Set form field or env {OMNIVOICE_ROOT_ENV}."
+                    ),
+                )
+            if not normalized_omnivoice_python_bin:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "omnivoice_python_bin is required when tts_backend=omnivoice or fallback_tts_backend=omnivoice. "
+                        f"Set form field or env {OMNIVOICE_PYTHON_BIN_ENV}."
+                    ),
+                )
+            if not normalized_omnivoice_model:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "omnivoice_model is required when tts_backend=omnivoice or fallback_tts_backend=omnivoice. "
+                        f"Set form field or env {OMNIVOICE_MODEL_ENV}."
+                    ),
+                )
     effective_api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
     skip_translation_by_subtitle = bool(has_subtitle_input and normalized_subtitle_mode == "translated")
     if (not skip_translation_by_subtitle) and (not effective_api_key) and normalized_translate_base_url == DEFAULT_TRANSLATE_BASE_URL:
@@ -483,11 +625,24 @@ def _normalize_auto_dubbing_request(
             status_code=400,
             detail="Translation API key is required. Provide api_key or configure a custom translate_base_url.",
         )
-    _ensure_index_tts_service(normalized_index_tts_api_url)
+    _switch_tts_runtime_on_demand(
+        tts_backend=normalized_tts_backend,
+        index_tts_api_url=normalized_index_tts_api_url,
+        omnivoice_via_api=normalized_omnivoice_via_api,
+        omnivoice_api_url=normalized_omnivoice_api_url,
+    )
     return {
         "subtitle_mode": normalized_subtitle_mode,
         "source_lang": source_lang,
         "target_lang": target_lang,
+        "tts_backend": normalized_tts_backend,
+        "fallback_tts_backend": normalized_fallback_tts_backend,
+        "omnivoice_root": normalized_omnivoice_root,
+        "omnivoice_python_bin": normalized_omnivoice_python_bin,
+        "omnivoice_model": normalized_omnivoice_model,
+        "omnivoice_device": normalized_omnivoice_device,
+        "omnivoice_via_api": normalized_omnivoice_via_api,
+        "omnivoice_api_url": normalized_omnivoice_api_url,
         "effective_api_key": effective_api_key,
         "translate_base_url": normalized_translate_base_url,
         "translate_model": normalized_translate_model,
@@ -498,6 +653,13 @@ def _normalize_auto_dubbing_request(
         "grouping_strategy": normalized_grouping_strategy,
         "short_merge_enabled": short_merge_enabled_value,
         "short_merge_threshold": int(short_merge_threshold),
+        "translated_short_merge_enabled": translated_short_merge_enabled_value,
+        "translated_short_merge_threshold": int(translated_short_merge_threshold),
+        "dub_audio_leveling_enabled": bool(dub_audio_leveling_enabled),
+        "dub_audio_leveling_target_rms": float(dub_audio_leveling_target_rms),
+        "dub_audio_leveling_activity_threshold_db": float(dub_audio_leveling_activity_threshold_db),
+        "dub_audio_leveling_max_gain_db": float(dub_audio_leveling_max_gain_db),
+        "dub_audio_leveling_peak_ceiling": float(dub_audio_leveling_peak_ceiling),
         "time_ranges": parsed_time_ranges,
         "auto_pick_ranges": auto_pick_ranges_enabled,
         "auto_pick_min_silence_sec": auto_pick_min_silence_sec,
@@ -599,6 +761,8 @@ def _queue_auto_dubbing_task(
     input_path: Path,
     input_srt_path: Optional[Path],
     options: Dict[str, Any],
+    resume_batch_dir: Optional[Path] = None,
+    out_root_override: Optional[Path] = None,
 ) -> Dict[str, str]:
     """创建 Auto Dubbing 任务记录并启动后台 CLI 线程，供两条启动入口共用。"""
 
@@ -607,7 +771,11 @@ def _queue_auto_dubbing_task(
         raise HTTPException(status_code=409, detail="Another auto dubbing job is already running")
 
     resolved_task_id = task_id or _build_readable_task_id()
-    out_root = OUTPUT_ROOT / f"web_{resolved_task_id}"
+    out_root = (
+        Path(str(out_root_override)).expanduser().resolve()
+        if out_root_override is not None
+        else (OUTPUT_ROOT / f"web_{resolved_task_id}")
+    )
     out_root.mkdir(parents=True, exist_ok=True)
 
     auto_pick_ranges_enabled = bool(options["auto_pick_ranges"])
@@ -627,12 +795,28 @@ def _queue_auto_dubbing_task(
             grouping_strategy=options["grouping_strategy"],
             short_merge_enabled=options["short_merge_enabled"],
             short_merge_threshold=options["short_merge_threshold"],
+            translated_short_merge_enabled=options["translated_short_merge_enabled"],
+            translated_short_merge_threshold=options["translated_short_merge_threshold"],
+            dub_audio_leveling_enabled=options["dub_audio_leveling_enabled"],
+            dub_audio_leveling_target_rms=options["dub_audio_leveling_target_rms"],
+            dub_audio_leveling_activity_threshold_db=options["dub_audio_leveling_activity_threshold_db"],
+            dub_audio_leveling_max_gain_db=options["dub_audio_leveling_max_gain_db"],
+            dub_audio_leveling_peak_ceiling=options["dub_audio_leveling_peak_ceiling"],
             translate_base_url=options["translate_base_url"],
             translate_model=options["translate_model"],
+            tts_backend=options["tts_backend"],
+            fallback_tts_backend=options["fallback_tts_backend"],
+            omnivoice_root=options["omnivoice_root"],
+            omnivoice_python_bin=options["omnivoice_python_bin"],
+            omnivoice_model=options["omnivoice_model"],
+            omnivoice_device=options["omnivoice_device"],
+            omnivoice_via_api=options["omnivoice_via_api"],
+            omnivoice_api_url=options["omnivoice_api_url"],
             index_tts_api_url=options["index_tts_api_url"],
             auto_pick_ranges=auto_pick_ranges_enabled,
             auto_pick_min_silence_sec=options["auto_pick_min_silence_sec"],
             auto_pick_min_speech_sec=options["auto_pick_min_speech_sec"],
+            resume_batch_dir=resume_batch_dir,
             input_srt=input_srt_path,
             input_srt_kind=options["subtitle_mode"],
             time_ranges=options["time_ranges"],
@@ -664,10 +848,30 @@ def _queue_auto_dubbing_task(
         "source_short_merge_enabled": options["short_merge_enabled"],
         "source_short_merge_threshold": options["short_merge_threshold"],
         "source_short_merge_threshold_mode": "seconds",
+        "translated_short_merge_enabled": options["translated_short_merge_enabled"],
+        "translated_short_merge_threshold": options["translated_short_merge_threshold"],
+        "translated_short_merge_threshold_mode": "seconds",
+        "dub_audio_leveling_enabled": options["dub_audio_leveling_enabled"],
+        "dub_audio_leveling_target_rms": options["dub_audio_leveling_target_rms"],
+        "dub_audio_leveling_activity_threshold_db": options["dub_audio_leveling_activity_threshold_db"],
+        "dub_audio_leveling_max_gain_db": options["dub_audio_leveling_max_gain_db"],
+        "dub_audio_leveling_peak_ceiling": options["dub_audio_leveling_peak_ceiling"],
         "source_lang": options["source_lang"],
         "subtitle_mode": options["subtitle_mode"],
+        "segment_minutes": float(options.get("segment_minutes", DEFAULT_SEGMENT_MINUTES) or DEFAULT_SEGMENT_MINUTES),
+        "min_segment_minutes": float(
+            options.get("min_segment_minutes", DEFAULT_MIN_SEGMENT_MINUTES) or DEFAULT_MIN_SEGMENT_MINUTES
+        ),
         "translate_base_url": options["translate_base_url"],
         "translate_model": options["translate_model"],
+        "tts_backend": options["tts_backend"],
+        "fallback_tts_backend": options["fallback_tts_backend"],
+        "omnivoice_root": options["omnivoice_root"],
+        "omnivoice_python_bin": options["omnivoice_python_bin"],
+        "omnivoice_model": options["omnivoice_model"],
+        "omnivoice_device": options["omnivoice_device"],
+        "omnivoice_via_api": options["omnivoice_via_api"],
+        "omnivoice_api_url": options["omnivoice_api_url"],
         "index_tts_api_url": options["index_tts_api_url"],
         "time_ranges": options["time_ranges"],
         "auto_pick_ranges": auto_pick_ranges_enabled,
@@ -683,6 +887,7 @@ def _queue_auto_dubbing_task(
         "input_srt": str(input_srt_path) if input_srt_path else None,
         "upload_dir": str(input_path.parent),
         "out_root": str(out_root),
+        "resume_batch_dir": str(resume_batch_dir) if resume_batch_dir else None,
         "command": [part if part != options["effective_api_key"] else "***" for part in cmd],
     }
     _task_store.create(resolved_task_id, task)
@@ -826,14 +1031,515 @@ def _find_batch_manifest(out_root: Path) -> Optional[Path]:
     return manifests[0] if manifests else None
 
 
+def _find_latest_batch_dir(out_root: Path) -> Optional[Path]:
+    # 从 web 输出目录下挑选最近的 longdub 目录，用于失败任务续跑。
+    root = out_root.expanduser().resolve()
+    candidates: List[Path] = []
+    if root.is_dir() and root.name.startswith("longdub_"):
+        candidates.append(root)
+    if root.exists():
+        candidates.extend(root.glob("longdub_*"))
+    for candidate in sorted({item.resolve() for item in candidates}, key=lambda item: item.stat().st_mtime, reverse=True):
+        if not candidate.is_dir():
+            continue
+        if (candidate / "segment_jobs").exists() or (candidate / "segments").exists() or (candidate / "batch_manifest.json").exists():
+            return candidate
+    return None
+
+
+def _resolve_resume_batch_dir(task: Dict[str, Any]) -> Path:
+    # 解析续跑批次目录：优先历史字段，其次 batch manifest，再退回 out_root 下最近 longdub。
+    direct = str(task.get("resume_batch_dir") or "").strip()
+    if direct:
+        direct_path = Path(direct).expanduser().resolve()
+        if direct_path.exists() and direct_path.is_dir():
+            return direct_path
+
+    manifest_text = str(task.get("batch_manifest_path") or "").strip()
+    if manifest_text:
+        manifest_path = Path(manifest_text).expanduser().resolve()
+        if manifest_path.exists():
+            return manifest_path.parent
+
+    out_root_text = str(task.get("out_root") or "").strip()
+    if out_root_text:
+        out_root = Path(out_root_text).expanduser().resolve()
+        latest = _find_latest_batch_dir(out_root)
+        if latest is not None:
+            return latest
+
+    raise HTTPException(status_code=404, detail="Resume batch directory not found")
+
+
+def _resolve_resume_out_root(task: Dict[str, Any], *, resume_batch_dir: Path) -> Path:
+    # 续跑输出根目录优先沿用原任务 out_root，保证结果继续落在同一 web_* 目录下。
+    out_root_text = str(task.get("out_root") or "").strip()
+    if out_root_text:
+        out_root = Path(out_root_text).expanduser().resolve()
+        if out_root.exists() and out_root.is_dir():
+            return out_root
+    return resume_batch_dir.parent.resolve()
+
+
+def _resolve_resume_input_media(task: Dict[str, Any], *, resume_batch_dir: Path) -> Path:
+    # 续跑时优先复用原始输入媒体路径，缺失时回退 batch manifest 中的 input_media_path。
+    preferred_candidates: List[Path] = []
+    fallback_candidates: List[Path] = []
+
+    def push_candidate(candidate: Path) -> None:
+        try:
+            normalized = candidate.expanduser().resolve()
+        except Exception:
+            return
+        if normalized in preferred_candidates or normalized in fallback_candidates:
+            return
+        target = fallback_candidates if _is_segment_slice_media_path(normalized) else preferred_candidates
+        target.append(normalized)
+
+    input_path_text = str(task.get("input_path") or "").strip()
+    if input_path_text:
+        push_candidate(Path(input_path_text))
+
+    manifest_path = resume_batch_dir / "batch_manifest.json"
+    if manifest_path.exists():
+        try:
+            batch_manifest = load_batch_manifest(manifest_path)
+            input_media_path = str(batch_manifest.input_media_path or "").strip()
+            if input_media_path:
+                preferred = _resolve_preferred_batch_input_media(
+                    batch_dir=resume_batch_dir,
+                    manifest_input_path=input_media_path,
+                )
+                if preferred is not None:
+                    push_candidate(preferred)
+                else:
+                    push_candidate(Path(input_media_path))
+        except Exception:
+            pass
+    else:
+        # 无 batch manifest 的中断批次，尝试按 web_<task_id> 回溯上传目录。
+        uploaded_media = _find_uploaded_media_for_batch_dir(resume_batch_dir)
+        if uploaded_media is not None:
+            push_candidate(uploaded_media)
+
+    upload_dir_text = str(task.get("upload_dir") or "").strip()
+    filename_text = str(task.get("filename") or "").strip()
+    if upload_dir_text and filename_text:
+        push_candidate(Path(upload_dir_text).expanduser().resolve() / Path(filename_text).name)
+
+    for candidate in preferred_candidates + fallback_candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    raise HTTPException(status_code=404, detail="Resume input media not found")
+
+
+def _resolve_resume_input_srt(task: Dict[str, Any]) -> Optional[Path]:
+    # 若原任务带了外部字幕输入，续跑时继续复用；文件丢失则自动回退无字幕输入。
+    input_srt_text = str(task.get("input_srt") or "").strip()
+    if not input_srt_text:
+        return None
+    input_srt_path = Path(input_srt_text).expanduser().resolve()
+    if not input_srt_path.exists() or not input_srt_path.is_file():
+        return None
+    return input_srt_path
+
+
+def _build_resume_options(
+    *,
+    task: Dict[str, Any],
+    resume_batch_dir: Path,
+    api_key: str,
+    has_subtitle_input: bool,
+) -> Dict[str, Any]:
+    # 从历史任务 + batch manifest 回放参数，并复用统一请求校验逻辑。
+    batch_options = None
+    batch_raw: Dict[str, Any] = {}
+    batch_manifest_path = resume_batch_dir / "batch_manifest.json"
+    if batch_manifest_path.exists():
+        try:
+            batch_manifest = load_batch_manifest(batch_manifest_path)
+            batch_options = batch_manifest.options
+            batch_raw = batch_manifest.raw
+        except Exception:
+            batch_options = None
+            batch_raw = {}
+
+    def pick_text(*values: Any, default: str = "") -> str:
+        for value in values:
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        return default
+
+    def pick_bool(*values: Any, default: bool) -> bool:
+        for value in values:
+            if value is None:
+                continue
+            return _coerce_bool(value, default=default)
+        return bool(default)
+
+    def pick_int(*values: Any, default: int) -> int:
+        for value in values:
+            if value is None or value == "":
+                continue
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                continue
+        return int(default)
+
+    def pick_float(*values: Any, default: float) -> float:
+        for value in values:
+            if value is None or value == "":
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return float(default)
+
+    time_ranges_value: Any = task.get("time_ranges")
+    if not isinstance(time_ranges_value, list) and batch_options is not None:
+        time_ranges_value = batch_options.time_ranges
+    time_ranges_form = ""
+    if isinstance(time_ranges_value, list) and time_ranges_value:
+        time_ranges_form = json.dumps(time_ranges_value, ensure_ascii=False)
+    elif isinstance(time_ranges_value, str):
+        time_ranges_form = time_ranges_value
+
+    return _normalize_auto_dubbing_request(
+        subtitle_mode=pick_text(task.get("subtitle_mode"), getattr(batch_options, "input_srt_kind", None), default="source"),
+        source_lang=pick_text(task.get("source_lang"), default="auto"),
+        target_lang=pick_text(task.get("target_lang"), getattr(batch_options, "target_lang", None)),
+        api_key=str(api_key or ""),
+        translate_base_url=pick_text(task.get("translate_base_url"), default=DEFAULT_TRANSLATE_BASE_URL),
+        translate_model=pick_text(task.get("translate_model"), default=DEFAULT_TRANSLATE_MODEL),
+        tts_backend=pick_text(task.get("tts_backend"), getattr(batch_options, "tts_backend", None), default="index-tts"),
+        fallback_tts_backend=pick_text(
+            task.get("fallback_tts_backend"),
+            getattr(batch_options, "fallback_tts_backend", None),
+            default="none",
+        ),
+        omnivoice_root=pick_text(task.get("omnivoice_root"), getattr(batch_options, "omnivoice_root", None)),
+        omnivoice_python_bin=pick_text(
+            task.get("omnivoice_python_bin"),
+            getattr(batch_options, "omnivoice_python_bin", None),
+        ),
+        omnivoice_model=pick_text(
+            task.get("omnivoice_model"),
+            getattr(batch_options, "omnivoice_model", None),
+            default=DEFAULT_OMNIVOICE_MODEL,
+        ),
+        omnivoice_device=pick_text(
+            task.get("omnivoice_device"),
+            getattr(batch_options, "omnivoice_device", None),
+            default=DEFAULT_OMNIVOICE_DEVICE,
+        ),
+        omnivoice_via_api="true"
+        if pick_bool(
+            task.get("omnivoice_via_api"),
+            getattr(batch_options, "omnivoice_via_api", None),
+            default=True,
+        )
+        else "false",
+        omnivoice_api_url=pick_text(
+            task.get("omnivoice_api_url"),
+            getattr(batch_options, "omnivoice_api_url", None),
+            default=DEFAULT_OMNIVOICE_API_URL,
+        ),
+        index_tts_api_url=pick_text(
+            task.get("index_tts_api_url"),
+            getattr(batch_options, "index_tts_api_url", None),
+            default=DEFAULT_INDEX_TTS_API_URL,
+        ),
+        segment_minutes=pick_float(
+            task.get("segment_minutes"),
+            batch_raw.get("segment_minutes"),
+            default=DEFAULT_SEGMENT_MINUTES,
+        ),
+        min_segment_minutes=pick_float(
+            task.get("min_segment_minutes"),
+            batch_raw.get("min_segment_minutes"),
+            default=DEFAULT_MIN_SEGMENT_MINUTES,
+        ),
+        timing_mode=pick_text(task.get("timing_mode"), getattr(batch_options, "timing_mode", None), default="strict"),
+        grouping_strategy=pick_text(
+            task.get("grouping_strategy"),
+            getattr(batch_options, "grouping_strategy", None),
+            default="sentence",
+        ),
+        short_merge_enabled="true"
+        if pick_bool(
+            task.get("source_short_merge_enabled"),
+            getattr(batch_options, "source_short_merge_enabled", None),
+            default=False,
+        )
+        else "false",
+        short_merge_threshold=pick_int(
+            task.get("source_short_merge_threshold"),
+            getattr(batch_options, "source_short_merge_threshold", None),
+            default=DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC,
+        ),
+        translated_short_merge_enabled="true"
+        if pick_bool(
+            task.get("translated_short_merge_enabled"),
+            getattr(batch_options, "translated_short_merge_enabled", None),
+            default=False,
+        )
+        else "false",
+        translated_short_merge_threshold=pick_int(
+            task.get("translated_short_merge_threshold"),
+            getattr(batch_options, "translated_short_merge_threshold", None),
+            default=DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC,
+        ),
+        time_ranges=time_ranges_form,
+        auto_pick_ranges="true"
+        if pick_bool(
+            task.get("auto_pick_ranges"),
+            getattr(batch_options, "auto_pick_ranges", None),
+            default=False,
+        )
+        else "false",
+        auto_pick_min_silence_sec=pick_float(task.get("auto_pick_min_silence_sec"), default=0.8),
+        auto_pick_min_speech_sec=pick_float(task.get("auto_pick_min_speech_sec"), default=1.0),
+        pipeline_version=pick_text(
+            task.get("pipeline_version"),
+            getattr(batch_options, "pipeline_version", None),
+            default="v1",
+        ),
+        rewrite_translation="true"
+        if pick_bool(
+            task.get("rewrite_translation"),
+            getattr(batch_options, "rewrite_translation", None),
+            default=True,
+        )
+        else "false",
+        has_subtitle_input=has_subtitle_input,
+        dub_audio_leveling_enabled=pick_bool(
+            task.get("dub_audio_leveling_enabled"),
+            getattr(batch_options, "dub_audio_leveling_enabled", None),
+            default=True,
+        ),
+        dub_audio_leveling_target_rms=pick_float(
+            task.get("dub_audio_leveling_target_rms"),
+            getattr(batch_options, "dub_audio_leveling_target_rms", None),
+            default=DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS,
+        ),
+        dub_audio_leveling_activity_threshold_db=pick_float(
+            task.get("dub_audio_leveling_activity_threshold_db"),
+            getattr(batch_options, "dub_audio_leveling_activity_threshold_db", None),
+            default=DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB,
+        ),
+        dub_audio_leveling_max_gain_db=pick_float(
+            task.get("dub_audio_leveling_max_gain_db"),
+            getattr(batch_options, "dub_audio_leveling_max_gain_db", None),
+            default=DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB,
+        ),
+        dub_audio_leveling_peak_ceiling=pick_float(
+            task.get("dub_audio_leveling_peak_ceiling"),
+            getattr(batch_options, "dub_audio_leveling_peak_ceiling", None),
+            default=DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING,
+        ),
+    )
+
+
 def _find_batch_manifest_by_name(batch_id: str) -> Optional[Path]:
     # 根据 longdub 批次目录名回查 manifest，支持刷新后恢复结果。
     return find_batch_manifest_by_name(output_root=OUTPUT_ROOT, batch_id=batch_id)
 
 
+def _find_batch_dir_by_name(batch_id: str) -> Optional[Path]:
+    # 根据 longdub 批次目录名回查目录（允许中断批次无 manifest）。
+    return find_batch_dir_by_name(output_root=OUTPUT_ROOT, batch_id=batch_id)
+
+
 def _list_available_batches(limit: int = 200) -> List[Dict[str, Any]]:
     # 列出可回载的 longdub 批次目录，供前端下拉选择。
     return list_available_batches(output_root=OUTPUT_ROOT, limit=limit)
+
+
+def _is_segment_slice_media_path(path: Path) -> bool:
+    """判断是否为 `segments/segment_0001.wav` 这类分段切片媒体。"""
+
+    try:
+        normalized = path.expanduser().resolve()
+    except Exception:
+        normalized = path
+    if normalized.parent.name != "segments":
+        return False
+    return re.fullmatch(r"segment_\d{4}", normalized.stem or "") is not None
+
+
+def _find_uploaded_media_for_batch_dir(batch_dir: Path) -> Optional[Path]:
+    """按 `web_<task_id>` 回溯 `uploads/dubbing/<task_id>/`，优先选视频文件。"""
+
+    web_dir_name = str(batch_dir.parent.name or "")
+    if not web_dir_name.startswith("web_"):
+        return None
+    task_hint = web_dir_name.removeprefix("web_").strip()
+    if not task_hint:
+        return None
+    upload_dir = (UPLOAD_ROOT / task_hint).expanduser()
+    if not upload_dir.exists() or not upload_dir.is_dir():
+        return None
+    files = [item for item in upload_dir.iterdir() if item.is_file()]
+    if not files:
+        return None
+    video_exts = {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi"}
+    media_exts = video_exts | {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
+    video_files = [item for item in files if item.suffix.lower() in video_exts]
+    if video_files:
+        video_files.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+        return video_files[0].resolve()
+    media_files = [item for item in files if item.suffix.lower() in media_exts]
+    if media_files:
+        media_files.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+        return media_files[0].resolve()
+    files.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+    return files[0].resolve()
+
+
+def _resolve_preferred_batch_input_media(*, batch_dir: Path, manifest_input_path: str = "") -> Optional[Path]:
+    """统一选择批次输入媒体：优先原始上传媒体，其次 manifest 记录。"""
+
+    manifest_candidate: Optional[Path] = None
+    manifest_text = str(manifest_input_path or "").strip()
+    if manifest_text:
+        try:
+            candidate = Path(manifest_text).expanduser().resolve()
+            if candidate.exists() and candidate.is_file():
+                manifest_candidate = candidate
+        except Exception:
+            manifest_candidate = None
+
+    uploaded_candidate = _find_uploaded_media_for_batch_dir(batch_dir)
+    if manifest_candidate and not _is_segment_slice_media_path(manifest_candidate):
+        return manifest_candidate
+    if uploaded_candidate is not None:
+        return uploaded_candidate
+    return manifest_candidate
+
+
+def _infer_incomplete_batch_task_fields(batch_dir: Path) -> Dict[str, Any]:
+    # 从中断批次的 segment manifest 里尽量回填续跑所需参数。
+    defaults: Dict[str, Any] = {
+        "filename": "",
+        "input_path": "",
+        "input_srt": None,
+        "source_lang": "auto",
+        "target_lang": "",
+        "subtitle_mode": "source",
+        "segment_minutes": DEFAULT_SEGMENT_MINUTES,
+        "min_segment_minutes": DEFAULT_MIN_SEGMENT_MINUTES,
+        "timing_mode": "strict",
+        "grouping_strategy": "sentence",
+        "source_short_merge_enabled": False,
+        "source_short_merge_threshold": DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC,
+        "translated_short_merge_enabled": False,
+        "translated_short_merge_threshold": DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC,
+        "dub_audio_leveling_enabled": True,
+        "dub_audio_leveling_target_rms": DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS,
+        "dub_audio_leveling_activity_threshold_db": DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB,
+        "dub_audio_leveling_max_gain_db": DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB,
+        "dub_audio_leveling_peak_ceiling": DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING,
+        "translate_base_url": DEFAULT_TRANSLATE_BASE_URL,
+        "translate_model": DEFAULT_TRANSLATE_MODEL,
+        "tts_backend": "index-tts",
+        "fallback_tts_backend": "none",
+        "omnivoice_root": "",
+        "omnivoice_python_bin": "",
+        "omnivoice_model": DEFAULT_OMNIVOICE_MODEL,
+        "omnivoice_device": DEFAULT_OMNIVOICE_DEVICE,
+        "omnivoice_via_api": True,
+        "omnivoice_api_url": DEFAULT_OMNIVOICE_API_URL,
+        "index_tts_api_url": DEFAULT_INDEX_TTS_API_URL,
+        "time_ranges": [],
+        "auto_pick_ranges": False,
+        "auto_pick_min_silence_sec": 0.8,
+        "auto_pick_min_speech_sec": 1.0,
+        "pipeline_version": "v1",
+        "rewrite_translation": True,
+    }
+    # 先尝试回溯原始上传媒体，避免续跑时把 segment_0001.wav 当输入媒体。
+    uploaded_media = _find_uploaded_media_for_batch_dir(batch_dir)
+    if uploaded_media is not None:
+        defaults["input_path"] = str(uploaded_media)
+        defaults["filename"] = uploaded_media.name
+
+    manifest_paths = sorted(batch_dir.glob("segment_jobs/segment_*/manifest.json"))
+    for manifest_path in manifest_paths:
+        try:
+            segment_manifest = load_segment_manifest(manifest_path)
+        except Exception:
+            continue
+        raw = segment_manifest.raw
+        input_media_path = str(segment_manifest.input_media_path or raw.get("input_media_path") or "").strip()
+        if input_media_path:
+            candidate = Path(input_media_path).expanduser().resolve()
+            if candidate.exists() and candidate.is_file():
+                # 仅当没有更可靠候选时，才使用 segment manifest 推断出的输入媒体。
+                if not defaults["input_path"]:
+                    defaults["input_path"] = str(candidate)
+                    defaults["filename"] = candidate.name
+                else:
+                    current = Path(str(defaults["input_path"])).expanduser()
+                    if _is_segment_slice_media_path(current) and not _is_segment_slice_media_path(candidate):
+                        defaults["input_path"] = str(candidate)
+                        defaults["filename"] = candidate.name
+        defaults["target_lang"] = str(raw.get("target_lang") or defaults["target_lang"])
+        defaults["source_lang"] = str(raw.get("source_lang") or defaults["source_lang"])
+        defaults["subtitle_mode"] = str(raw.get("input_srt_kind") or defaults["subtitle_mode"])
+        defaults["timing_mode"] = str(raw.get("timing_mode") or defaults["timing_mode"])
+        defaults["grouping_strategy"] = str(raw.get("grouping_strategy") or defaults["grouping_strategy"])
+        defaults["source_short_merge_enabled"] = _coerce_bool(
+            raw.get("source_short_merge_enabled"),
+            default=bool(defaults["source_short_merge_enabled"]),
+        )
+        try:
+            defaults["source_short_merge_threshold"] = int(
+                raw.get("source_short_merge_threshold") or defaults["source_short_merge_threshold"]
+            )
+        except (TypeError, ValueError):
+            pass
+        defaults["translated_short_merge_enabled"] = _coerce_bool(
+            raw.get("translated_short_merge_enabled"),
+            default=bool(defaults["translated_short_merge_enabled"]),
+        )
+        try:
+            defaults["translated_short_merge_threshold"] = int(
+                raw.get("translated_short_merge_threshold") or defaults["translated_short_merge_threshold"]
+            )
+        except (TypeError, ValueError):
+            pass
+        defaults["dub_audio_leveling_enabled"] = _coerce_bool(
+            raw.get("dub_audio_leveling_enabled"),
+            default=bool(defaults["dub_audio_leveling_enabled"]),
+        )
+        for key in (
+            "dub_audio_leveling_target_rms",
+            "dub_audio_leveling_activity_threshold_db",
+            "dub_audio_leveling_max_gain_db",
+            "dub_audio_leveling_peak_ceiling",
+        ):
+            try:
+                defaults[key] = float(raw.get(key) or defaults[key])
+            except (TypeError, ValueError):
+                pass
+        defaults["pipeline_version"] = str(raw.get("pipeline_version") or defaults["pipeline_version"])
+        defaults["rewrite_translation"] = _coerce_bool(raw.get("rewrite_translation"), default=True)
+        defaults["tts_backend"] = str(raw.get("tts_backend") or defaults["tts_backend"])
+        defaults["fallback_tts_backend"] = str(raw.get("fallback_tts_backend") or defaults["fallback_tts_backend"])
+        defaults["omnivoice_root"] = str(raw.get("omnivoice_root") or defaults["omnivoice_root"])
+        defaults["omnivoice_python_bin"] = str(raw.get("omnivoice_python_bin") or defaults["omnivoice_python_bin"])
+        defaults["omnivoice_model"] = str(raw.get("omnivoice_model") or defaults["omnivoice_model"])
+        defaults["omnivoice_device"] = str(raw.get("omnivoice_device") or defaults["omnivoice_device"])
+        defaults["omnivoice_via_api"] = _coerce_bool(raw.get("omnivoice_via_api"), default=True)
+        defaults["omnivoice_api_url"] = str(raw.get("omnivoice_api_url") or defaults["omnivoice_api_url"])
+        defaults["index_tts_api_url"] = str(raw.get("index_tts_api_url") or defaults["index_tts_api_url"])
+        break
+    return defaults
 
 
 def _artifact_url(task_id: str, key: str) -> str:
@@ -896,6 +1602,182 @@ def _ensure_index_tts_service(api_url: str) -> None:
             _check_index_tts_service(api_url)
         except HTTPException:
             raise exc
+
+
+def _check_omnivoice_service(api_url: str, timeout_sec: float = 2.0) -> None:
+    """探测 OmniVoice HTTP 服务健康状态。"""
+
+    url = api_url.rstrip("/") + "/health"
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"omnivoice service unavailable: {exc}. Run ./start_omnivoice_api.sh first.",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"omnivoice health check failed: {exc}. Run ./start_omnivoice_api.sh first.",
+        ) from exc
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        raise HTTPException(
+            status_code=503,
+            detail=f"omnivoice service unhealthy: {payload}. Run ./start_omnivoice_api.sh first.",
+        )
+
+
+def _auto_start_local_omnivoice(api_url: str) -> None:
+    """在默认本地 URL 下自动拉起 OmniVoice 服务。"""
+
+    normalized = api_url.rstrip("/")
+    if normalized != DEFAULT_OMNIVOICE_API_URL:
+        return
+    if not OMNIVOICE_START_SCRIPT.exists():
+        return
+
+    # OmniVoice 冷启动（首次 import / 环境慢盘）可能超过 120s。
+    # 允许通过环境变量调大等待上限，避免父进程超时误杀启动脚本。
+    startup_timeout_raw = str(os.environ.get("OMNIVOICE_AUTO_START_TIMEOUT_SEC", "420") or "420").strip()
+    try:
+        startup_timeout_sec = int(startup_timeout_raw)
+    except ValueError:
+        startup_timeout_sec = 420
+    startup_timeout_sec = max(60, min(1800, startup_timeout_sec))
+    env = os.environ.copy()
+    # 让 shell 启动脚本的轮询窗口和父进程超时保持一致，避免脚本过早返回失败。
+    env.setdefault("OMNIVOICE_START_WAIT_SEC", str(max(60, startup_timeout_sec - 30)))
+    try:
+        proc = subprocess.run(
+            [str(OMNIVOICE_START_SCRIPT)],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=startup_timeout_sec,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # 超时后再做一次探活：若服务实际已起来，不阻断主流程。
+        try:
+            _check_omnivoice_service(api_url, timeout_sec=2.0)
+            return
+        except HTTPException:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "omnivoice auto-start timeout after "
+                    f"{startup_timeout_sec}s. Run ./start_omnivoice_api.sh manually."
+                ),
+            ) from exc
+    if proc.returncode != 0:
+        # 脚本可能因父进程/信号退出非 0，但服务已经可用，先探活再决定是否报错。
+        try:
+            _check_omnivoice_service(api_url, timeout_sec=2.0)
+            return
+        except HTTPException:
+            pass
+        stderr = (proc.stderr or "").strip()
+        stdout = (proc.stdout or "").strip()
+        details = stderr or stdout or "unknown error"
+        raise HTTPException(
+            status_code=503,
+            detail=f"omnivoice auto-start failed: {details}. Run ./start_omnivoice_api.sh manually.",
+        )
+
+
+def _ensure_omnivoice_service(api_url: str) -> None:
+    """确保 OmniVoice API 可用：先探活，失败时尝试本地自启动。"""
+
+    try:
+        _check_omnivoice_service(api_url)
+    except HTTPException as exc:
+        _auto_start_local_omnivoice(api_url)
+        try:
+            _check_omnivoice_service(api_url)
+        except HTTPException:
+            raise exc
+
+
+def _normalize_api_base_url(api_url: str, default_url: str) -> str:
+    """统一规范 API 地址，避免 trailing slash 导致比较失效。"""
+
+    normalized = str(api_url or "").strip().rstrip("/")
+    if normalized:
+        return normalized
+    return default_url.rstrip("/")
+
+
+def _run_local_service_script(script_path: Path, *, timeout_sec: int, action_name: str) -> None:
+    """执行本地服务脚本；失败时抛出可读错误，便于前端提示。"""
+
+    if not script_path.exists():
+        return
+    proc = subprocess.run(
+        [str(script_path)],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=timeout_sec,
+    )
+    if proc.returncode == 0:
+        return
+    stderr = (proc.stderr or "").strip()
+    stdout = (proc.stdout or "").strip()
+    details = stderr or stdout or "unknown error"
+    raise HTTPException(status_code=503, detail=f"{action_name} failed: {details}")
+
+
+def _stop_index_tts_service_if_local(api_url: str) -> None:
+    """仅在本地默认 index-tts URL 时停止服务，避免误操作远端服务。"""
+
+    if _normalize_api_base_url(api_url, DEFAULT_INDEX_TTS_API_URL) != DEFAULT_INDEX_TTS_API_URL:
+        return
+    _run_local_service_script(
+        INDEX_TTS_STOP_SCRIPT,
+        timeout_sec=30,
+        action_name="index-tts stop",
+    )
+
+
+def _stop_omnivoice_service_if_local(api_url: str) -> None:
+    """仅在本地默认 OmniVoice URL 时停止服务，避免误操作远端服务。"""
+
+    if _normalize_api_base_url(api_url, DEFAULT_OMNIVOICE_API_URL) != DEFAULT_OMNIVOICE_API_URL:
+        return
+    _run_local_service_script(
+        OMNIVOICE_STOP_SCRIPT,
+        timeout_sec=30,
+        action_name="omnivoice stop",
+    )
+
+
+def _switch_tts_runtime_on_demand(
+    *,
+    tts_backend: str,
+    index_tts_api_url: str,
+    omnivoice_via_api: bool,
+    omnivoice_api_url: str,
+) -> None:
+    """懒汉式切换 TTS：先停当前模型，再按请求拉起目标模型。"""
+
+    normalized_backend = (tts_backend or "").strip().lower()
+    if normalized_backend == "index-tts":
+        # 切到 index-tts 前先释放 OmniVoice，避免双模型并驻导致内存峰值过高。
+        _stop_omnivoice_service_if_local(omnivoice_api_url)
+        _ensure_index_tts_service(index_tts_api_url)
+        return
+    if normalized_backend == "omnivoice":
+        # 切到 OmniVoice 前先释放 index-tts，保持单模型驻留。
+        _stop_index_tts_service_if_local(index_tts_api_url)
+        if omnivoice_via_api:
+            _ensure_omnivoice_service(omnivoice_api_url)
+        return
+    if normalized_backend == "qwen":
+        # qwen 不依赖本地 TTS API，顺手释放两侧服务避免占用显存/内存。
+        _stop_index_tts_service_if_local(index_tts_api_url)
+        _stop_omnivoice_service_if_local(omnivoice_api_url)
 
 
 def _build_artifacts(task_id: str, manifest_path: Path) -> List[Dict[str, str]]:
@@ -1000,6 +1882,14 @@ async def start_auto_dubbing(
     api_key: str = Form(""),
     translate_base_url: str = Form(DEFAULT_TRANSLATE_BASE_URL),
     translate_model: str = Form(DEFAULT_TRANSLATE_MODEL),
+    tts_backend: str = Form("index-tts"),
+    fallback_tts_backend: str = Form("none"),
+    omnivoice_root: str = Form(""),
+    omnivoice_python_bin: str = Form(""),
+    omnivoice_model: str = Form(DEFAULT_OMNIVOICE_MODEL),
+    omnivoice_device: str = Form(DEFAULT_OMNIVOICE_DEVICE),
+    omnivoice_via_api: str = Form("true"),
+    omnivoice_api_url: str = Form(DEFAULT_OMNIVOICE_API_URL),
     index_tts_api_url: str = Form(DEFAULT_INDEX_TTS_API_URL),
     segment_minutes: float = Form(8.0),
     min_segment_minutes: float = Form(4.0),
@@ -1007,6 +1897,8 @@ async def start_auto_dubbing(
     grouping_strategy: str = Form("sentence"),
     short_merge_enabled: str = Form("false"),
     short_merge_threshold: int = Form(DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC),
+    translated_short_merge_enabled: str = Form("false"),
+    translated_short_merge_threshold: int = Form(DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC),
     time_ranges: str = Form(""),
     auto_pick_ranges: str = Form("false"),
     auto_pick_min_silence_sec: float = Form(0.8),
@@ -1057,6 +1949,14 @@ async def start_auto_dubbing(
         api_key=api_key,
         translate_base_url=translate_base_url,
         translate_model=translate_model,
+        tts_backend=tts_backend,
+        fallback_tts_backend=fallback_tts_backend,
+        omnivoice_root=omnivoice_root,
+        omnivoice_python_bin=omnivoice_python_bin,
+        omnivoice_model=omnivoice_model,
+        omnivoice_device=omnivoice_device,
+        omnivoice_via_api=omnivoice_via_api,
+        omnivoice_api_url=omnivoice_api_url,
         index_tts_api_url=index_tts_api_url,
         segment_minutes=segment_minutes,
         min_segment_minutes=min_segment_minutes,
@@ -1064,6 +1964,8 @@ async def start_auto_dubbing(
         grouping_strategy=grouping_strategy,
         short_merge_enabled=short_merge_enabled,
         short_merge_threshold=short_merge_threshold,
+        translated_short_merge_enabled=translated_short_merge_enabled,
+        translated_short_merge_threshold=translated_short_merge_threshold,
         time_ranges=time_ranges,
         auto_pick_ranges=auto_pick_ranges,
         auto_pick_min_silence_sec=auto_pick_min_silence_sec,
@@ -1093,6 +1995,14 @@ async def start_auto_dubbing_from_project(
     api_key: str = Form(""),
     translate_base_url: str = Form(DEFAULT_TRANSLATE_BASE_URL),
     translate_model: str = Form(DEFAULT_TRANSLATE_MODEL),
+    tts_backend: str = Form("index-tts"),
+    fallback_tts_backend: str = Form("none"),
+    omnivoice_root: str = Form(""),
+    omnivoice_python_bin: str = Form(""),
+    omnivoice_model: str = Form(DEFAULT_OMNIVOICE_MODEL),
+    omnivoice_device: str = Form(DEFAULT_OMNIVOICE_DEVICE),
+    omnivoice_via_api: str = Form("true"),
+    omnivoice_api_url: str = Form(DEFAULT_OMNIVOICE_API_URL),
     index_tts_api_url: str = Form(DEFAULT_INDEX_TTS_API_URL),
     segment_minutes: float = Form(8.0),
     min_segment_minutes: float = Form(4.0),
@@ -1100,6 +2010,8 @@ async def start_auto_dubbing_from_project(
     grouping_strategy: str = Form("sentence"),
     short_merge_enabled: str = Form("false"),
     short_merge_threshold: int = Form(DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC),
+    translated_short_merge_enabled: str = Form("false"),
+    translated_short_merge_threshold: int = Form(DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC),
     time_ranges: str = Form(""),
     auto_pick_ranges: str = Form("false"),
     auto_pick_min_silence_sec: float = Form(0.8),
@@ -1129,6 +2041,14 @@ async def start_auto_dubbing_from_project(
         api_key=api_key,
         translate_base_url=translate_base_url,
         translate_model=translate_model,
+        tts_backend=tts_backend,
+        fallback_tts_backend=fallback_tts_backend,
+        omnivoice_root=omnivoice_root,
+        omnivoice_python_bin=omnivoice_python_bin,
+        omnivoice_model=omnivoice_model,
+        omnivoice_device=omnivoice_device,
+        omnivoice_via_api=omnivoice_via_api,
+        omnivoice_api_url=omnivoice_api_url,
         index_tts_api_url=index_tts_api_url,
         segment_minutes=segment_minutes,
         min_segment_minutes=min_segment_minutes,
@@ -1136,6 +2056,8 @@ async def start_auto_dubbing_from_project(
         grouping_strategy=grouping_strategy,
         short_merge_enabled=short_merge_enabled,
         short_merge_threshold=short_merge_threshold,
+        translated_short_merge_enabled=translated_short_merge_enabled,
+        translated_short_merge_threshold=translated_short_merge_threshold,
         time_ranges=time_ranges,
         auto_pick_ranges=auto_pick_ranges,
         auto_pick_min_silence_sec=auto_pick_min_silence_sec,
@@ -1160,7 +2082,77 @@ async def load_auto_dubbing_batch(batch_id: str = Form(...)):
     # 通过 longdub 文件夹名恢复历史任务状态与下载入口（页面刷新后可继续查看结果）。
     manifest_path = _find_batch_manifest_by_name(batch_id)
     if manifest_path is None:
-        raise HTTPException(status_code=404, detail="Batch folder not found")
+        batch_dir = _find_batch_dir_by_name(batch_id)
+        if batch_dir is None:
+            raise HTTPException(status_code=404, detail="Batch folder not found")
+
+        task_id = _build_readable_task_id()
+        inferred = _infer_incomplete_batch_task_fields(batch_dir)
+        task = {
+            "id": task_id,
+            "short_id": task_id.split("-")[0],
+            "status": "failed",
+            "stage": "failed",
+            "progress": 100.0,
+            "created_at": _iso_now(),
+            "updated_at": _iso_now(),
+            "source_lang": inferred["source_lang"],
+            "target_lang": inferred["target_lang"],
+            "subtitle_mode": inferred["subtitle_mode"],
+            "segment_minutes": inferred["segment_minutes"],
+            "min_segment_minutes": inferred["min_segment_minutes"],
+            "timing_mode": inferred["timing_mode"],
+            "grouping_strategy": inferred["grouping_strategy"],
+            "source_short_merge_enabled": inferred["source_short_merge_enabled"],
+            "source_short_merge_threshold": inferred["source_short_merge_threshold"],
+            "source_short_merge_threshold_mode": "seconds",
+            "translated_short_merge_enabled": inferred["translated_short_merge_enabled"],
+            "translated_short_merge_threshold": inferred["translated_short_merge_threshold"],
+            "translated_short_merge_threshold_mode": "seconds",
+            "dub_audio_leveling_enabled": inferred["dub_audio_leveling_enabled"],
+            "dub_audio_leveling_target_rms": inferred["dub_audio_leveling_target_rms"],
+            "dub_audio_leveling_activity_threshold_db": inferred["dub_audio_leveling_activity_threshold_db"],
+            "dub_audio_leveling_max_gain_db": inferred["dub_audio_leveling_max_gain_db"],
+            "dub_audio_leveling_peak_ceiling": inferred["dub_audio_leveling_peak_ceiling"],
+            "translate_base_url": inferred["translate_base_url"],
+            "translate_model": inferred["translate_model"],
+            "tts_backend": inferred["tts_backend"],
+            "fallback_tts_backend": inferred["fallback_tts_backend"],
+            "omnivoice_root": inferred["omnivoice_root"],
+            "omnivoice_python_bin": inferred["omnivoice_python_bin"],
+            "omnivoice_model": inferred["omnivoice_model"],
+            "omnivoice_device": inferred["omnivoice_device"],
+            "omnivoice_via_api": inferred["omnivoice_via_api"],
+            "omnivoice_api_url": inferred["omnivoice_api_url"],
+            "index_tts_api_url": inferred["index_tts_api_url"],
+            "time_ranges": inferred["time_ranges"],
+            "auto_pick_ranges": inferred["auto_pick_ranges"],
+            "auto_pick_min_silence_sec": inferred["auto_pick_min_silence_sec"],
+            "auto_pick_min_speech_sec": inferred["auto_pick_min_speech_sec"],
+            "pipeline_version": inferred["pipeline_version"],
+            "rewrite_translation": inferred["rewrite_translation"],
+            "processed_segments": 0,
+            "total_segments": None,
+            "manual_review_segments": 0,
+            "artifacts": [],
+            "stdout_tail": [],
+            "filename": inferred["filename"] or batch_dir.name,
+            "input_path": inferred["input_path"],
+            "input_srt": inferred["input_srt"],
+            "upload_dir": str(UPLOAD_ROOT),
+            "out_root": str(batch_dir.parent),
+            "resume_batch_dir": str(batch_dir),
+            "batch_id": batch_dir.name,
+            "batch_manifest_path": None,
+            "error": "Batch manifest missing: loaded as interrupted job. Use '从失败处继续' to resume.",
+            "command": [],
+            "process": None,
+        }
+        _task_store.create(task_id, task)
+        loaded = _task_store.get_public(task_id)
+        if not loaded:
+            raise HTTPException(status_code=500, detail="Failed to load interrupted batch")
+        return loaded
 
     task_id = _build_readable_task_id()
     task = build_loaded_batch_task(
@@ -1192,6 +2184,46 @@ async def get_auto_dubbing_status(task_id: str):
     if not task:
         raise HTTPException(status_code=404, detail="Dubbing task not found")
     return task
+
+
+@router.post("/resume/{task_id}")
+async def resume_auto_dubbing(task_id: str, api_key: str = Form("")):
+    # 失败/取消任务从既有 batch 断点续跑：复用 segment 目录与 CLI resume 机制。
+    task_copy = _task_store.get_copy(task_id)
+    if not task_copy:
+        raise HTTPException(status_code=404, detail="Dubbing task not found")
+
+    task_status = str(task_copy.get("status") or "").strip().lower()
+    if task_status not in {"failed", "cancelled"}:
+        raise HTTPException(status_code=409, detail="Only failed/cancelled tasks can be resumed")
+
+    active_ids = [active_id for active_id in _task_store.list_active_ids() if active_id != task_id]
+    if active_ids:
+        raise HTTPException(status_code=409, detail="Another auto dubbing job is already running")
+
+    resume_batch_dir = _resolve_resume_batch_dir(task_copy)
+    resume_out_root = _resolve_resume_out_root(task_copy, resume_batch_dir=resume_batch_dir)
+    input_path = _resolve_resume_input_media(task_copy, resume_batch_dir=resume_batch_dir)
+    input_srt_path = _resolve_resume_input_srt(task_copy)
+    options = _build_resume_options(
+        task=task_copy,
+        resume_batch_dir=resume_batch_dir,
+        api_key=api_key,
+        has_subtitle_input=input_srt_path is not None,
+    )
+    resumed_task_id = _build_readable_task_id()
+    response = _queue_auto_dubbing_task(
+        task_id=resumed_task_id,
+        filename=Path(str(task_copy.get("filename") or input_path.name)).name,
+        input_path=input_path,
+        input_srt_path=input_srt_path,
+        options=options,
+        resume_batch_dir=resume_batch_dir,
+        out_root_override=resume_out_root,
+    )
+    response["resumed_from_task_id"] = task_id
+    response["resume_batch_id"] = resume_batch_dir.name
+    return response
 
 
 @router.get("/review/{task_id}")
@@ -1248,7 +2280,6 @@ async def save_and_redub_review_lines(
     task_copy = _task_store.get_copy(task_id)
     if not task_copy:
         raise HTTPException(status_code=404, detail="Dubbing task not found")
-    _set_task(task_id, status="running", stage="dubbing:review_redub", progress=35.0)
 
     manifest_path = _resolve_task_manifest(task_copy)
     try:
@@ -1272,100 +2303,34 @@ async def save_and_redub_review_lines(
     updates = _filter_effective_review_updates(manifest_path, updates)
     if not updates:
         return {"status": "no_changes"}
-
-    # 将全局行号映射到 segment 局部行号，并更新段内 translated.srt。
-    mapping = _build_review_line_mapping(manifest_path)
-    segment_updates: Dict[Path, Dict[int, str]] = {}
-    for global_index, text in updates.items():
-        item = mapping.get(global_index)
-        if not item:
-            continue
-        segment_job_dir = Path(str(item["job_dir"])).expanduser().resolve()
-        local_index = int(item["local_index"])
-        segment_updates.setdefault(segment_job_dir, {})[local_index] = text
-
-    if not segment_updates:
-        return {"status": "no_changes"}
-
-    redubbed_segments = 0
-    batch_manifest = load_batch_manifest(manifest_path)
-    target_lang = str(task_copy.get("target_lang") or batch_manifest.options.target_lang)
-    index_tts_api_url = str(task_copy.get("index_tts_api_url") or batch_manifest.options.index_tts_api_url)
-    pipeline_version = str(task_copy.get("pipeline_version") or batch_manifest.options.pipeline_version)
-    rewrite_translation = _coerce_bool(
-        task_copy.get("rewrite_translation"),
-        default=batch_manifest.options.rewrite_translation,
+    _set_task(task_id, status="running", stage="dubbing:review_redub", progress=35.0)
+    return _execute_review_redub(
+        task_id=task_id,
+        task_copy=task_copy,
+        manifest_path=manifest_path,
+        text_updates=updates,
     )
-    snapshot = _create_review_redub_snapshot(manifest_path=manifest_path, segment_job_dirs=list(segment_updates.keys()))
 
-    try:
-        for segment_job_dir, local_updates in segment_updates.items():
-            translated_srt_path = segment_job_dir / "subtitles" / "translated.srt"
-            source_srt_path = segment_job_dir / "subtitles" / "source.srt"
-            dubbed_final_srt_path = segment_job_dir / "subtitles" / "dubbed_final.srt"
-            segment_manifest_path = segment_job_dir / "manifest.json"
-            if not translated_srt_path.exists() or not source_srt_path.exists() or not segment_manifest_path.exists():
-                continue
 
-            translated_items = parse_srt(translated_srt_path.read_text(encoding="utf-8"))
-            source_items = parse_srt(source_srt_path.read_text(encoding="utf-8"))
-            if not translated_items or len(translated_items) != len(source_items):
-                continue
+@router.post("/review/{task_id}/redub-failed")
+async def force_redub_failed_review_lines(task_id: str):
+    # 保持当前 translated.srt 不变，只对 missing/manual_review 候选句触发局部重配。
+    task_copy = _task_store.get_copy(task_id)
+    if not task_copy:
+        raise HTTPException(status_code=404, detail="Dubbing task not found")
 
-            for local_index, new_text in local_updates.items():
-                if 1 <= local_index <= len(translated_items):
-                    translated_items[local_index - 1]["text"] = new_text
-            translated_srt_path.write_text(format_srt(translated_items), encoding="utf-8")
-            dubbed_final_srt_path.write_text(_build_segment_bilingual_srt(source_items, translated_items), encoding="utf-8")
-
-            # 同步更新段 manifest 中的 translated_text，保持调试信息一致。
-            segment_manifest = load_segment_manifest(segment_manifest_path)
-            records = list(segment_manifest.segment_rows)
-            for local_index, new_text in local_updates.items():
-                if 1 <= local_index <= len(records):
-                    records[local_index - 1]["translated_text"] = new_text
-            segment_manifest.raw["segments"] = records
-            segment_manifest_path.write_text(json.dumps(segment_manifest.raw, ensure_ascii=False, indent=2), encoding="utf-8")
-
-            _rerun_segment_with_translated_srt(
-                segment_job_dir=segment_job_dir,
-                target_lang=target_lang,
-                index_tts_api_url=index_tts_api_url,
-                pipeline_version=pipeline_version,
-                rewrite_translation=rewrite_translation,
-                redub_local_indices=list(local_updates.keys()),
-            )
-            redubbed_segments += 1
-            # 局部进度回写：让前端状态轮询可见“重配进行中”。
-            progress = min(82.0, 35.0 + 45.0 * (redubbed_segments / max(1, len(segment_updates))))
-            _set_task(task_id, stage="dubbing:review_redub", progress=progress)
-
-        # 段内重配完成后，重拼 batch final 产物并刷新任务状态。
-        batch_dir = manifest_path.parent
-        _set_task(task_id, stage="dubbing:merging", progress=90.0)
-        rebuild = _rebuild_batch_outputs(batch_dir)
-        _complete_task_from_manifest(task_id, manifest_path)
-        written = _collect_written_batch_paths(manifest_path)
-        return {
-            "status": "saved_and_redubbed",
-            "updated_count": len(updates),
-            "redubbed_segments": redubbed_segments,
-            "written": written,
-            "rebuild": rebuild,
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        try:
-            _restore_review_redub_snapshot(snapshot)
-            _rebuild_batch_outputs(manifest_path.parent)
-        except Exception:
-            pass
-        # 失败时显式回写任务状态，避免前端“无反应/一直转圈”。
-        _set_task(task_id, status="failed", stage="failed", progress=100.0, error=str(exc))
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    finally:
-        _cleanup_review_redub_snapshot(snapshot)
+    manifest_path = _resolve_task_manifest(task_copy)
+    force_indices = set(_collect_force_redub_review_indices(manifest_path))
+    if not force_indices:
+        return {"status": "no_candidates", "forced_line_count": 0}
+    _set_task(task_id, status="running", stage="dubbing:review_redub", progress=35.0)
+    return _execute_review_redub(
+        task_id=task_id,
+        task_copy=task_copy,
+        manifest_path=manifest_path,
+        text_updates={},
+        force_global_indices=force_indices,
+    )
 
 
 @router.post("/cancel/{task_id}")
@@ -1394,8 +2359,12 @@ def _resolve_artifact(task: Dict[str, Any], artifact: str) -> Path:
     manifest_path = Path(manifest_path_text).resolve()
     manifest = load_batch_manifest(manifest_path)
     paths = manifest.paths
+    resolved_input_media = _resolve_preferred_batch_input_media(
+        batch_dir=manifest_path.parent,
+        manifest_input_path=manifest.input_media_path,
+    )
     key_to_path = {
-        "input_media": manifest.input_media_path,
+        "input_media": str(resolved_input_media) if resolved_input_media is not None else manifest.input_media_path,
         "preferred_audio": paths.get("preferred_audio"),
         "mix": paths.get("dubbed_mix_full"),
         "vocals": paths.get("dubbed_vocals_full"),
@@ -1455,6 +2424,8 @@ def _collect_review_lines(manifest_path: Path) -> List[Dict[str, Any]]:
         for row in segment_manifest.segment_rows:
             start_local = float(row.get("start_sec", 0.0) or 0.0)
             end_local = float(row.get("end_sec", start_local) or start_local)
+            tts_audio_path = str(row.get("tts_audio_path") or "")
+            needs_force_redub = _segment_row_needs_force_redub(row)
             lines.append(
                 {
                     "index": line_index,
@@ -1467,6 +2438,9 @@ def _collect_review_lines(manifest_path: Path) -> List[Dict[str, Any]]:
                     "duration_error_ratio": row.get("duration_error_ratio"),
                     "prosody_distance": row.get("prosody_distance"),
                     "selection_score": row.get("selection_score"),
+                    "tts_audio_path": tts_audio_path,
+                    "tts_audio_missing": tts_audio_path.endswith("_missing.wav"),
+                    "needs_force_redub": needs_force_redub,
                 }
             )
             line_index += 1
@@ -1504,6 +2478,42 @@ def _collect_review_lines(manifest_path: Path) -> List[Dict[str, Any]]:
             pass
 
     return lines
+
+
+def _segment_row_needs_force_redub(row: Dict[str, Any]) -> bool:
+    # 判断该行是否属于“保留现有译文也应该强制重配”的候选。
+    status = str(row.get("status") or "").strip().lower()
+    tts_audio_path_text = str(row.get("tts_audio_path") or "").strip()
+    if tts_audio_path_text.endswith("_missing.wav"):
+        return True
+    if status == "failed":
+        return True
+    if status != "manual_review":
+        return False
+    if not tts_audio_path_text:
+        return True
+    try:
+        return not Path(tts_audio_path_text).expanduser().exists()
+    except Exception:
+        return True
+
+
+def _collect_force_redub_review_indices(manifest_path: Path) -> List[int]:
+    # 从 batch/segment manifest 中找出需要“原文不变重配”的全局行号。
+    batch_manifest = load_batch_manifest(manifest_path)
+    indices: List[int] = []
+    global_index = 1
+    for segment in batch_manifest.segments:
+        job_dir = Path(str(segment.get("job_dir") or "")).expanduser()
+        segment_manifest_path = job_dir / "manifest.json"
+        if not segment_manifest_path.exists():
+            continue
+        segment_manifest = load_segment_manifest(segment_manifest_path)
+        for row in segment_manifest.segment_rows:
+            if _segment_row_needs_force_redub(row):
+                indices.append(global_index)
+            global_index += 1
+    return indices
 
 
 def _persist_review_lines(manifest_path: Path, updates: Dict[int, str]) -> Dict[str, Optional[str]]:
@@ -1613,6 +2623,163 @@ def _build_segment_bilingual_srt(source_items: List[Dict[str, Any]], translated_
     return format_srt(merged)
 
 
+def _build_segment_review_redub_plan(
+    manifest_path: Path,
+    *,
+    text_updates: Dict[int, str],
+    force_global_indices: Optional[set[int]],
+) -> Dict[Path, Dict[str, Any]]:
+    # 把全局行号映射成段内计划，统一服务“改文案重配”和“强制重配失败句”两种入口。
+    mapping = _build_review_line_mapping(manifest_path)
+    segment_updates: Dict[Path, Dict[str, Any]] = {}
+
+    for global_index, text in text_updates.items():
+        item = mapping.get(global_index)
+        if not item:
+            continue
+        segment_job_dir = Path(str(item["job_dir"])).expanduser().resolve()
+        local_index = int(item["local_index"])
+        entry = segment_updates.setdefault(segment_job_dir, {"text_updates": {}, "redub_local_indices": set()})
+        entry["text_updates"][local_index] = text
+        entry["redub_local_indices"].add(local_index)
+
+    for global_index in sorted(force_global_indices or set()):
+        item = mapping.get(global_index)
+        if not item:
+            continue
+        segment_job_dir = Path(str(item["job_dir"])).expanduser().resolve()
+        local_index = int(item["local_index"])
+        entry = segment_updates.setdefault(segment_job_dir, {"text_updates": {}, "redub_local_indices": set()})
+        entry["redub_local_indices"].add(local_index)
+
+    return segment_updates
+
+
+def _execute_review_redub(
+    *,
+    task_id: str,
+    task_copy: Dict[str, Any],
+    manifest_path: Path,
+    text_updates: Dict[int, str],
+    force_global_indices: Optional[set[int]] = None,
+) -> Dict[str, Any]:
+    # 统一执行 review redub 事务：可选改字幕文本，也可只重跑失败句。
+    segment_updates = _build_segment_review_redub_plan(
+        manifest_path,
+        text_updates=text_updates,
+        force_global_indices=force_global_indices,
+    )
+    if not segment_updates:
+        return {"status": "no_candidates" if force_global_indices else "no_changes"}
+
+    redubbed_segments = 0
+    batch_manifest = load_batch_manifest(manifest_path)
+    target_lang = str(task_copy.get("target_lang") or batch_manifest.options.target_lang)
+    index_tts_api_url = str(task_copy.get("index_tts_api_url") or batch_manifest.options.index_tts_api_url)
+    fallback_tts_backend = str(task_copy.get("fallback_tts_backend") or batch_manifest.options.fallback_tts_backend or "none")
+    omnivoice_root = str(task_copy.get("omnivoice_root") or batch_manifest.options.omnivoice_root or "")
+    omnivoice_python_bin = str(
+        task_copy.get("omnivoice_python_bin") or batch_manifest.options.omnivoice_python_bin or ""
+    )
+    omnivoice_model = str(task_copy.get("omnivoice_model") or batch_manifest.options.omnivoice_model or "")
+    omnivoice_device = str(task_copy.get("omnivoice_device") or batch_manifest.options.omnivoice_device or "auto")
+    omnivoice_via_api = _coerce_bool(
+        task_copy.get("omnivoice_via_api"),
+        default=batch_manifest.options.omnivoice_via_api,
+    )
+    omnivoice_api_url = str(
+        task_copy.get("omnivoice_api_url")
+        or batch_manifest.options.omnivoice_api_url
+        or DEFAULT_OMNIVOICE_API_URL
+    )
+    pipeline_version = str(task_copy.get("pipeline_version") or batch_manifest.options.pipeline_version)
+    rewrite_translation = _coerce_bool(
+        task_copy.get("rewrite_translation"),
+        default=batch_manifest.options.rewrite_translation,
+    )
+    snapshot = _create_review_redub_snapshot(manifest_path=manifest_path, segment_job_dirs=list(segment_updates.keys()))
+
+    try:
+        for segment_job_dir, plan in segment_updates.items():
+            local_updates = dict(plan.get("text_updates") or {})
+            redub_local_indices = sorted(int(index) for index in set(plan.get("redub_local_indices") or set()))
+            translated_srt_path = segment_job_dir / "subtitles" / "translated.srt"
+            source_srt_path = segment_job_dir / "subtitles" / "source.srt"
+            dubbed_final_srt_path = segment_job_dir / "subtitles" / "dubbed_final.srt"
+            segment_manifest_path = segment_job_dir / "manifest.json"
+            if not translated_srt_path.exists() or not source_srt_path.exists() or not segment_manifest_path.exists():
+                continue
+
+            translated_items = parse_srt(translated_srt_path.read_text(encoding="utf-8"))
+            source_items = parse_srt(source_srt_path.read_text(encoding="utf-8"))
+            if not translated_items or len(translated_items) != len(source_items):
+                continue
+
+            for local_index, new_text in local_updates.items():
+                if 1 <= local_index <= len(translated_items):
+                    translated_items[local_index - 1]["text"] = new_text
+            if local_updates:
+                translated_srt_path.write_text(format_srt(translated_items), encoding="utf-8")
+                dubbed_final_srt_path.write_text(_build_segment_bilingual_srt(source_items, translated_items), encoding="utf-8")
+
+                # 同步更新段 manifest 中的 translated_text，保持调试信息一致。
+                segment_manifest = load_segment_manifest(segment_manifest_path)
+                records = list(segment_manifest.segment_rows)
+                for local_index, new_text in local_updates.items():
+                    if 1 <= local_index <= len(records):
+                        records[local_index - 1]["translated_text"] = new_text
+                segment_manifest.raw["segments"] = records
+                manifest_paths = dict(segment_manifest.raw.get("paths") or {})
+                manifest_paths["translated_srt"] = str(translated_srt_path.resolve())
+                manifest_paths["dubbed_final_srt"] = str(dubbed_final_srt_path.resolve())
+                segment_manifest.raw["paths"] = manifest_paths
+                write_manifest_json(segment_manifest_path, segment_manifest.raw)
+
+            _rerun_segment_with_translated_srt(
+                segment_job_dir=segment_job_dir,
+                target_lang=target_lang,
+                index_tts_api_url=index_tts_api_url,
+                pipeline_version=pipeline_version,
+                rewrite_translation=rewrite_translation,
+                redub_local_indices=redub_local_indices,
+                fallback_tts_backend=fallback_tts_backend,
+                omnivoice_root=omnivoice_root,
+                omnivoice_python_bin=omnivoice_python_bin,
+                omnivoice_model=omnivoice_model,
+                omnivoice_device=omnivoice_device,
+                omnivoice_via_api=omnivoice_via_api,
+                omnivoice_api_url=omnivoice_api_url,
+            )
+            redubbed_segments += 1
+            # 局部进度回写：让前端状态轮询可见“重配进行中”。
+            progress = min(82.0, 35.0 + 45.0 * (redubbed_segments / max(1, len(segment_updates))))
+            _set_task(task_id, stage="dubbing:review_redub", progress=progress)
+
+        # 段内重配完成后，重拼 batch final 产物并刷新任务状态。
+        batch_dir = manifest_path.parent
+        _set_task(task_id, stage="dubbing:merging", progress=90.0)
+        _rebuild_batch_outputs(batch_dir)
+        _complete_task_from_manifest(task_id, manifest_path)
+        written = _collect_written_batch_paths(manifest_path)
+        return {
+            "status": "saved_and_redubbed" if text_updates else "forced_redubbed",
+            "updated_count": len(text_updates),
+            "forced_line_count": len(force_global_indices or set()),
+            "redubbed_segments": redubbed_segments,
+            "written": written,
+        }
+    except Exception as exc:
+        try:
+            _restore_review_redub_snapshot(snapshot)
+            _rebuild_batch_outputs(manifest_path.parent)
+        except Exception:
+            pass
+        _set_task(task_id, status="failed", stage="failed", progress=100.0, error=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        _cleanup_review_redub_snapshot(snapshot)
+
+
 def _compact_process_error_output(stdout: str, stderr: str, *, keep_lines: int = 120) -> str:
     # 提炼子进程错误：合并 stdout/stderr，过滤 flash-attn 噪音，保留尾部关键上下文。
     noise_markers = ("Warning: flash-attn is not installed",)
@@ -1717,6 +2884,13 @@ def _rerun_segment_with_translated_srt(
     pipeline_version: str,
     rewrite_translation: bool,
     redub_local_indices: List[int],
+    fallback_tts_backend: str = "none",
+    omnivoice_root: str = "",
+    omnivoice_python_bin: str = "",
+    omnivoice_model: str = "",
+    omnivoice_device: str = "auto",
+    omnivoice_via_api: bool = True,
+    omnivoice_api_url: str = DEFAULT_OMNIVOICE_API_URL,
 ) -> None:
     # 仅重跑单个 segment（跳过 ASR/翻译），实现局部重配而非全量重跑。
     segment_manifest_path = segment_job_dir / "manifest.json"
@@ -1731,6 +2905,19 @@ def _rerun_segment_with_translated_srt(
         fallback_pipeline_version=pipeline_version,
         fallback_rewrite_translation=rewrite_translation,
         fallback_index_tts_api_url=index_tts_api_url,
+        fallback_tts_backend=fallback_tts_backend,
+        fallback_omnivoice_root=omnivoice_root,
+        fallback_omnivoice_python_bin=omnivoice_python_bin,
+        fallback_omnivoice_model=omnivoice_model,
+        fallback_omnivoice_device=omnivoice_device,
+        fallback_omnivoice_via_api=omnivoice_via_api,
+        fallback_omnivoice_api_url=omnivoice_api_url,
+    )
+    _switch_tts_runtime_on_demand(
+        tts_backend=runtime_options.tts_backend,
+        index_tts_api_url=runtime_options.index_tts_api_url,
+        omnivoice_via_api=runtime_options.omnivoice_via_api,
+        omnivoice_api_url=runtime_options.omnivoice_api_url,
     )
 
     translated_srt = segment_job_dir / "subtitles" / "translated.srt"
@@ -1747,6 +2934,13 @@ def _rerun_segment_with_translated_srt(
             target_lang=target_lang or "Chinese",
             translated_srt=translated_srt,
             index_tts_api_url=runtime_options.index_tts_api_url,
+            fallback_tts_backend=runtime_options.fallback_tts_backend,
+            omnivoice_root=runtime_options.omnivoice_root,
+            omnivoice_python_bin=runtime_options.omnivoice_python_bin,
+            omnivoice_model=runtime_options.omnivoice_model,
+            omnivoice_device=runtime_options.omnivoice_device,
+            omnivoice_via_api=runtime_options.omnivoice_via_api,
+            omnivoice_api_url=runtime_options.omnivoice_api_url,
             pipeline_version=runtime_options.pipeline_version,
             rewrite_translation=runtime_options.rewrite_translation,
             grouped_synthesis=runtime_options.grouped_synthesis,

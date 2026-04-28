@@ -59,6 +59,14 @@ class JobRecoveryTests(unittest.TestCase):
                     "source_short_merge_enabled": True,
                     "source_short_merge_threshold": 12,
                     "source_short_merge_threshold_mode": "seconds",
+                    "translated_short_merge_enabled": True,
+                    "translated_short_merge_threshold": 10,
+                    "translated_short_merge_threshold_mode": "seconds",
+                    "dub_audio_leveling_enabled": True,
+                    "dub_audio_leveling_target_rms": 0.12,
+                    "dub_audio_leveling_activity_threshold_db": -35.0,
+                    "dub_audio_leveling_max_gain_db": 8.0,
+                    "dub_audio_leveling_peak_ceiling": 0.95,
                     "input_srt_kind": "translated",
                     "index_tts_api_url": "http://127.0.0.1:8011",
                     "auto_pick_ranges": True,
@@ -90,6 +98,13 @@ class JobRecoveryTests(unittest.TestCase):
         self.assertEqual(updates["grouping_strategy"], "legacy")
         self.assertTrue(updates["source_short_merge_enabled"])
         self.assertEqual(updates["source_short_merge_threshold"], 12)
+        self.assertTrue(updates["translated_short_merge_enabled"])
+        self.assertEqual(updates["translated_short_merge_threshold"], 10)
+        self.assertTrue(updates["dub_audio_leveling_enabled"])
+        self.assertEqual(updates["dub_audio_leveling_target_rms"], 0.12)
+        self.assertEqual(updates["dub_audio_leveling_activity_threshold_db"], -35.0)
+        self.assertEqual(updates["dub_audio_leveling_max_gain_db"], 8.0)
+        self.assertEqual(updates["dub_audio_leveling_peak_ceiling"], 0.95)
         self.assertEqual(updates["subtitle_mode"], "translated")
         self.assertEqual(updates["index_tts_api_url"], "http://127.0.0.1:8011")
         self.assertTrue(updates["auto_pick_ranges"])

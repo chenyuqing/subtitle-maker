@@ -11,6 +11,7 @@ from .recovery import (
     build_batch_artifacts,
     build_batch_task_updates,
     build_loaded_batch_task,
+    find_batch_dir_by_name,
     find_batch_manifest_by_name,
     list_available_batches,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "build_auto_dubbing_command",
     "build_loaded_batch_task",
     "build_segment_redub_command",
+    "find_batch_dir_by_name",
     "find_batch_manifest_by_name",
     "list_available_batches",
 ]
