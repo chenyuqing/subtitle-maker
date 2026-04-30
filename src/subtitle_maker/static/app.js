@@ -84,6 +84,8 @@ function setVideoSourceWithFallback(primaryUrl, fallbackUrl = '') {
     }
 }
 
+// 统一把左侧 ORIGINAL 字幕框高度对齐到右侧 Translation 编辑区（不包含 Export 区）。
+// 通过运行时测量并写入内联高度，规避不同浏览器在 grid/flex auto 尺寸上的差异。
 // 处理播放器加载失败：先尝试回退到本地源，仍失败时明确提示用户。
 function setupVideoPlaybackFallback() {
     if (!videoPlayer) return;

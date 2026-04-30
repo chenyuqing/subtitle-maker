@@ -10,7 +10,12 @@ from typing import Dict, List, Optional
 
 from fastapi.templating import Jinja2Templates
 
-from subtitle_maker.transcriber import SubtitleGenerator, format_srt
+from subtitle_maker.transcriber import (
+    SubtitleGenerator,
+    format_srt,
+    merge_chunk_subtitles,
+    normalize_subtitle_timeline,
+)
 
 
 logging.basicConfig(level=logging.INFO)
@@ -145,7 +150,11 @@ def transcribe_task(
                     return
 
                 chunk_subtitles = gen.generate_subtitles(chunk_results, max_len=max_width)
-                tasks[task_id]["subtitles"].extend(chunk_subtitles)
+                # 在 chunk 边界先做轻量去重拼接，避免首尾重复行直接写入任务态。
+                tasks[task_id]["subtitles"] = merge_chunk_subtitles(
+                    tasks[task_id]["subtitles"],
+                    chunk_subtitles,
+                )
                 tasks[task_id]["processed_chunks"] += 1
                 tasks[task_id]["generated_lines"] = len(tasks[task_id]["subtitles"])
 
@@ -165,10 +174,10 @@ def transcribe_task(
                 )
                 all_subtitles = existing_subtitles + new_subtitles
                 all_subtitles.sort(key=lambda item: item.get("start", 0))
-                subtitles = all_subtitles
+                subtitles = normalize_subtitle_timeline(all_subtitles)
                 logger.info("Task %s: Total after merge: %s subtitles", task_id, len(subtitles))
             else:
-                subtitles = new_subtitles
+                subtitles = normalize_subtitle_timeline(new_subtitles)
 
             srt_content = format_srt(subtitles)
             base_name = os.path.basename(file_path)

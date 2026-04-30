@@ -1,5 +1,48 @@
 # TODO
 
+## TODO（2026-04-30 ASR 可读性 V2 调优）
+- [x] `normalize_subtitle_timeline` 增加节奏归一：短句并入（<2s）、长句拆分（>6s）
+- [x] 增加句首弱词/句首孤立标点修复，减少 “and/that/is” 起句与标点起句
+- [x] `format_srt` 增加 42 字符换行器（优先 1~2 行），并确保不截断文本
+- [x] 扩展 `tests/test_transcriber_asr_layout.py` 覆盖新规则
+- [x] 产出样本对比文件 `64e5f172-...v2.srt` 供听感与可读性复核
+- [x] 归档本轮计划到 `docs/plans/0003-asr-v2-readability-2026-04-30.md`
+
+## Review（2026-04-30 ASR 可读性 V2 调优）
+- 代码落点：
+  - [src/subtitle_maker/transcriber.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/transcriber.py)  
+    新增句首弱词判定、句首标点清洗、长句拆分、42 字符换行与无截断约束；
+  - [tests/test_transcriber_asr_layout.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_transcriber_asr_layout.py)  
+    新增 4 条回归用例覆盖“弱词起句/长句拆分/标点修复/行宽换行”。
+- 样本验证（`64e5f172-...srt`）：
+  - 原始：`lt2=79`, `gt6=153`, `leading_punct=230`, `line_gt42=409`, `start_conn=130`
+  - 新版：`lt2=24`, `gt6=11`, `leading_punct=0`, `line_gt42=136`, `start_conn=85`
+  - 输出文件：[64e5f172-1cd4-4e1d-a3b2-bed953c6e990.v2.srt](/Users/tim/Downloads/64e5f172-1cd4-4e1d-a3b2-bed953c6e990.v2.srt)
+- 验证证据：
+  - `uv run python -m py_compile src/subtitle_maker/transcriber.py tests/test_transcriber_asr_layout.py`
+  - `uv run python -m unittest tests.test_transcriber_asr_layout`
+  - `uv run python -m unittest tests.test_web_routes_legacy`
+
+## TODO（2026-04-30 ASR 前置修复 + 计划归档编号）
+- [x] ASR 前置切分从词级改为句级优先（标点/长停顿/连接词尾保护/最小可读单元）
+- [x] `transcribe` chunk 拼接改为边界去重合并，消除首尾重复与时间交叉
+- [x] 写 SRT 前增加轻量时间轴兜底（排序、去空、overlap clamp、极短孤立片段并句）
+- [x] 新增 `tests/test_transcriber_asr_layout.py` 并跑通 ASR 布局相关回归
+- [x] 建立 `docs/plans/` 编号归档，并落盘本次方案 `0001-asr-pre-fix-2026-04-30.md`
+
+## Review（2026-04-30 ASR 前置修复 + 计划归档编号）
+- 代码落点：
+  - 句级分句与规则常量、边界去重、时间轴轻兜底已在 [src/subtitle_maker/transcriber.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/transcriber.py) 落地；
+  - `transcribe_task()` 的 chunk 合并改为 `merge_chunk_subtitles(...)`，最终落盘前执行 `normalize_subtitle_timeline(...)`，见 [src/subtitle_maker/app/legacy_runtime.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/app/legacy_runtime.py)；
+  - 新增单测文件 [tests/test_transcriber_asr_layout.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_transcriber_asr_layout.py) 覆盖“重叠、碎片、连接词断裂、chunk 边界重复”。
+- 计划归档：
+  - 新增目录 [docs/plans/](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/docs/plans/)；
+  - 本次方案已归档到 [docs/plans/0001-asr-pre-fix-2026-04-30.md](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/docs/plans/0001-asr-pre-fix-2026-04-30.md)。
+- 验证证据：
+  - `uv run python -m py_compile src/subtitle_maker/transcriber.py src/subtitle_maker/app/legacy_runtime.py tests/test_transcriber_asr_layout.py`
+  - `uv run python -m unittest tests.test_transcriber_asr_layout`
+  - `uv run python -m unittest tests.test_web_routes_legacy`
+
 ## TODO（2026-04-30 Sidebar Logo 重做 + 上传入口合并）
 - [x] 左侧栏 Logo 区改为导航式左对齐（图标左 + `Subtitle/Maker` 两行右），移除 96x96 方块占位
 - [x] 折叠态宽度收敛到数字导航同级（约 64px），仅保留小图标与紧凑折叠按钮

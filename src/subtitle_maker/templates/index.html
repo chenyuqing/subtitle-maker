@@ -855,12 +855,12 @@
                         <h2>✏️ Editor & Translation</h2>
                         <div id="transcription-timer" style="color: var(--text-muted); font-size: 0.9em; margin-bottom: 10px;"></div>
                         <div class="subtitle-editor">
-                            <div class="subtitle-column">
+                            <div class="subtitle-column subtitle-column-original">
                                 <h3>Original</h3>
                                 <div id="original-subtitles" class="subtitle-display"></div>
                                 <a id="download-original" class="download-link" style="display:none">Download SRT</a>
                             </div>
-                            <div class="subtitle-column">
+                            <div class="subtitle-column translation-workspace">
                                 <h3>Translation</h3>
                                 <div class="trans-controls-stack">
                                     <select id="model-provider" style="flex: 1;">
@@ -881,36 +881,37 @@
                                 </div>
                                 <button id="translate-btn" class="secondary-btn" disabled>Translate</button>
                                 <div id="translated-subtitles" class="subtitle-display"></div>
+                            </div>
+                        </div>
 
-                                <div class="export-section">
-                                    <h3>Export Final</h3>
-                                    <div class="row">
-                                        <select id="export-format">
-                                            <option value="original">Original Only</option>
-                                            <option value="translated">Translation Only</option>
-                                            <option value="bilingual_orig_trans">Original + Translation</option>
-                                            <option value="bilingual_trans_orig">Translation + Original</option>
-                                        </select>
-                                        <button id="export-btn" class="primary-btn" type="button" disabled>Download</button>
-                                    </div>
+                        <div class="subtitle-export-stack">
+                            <div class="export-section">
+                                <h3>Export Final</h3>
+                                <div class="row">
+                                    <select id="export-format">
+                                        <option value="original">Original Only</option>
+                                        <option value="translated">Translation Only</option>
+                                        <option value="bilingual_orig_trans">Original + Translation</option>
+                                        <option value="bilingual_trans_orig">Translation + Original</option>
+                                    </select>
+                                    <button id="export-btn" class="primary-btn" type="button" disabled>Download</button>
                                 </div>
+                            </div>
 
-                                <div class="export-section"
-                                    style="margin-top: 20px; border-top: 1px solid var(--border-light); padding-top: 15px;">
-                                    <h3>Export Audio Segments</h3>
-                                    <p style="font-size: 0.8em; color: var(--text-muted); margin-bottom: 10px;">
-                                        Export individual WAV files aligned with subtitles. Useful for TTS training.
-                                    </p>
-                                    <div class="row" style="align-items: center;">
-                                        <div class="input-group" style="margin-bottom: 0; margin-right: 10px; flex: 1;">
-                                            <label for="seg-max-duration" style="font-size: 0.8em;">Max Duration
-                                                (sec)</label>
-                                            <input type="number" id="seg-max-duration" value="30" min="1" max="300"
-                                                step="1">
-                                        </div>
-                                        <button id="export-segments-btn" class="secondary-btn" type="button" style="flex: 1;"
-                                            disabled>Export ZIP</button>
+                            <div class="export-section subtitle-export-audio">
+                                <h3>Export Audio Segments</h3>
+                                <p style="font-size: 0.8em; color: var(--text-muted); margin-bottom: 10px;">
+                                    Export individual WAV files aligned with subtitles. Useful for TTS training.
+                                </p>
+                                <div class="row" style="align-items: center;">
+                                    <div class="input-group" style="margin-bottom: 0; margin-right: 10px; flex: 1;">
+                                        <label for="seg-max-duration" style="font-size: 0.8em;">Max Duration
+                                            (sec)</label>
+                                        <input type="number" id="seg-max-duration" value="30" min="1" max="300"
+                                            step="1">
                                     </div>
+                                    <button id="export-segments-btn" class="secondary-btn" type="button" style="flex: 1;"
+                                        disabled>Export ZIP</button>
                                 </div>
                             </div>
                         </div>

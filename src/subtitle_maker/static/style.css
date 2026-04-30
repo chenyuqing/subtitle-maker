@@ -1683,6 +1683,7 @@ textarea::placeholder {
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: var(--space-lg);
+    align-items: stretch;
 }
 
 .subtitle-column {
@@ -1691,11 +1692,25 @@ textarea::placeholder {
     gap: var(--space-sm);
 }
 
+.subtitle-export-stack {
+    margin-top: var(--space-lg);
+}
+
+.subtitle-export-stack .export-section {
+    margin-top: 0;
+}
+
+.subtitle-export-stack .export-section + .export-section {
+    margin-top: 20px;
+    border-top: 1px solid var(--border-light);
+    padding-top: 15px;
+}
+
 .subtitle-display {
     background: var(--bg-primary);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
-    height: 380px;
+    height: 500px;
     overflow-y: auto;
     padding: var(--space-md);
     font-size: 0.9rem;
