@@ -27,6 +27,7 @@ from subtitle_maker.core.ffmpeg import (
     run_cmd_stream as run_cmd_stream_impl,
 )
 from subtitle_maker.domains.media import (
+    build_dubbed_video_two_step as build_dubbed_video_two_step_impl,
     build_full_timeline_bgm as build_full_timeline_bgm_impl,
     build_full_timeline_mix as build_full_timeline_mix_impl,
     build_full_timeline_vocals as build_full_timeline_vocals_impl,
@@ -256,6 +257,24 @@ def concat_wav_files(inputs: List[Path], output_wav: Path) -> None:
 def mix_vocals_with_bgm(*, vocals_wav: Path, bgm_wav: Path, output_wav: Path) -> None:
     """兼容旧入口：长视频全时轴场景的固定采样率混音封装。"""
     return mix_vocals_with_bgm_impl(vocals_wav=vocals_wav, bgm_wav=bgm_wav, output_wav=output_wav)
+
+
+def build_dubbed_video_two_step(
+    *,
+    input_media_path: Path,
+    preferred_audio_path: Optional[Path],
+    output_video_path: Path,
+    output_audio_path: Path,
+    target_duration_sec: Optional[float],
+) -> Dict[str, Any]:
+    """兼容旧入口：执行配音后处理 two-step，输出最终配音视频。"""
+    return build_dubbed_video_two_step_impl(
+        input_media_path=input_media_path,
+        preferred_audio_path=preferred_audio_path,
+        output_video_path=output_video_path,
+        output_audio_path=output_audio_path,
+        target_duration_sec=target_duration_sec,
+    )
 
 
 def _load_mono_audio(path: Path) -> Tuple[np.ndarray, int]:
@@ -1252,6 +1271,31 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         preferred_audio = merged_mix or merged_vocals
 
+    dubbed_video_full: Optional[Path] = None
+    dubbed_audio_for_video: Optional[Path] = None
+    print("Step 6/6: postprocess dubbed video")
+    video_postprocess = build_dubbed_video_two_step(
+        input_media_path=input_media,
+        preferred_audio_path=preferred_audio,
+        output_video_path=final_dir / "dubbed_video_full.mp4",
+        output_audio_path=final_dir / "dubbed_audio_for_video.m4a",
+        target_duration_sec=ffprobe_duration(input_media),
+    )
+    if str(video_postprocess.get("status") or "").strip().lower() == "done":
+        dubbed_video_full = Path(str(video_postprocess.get("output_video_path") or "")).expanduser().resolve()
+        dubbed_audio_for_video = Path(str(video_postprocess.get("output_audio_path") or "")).expanduser().resolve()
+        print(
+            "video_postprocess_done: "
+            f"mux_mode={video_postprocess.get('mux_mode')} "
+            f"duration_sec={video_postprocess.get('duration_sec')} "
+            f"video={dubbed_video_full}"
+        )
+    else:
+        print(
+            "video_postprocess_skipped: "
+            f"reason={video_postprocess.get('reason', 'unknown')}"
+        )
+
     batch_options = BatchReplayOptions(
         target_lang=args.target_lang,
         pipeline_version="v2" if v2_mode else "v1",
@@ -1299,6 +1343,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         merged_mix=merged_mix,
         merged_bgm=merged_bgm,
         final_dir=final_dir,
+        dubbed_audio_for_video=dubbed_audio_for_video,
+        dubbed_video_full=dubbed_video_full,
         segments=[
             {
                 "index": item.index,

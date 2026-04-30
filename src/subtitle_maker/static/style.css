@@ -17,7 +17,19 @@
 
     /* Layout */
     --sidebar-width: 280px;
-    --sidebar-collapsed-width: 72px;
+    --sidebar-toggle-size: 28px;
+    --sidebar-collapsed-side-padding: 5px;
+    --sidebar-collapsed-logo-size: 22px;
+    --sidebar-collapsed-toggle-size: 28px;
+    --sidebar-collapsed-gap: 2px;
+    /* 折叠态目标宽度约 64px，和左侧步骤数字栏同量级。 */
+    --sidebar-collapsed-width: calc(
+        (var(--sidebar-collapsed-side-padding) * 2) +
+        var(--sidebar-collapsed-logo-size) +
+        var(--sidebar-collapsed-gap) +
+        var(--sidebar-collapsed-toggle-size) +
+        2px
+    );
     --header-height: 64px;
     --radius-sm: 6px;
     --radius-md: 10px;
@@ -122,40 +134,65 @@ body {
 }
 
 .logo-area {
-    padding: var(--space-lg);
+    padding: 12px 14px;
     border-bottom: 1px solid var(--border);
     position: relative;
 }
 
 .logo-head {
+    /* 展开态改为导航式左对齐，右上角按钮独立定位，不干扰品牌视觉重心。 */
     display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: var(--space-sm);
+    align-items: center;
+    justify-content: flex-start;
+    min-height: 40px;
+    padding-right: 36px;
 }
 
-.logo-copy {
+.logo-link {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 5px;
+    width: auto;
+    height: auto;
+    text-decoration: none;
+    color: inherit;
     min-width: 0;
 }
 
-.logo-area h1 {
-    font-size: 1.4rem;
-    font-weight: 600;
-    margin: 0;
-    color: var(--text-primary);
-    letter-spacing: -0.02em;
+.logo-image {
+    width: 40px;
+    height: 40px;
+    object-fit: contain;
+    flex-shrink: 0;
 }
 
-.logo-area p {
-    margin: var(--space-xs) 0 0;
-    color: var(--text-muted);
+.logo-title {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0;
+    width: auto;
     font-size: 0.8rem;
-    font-weight: 400;
+    font-weight: 600;
+    color: var(--text-primary);
+    letter-spacing: 0.015em;
+    line-height: 1.02;
+    text-align: left;
+    white-space: normal;
+}
+
+.logo-title-line {
+    display: block;
 }
 
 .sidebar-toggle-btn {
-    width: 34px;
-    height: 34px;
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    width: var(--sidebar-toggle-size);
+    height: var(--sidebar-toggle-size);
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     background: var(--surface);
@@ -407,17 +444,36 @@ body {
     }
 
     .app-layout.sidebar-collapsed .logo-area {
-        padding: 12px 10px;
+        padding: 8px var(--sidebar-collapsed-side-padding);
     }
 
     .app-layout.sidebar-collapsed .logo-head {
-        justify-content: center;
+        min-height: var(--sidebar-collapsed-logo-size);
+        padding-right: var(--sidebar-collapsed-toggle-size);
     }
 
-    .app-layout.sidebar-collapsed .logo-copy,
+    .app-layout.sidebar-collapsed .logo-title,
     .app-layout.sidebar-collapsed .nav-label,
     .app-layout.sidebar-collapsed .sidebar-footer {
         display: none;
+    }
+
+    .app-layout.sidebar-collapsed .logo-link {
+        gap: 0;
+        width: auto;
+        height: auto;
+    }
+
+    .app-layout.sidebar-collapsed .logo-image {
+        width: var(--sidebar-collapsed-logo-size);
+        height: var(--sidebar-collapsed-logo-size);
+    }
+
+    .app-layout.sidebar-collapsed .sidebar-toggle-btn {
+        top: 6px;
+        right: var(--sidebar-collapsed-side-padding);
+        width: var(--sidebar-collapsed-toggle-size);
+        height: var(--sidebar-collapsed-toggle-size);
     }
 
     .app-layout.sidebar-collapsed .nav-item {
@@ -858,6 +914,20 @@ body.panel-select-open #panel-results {
     margin-bottom: var(--space-md);
 }
 
+.upload-dual-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--space-lg);
+}
+
+.upload-block {
+    min-width: 0;
+}
+
+.upload-block h3 {
+    margin-bottom: var(--space-md);
+}
+
 /* Forms */
 .form-group {
     margin-bottom: var(--space-lg);
@@ -987,7 +1057,7 @@ textarea::placeholder {
 .upload-area {
     border: 2px dashed var(--border);
     border-radius: var(--radius-lg);
-    padding: var(--space-2xl);
+    padding: var(--space-xl) var(--space-lg);
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -1842,6 +1912,10 @@ textarea::placeholder {
 
 /* Mobile adjustments */
 @media (max-width: 1120px) {
+    .upload-dual-grid {
+        grid-template-columns: 1fr;
+    }
+
     .auto-dub-top-grid,
     .auto-dub-main-grid,
     .auto-dub-support-grid {
@@ -1858,14 +1932,29 @@ textarea::placeholder {
         width: 60px;
     }
 
-    .logo-copy,
+    .logo-area {
+        padding: 10px;
+    }
+
+    .logo-title,
     .nav-label,
     .sidebar-toggle-btn {
         display: none;
     }
 
     .logo-head {
+        min-height: 32px;
         justify-content: center;
+    }
+
+    .logo-image {
+        width: 32px;
+        height: 32px;
+    }
+
+    .logo-link {
+        width: 32px;
+        height: 32px;
     }
 
     .nav-item {

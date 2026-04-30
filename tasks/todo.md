@@ -1,5 +1,31 @@
 # TODO
 
+## TODO（2026-04-30 Sidebar Logo 重做 + 上传入口合并）
+- [x] 左侧栏 Logo 区改为导航式左对齐（图标左 + `Subtitle/Maker` 两行右），移除 96x96 方块占位
+- [x] 折叠态宽度收敛到数字导航同级（约 64px），仅保留小图标与紧凑折叠按钮
+- [x] 基于 `assets/logo.png` 做浅底抠除，重生透明版 `static/logo/logo.png`
+- [x] 同步重生 favicon 全套（ico/png/apple/android/webmanifest）并保持模板版本参数防缓存
+- [x] 合并 `1.Upload Video` 与 `4.Import SRT`：菜单改为 `Upload Video & SRT`，Panel 1 内双上传控件左右并排
+- [x] 前端增加 SRT 导入守卫：未上传视频/音频时阻断并提示，避免孤立字幕任务
+- [x] 最小验证：`node --check`（`app.js` / `dubbingPanel.js`）通过，静态图格式与尺寸校验通过
+
+## Review（2026-04-30 Sidebar Logo 重做 + 上传入口合并）
+- Logo 布局与折叠态：
+  - [src/subtitle_maker/static/style.css](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/style.css) 将 Logo 头部改为左对齐紧凑导航样式；
+  - 折叠宽度使用 `--sidebar-collapsed-width` 新参数（约 64px），折叠图标 22px、按钮 28px，避免“展开态尺寸牵连折叠态”。
+- Logo/Favicon 资源：
+  - 透明化输出 [src/subtitle_maker/static/logo/logo.png](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/logo/logo.png)；
+  - 新增 [src/subtitle_maker/static/favicon/](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/favicon/) 全套图标与 manifest；
+  - 模板 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 保持 favicon/logo 版本参数，避免浏览器读到旧缓存。
+- 上传入口合并：
+  - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 移除 `panel-srt`，Panel 1 合并“视频必选 + SRT 可选”双区块；
+  - [src/subtitle_maker/static/style.css](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/style.css) 新增 `upload-dual-grid`，桌面左右并排、窄屏自动单列；
+  - [src/subtitle_maker/static/app.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js) `handleSrtUploadWrapper()` 增加“先有媒体再传 SRT”守卫。
+- 验证证据：
+  - `node --check src/subtitle_maker/static/app.js`
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js`
+  - `file`/Pillow 检查 `logo.png` 与 `favicon` 全套为 RGBA + 目标尺寸。
+
 ## TODO（2026-04-27 上传 translated.srt 后强制重配 missing 行）
 - [x] 现状确认：上传 `translated.srt` 时后端跳过翻译并关闭 rewrite，`missing` 仅由 TTS 失败产生
 - [x] 后端新增“保持译文不变，强制重配指定 review 行”的入口，覆盖 `manual_review/missing` 补跑

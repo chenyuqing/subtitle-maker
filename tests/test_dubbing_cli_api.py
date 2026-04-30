@@ -1913,6 +1913,8 @@ class DubbingCliApiTests(unittest.TestCase):
 
         mix_path = final_dir / "dubbed_mix_full.wav"
         mix_path.write_bytes(b"mix-bytes")
+        video_path = final_dir / "dubbed_video_full.mp4"
+        video_path.write_bytes(b"video-bytes")
         bilingual_srt_path = final_dir / "dubbed_final_full.srt"
         bilingual_srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nhello\n", encoding="utf-8")
         manifest_path = batch_dir / "batch_manifest.json"
@@ -1924,6 +1926,7 @@ class DubbingCliApiTests(unittest.TestCase):
                     "paths": {
                         "batch_dir": str(batch_dir),
                         "preferred_audio": str(mix_path),
+                        "dubbed_video_full": str(video_path),
                         "dubbed_mix_full": str(mix_path),
                         "dubbed_final_full_srt": str(bilingual_srt_path),
                     },
@@ -1951,11 +1954,15 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(payload["manual_review_segments"], 1)
         artifact_keys = {item["key"] for item in payload["artifacts"]}
         self.assertIn("preferred_audio", artifact_keys)
+        self.assertIn("video", artifact_keys)
         self.assertIn("bilingual_srt", artifact_keys)
 
         download = self.client.get(f"/dubbing/auto/artifact/{task_id}/preferred_audio")
         self.assertEqual(download.status_code, 200)
         self.assertEqual(download.content, b"mix-bytes")
+        video_download = self.client.get(f"/dubbing/auto/artifact/{task_id}/video")
+        self.assertEqual(video_download.status_code, 200)
+        self.assertEqual(video_download.content, b"video-bytes")
 
     def test_input_media_artifact_prefers_uploaded_video_when_manifest_points_segment_audio(self):
         task_id = "task-input-media"

@@ -333,6 +333,8 @@ def build_batch_manifest(
     merged_bgm: Optional[Path],
     final_dir: Path,
     segments: List[Dict[str, Any]],
+    dubbed_audio_for_video: Optional[Path] = None,
+    dubbed_video_full: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """构建长视频批处理 manifest。"""
 
@@ -386,6 +388,8 @@ def build_batch_manifest(
             "dubbed_vocals_full": str(merged_vocals) if merged_vocals else None,
             "dubbed_mix_full": str(merged_mix) if merged_mix else None,
             "source_bgm_full": str(merged_bgm) if merged_bgm else None,
+            "dubbed_audio_for_video": str(dubbed_audio_for_video) if dubbed_audio_for_video else None,
+            "dubbed_video_full": str(dubbed_video_full) if dubbed_video_full else None,
             "source_full_srt": str(final_dir / "source_full.srt") if (final_dir / "source_full.srt").exists() else None,
             "dubbed_final_full_srt": (
                 str(final_dir / "dubbed_final_full.srt") if (final_dir / "dubbed_final_full.srt").exists() else None

@@ -2366,6 +2366,7 @@ def _resolve_artifact(task: Dict[str, Any], artifact: str) -> Path:
     key_to_path = {
         "input_media": str(resolved_input_media) if resolved_input_media is not None else manifest.input_media_path,
         "preferred_audio": paths.get("preferred_audio"),
+        "video": paths.get("dubbed_video_full"),
         "mix": paths.get("dubbed_mix_full"),
         "vocals": paths.get("dubbed_vocals_full"),
         "bgm": paths.get("source_bgm_full"),

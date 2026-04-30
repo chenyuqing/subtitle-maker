@@ -8,7 +8,11 @@ import numpy as np
 import soundfile as sf
 
 from subtitle_maker.core.ffmpeg import run_cmd, run_cmd_checked
-from subtitle_maker.domains.media.probe import load_mono_audio, resample_mono_audio
+from subtitle_maker.domains.media.probe import (
+    ffprobe_duration as probe_ffprobe_duration,
+    load_mono_audio,
+    resample_mono_audio,
+)
 from subtitle_maker.transcriber import format_srt, parse_srt
 
 
@@ -287,6 +291,193 @@ def mix_vocals_with_bgm(*, vocals_wav: Path, bgm_wav: Path, output_wav: Path) ->
         target_sr=44100,
         error_prefix=None,
     )
+
+
+def has_video_stream(input_media: Path) -> bool:
+    """检测输入媒体是否包含视频流；检测失败时按“无视频流”处理。"""
+
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_type",
+        "-of",
+        "default=nokey=1:noprint_wrappers=1",
+        str(input_media),
+    ]
+    code, out, _ = run_cmd(cmd)
+    if code != 0:
+        return False
+    return bool((out or "").strip())
+
+
+def prepare_dubbed_audio_for_video(
+    *,
+    preferred_audio_path: Path,
+    output_audio_path: Path,
+    target_duration_sec: float,
+) -> Path:
+    """Two-step 第一步：把配音音轨统一编码并严格对齐到视频时长。"""
+
+    safe_duration = max(0.05, float(target_duration_sec))
+    output_audio_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(preferred_audio_path),
+        "-filter_complex",
+        f"[0:a]apad,atrim=0:{safe_duration:.6f}[aout]",
+        "-map",
+        "[aout]",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        "-t",
+        f"{safe_duration:.6f}",
+        str(output_audio_path),
+    ]
+    code, out, err = run_cmd(cmd)
+    if code != 0:
+        _raise_command_error(
+            cmd=cmd,
+            code=code,
+            out=out,
+            err=err,
+            error_prefix="failed to prepare dubbed audio for video",
+        )
+    return output_audio_path
+
+
+def replace_video_audio_two_step(
+    *,
+    input_media_path: Path,
+    prepared_audio_path: Path,
+    output_video_path: Path,
+    target_duration_sec: float,
+) -> str:
+    """Two-step 第二步：替换视频音轨，优先 copy，失败后回退重编码。"""
+
+    safe_duration = max(0.05, float(target_duration_sec))
+    output_video_path.parent.mkdir(parents=True, exist_ok=True)
+    copy_cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_media_path),
+        "-i",
+        str(prepared_audio_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "copy",
+        "-t",
+        f"{safe_duration:.6f}",
+        "-movflags",
+        "+faststart",
+        str(output_video_path),
+    ]
+    code, out, err = run_cmd(copy_cmd)
+    if code == 0:
+        return "copy"
+
+    # 某些输入容器/编码与 copy 组合不兼容，回退到重编码兜底，保证产物可用。
+    reencode_cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_media_path),
+        "-i",
+        str(prepared_audio_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "fast",
+        "-crf",
+        "20",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-t",
+        f"{safe_duration:.6f}",
+        "-movflags",
+        "+faststart",
+        str(output_video_path),
+    ]
+    reencode_code, reencode_out, reencode_err = run_cmd(reencode_cmd)
+    if reencode_code != 0:
+        raise RuntimeError(
+            "failed to replace video audio: "
+            f"copy_err={err.strip()}; "
+            f"reencode_err={reencode_err.strip()}\n"
+            f"copy_out={out}\n"
+            f"reencode_out={reencode_out}"
+        )
+    return "reencode"
+
+
+def build_dubbed_video_two_step(
+    *,
+    input_media_path: Path,
+    preferred_audio_path: Optional[Path],
+    output_video_path: Path,
+    output_audio_path: Path,
+    target_duration_sec: Optional[float] = None,
+) -> Dict[str, Any]:
+    """执行 two-step 配音后处理，返回 done/skipped 以及原因和产物路径。"""
+
+    if preferred_audio_path is None:
+        return {"status": "skipped", "reason": "missing_preferred_audio"}
+    if not preferred_audio_path.exists():
+        return {
+            "status": "skipped",
+            "reason": "preferred_audio_not_found",
+            "preferred_audio_path": str(preferred_audio_path),
+        }
+    if not has_video_stream(input_media_path):
+        return {"status": "skipped", "reason": "input_has_no_video_stream"}
+
+    media_duration_sec = (
+        max(0.05, float(target_duration_sec))
+        if target_duration_sec is not None
+        else max(0.05, float(probe_ffprobe_duration(input_media_path)))
+    )
+    prepared_audio = prepare_dubbed_audio_for_video(
+        preferred_audio_path=preferred_audio_path,
+        output_audio_path=output_audio_path,
+        target_duration_sec=media_duration_sec,
+    )
+    mux_mode = replace_video_audio_two_step(
+        input_media_path=input_media_path,
+        prepared_audio_path=prepared_audio,
+        output_video_path=output_video_path,
+        target_duration_sec=media_duration_sec,
+    )
+    return {
+        "status": "done",
+        "reason": "ok",
+        "mux_mode": mux_mode,
+        "duration_sec": round(float(media_duration_sec), 3),
+        "output_video_path": str(output_video_path),
+        "output_audio_path": str(output_audio_path),
+    }
 
 
 def compose_vocals_master(

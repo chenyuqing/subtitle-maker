@@ -19,7 +19,11 @@ from subtitle_maker.domains.dubbing import (
     synthesize_segments_grouped,
     synthesize_text_once,
 )
-from subtitle_maker.domains.media.compose import compose_vocals_master, normalize_speech_audio_level
+from subtitle_maker.domains.media.compose import (
+    build_dubbed_video_two_step,
+    compose_vocals_master,
+    normalize_speech_audio_level,
+)
 from subtitle_maker.manifests import load_segment_manifest
 
 
@@ -156,6 +160,104 @@ class DubbingAlignmentTests(unittest.TestCase):
             self.assertLess(float(capped_stats["output_active_rms"]), 0.12)
             self.assertTrue(peak_limited_stats["peak_limited"])
             self.assertLessEqual(float(peak_limited_stats["peak_after"]), 0.5)
+
+    def test_build_dubbed_video_two_step_runs_copy_path(self):
+        """two-step 成功路径应先准备音频，再走视频 copy 合并。"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            input_media = tmp_path / "demo.mp4"
+            preferred_audio = tmp_path / "dubbed_mix_full.wav"
+            output_video = tmp_path / "dubbed_video_full.mp4"
+            output_audio = tmp_path / "dubbed_audio_for_video.m4a"
+            input_media.write_bytes(b"fake-video")
+            preferred_audio.write_bytes(b"fake-audio")
+
+            with patch("subtitle_maker.domains.media.compose.run_cmd") as run_cmd_mock:
+                run_cmd_mock.side_effect = [
+                    (0, "video\n", ""),
+                    (0, "", ""),
+                    (0, "", ""),
+                ]
+                result = build_dubbed_video_two_step(
+                    input_media_path=input_media,
+                    preferred_audio_path=preferred_audio,
+                    output_video_path=output_video,
+                    output_audio_path=output_audio,
+                    target_duration_sec=12.34,
+                )
+
+            self.assertEqual(result["status"], "done")
+            self.assertEqual(result["mux_mode"], "copy")
+            self.assertEqual(run_cmd_mock.call_count, 3)
+            first_cmd = run_cmd_mock.call_args_list[0].args[0]
+            second_cmd = run_cmd_mock.call_args_list[1].args[0]
+            third_cmd = run_cmd_mock.call_args_list[2].args[0]
+            self.assertEqual(first_cmd[0], "ffprobe")
+            self.assertTrue(any("apad,atrim=0:12.340000" in token for token in second_cmd))
+            self.assertIn("-c:v", third_cmd)
+            self.assertIn("copy", third_cmd)
+
+    def test_build_dubbed_video_two_step_falls_back_to_reencode(self):
+        """视频 copy 失败时应自动回退到重编码，保证 mp4 产物可输出。"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            input_media = tmp_path / "demo.mp4"
+            preferred_audio = tmp_path / "dubbed_mix_full.wav"
+            output_video = tmp_path / "dubbed_video_full.mp4"
+            output_audio = tmp_path / "dubbed_audio_for_video.m4a"
+            input_media.write_bytes(b"fake-video")
+            preferred_audio.write_bytes(b"fake-audio")
+
+            with patch("subtitle_maker.domains.media.compose.run_cmd") as run_cmd_mock:
+                run_cmd_mock.side_effect = [
+                    (0, "video\n", ""),
+                    (0, "", ""),
+                    (1, "", "copy failed"),
+                    (0, "", ""),
+                ]
+                result = build_dubbed_video_two_step(
+                    input_media_path=input_media,
+                    preferred_audio_path=preferred_audio,
+                    output_video_path=output_video,
+                    output_audio_path=output_audio,
+                    target_duration_sec=9.5,
+                )
+
+            self.assertEqual(result["status"], "done")
+            self.assertEqual(result["mux_mode"], "reencode")
+            self.assertEqual(run_cmd_mock.call_count, 4)
+            third_cmd = run_cmd_mock.call_args_list[2].args[0]
+            fourth_cmd = run_cmd_mock.call_args_list[3].args[0]
+            self.assertIn("-c:v", third_cmd)
+            self.assertIn("copy", third_cmd)
+            self.assertIn("libx264", fourth_cmd)
+
+    def test_build_dubbed_video_two_step_skips_when_no_video_stream(self):
+        """输入媒体没有视频流时应跳过后处理，不影响主任务成功。"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            input_media = tmp_path / "demo.wav"
+            preferred_audio = tmp_path / "dubbed_mix_full.wav"
+            output_video = tmp_path / "dubbed_video_full.mp4"
+            output_audio = tmp_path / "dubbed_audio_for_video.m4a"
+            input_media.write_bytes(b"fake-audio-media")
+            preferred_audio.write_bytes(b"fake-audio")
+
+            with patch("subtitle_maker.domains.media.compose.run_cmd", return_value=(0, "", "")) as run_cmd_mock:
+                result = build_dubbed_video_two_step(
+                    input_media_path=input_media,
+                    preferred_audio_path=preferred_audio,
+                    output_video_path=output_video,
+                    output_audio_path=output_audio,
+                    target_duration_sec=4.0,
+                )
+
+            self.assertEqual(result["status"], "skipped")
+            self.assertEqual(result["reason"], "input_has_no_video_stream")
+            self.assertEqual(run_cmd_mock.call_count, 1)
 
 
 class DubbingPipelineTests(unittest.TestCase):

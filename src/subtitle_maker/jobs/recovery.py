@@ -82,6 +82,7 @@ def build_batch_artifacts(
     candidates = [
         ("input_media", "Source Media", input_media_path),
         ("preferred_audio", "Preferred Audio", paths.get("preferred_audio")),
+        ("video", "Dubbed Video MP4", paths.get("dubbed_video_full")),
         ("mix", "Mixed Audio WAV", paths.get("dubbed_mix_full")),
         ("vocals", "Vocals WAV", paths.get("dubbed_vocals_full")),
         ("bilingual_srt", "Bilingual SRT", paths.get("dubbed_final_full_srt")),

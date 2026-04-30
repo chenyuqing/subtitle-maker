@@ -41,6 +41,8 @@ class JobRecoveryTests(unittest.TestCase):
         media_path.write_bytes(b"fake-media")
         audio_path = final_dir / "dubbed_mix_full.wav"
         audio_path.write_bytes(b"fake-audio")
+        video_path = final_dir / "dubbed_video_full.mp4"
+        video_path.write_bytes(b"fake-video")
         srt_path = final_dir / "dubbed_final_full.srt"
         srt_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nhello\n", encoding="utf-8")
 
@@ -76,6 +78,7 @@ class JobRecoveryTests(unittest.TestCase):
                     "segments": [{"summary": {"total": 1, "done": 1, "manual_review": 0}}],
                     "paths": {
                         "preferred_audio": str(audio_path),
+                        "dubbed_video_full": str(video_path),
                         "dubbed_mix_full": str(audio_path),
                         "dubbed_final_full_srt": str(srt_path),
                     },
@@ -115,6 +118,7 @@ class JobRecoveryTests(unittest.TestCase):
         self.assertEqual(updates["result_srt"], "/dubbing/auto/artifact/task_001/bilingual_srt")
         artifact_keys = {item["key"] for item in updates["artifacts"]}
         self.assertIn("preferred_audio", artifact_keys)
+        self.assertIn("video", artifact_keys)
         self.assertIn("bilingual_srt", artifact_keys)
         self.assertIn("input_media", artifact_keys)
 

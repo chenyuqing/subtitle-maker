@@ -1214,7 +1214,7 @@ if (videoPlayer) {
 // 1. Media Upload Logic (Panel 1)
 setupUploadLogic(mediaUploadArea, mediaFileInput, handleMediaUpload);
 
-// 4. SRT Upload Logic (Panel 4)
+// 1. Optional SRT Upload Logic (Panel 1)
 setupUploadLogic(srtUploadArea, srtFileInput, handleSrtUploadWrapper);
 
 function setupUploadLogic(area, input, handler) {
@@ -1334,9 +1334,12 @@ async function handleSrtUploadWrapper(file) {
         return;
     }
 
-    // Clear video if any, or maybe keep it? 
-    // Usually if importing SRT, it matches the video? 
-    // For now, let's just upload SRT.
+    // SRT 导入依赖“当前项目媒体”上下文；未上传视频/音频时直接阻断，避免生成孤立字幕任务。
+    const mediaName = String(currentProjectMediaFilename || currentFilename || '').trim();
+    if (!mediaName || mediaName.toLowerCase().endsWith('.srt')) {
+        alert("请先上传视频/音频，再上传 SRT 字幕。");
+        return;
+    }
 
     try {
         await handleSrtUpload(file);

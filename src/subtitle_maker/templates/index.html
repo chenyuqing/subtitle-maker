@@ -5,6 +5,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Subtitle Maker</title>
+    <link rel="icon" type="image/x-icon" href="/static/favicon/favicon.ico?v={{ style_css_version }}">
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon/favicon-32x32.png?v={{ style_css_version }}">
+    <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon/favicon-16x16.png?v={{ style_css_version }}">
+    <link rel="apple-touch-icon" sizes="180x180" href="/static/favicon/apple-touch-icon.png?v={{ style_css_version }}">
+    <link rel="manifest" href="/static/favicon/site.webmanifest?v={{ style_css_version }}">
     <link rel="stylesheet" href="/static/style.css?v={{ style_css_version }}">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -17,10 +22,13 @@
             <aside class="sidebar">
                 <div class="logo-area">
                     <div class="logo-head">
-                        <div class="logo-copy">
-                            <h1>Subtitle Maker</h1>
-                            <p>AI-Powered Subtitling</p>
-                        </div>
+                        <a class="logo-link" href="/" aria-label="Back to home">
+                            <img class="logo-image" src="/static/logo/logo.png?v={{ style_css_version }}" alt="Subtitle Maker logo">
+                            <span class="logo-title">
+                                <span class="logo-title-line">Subtitle</span>
+                                <span class="logo-title-line">Maker</span>
+                            </span>
+                        </a>
                         <button
                             id="sidebar-toggle-btn"
                             class="sidebar-toggle-btn"
@@ -36,7 +44,7 @@
                 <nav class="nav-menu">
                     <button class="nav-item active" data-target="panel-upload">
                         <span class="step-num">1</span>
-                        <span class="nav-label">Upload Video</span>
+                        <span class="nav-label">Upload Video & SRT</span>
                     </button>
                     <button class="nav-item" data-target="panel-transcribe">
                         <span class="step-num">2</span>
@@ -46,16 +54,12 @@
                         <span class="step-num">3</span>
                         <span class="nav-label">Subtitles & Translation</span>
                     </button>
-                    <button class="nav-item" data-target="panel-srt">
-                        <span class="step-num">4</span>
-                        <span class="nav-label">Import SRT</span>
-                    </button>
                     <button class="nav-item" data-target="panel-auto-dub">
-                        <span class="step-num">5</span>
+                        <span class="step-num">4</span>
                         <span class="nav-label">Auto Dubbing</span>
                     </button>
                     <button class="nav-item" data-target="panel-auto-dub-v2">
-                        <span class="step-num">6</span>
+                        <span class="step-num">5</span>
                         <span class="nav-label">Auto Dubbing V2</span>
                     </button>
                 </nav>
@@ -166,33 +170,34 @@
 
             <!-- Scrollable Content Section (Bottom) -->
             <div class="dynamic-content-section">
-                <!-- Panel 1: Upload Video -->
+                <!-- Panel 1: Upload Video + Optional SRT -->
                 <div id="panel-upload" class="panel active">
                     <div class="card">
-                        <h2>📁 Upload Media File</h2>
-                        <div id="upload-area" class="upload-area">
-                            <input type="file" id="file-input" accept="video/*,audio/*" style="display: none;">
-                            <div class="upload-icon">📁</div>
-                            <p class="upload-text">Click or Drag & Drop Video/Audio</p>
-                            <p class="upload-hint">支持格式: MP4, MOV, MKV, MP3, WAV</p>
+                        <h2>📁 Upload Video + Optional SRT</h2>
+                        <div class="upload-dual-grid">
+                            <div class="upload-block">
+                                <h3>Video / Audio (Required)</h3>
+                                <div id="upload-area" class="upload-area">
+                                    <input type="file" id="file-input" accept="video/*,audio/*" style="display: none;">
+                                    <div class="upload-icon">📁</div>
+                                    <p class="upload-text">Click or Drag & Drop Video/Audio</p>
+                                    <p class="upload-hint">支持格式: MP4, MOV, MKV, MP3, WAV</p>
+                                </div>
+                            </div>
+                            <div class="upload-block">
+                                <h3>SRT Subtitles (Optional)</h3>
+                                <div id="srt-upload-area" class="upload-area">
+                                    <input type="file" id="srt-file-input" accept=".srt" style="display: none;">
+                                    <div class="upload-icon">📄</div>
+                                    <p class="upload-text">Click or Drag & Drop SRT File</p>
+                                    <p class="upload-hint">需先上传视频/音频，再导入 SRT</p>
+                                </div>
+                            </div>
                         </div>
                     </div>
                 </div>
 
-                <!-- Panel 4: Import SRT -->
-                <div id="panel-srt" class="panel" style="display: none;">
-                    <div class="card">
-                        <h2>📄 Import SRT Subtitles</h2>
-                        <div id="srt-upload-area" class="upload-area">
-                            <input type="file" id="srt-file-input" accept=".srt" style="display: none;">
-                            <div class="upload-icon">📄</div>
-                            <p class="upload-text">Click or Drag & Drop SRT File</p>
-                            <p class="upload-hint">Directly upload .srt to edit & translate</p>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Panel 5: Auto Dubbing -->
+                <!-- Panel 4: Auto Dubbing -->
                 <div id="panel-auto-dub" class="panel" style="display: none;">
                     <div class="card auto-dub-card">
                         <h2>🎙️ Auto Dubbing</h2>
@@ -480,7 +485,7 @@
                             </div>
                         </div>
                     </div>
-                <!-- Panel 6: Auto Dubbing V2 -->
+                <!-- Panel 5: Auto Dubbing V2 -->
                 <div id="panel-auto-dub-v2" class="panel" style="display: none;">
                     <div class="card auto-dub-card">
                         <h2>🎙️ Auto Dubbing V2</h2>

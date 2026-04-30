@@ -601,6 +601,244 @@ class DubLongVideoTests(unittest.TestCase):
         self.assertIn("你好（新）", dubbed_final_full_srt.read_text(encoding="utf-8"))
         self.assertNotIn("你好（旧）", dubbed_final_full_srt.read_text(encoding="utf-8"))
 
+    def test_main_writes_video_postprocess_paths_when_two_step_done(self) -> None:
+        """two-step 后处理成功时，batch manifest 应记录视频与对齐音轨路径。"""
+
+        def fake_extract_source_audio(input_media: Path, output_wav: Path) -> None:
+            output_wav.parent.mkdir(parents=True, exist_ok=True)
+            output_wav.write_bytes(b"fake-source-audio")
+
+        def fake_ffprobe_duration(path: Path) -> float:
+            return 10.0
+
+        def fake_cut_audio_segment(*, source_audio: Path, output_audio: Path, start_sec: float, end_sec: float) -> None:
+            output_audio.parent.mkdir(parents=True, exist_ok=True)
+            output_audio.write_bytes(f"{start_sec:.3f}-{end_sec:.3f}".encode("utf-8"))
+
+        def fake_run_segment_job(
+            *,
+            segment_index: int,
+            segment_audio: Path,
+            target_lang: str,
+            segment_jobs_dir: Path,
+            shared_ref: Path | None,
+            single_speaker_ref_seconds: float,
+            api_key: str | None,
+            extra_args: list[str],
+            segment_time_ranges: list[tuple[float, float]] | None = None,
+            input_srt_path: Path | None = None,
+            input_srt_kind: str = "source",
+            resume_job_dir: Path | None = None,
+        ) -> Path:
+            job_dir = resume_job_dir or (segment_jobs_dir / f"segment_{segment_index:04d}")
+            subtitles_dir = job_dir / "subtitles"
+            subtitles_dir.mkdir(parents=True, exist_ok=True)
+
+            source_srt = subtitles_dir / "source.srt"
+            translated_srt = subtitles_dir / "translated.srt"
+            dubbed_final_srt = subtitles_dir / "dubbed_final.srt"
+            dubbed_vocals = job_dir / "dubbed_vocals.wav"
+            source_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\nHello\n", encoding="utf-8")
+            translated_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\n你好\n", encoding="utf-8")
+            dubbed_final_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\n你好\nHello\n", encoding="utf-8")
+            dubbed_vocals.write_bytes(b"fake-vocals")
+            manifest = {
+                "manifest_version": "v1",
+                "job_id": f"segment_{segment_index:04d}",
+                "input_media_path": str(segment_audio),
+                "target_lang": target_lang,
+                "paths": {
+                    "source_srt": str(source_srt),
+                    "translated_srt": str(translated_srt),
+                    "dubbed_final_srt": str(dubbed_final_srt),
+                    "dubbed_vocals": str(dubbed_vocals),
+                    "source_bgm": None,
+                    "dubbed_mix": None,
+                },
+                "stats": {"total": 1, "done": 1, "failed": 0, "manual_review": 0},
+                "segments": [{"id": "seg_0001", "status": "done"}],
+                "manual_review": [],
+            }
+            (job_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            return job_dir
+
+        def fake_concat_wav_files(inputs: list[Path], output_wav: Path) -> None:
+            output_wav.parent.mkdir(parents=True, exist_ok=True)
+            output_wav.write_bytes(b"concat-audio")
+
+        def fake_two_step(
+            *,
+            input_media_path: Path,
+            preferred_audio_path: Path | None,
+            output_video_path: Path,
+            output_audio_path: Path,
+            target_duration_sec: float | None,
+        ) -> dict[str, object]:
+            output_video_path.parent.mkdir(parents=True, exist_ok=True)
+            output_audio_path.parent.mkdir(parents=True, exist_ok=True)
+            output_video_path.write_bytes(b"fake-video")
+            output_audio_path.write_bytes(b"fake-audio")
+            return {
+                "status": "done",
+                "reason": "ok",
+                "mux_mode": "copy",
+                "duration_sec": 10.0,
+                "output_video_path": str(output_video_path),
+                "output_audio_path": str(output_audio_path),
+            }
+
+        with patch.object(dub_long_video, "build_readable_batch_id", return_value="batchvideo"), patch.object(
+            dub_long_video, "extract_source_audio", side_effect=fake_extract_source_audio
+        ), patch.object(
+            dub_long_video, "ffprobe_duration", side_effect=fake_ffprobe_duration
+        ), patch.object(
+            dub_long_video, "detect_silence_endpoints", return_value=[]
+        ), patch.object(
+            dub_long_video, "cut_audio_segment", side_effect=fake_cut_audio_segment
+        ), patch.object(
+            dub_long_video, "collect_reusable_jobs_by_segment", return_value={}
+        ), patch.object(
+            dub_long_video, "collect_latest_jobs_by_segment", return_value={}
+        ), patch.object(
+            dub_long_video, "run_segment_job", side_effect=fake_run_segment_job
+        ), patch.object(
+            dub_long_video, "concat_wav_files", side_effect=fake_concat_wav_files
+        ), patch.object(
+            dub_long_video, "mix_vocals_with_bgm", return_value=None
+        ), patch.object(
+            dub_long_video, "build_dubbed_video_two_step", side_effect=fake_two_step
+        ):
+            code = dub_long_video.main(
+                [
+                    "--input-media",
+                    str(self.input_media),
+                    "--input-srt",
+                    str(self.input_srt),
+                    "--target-lang",
+                    "Chinese",
+                    "--out-dir",
+                    str(self.out_dir),
+                    "--segment-minutes",
+                    "0.2",
+                    "--min-segment-minutes",
+                    "0.1",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        batch_dir = self.out_dir / "longdub_batchvideo"
+        manifest = json.loads((batch_dir / "batch_manifest.json").read_text(encoding="utf-8"))
+        self.assertTrue(str(manifest["paths"]["dubbed_video_full"]).endswith("/final/dubbed_video_full.mp4"))
+        self.assertTrue(str(manifest["paths"]["dubbed_audio_for_video"]).endswith("/final/dubbed_audio_for_video.m4a"))
+
+    def test_main_keeps_video_postprocess_paths_empty_when_two_step_skipped(self) -> None:
+        """two-step 后处理跳过时，batch manifest 不应写入视频产物路径。"""
+
+        def fake_extract_source_audio(input_media: Path, output_wav: Path) -> None:
+            output_wav.parent.mkdir(parents=True, exist_ok=True)
+            output_wav.write_bytes(b"fake-source-audio")
+
+        def fake_ffprobe_duration(path: Path) -> float:
+            return 10.0
+
+        def fake_cut_audio_segment(*, source_audio: Path, output_audio: Path, start_sec: float, end_sec: float) -> None:
+            output_audio.parent.mkdir(parents=True, exist_ok=True)
+            output_audio.write_bytes(f"{start_sec:.3f}-{end_sec:.3f}".encode("utf-8"))
+
+        def fake_run_segment_job(
+            *,
+            segment_index: int,
+            segment_audio: Path,
+            target_lang: str,
+            segment_jobs_dir: Path,
+            shared_ref: Path | None,
+            single_speaker_ref_seconds: float,
+            api_key: str | None,
+            extra_args: list[str],
+            segment_time_ranges: list[tuple[float, float]] | None = None,
+            input_srt_path: Path | None = None,
+            input_srt_kind: str = "source",
+            resume_job_dir: Path | None = None,
+        ) -> Path:
+            job_dir = resume_job_dir or (segment_jobs_dir / f"segment_{segment_index:04d}")
+            subtitles_dir = job_dir / "subtitles"
+            subtitles_dir.mkdir(parents=True, exist_ok=True)
+            source_srt = subtitles_dir / "source.srt"
+            translated_srt = subtitles_dir / "translated.srt"
+            dubbed_final_srt = subtitles_dir / "dubbed_final.srt"
+            dubbed_vocals = job_dir / "dubbed_vocals.wav"
+            source_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\nHello\n", encoding="utf-8")
+            translated_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\n你好\n", encoding="utf-8")
+            dubbed_final_srt.write_text("1\n00:00:00,000 --> 00:00:02,000\n你好\nHello\n", encoding="utf-8")
+            dubbed_vocals.write_bytes(b"fake-vocals")
+            manifest = {
+                "manifest_version": "v1",
+                "job_id": f"segment_{segment_index:04d}",
+                "input_media_path": str(segment_audio),
+                "target_lang": target_lang,
+                "paths": {
+                    "source_srt": str(source_srt),
+                    "translated_srt": str(translated_srt),
+                    "dubbed_final_srt": str(dubbed_final_srt),
+                    "dubbed_vocals": str(dubbed_vocals),
+                    "source_bgm": None,
+                    "dubbed_mix": None,
+                },
+                "stats": {"total": 1, "done": 1, "failed": 0, "manual_review": 0},
+                "segments": [{"id": "seg_0001", "status": "done"}],
+                "manual_review": [],
+            }
+            (job_dir / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            return job_dir
+
+        def fake_concat_wav_files(inputs: list[Path], output_wav: Path) -> None:
+            output_wav.parent.mkdir(parents=True, exist_ok=True)
+            output_wav.write_bytes(b"concat-audio")
+
+        with patch.object(dub_long_video, "build_readable_batch_id", return_value="batchvideoskip"), patch.object(
+            dub_long_video, "extract_source_audio", side_effect=fake_extract_source_audio
+        ), patch.object(
+            dub_long_video, "ffprobe_duration", side_effect=fake_ffprobe_duration
+        ), patch.object(
+            dub_long_video, "detect_silence_endpoints", return_value=[]
+        ), patch.object(
+            dub_long_video, "cut_audio_segment", side_effect=fake_cut_audio_segment
+        ), patch.object(
+            dub_long_video, "collect_reusable_jobs_by_segment", return_value={}
+        ), patch.object(
+            dub_long_video, "collect_latest_jobs_by_segment", return_value={}
+        ), patch.object(
+            dub_long_video, "run_segment_job", side_effect=fake_run_segment_job
+        ), patch.object(
+            dub_long_video, "concat_wav_files", side_effect=fake_concat_wav_files
+        ), patch.object(
+            dub_long_video, "mix_vocals_with_bgm", return_value=None
+        ), patch.object(
+            dub_long_video, "build_dubbed_video_two_step", return_value={"status": "skipped", "reason": "input_has_no_video_stream"}
+        ):
+            code = dub_long_video.main(
+                [
+                    "--input-media",
+                    str(self.input_media),
+                    "--input-srt",
+                    str(self.input_srt),
+                    "--target-lang",
+                    "Chinese",
+                    "--out-dir",
+                    str(self.out_dir),
+                    "--segment-minutes",
+                    "0.2",
+                    "--min-segment-minutes",
+                    "0.1",
+                ]
+            )
+
+        self.assertEqual(code, 0)
+        batch_dir = self.out_dir / "longdub_batchvideoskip"
+        manifest = json.loads((batch_dir / "batch_manifest.json").read_text(encoding="utf-8"))
+        self.assertIsNone(manifest["paths"]["dubbed_video_full"])
+        self.assertIsNone(manifest["paths"]["dubbed_audio_for_video"])
+
 
 if __name__ == "__main__":
     unittest.main()
