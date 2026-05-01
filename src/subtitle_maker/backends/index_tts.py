@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -10,6 +11,10 @@ from typing import Any, Dict, List, Optional
 from subtitle_maker.domains.media import concat_generated_wavs
 
 from .base import TtsBackend, TtsSynthesisRequest
+
+
+DEFAULT_INDEX_TTS_RECOVERY_WAIT_SEC = 180.0
+DEFAULT_INDEX_TTS_RECOVERY_POLL_SEC = 1.0
 
 
 def _http_json_request(
@@ -90,7 +95,7 @@ def synthesize_via_index_tts_api(
     top_k: int,
     temperature: float,
     max_text_tokens: int,
-) -> None:
+) -> Dict[str, Any]:
     """通过 Index-TTS HTTP API 执行一次合成。"""
 
     payload = {
@@ -117,6 +122,45 @@ def synthesize_via_index_tts_api(
         raise RuntimeError(f"E-TTS-001 index-tts api returned non-ok: {result}")
     if not output_path.exists():
         raise RuntimeError("E-TTS-001 index-tts api finished but output missing")
+    return result
+
+
+def _is_index_tts_transient_error(exc: Exception) -> bool:
+    """判断是否为可恢复的短暂故障（重启窗口/连接抖动）。"""
+
+    detail = str(exc or "").lower()
+    transient_markers = (
+        "http 503",
+        "connect failed",
+        "connection refused",
+        "connection reset",
+        "remote end closed connection",
+        "timed out",
+        "service unavailable",
+    )
+    return any(marker in detail for marker in transient_markers)
+
+
+def _wait_index_tts_service_ready(
+    *,
+    api_url: str,
+    timeout_sec: float,
+    wait_sec: float = DEFAULT_INDEX_TTS_RECOVERY_WAIT_SEC,
+    poll_sec: float = DEFAULT_INDEX_TTS_RECOVERY_POLL_SEC,
+) -> Dict[str, Any]:
+    """轮询等待 Index-TTS 服务恢复健康，避免重启窗口内连续 missing。"""
+
+    deadline = time.time() + max(5.0, float(wait_sec))
+    last_exc: Optional[Exception] = None
+    while time.time() < deadline:
+        try:
+            return check_index_tts_service(api_url=api_url, timeout_sec=timeout_sec)
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(max(0.2, float(poll_sec)))
+    if last_exc is None:
+        raise RuntimeError("E-TTS-001 index-tts service recovery timeout")
+    raise RuntimeError(f"E-TTS-001 index-tts service recovery timeout: {last_exc}") from last_exc
 
 
 def split_text_for_index_tts(text: str, *, max_text_tokens: int) -> List[str]:
@@ -208,30 +252,12 @@ class IndexTtsBackend(TtsBackend):
     def _synthesize_api(self, request: TtsSynthesisRequest) -> None:
         """通过 HTTP API 执行一次合成，并保留一次释放后重试。"""
 
-        try:
-            synthesize_via_index_tts_api(
-                api_url=self.api_url,
-                timeout_sec=self.timeout_sec,
-                text=request.text,
-                ref_audio_path=request.ref_audio_path,
-                output_path=request.output_path,
-                emo_audio_prompt=request.emo_audio_prompt,
-                emo_alpha=request.emo_alpha,
-                use_emo_text=request.use_emo_text,
-                emo_text=request.emo_text,
-                top_p=request.top_p,
-                top_k=request.top_k,
-                temperature=request.temperature,
-                max_text_tokens=request.max_text_tokens,
-            )
-            return
-        except Exception as first_exc:
+        # 允许最多三次尝试：覆盖“重启窗口 + 首次冷启动 + 一次真实重试”。
+        errors: List[str] = []
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
             try:
-                release_index_tts_api_model(api_url=self.api_url, timeout_sec=self.timeout_sec)
-            except Exception:
-                pass
-            try:
-                synthesize_via_index_tts_api(
+                result = synthesize_via_index_tts_api(
                     api_url=self.api_url,
                     timeout_sec=self.timeout_sec,
                     text=request.text,
@@ -246,11 +272,36 @@ class IndexTtsBackend(TtsBackend):
                     temperature=request.temperature,
                     max_text_tokens=request.max_text_tokens,
                 )
+                # 到达自动重启阈值时，服务会在本次响应后退出重启；
+                # 这里主动等待恢复，避免下一句直接打到 503。
+                if bool(result.get("restart_pending")):
+                    _wait_index_tts_service_ready(
+                        api_url=self.api_url,
+                        timeout_sec=self.timeout_sec,
+                    )
                 return
-            except Exception as second_exc:
-                raise RuntimeError(
-                    f"E-TTS-001 index-tts api failed after one retry: first={first_exc}; second={second_exc}"
-                ) from second_exc
+            except Exception as exc:
+                errors.append(f"attempt{attempt}={exc}")
+                # 短暂故障先等服务健康恢复（常见于 auto-restart 窗口）。
+                if _is_index_tts_transient_error(exc):
+                    try:
+                        _wait_index_tts_service_ready(
+                            api_url=self.api_url,
+                            timeout_sec=self.timeout_sec,
+                        )
+                    except Exception as wait_exc:
+                        errors.append(f"attempt{attempt}_wait={wait_exc}")
+                # 无论是否短暂故障，都尝试释放一次模型，降低后续爆显存概率。
+                try:
+                    release_index_tts_api_model(api_url=self.api_url, timeout_sec=self.timeout_sec)
+                except Exception as release_exc:
+                    errors.append(f"attempt{attempt}_release={release_exc}")
+                if attempt >= max_attempts:
+                    joined = "; ".join(errors)
+                    raise RuntimeError(
+                        "E-TTS-001 index-tts api failed after retries: "
+                        f"{joined}"
+                    ) from exc
 
     def _synthesize_one(self, request: TtsSynthesisRequest) -> None:
         """执行单个文本分片的合成。"""

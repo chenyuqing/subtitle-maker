@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import soundfile as sf
 
-from subtitle_maker.backends import OmniVoiceBackend, TtsSynthesisRequest, split_text_for_index_tts
+from subtitle_maker.backends import IndexTtsBackend, OmniVoiceBackend, TtsSynthesisRequest, split_text_for_index_tts
 from subtitle_maker.domains.dubbing import (
     build_atempo_filter_chain,
     build_synthesis_groups,
@@ -1322,6 +1322,74 @@ class DubbingReviewTests(unittest.TestCase):
         self.assertTrue(options.omnivoice_via_api)
         self.assertEqual(options.omnivoice_api_url, "http://127.0.0.1:8020")
         self.assertEqual(options.index_tts_api_url, "http://127.0.0.1:19010")
+
+
+class IndexTtsBackendRecoveryTests(unittest.TestCase):
+    def _build_request(self, tmpdir: str) -> TtsSynthesisRequest:
+        """构造最小化请求对象，供 Index-TTS API 重试逻辑测试复用。"""
+
+        base = Path(tmpdir)
+        return TtsSynthesisRequest(
+            text="hello world",
+            ref_audio_path=base / "ref.wav",
+            output_path=base / "out.wav",
+        )
+
+    def test_index_tts_backend_waits_for_restart_pending_before_next_call(self):
+        """当服务返回 restart_pending 时，应先等待健康恢复，避免下一句打到 503。"""
+
+        backend = IndexTtsBackend(
+            via_api=True,
+            api_url="http://127.0.0.1:8010",
+            timeout_sec=12.0,
+            local_model=None,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            request = self._build_request(tmpdir)
+            with patch(
+                "subtitle_maker.backends.index_tts.synthesize_via_index_tts_api",
+                return_value={"ok": True, "restart_pending": True},
+            ) as synth_mock, patch(
+                "subtitle_maker.backends.index_tts._wait_index_tts_service_ready",
+                return_value={"ok": True, "status": "ok"},
+            ) as wait_mock, patch(
+                "subtitle_maker.backends.index_tts.release_index_tts_api_model"
+            ) as release_mock:
+                backend._synthesize_api(request)
+
+        self.assertEqual(synth_mock.call_count, 1)
+        wait_mock.assert_called_once_with(api_url="http://127.0.0.1:8010", timeout_sec=12.0)
+        release_mock.assert_not_called()
+
+    def test_index_tts_backend_retries_after_transient_503_and_recovers(self):
+        """遇到 503/断连等短暂故障时，应等待恢复后重试而非直接判 missing。"""
+
+        backend = IndexTtsBackend(
+            via_api=True,
+            api_url="http://127.0.0.1:8010",
+            timeout_sec=12.0,
+            local_model=None,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            request = self._build_request(tmpdir)
+            with patch(
+                "subtitle_maker.backends.index_tts.synthesize_via_index_tts_api",
+                side_effect=[
+                    RuntimeError("E-TTS-001 index-tts api http 503: "),
+                    {"ok": True, "restart_pending": False},
+                ],
+            ) as synth_mock, patch(
+                "subtitle_maker.backends.index_tts._wait_index_tts_service_ready",
+                return_value={"ok": True, "status": "ok"},
+            ) as wait_mock, patch(
+                "subtitle_maker.backends.index_tts.release_index_tts_api_model",
+                return_value={"ok": True},
+            ) as release_mock:
+                backend._synthesize_api(request)
+
+        self.assertEqual(synth_mock.call_count, 2)
+        wait_mock.assert_called_once_with(api_url="http://127.0.0.1:8010", timeout_sec=12.0)
+        release_mock.assert_called_once_with(api_url="http://127.0.0.1:8010", timeout_sec=12.0)
 
 
 if __name__ == "__main__":

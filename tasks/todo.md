@@ -1,5 +1,14 @@
 # TODO
 
+## TODO（2026-05-02 Index-TTS 吞字修复）
+- [ ] 新建 `docs/plans/0001-index-tts-timing-fix-2026-05-02.md` 并落档本轮实施计划
+- [ ] 创建本地 checkpoint commit，纳入当前 `Index-TTS` 相关未提交改动，作为回滚锚点
+- [ ] 扩展 `Index-TTS` strict 尾部保护，避免阈值内强制 fit 导致句尾被截断
+- [ ] 放宽 `trim_silence_edges()` 的默认 padding，减少轻声首尾被误裁
+- [ ] 使用 `Index-TTS` API 返回的 `duration_sec` 建立过短/过长质量反馈与重试
+- [ ] 在进入 `compose_vocals_master()` 前增加超窗守卫，阻止会被二次裁尾的 `done` 片段
+- [ ] 补单测与回归验证，覆盖 strict 尾部保护、trim padding、duration 反馈、compose 守卫
+
 ## TODO（2026-04-30 Sidebar Logo 重做 + 上传入口合并）
 - [x] 左侧栏 Logo 区改为导航式左对齐（图标左 + `Subtitle/Maker` 两行右），移除 96x96 方块占位
 - [x] 折叠态宽度收敛到数字导航同级（约 64px），仅保留小图标与紧凑折叠按钮
