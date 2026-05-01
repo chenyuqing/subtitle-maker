@@ -37,12 +37,109 @@ if TYPE_CHECKING:
 DEFAULT_MISSING_AUDIO_SR = 24000
 OMNIVOICE_DURATION_PRECHECK_REASON_CODE = "omnivoice_target_duration_below_safe_floor"
 OMNIVOICE_DURATION_PRECHECK_ERROR_CODE = "E-TTS-001"
+COMPOSE_WINDOW_OVERRUN_REASON_CODE = "compose_window_overrun"
+COMPOSE_WINDOW_OVERRUN_ERROR_CODE = "E-ALN-001"
+DEFAULT_COMPOSE_WINDOW_OVERRUN_TOLERANCE_SEC = 0.03
 
 
 def _is_sentence_end(text: str) -> bool:
     """判断一行文本是否自然收在句末边界。"""
 
     return bool(re.search(r"[.!?。！？][\"')\]]*\s*$", (text or "").strip()))
+
+
+def _backend_supports_tail_preserve(backend_name: str) -> bool:
+    """判断当前 TTS backend 是否应在阈值内保留自然尾音。"""
+
+    normalized = (backend_name or "").strip().lower()
+    return normalized in {"omnivoice", "index-tts"}
+
+
+def _backend_requires_compose_window_guard(backend_name: str) -> bool:
+    """当前仅对 Index-TTS 开启 compose 超窗守卫，避免扩大回归面。"""
+
+    return (backend_name or "").strip().lower() == "index-tts"
+
+
+def _should_skip_fit_to_preserve_tail(
+    *,
+    backend_name: str,
+    effective_delta_sec: float,
+    delta_pass_ms: float,
+) -> bool:
+    """判断是否应跳过 strict fit，避免 atrim 把尾字裁掉。"""
+
+    return _backend_supports_tail_preserve(backend_name) and abs(float(effective_delta_sec)) * 1000 <= float(delta_pass_ms)
+
+
+def _compute_compose_window_overrun_sec(
+    *,
+    actual_duration_sec: float,
+    effective_target_duration_sec: float,
+    tolerance_sec: float = DEFAULT_COMPOSE_WINDOW_OVERRUN_TOLERANCE_SEC,
+) -> float:
+    """计算音频超出 compose 安全窗口的秒数。"""
+
+    allowed_duration_sec = max(0.05, float(effective_target_duration_sec)) + max(0.0, float(tolerance_sec))
+    return max(0.0, float(actual_duration_sec) - allowed_duration_sec)
+
+
+def _build_compose_window_guard_attempt(
+    *,
+    attempt_no: int,
+    action: str,
+    input_text: str,
+    actual_duration_sec: float,
+    delta_sec: float,
+    effective_target_duration_sec: float,
+    borrowed_gap_sec: float,
+    effective_delta_sec: float,
+    compose_window_overrun_sec: float,
+) -> Dict[str, Any]:
+    """构造 compose 超窗守卫的结构化 attempt 记录。"""
+
+    return {
+        "attempt_no": int(attempt_no),
+        "action": action,
+        "input_text": input_text,
+        "actual_duration_sec": round(float(actual_duration_sec), 3),
+        "delta_sec": round(float(delta_sec), 3),
+        "result": "fail",
+        "error": (
+            "E-ALN-001 compose window overrun: "
+            f"{float(compose_window_overrun_sec):.3f}s beyond "
+            f"{float(DEFAULT_COMPOSE_WINDOW_OVERRUN_TOLERANCE_SEC):.3f}s tolerance"
+        ),
+        "data": {
+            "effective_target_sec": round(float(effective_target_duration_sec), 3),
+            "borrowed_gap_sec": round(float(borrowed_gap_sec), 3),
+            "effective_delta_sec": round(float(effective_delta_sec), 3),
+            "compose_window_overrun_sec": round(float(compose_window_overrun_sec), 3),
+            "compose_window_tolerance_sec": round(float(DEFAULT_COMPOSE_WINDOW_OVERRUN_TOLERANCE_SEC), 3),
+        },
+        "ts": _iso_now(),
+    }
+
+
+def _build_compose_window_review_reason(
+    *,
+    last_delta_sec: float,
+    last_effective_delta_sec: float,
+    last_attempt_no: int,
+    compose_window_overrun_sec: float,
+) -> Dict[str, Any]:
+    """生成 compose 超窗导致 manual_review 的统一原因。"""
+
+    return {
+        "reason_code": COMPOSE_WINDOW_OVERRUN_REASON_CODE,
+        "reason_detail": "candidate audio still exceeds compose window tolerance after timing adjustments",
+        "last_delta_sec": round(float(last_delta_sec), 3),
+        "last_effective_delta_sec": round(float(last_effective_delta_sec), 3),
+        "last_attempt_no": int(last_attempt_no),
+        "error_code": COMPOSE_WINDOW_OVERRUN_ERROR_CODE,
+        "error_stage": "duration_align",
+        "compose_window_overrun_sec": round(float(compose_window_overrun_sec), 3),
+    }
 
 
 def build_synthesis_groups(
@@ -632,6 +729,7 @@ def synthesize_segments_grouped(
         fit_path = segment_dir / f"{group_id}_fit.wav"
         attempts_base: List[Dict[str, Any]] = []
         group_review_reason: Optional[Dict[str, Any]] = None
+        group_last_attempt_no = 0
         try:
             if force_fit_timing and fit_path.exists():
                 reused_actual = audio_duration(fit_path)
@@ -953,8 +1051,12 @@ def synthesize_segments_grouped(
                                     }
                                 )
                         elif timing_mode == "strict":
-                            # OmniVoice 在阈值内保留原始尾音，避免 strict fit 的 atrim 截断句尾。
-                            if (tts_backend or "").strip().lower() == "omnivoice" and abs(raw_group_delta_effective) * 1000 <= delta_pass_ms:
+                            # Index-TTS/OmniVoice 在阈值内都保留原始尾音，避免 strict fit 的 atrim 截断句尾。
+                            if _should_skip_fit_to_preserve_tail(
+                                backend_name=tts_backend,
+                                effective_delta_sec=raw_group_delta_effective,
+                                delta_pass_ms=delta_pass_ms,
+                            ):
                                 attempts_base.append(
                                     {
                                         "attempt_no": 0,
@@ -1134,7 +1236,11 @@ def synthesize_segments_grouped(
                                 )
                                 retry_use = retry_fit
                     elif timing_mode == "strict":
-                        if (retry_backend or "").strip().lower() == "omnivoice" and abs(retry_delta_effective) * 1000 <= delta_pass_ms:
+                        if _should_skip_fit_to_preserve_tail(
+                            backend_name=retry_backend,
+                            effective_delta_sec=retry_delta_effective,
+                            delta_pass_ms=delta_pass_ms,
+                        ):
                             pass
                         else:
                             fit_audio_to_duration(
@@ -1171,6 +1277,7 @@ def synthesize_segments_grouped(
                 )
                 if not retry_still_silent:
                     use_path = retry_use
+                    group_last_attempt_no = 1
                 else:
                     group_review_reason = {
                         "reason_code": "tts_silent_after_retry",
@@ -1184,9 +1291,36 @@ def synthesize_segments_grouped(
             group_actual = audio_duration(use_path)
             group_delta = group_actual - group_target_duration
             group_delta_effective = group_actual - group_effective_target_duration
+            group_compose_window_overrun_sec = _compute_compose_window_overrun_sec(
+                actual_duration_sec=group_actual,
+                effective_target_duration_sec=group_effective_target_duration,
+            )
             anchor_status = "done" if abs(group_delta_effective) * 1000 <= delta_pass_ms else "manual_review"
             if group_review_reason is not None:
                 anchor_status = "manual_review"
+            if _backend_requires_compose_window_guard(tts_backend) and group_compose_window_overrun_sec > 0.0:
+                attempts_base.append(
+                    _build_compose_window_guard_attempt(
+                        attempt_no=group_last_attempt_no,
+                        action="group_compose_window_overrun_guard",
+                        input_text=group_text,
+                        actual_duration_sec=group_actual,
+                        delta_sec=group_delta,
+                        effective_target_duration_sec=group_effective_target_duration,
+                        borrowed_gap_sec=group_borrowed_gap_sec,
+                        effective_delta_sec=group_delta_effective,
+                        compose_window_overrun_sec=group_compose_window_overrun_sec,
+                    )
+                )
+                if anchor_status == "done":
+                    anchor_status = "manual_review"
+                    if group_review_reason is None:
+                        group_review_reason = _build_compose_window_review_reason(
+                            last_delta_sec=group_delta,
+                            last_effective_delta_sec=group_delta_effective,
+                            last_attempt_no=group_last_attempt_no,
+                            compose_window_overrun_sec=group_compose_window_overrun_sec,
+                        )
             leveling_stats = maybe_level_output_audio(use_path, log_segment_id=group_id)
 
             for local_index, global_index in enumerate(indices):
@@ -1887,9 +2021,13 @@ def synthesize_segments(
             )
 
             if force_fit_timing:
-                # OmniVoice 已经支持原生 duration 控制，阈值内优先保留原始尾音，
+                # Index-TTS / OmniVoice 在阈值内优先保留原始尾音，
                 # 避免再次 fit(含 atrim)造成句尾字被截断。
-                if primary_backend_name == "omnivoice" and abs_delta * 1000 <= delta_pass_ms:
+                if _should_skip_fit_to_preserve_tail(
+                    backend_name=primary_backend_name,
+                    effective_delta_sec=delta_effective,
+                    delta_pass_ms=delta_pass_ms,
+                ):
                     attempts.append(
                         {
                             "attempt_no": attempt_no,
@@ -2187,8 +2325,13 @@ def synthesize_segments(
             best_prosody_distance = best["prosody_distance"]
             retry_count = max(retry_count, int(best.get("attempt_no", retry_count)))
         effective_delta_best = actual_best - effective_target_duration
+        compose_window_overrun_sec = _compute_compose_window_overrun_sec(
+            actual_duration_sec=actual_best,
+            effective_target_duration_sec=effective_target_duration,
+        )
+        compose_guard_attempt_no = int(best.get("attempt_no", retry_count)) if best is not None else int(retry_count)
 
-        if final_status != "done" and v2_mode and best is not None:
+        if final_status != "done" and v2_mode and best is not None and compose_window_overrun_sec <= 0.0:
             final_status = "done"
             attempts.append(
                 {
@@ -2206,6 +2349,24 @@ def synthesize_segments(
                     },
                     "ts": _iso_now(),
                 }
+            )
+        if _backend_requires_compose_window_guard(primary_backend_name) and final_status == "done" and compose_window_overrun_sec > 0.0:
+            final_status = "manual_review"
+            failure_reason_code = COMPOSE_WINDOW_OVERRUN_REASON_CODE
+            failure_error_code = COMPOSE_WINDOW_OVERRUN_ERROR_CODE
+            failure_stage = "duration_align"
+            attempts.append(
+                _build_compose_window_guard_attempt(
+                    attempt_no=compose_guard_attempt_no,
+                    action="compose_window_overrun_guard",
+                    input_text=current_text,
+                    actual_duration_sec=actual_best,
+                    delta_sec=delta_best,
+                    effective_target_duration_sec=effective_target_duration,
+                    borrowed_gap_sec=borrowed_gap_sec,
+                    effective_delta_sec=effective_delta_best,
+                    compose_window_overrun_sec=compose_window_overrun_sec,
+                )
             )
 
         record: Dict[str, Any] = {
@@ -2243,16 +2404,26 @@ def synthesize_segments(
         records.append(record)
 
         if record["status"] != "done":
+            review_reason_detail = "segment not within pass threshold after retries"
+            if failure_reason_code == COMPOSE_WINDOW_OVERRUN_REASON_CODE:
+                review_reason_detail = (
+                    "candidate audio still exceeds compose window tolerance after timing adjustments"
+                )
             manual_review.append(
                 {
                     "segment_id": seg_id,
                     "reason_code": failure_reason_code,
-                    "reason_detail": "segment not within pass threshold after retries",
+                    "reason_detail": review_reason_detail,
                     "last_delta_sec": round(delta_best, 3),
                     "last_effective_delta_sec": round(effective_delta_best, 3),
-                    "last_attempt_no": max_retry,
+                    "last_attempt_no": compose_guard_attempt_no if failure_reason_code == COMPOSE_WINDOW_OVERRUN_REASON_CODE else max_retry,
                     "error_code": failure_error_code,
                     "error_stage": failure_stage,
+                    **(
+                        {"compose_window_overrun_sec": round(compose_window_overrun_sec, 3)}
+                        if failure_reason_code == COMPOSE_WINDOW_OVERRUN_REASON_CODE
+                        else {}
+                    ),
                 }
             )
             logger.log(

@@ -8,13 +8,18 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from subtitle_maker.domains.media import concat_generated_wavs
+from subtitle_maker.domains.media import audio_duration, concat_generated_wavs
 
 from .base import TtsBackend, TtsSynthesisRequest
 
 
 DEFAULT_INDEX_TTS_RECOVERY_WAIT_SEC = 180.0
 DEFAULT_INDEX_TTS_RECOVERY_POLL_SEC = 1.0
+DEFAULT_INDEX_TTS_QUALITY_MIN_TARGET_SEC = 0.80
+DEFAULT_INDEX_TTS_QUALITY_MIN_RATIO = 0.72
+DEFAULT_INDEX_TTS_QUALITY_MAX_RATIO = 1.18
+DEFAULT_INDEX_TTS_QUALITY_MIN_SHORTFALL_SEC = 0.25
+DEFAULT_INDEX_TTS_QUALITY_MIN_OVERRUN_SEC = 0.18
 
 
 def _http_json_request(
@@ -53,6 +58,17 @@ def _http_json_request(
         return json.loads(body)
     except Exception as exc:
         raise RuntimeError(f"E-TTS-001 index-tts api invalid json: {body[:200]}") from exc
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    """把任意值安全转换为浮点数；失败时返回 None。"""
+
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def check_index_tts_service(*, api_url: str, timeout_sec: float) -> Dict[str, Any]:
@@ -226,8 +242,10 @@ class IndexTtsBackend(TtsBackend):
         self.api_url = str(api_url)
         self.timeout_sec = float(timeout_sec)
         self.local_model = local_model
+        # 记录最近一次整句合成的时长观测，便于上游排障和单测验证。
+        self.last_synthesis_meta: Optional[Dict[str, Any]] = None
 
-    def _synthesize_local(self, request: TtsSynthesisRequest) -> None:
+    def _synthesize_local(self, request: TtsSynthesisRequest) -> Dict[str, Any]:
         """通过本地 Index-TTS 模型执行一次合成。"""
 
         if self.local_model is None:
@@ -248,8 +266,13 @@ class IndexTtsBackend(TtsBackend):
         )
         if not request.output_path.exists():
             raise RuntimeError("E-TTS-001 index-tts produced no output audio")
+        return {
+            "ok": True,
+            "duration_sec": audio_duration(request.output_path),
+            "backend_mode": "local",
+        }
 
-    def _synthesize_api(self, request: TtsSynthesisRequest) -> None:
+    def _synthesize_api(self, request: TtsSynthesisRequest) -> Dict[str, Any]:
         """通过 HTTP API 执行一次合成，并保留一次释放后重试。"""
 
         # 允许最多三次尝试：覆盖“重启窗口 + 首次冷启动 + 一次真实重试”。
@@ -279,7 +302,7 @@ class IndexTtsBackend(TtsBackend):
                         api_url=self.api_url,
                         timeout_sec=self.timeout_sec,
                     )
-                return
+                return result
             except Exception as exc:
                 errors.append(f"attempt{attempt}={exc}")
                 # 短暂故障先等服务健康恢复（常见于 auto-restart 窗口）。
@@ -303,44 +326,116 @@ class IndexTtsBackend(TtsBackend):
                         f"{joined}"
                     ) from exc
 
-    def _synthesize_one(self, request: TtsSynthesisRequest) -> None:
+    def _synthesize_one(self, request: TtsSynthesisRequest) -> Dict[str, Any]:
         """执行单个文本分片的合成。"""
 
         if self.via_api:
-            self._synthesize_api(request)
-            return
-        self._synthesize_local(request)
+            return self._synthesize_api(request)
+        return self._synthesize_local(request)
+
+    def _build_duration_summary(
+        self,
+        request: TtsSynthesisRequest,
+        *,
+        chunk_results: List[Dict[str, Any]],
+        output_duration_sec: Optional[float],
+        quality_attempt_no: int,
+    ) -> Dict[str, Any]:
+        """汇总整句时长质量信息，用于是否追加一次保守重试。"""
+
+        api_chunk_durations = [
+            duration
+            for duration in (_safe_float(item.get("duration_sec")) for item in chunk_results)
+            if duration is not None and duration > 0.0
+        ]
+        api_duration_sec = round(sum(api_chunk_durations), 6) if api_chunk_durations else None
+        target_duration_sec = _safe_float(request.target_duration_sec)
+        observed_duration_sec = api_duration_sec if api_duration_sec is not None else _safe_float(output_duration_sec)
+        duration_ratio: Optional[float] = None
+        quality_retry_reason: Optional[str] = None
+
+        if (
+            target_duration_sec is not None
+            and target_duration_sec >= DEFAULT_INDEX_TTS_QUALITY_MIN_TARGET_SEC
+            and observed_duration_sec is not None
+            and observed_duration_sec > 0.0
+        ):
+            duration_ratio = observed_duration_sec / target_duration_sec
+            shortfall_sec = target_duration_sec - observed_duration_sec
+            overrun_sec = observed_duration_sec - target_duration_sec
+            if (
+                duration_ratio < DEFAULT_INDEX_TTS_QUALITY_MIN_RATIO
+                and shortfall_sec >= DEFAULT_INDEX_TTS_QUALITY_MIN_SHORTFALL_SEC
+            ):
+                quality_retry_reason = "too_short"
+            elif (
+                duration_ratio > DEFAULT_INDEX_TTS_QUALITY_MAX_RATIO
+                and overrun_sec >= DEFAULT_INDEX_TTS_QUALITY_MIN_OVERRUN_SEC
+            ):
+                quality_retry_reason = "too_long"
+
+        return {
+            "target_duration_sec": target_duration_sec,
+            "output_duration_sec": None if output_duration_sec is None else round(float(output_duration_sec), 6),
+            "api_duration_sec": api_duration_sec,
+            "observed_duration_sec": None if observed_duration_sec is None else round(float(observed_duration_sec), 6),
+            "duration_ratio": None if duration_ratio is None else round(float(duration_ratio), 6),
+            "quality_retry_reason": quality_retry_reason,
+            "quality_attempt_no": int(quality_attempt_no),
+            "chunk_count": len(chunk_results),
+        }
 
     def synthesize(self, request: TtsSynthesisRequest) -> None:
         """按分片规则执行整句 Index-TTS 合成。"""
 
+        self.last_synthesis_meta = None
+        max_quality_attempts = 2 if self.via_api and request.target_duration_sec is not None else 1
         chunks = split_text_for_index_tts(request.text, max_text_tokens=request.max_text_tokens)
-        part_paths: List[Path] = []
-        for index, chunk in enumerate(chunks):
-            chunk_output = request.output_path.with_name(f"{request.output_path.stem}_part{index:03d}.wav")
-            self._synthesize_one(
-                TtsSynthesisRequest(
-                    text=chunk,
-                    ref_audio_path=request.ref_audio_path,
-                    output_path=chunk_output,
-                    emo_audio_prompt=request.emo_audio_prompt,
-                    emo_alpha=request.emo_alpha,
-                    use_emo_text=request.use_emo_text,
-                    emo_text=request.emo_text,
-                    top_p=request.top_p,
-                    top_k=request.top_k,
-                    temperature=request.temperature,
-                    max_text_tokens=request.max_text_tokens,
-                )
-            )
-            part_paths.append(chunk_output)
+        for quality_attempt_no in range(1, max_quality_attempts + 1):
+            part_paths: List[Path] = []
+            chunk_results: List[Dict[str, Any]] = []
+            try:
+                for index, chunk in enumerate(chunks):
+                    chunk_output = request.output_path.with_name(f"{request.output_path.stem}_part{index:03d}.wav")
+                    chunk_result = self._synthesize_one(
+                        TtsSynthesisRequest(
+                            text=chunk,
+                            ref_audio_path=request.ref_audio_path,
+                            output_path=chunk_output,
+                            emo_audio_prompt=request.emo_audio_prompt,
+                            emo_alpha=request.emo_alpha,
+                            use_emo_text=request.use_emo_text,
+                            emo_text=request.emo_text,
+                            top_p=request.top_p,
+                            top_k=request.top_k,
+                            temperature=request.temperature,
+                            max_text_tokens=request.max_text_tokens,
+                            target_duration_sec=request.target_duration_sec,
+                        )
+                    )
+                    part_paths.append(chunk_output)
+                    if isinstance(chunk_result, dict):
+                        chunk_results.append(dict(chunk_result))
 
-        try:
-            concat_generated_wavs(part_paths, request.output_path)
-        finally:
-            for part_path in part_paths:
-                try:
-                    if part_path.exists():
-                        part_path.unlink()
-                except Exception:
-                    pass
+                concat_generated_wavs(part_paths, request.output_path)
+            finally:
+                for part_path in part_paths:
+                    try:
+                        if part_path.exists():
+                            part_path.unlink()
+                    except Exception:
+                        pass
+
+            output_duration_sec = audio_duration(request.output_path) if request.output_path.exists() else None
+            summary = self._build_duration_summary(
+                request,
+                chunk_results=chunk_results,
+                output_duration_sec=output_duration_sec,
+                quality_attempt_no=quality_attempt_no,
+            )
+            self.last_synthesis_meta = summary
+            retry_reason = str(summary.get("quality_retry_reason") or "").strip().lower()
+            if retry_reason and quality_attempt_no < max_quality_attempts:
+                # 只对明显偏短/偏长结果补一次保守重试，避免直接把异常时长交给后处理硬裁。
+                continue
+            return

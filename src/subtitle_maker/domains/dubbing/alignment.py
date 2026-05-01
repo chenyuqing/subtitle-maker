@@ -61,7 +61,7 @@ def trim_silence_edges(
     input_path: Path,
     output_path: Path,
     threshold_db: float = -35.0,
-    pad_sec: float = 0.03,
+    pad_sec: float = 0.08,
     min_keep_sec: float = 0.10,
 ) -> Tuple[float, float]:
     """裁掉音频首尾静音，并返回裁前/裁后时长。"""

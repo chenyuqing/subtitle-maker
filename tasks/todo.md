@@ -1,13 +1,25 @@
 # TODO
 
 ## TODO（2026-05-02 Index-TTS 吞字修复）
-- [ ] 新建 `docs/plans/0001-index-tts-timing-fix-2026-05-02.md` 并落档本轮实施计划
-- [ ] 创建本地 checkpoint commit，纳入当前 `Index-TTS` 相关未提交改动，作为回滚锚点
-- [ ] 扩展 `Index-TTS` strict 尾部保护，避免阈值内强制 fit 导致句尾被截断
-- [ ] 放宽 `trim_silence_edges()` 的默认 padding，减少轻声首尾被误裁
-- [ ] 使用 `Index-TTS` API 返回的 `duration_sec` 建立过短/过长质量反馈与重试
-- [ ] 在进入 `compose_vocals_master()` 前增加超窗守卫，阻止会被二次裁尾的 `done` 片段
-- [ ] 补单测与回归验证，覆盖 strict 尾部保护、trim padding、duration 反馈、compose 守卫
+- [x] 新建 `docs/plans/0001-index-tts-timing-fix-2026-05-02.md` 并落档本轮实施计划
+- [x] 创建本地 checkpoint commit，纳入当前 `Index-TTS` 相关未提交改动，作为回滚锚点
+- [x] 扩展 `Index-TTS` strict 尾部保护，避免阈值内强制 fit 导致句尾被截断
+- [x] 放宽 `trim_silence_edges()` 的默认 padding，减少轻声首尾被误裁
+- [x] 使用 `Index-TTS` API 返回的 `duration_sec` 建立过短/过长质量反馈与重试
+- [x] 在进入 `compose_vocals_master()` 前增加超窗守卫，阻止会被二次裁尾的 `done` 片段
+- [x] 补单测与回归验证，覆盖 strict 尾部保护、trim padding、duration 反馈、compose 守卫
+
+## Review（2026-05-02 Index-TTS 吞字修复）
+- 计划与回滚锚点：
+  - 新增 [docs/plans/0001-index-tts-timing-fix-2026-05-02.md](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/docs/plans/0001-index-tts-timing-fix-2026-05-02.md)；
+  - 本地 checkpoint commit：`355d7e0 chore: checkpoint index tts timing fix plan`。
+- 后端修复：
+  - [src/subtitle_maker/backends/index_tts.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/index_tts.py) 现在会消费 API `duration_sec`，对明显偏短/偏长结果做一次内部质量重试，并保留 `last_synthesis_meta` 供排障；
+  - [src/subtitle_maker/domains/dubbing/alignment.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/alignment.py) 把 `trim_silence_edges()` 默认 `pad_sec` 从 `0.03` 提到 `0.08`；
+  - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 将 strict 尾部保护扩到 `Index-TTS`，并新增仅对 `Index-TTS` 生效的 compose 超窗守卫，超出 `effective_target + 0.03s` 的候选会转 `manual_review`，不再静默进入拼轨。
+- 验证证据：
+  - `uv run python -m py_compile src/subtitle_maker/backends/index_tts.py src/subtitle_maker/domains/dubbing/alignment.py src/subtitle_maker/domains/dubbing/pipeline.py tests/test_dubbing_runtime.py`
+  - `uv run python -m unittest tests.test_dubbing_runtime tests.test_index_tts_fastapi_server`
 
 ## TODO（2026-04-30 Sidebar Logo 重做 + 上传入口合并）
 - [x] 左侧栏 Logo 区改为导航式左对齐（图标左 + `Subtitle/Maker` 两行右），移除 96x96 方块占位
