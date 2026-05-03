@@ -1,5 +1,14 @@
 # TODO
 
+## TODO（2026-05-03 Auto Dubbing V3）
+- [x] 新建 `docs/plans/0002-auto-dubbing-v3-2026-05-03.md` 并落档 V3 计划书
+- [ ] 创建本地 checkpoint commit，作为 V3 实现前可回滚锚点
+- [ ] 左侧栏新增 `Auto Dubbing V3` 与 `panel-auto-dub-v3`
+- [ ] 后端允许 `pipeline_version=v3`，并透传 V3 CLI 参数
+- [ ] 接入 `asd-pipeline /run-tracked`，生成 `speaker_segments.json`
+- [ ] 复用 OmniVoice 时长控制链路完成 V3 配音
+- [ ] 补测试并验证 V1/V2 不回归
+
 ## TODO（2026-05-02 Index-TTS 吞字修复）
 - [x] 新建 `docs/plans/0001-index-tts-timing-fix-2026-05-02.md` 并落档本轮实施计划
 - [x] 创建本地 checkpoint commit，纳入当前 `Index-TTS` 相关未提交改动，作为回滚锚点
