@@ -55,7 +55,7 @@ async def stream_video(filename: str):
 
 @router.post("/project/reset")
 async def reset_project_storage():
-    """清理 legacy 上传/输出目录，但保留 dubbing 历史目录。"""
+    """清理当前项目态与上传目录，但保留所有已生成的配音结果。"""
 
     cancelled_auto_tasks = cancel_active_dubbing("Cancelled via project reset")
     uploads_removed = legacy_runtime.clear_directory_contents(
@@ -66,14 +66,11 @@ async def reset_project_storage():
         os.path.join(legacy_runtime.UPLOAD_DIR, "dubbing"),
         keep_count=3,
     )
-    outputs_removed = legacy_runtime.clear_directory_contents(
-        legacy_runtime.OUTPUT_DIR,
-        exclude_names={"dub_jobs"},
-    )
     return {
         "status": "reset",
         "cancelled_auto_tasks": cancelled_auto_tasks,
         "uploads_removed": uploads_removed,
         "dubbing_pruned": dubbing_pruned,
-        "outputs_removed": outputs_removed,
+        # 配音产物属于可恢复/可下载结果，New Project 不应删除。
+        "outputs_removed": 0,
     }

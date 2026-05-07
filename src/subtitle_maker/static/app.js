@@ -1090,7 +1090,7 @@ function syncDubbingLanguage(lang) {
 }
 
 async function clearState() {
-    const confirmed = confirm("Are you sure you want to start a new project? This will clear current progress and uploaded files.");
+    const confirmed = confirm("Are you sure you want to start a new project? This will clear current progress and uploaded files, but keep generated dubbing outputs.");
     if (!confirmed) return;
 
     const cleanupRequests = [];

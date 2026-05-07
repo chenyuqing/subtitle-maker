@@ -1,5 +1,60 @@
 # TODO
 
+## 66. 2026-05-07 OmniVoice 输出目录并入 dub_jobs
+- [x] 目标
+  - 5 号 `Auto Dub Omnivoice` 的结果目录从 `outputs/omnivoice_dub_jobs/` 迁移到 `outputs/dub_jobs/`
+  - 保持 4 号和 5 号都在同一个 `dub_jobs` 根目录下，但目录名前缀区分，避免串台
+- [x] 目录约定
+  - 4 号继续使用 `outputs/dub_jobs/web_<task_id>/...`
+  - 5 号改为 `outputs/dub_jobs/omnivoice_<task_id>/...`
+  - 兼容旧的 `outputs/omnivoice_dub_jobs/` 历史结果用于恢复和下载
+- [x] 验证
+  - 新任务的 manifest / artifact / load-batch 都能正常工作
+  - 旧任务仍能被列表和恢复接口识别
+- [x] Review
+  - 新任务输出现在统一落到 `outputs/dub_jobs/omnivoice_<task_id>/...`
+  - 旧的 `outputs/omnivoice_dub_jobs/` 仍可恢复，不影响历史结果
+
+## 65. 2026-05-07 New Project 保留 outputs 配音结果
+- [ ] 目标
+  - 左下角 `New Project` 只清当前项目状态、上传文件和任务态
+  - 不删除 `outputs/` 下已经生成的配音结果、manifest、视频和可恢复批次
+- [ ] 后端
+  - `/project/reset` 不再清空整个 `outputs/` 目录
+  - 保留 `outputs/dub_jobs`、`outputs/omnivoice_dub_jobs` 等结果目录
+- [ ] 前端
+  - 更新确认文案，明确 `New Project` 不会删除已生成的配音内容
+- [ ] 验证
+  - `New Project` 后当前项目状态清空，但 `outputs/` 中旧配音结果仍可加载/下载
+
+## 64. 2026-05-07 OmniVoice 空翻译句兜底
+- [x] 目标
+  - 解决 source 字幕翻译后，最后一条或个别句子被翻成空字符串，进而触发 OmniVoice 422 `body.text` 缺失
+- [x] 修复
+  - `_normalize_translation_result()` 保留原始翻译结果，不再回填原文
+  - 新增空字幕过滤：空翻译行会直接从配音链路里跳过，不会送进 OmniVoice
+- [x] 验证
+  - `uv run python -m py_compile src/subtitle_maker/omnivoice_dub_api.py`
+  - 模拟翻译结果最后一条为空时，归一化后会被过滤掉，不再保留空文本
+- [x] Review
+  - 这次 422 的根因不是 OmniVoice 接口本身，而是翻译输出里出现了空句
+  - 以后只要发现翻译结果有空行，优先直接过滤，不要回填原文去污染目标语言
+
+## 63. 2026-05-07 复制 4 号面板 Custom System Prompt 行为到 5 号 OmniVoice
+- [x] 目标
+  - 让 5 号 `Auto Dub Omnivoice` 的 `Custom System Prompt (Optional)` 行为与 4 号面板对齐
+  - 翻译仍复用全局 OpenAI-compatible API，不影响配音主链路
+- [x] 前端行为
+  - 5 号面板优先读取自己的 `omnivoice-translate-system-prompt`
+  - 若 5 号输入为空，回退读取旧的 `system-prompt`，和 4 号面板保持一致的兼容行为
+  - 空 prompt 时不向后端传参，避免污染翻译请求
+- [x] 验证
+  - `node --check src/subtitle_maker/static/js/omnivoiceDubbingPanel.js`
+  - source 字幕继续走翻译，translated 字幕继续跳过翻译，不影响配音主链路
+- [x] Review
+  - 5 号 OmniVoice 的翻译系统提示词现在与 4 号面板的兼容行为对齐
+  - 只改 `translate_system_prompt` 的读取回退逻辑，没有碰 speaker 映射或生成链路
+
 ## 62. 2026-05-07 OmniVoice strict speaker 参考音上传
 - [x] 目标
   - 5 号 `Auto Dub Omnivoice` 不再默认依赖“从原视频自动聚合参考音”作为主路径

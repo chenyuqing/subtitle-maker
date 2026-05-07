@@ -394,7 +394,19 @@ export function setupOmnivoiceDubbingPanel(deps) {
         formData.append('api_key', getTranslateApiKey ? getTranslateApiKey() : '');
         formData.append('translate_base_url', getTranslateBaseUrl ? getTranslateBaseUrl() : '');
         formData.append('translate_model', getTranslateModel ? getTranslateModel() : '');
-        formData.append('translate_system_prompt', translateSystemPromptInput?.value.trim() || '');
+        // 兼容 4 号面板的旧习惯：优先用 5 号自己的 prompt，空时回退读 legacy 全局 prompt。
+        // 只影响 source->translate，不会改变配音音色或 speaker 路由。
+        const translateSystemPrompt = (() => {
+            const panelPrompt = String(translateSystemPromptInput?.value || '').trim();
+            if (panelPrompt) {
+                return panelPrompt;
+            }
+            const legacyPromptInput = document.getElementById('system-prompt');
+            return String(legacyPromptInput?.value || '').trim();
+        })();
+        if (translateSystemPrompt) {
+            formData.append('translate_system_prompt', translateSystemPrompt);
+        }
         const speakerIds = validateSpeakerReferenceUploads();
         formData.append('speaker_ref_speaker_ids_json', JSON.stringify(speakerIds));
         speakerIds.forEach((speakerId) => {

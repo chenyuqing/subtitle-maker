@@ -57,8 +57,10 @@ from subtitle_maker.translator import (
 router = APIRouter(prefix="/omnivoice/auto", tags=["omnivoice-auto"])
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-OUTPUT_ROOT = REPO_ROOT / "outputs" / "omnivoice_dub_jobs"
+OUTPUT_ROOT = REPO_ROOT / "outputs" / "dub_jobs"
+LEGACY_OUTPUT_ROOT = REPO_ROOT / "outputs" / "omnivoice_dub_jobs"
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+LEGACY_OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
 _task_store = TaskStore()
 logger = logging.getLogger(__name__)
@@ -91,7 +93,7 @@ def _build_readable_task_id() -> str:
     existing_ids = set(_task_store.keys_snapshot())
     candidate = base
     index = 2
-    while candidate in existing_ids or (OUTPUT_ROOT / f"web_{candidate}").exists():
+    while candidate in existing_ids or (OUTPUT_ROOT / f"omnivoice_{candidate}").exists():
         candidate = f"{base}_{index:02d}"
         index += 1
     return candidate
@@ -100,7 +102,13 @@ def _build_readable_task_id() -> str:
 def _resolve_output_dir(task_id: str) -> Path:
     """按任务 ID 解析输出目录。"""
 
-    return (OUTPUT_ROOT / f"web_{task_id}").resolve()
+    return (OUTPUT_ROOT / f"omnivoice_{task_id}").resolve()
+
+
+def _resolve_legacy_output_dir(task_id: str) -> Path:
+    """按旧任务 ID 解析历史 OmniVoice 输出目录。"""
+
+    return (LEGACY_OUTPUT_ROOT / f"web_{task_id}").resolve()
 
 
 def _build_artifact_url(task_id: str, artifact: str) -> str:
@@ -199,6 +207,33 @@ def _normalize_translation_result(
             }
         )
     return normalized
+
+
+def _drop_empty_subtitle_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    label: str,
+) -> List[Dict[str, Any]]:
+    """过滤空字幕行，避免空文本继续进入 OmniVoice 生成阶段。"""
+
+    filtered: List[Dict[str, Any]] = []
+    dropped = 0
+    for row in rows:
+        text = str(row.get("text") or "").strip()
+        if not text:
+            dropped += 1
+            continue
+        filtered.append(
+            {
+                "start": float(row.get("start", 0.0) or 0.0),
+                "end": float(row.get("end", 0.0) or 0.0),
+                "text": text,
+                "speaker_id": str(row.get("speaker_id") or "").strip(),
+            }
+        )
+    if dropped > 0:
+        logger.warning("OmniVoice dropped %d empty %s rows before synthesis", dropped, label)
+    return filtered
 
 
 def _pick_reference_slices(items: List[Tuple[int, Dict[str, Any]]]) -> List[Tuple[int, Dict[str, Any]]]:
@@ -653,6 +688,9 @@ def _translate_subtitles_if_needed(
     )
     translated_rows = _normalize_translation_result(selected_rows, translated_texts)
     translated_rows = _ensure_speaker_ids(translated_rows, fallback_rows=source_rows)
+    translated_rows = _drop_empty_subtitle_rows(translated_rows, label="translated")
+    if not translated_rows:
+        raise HTTPException(status_code=400, detail="OmniVoice translation produced no usable subtitle rows")
     logger.info("OmniVoice task %s translated %d subtitles from source mode", task_id, len(translated_rows))
     return translated_rows, selected_mode
 
@@ -829,14 +867,22 @@ def _build_manifest(
 def _load_manifest(batch_id: str) -> Optional[Dict[str, Any]]:
     """从磁盘加载历史 OmniVoice manifest。"""
 
-    out_root = _resolve_output_dir(batch_id)
-    manifest_path = out_root / "manifest.json"
-    if not manifest_path.exists():
-        return None
-    try:
-        return json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+    candidate_roots = [
+        _resolve_output_dir(batch_id),
+        _resolve_legacy_output_dir(batch_id),
+    ]
+    for out_root in candidate_roots:
+        manifest_path = out_root / "manifest.json"
+        if not manifest_path.exists():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if isinstance(manifest, dict):
+                manifest["_manifest_path"] = str(manifest_path.resolve())
+            return manifest
+        except Exception:
+            continue
+    return None
 
 
 def _artifact_path_from_task(task: Dict[str, Any], artifact: str) -> Optional[Path]:
@@ -862,6 +908,9 @@ def _create_task_from_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
     task_id = str(manifest.get("task_id") or manifest.get("batch_id") or "").strip()
     if not task_id:
         raise HTTPException(status_code=400, detail="Invalid OmniVoice manifest")
+    manifest_path_text = str(manifest.get("_manifest_path") or "").strip()
+    manifest_path = Path(manifest_path_text).expanduser().resolve() if manifest_path_text else None
+    out_root = manifest_path.parent if manifest_path and manifest_path.exists() else _resolve_output_dir(task_id)
     task = _create_task_payload(
         task_id=task_id,
         project_filename=str(manifest.get("project_filename") or ""),
@@ -872,7 +921,7 @@ def _create_task_from_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
         source_count=int(manifest.get("source_subtitles_count") or 0),
         translated_count=int(manifest.get("translated_subtitles_count") or 0),
         speaker_ids=list(manifest.get("speaker_ids") or []),
-        out_root=_resolve_output_dir(task_id),
+        out_root=out_root,
     )
     task["status"] = str(manifest.get("status") or "completed")
     task["stage"] = str(manifest.get("stage") or "completed")
@@ -882,7 +931,7 @@ def _create_task_from_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
     task["artifacts"] = list(manifest.get("artifacts") or [])
     task["result_srt"] = str((manifest.get("paths") or {}).get("dubbed_final_srt") or "") or None
     task["result_audio"] = str((manifest.get("paths") or {}).get("dubbed_mix") or "") or None
-    task["batch_manifest_path"] = str(_resolve_output_dir(task_id) / "manifest.json")
+    task["batch_manifest_path"] = str((out_root / "manifest.json").resolve())
     _task_store.create(task_id, task)
     return task
 
@@ -1023,6 +1072,7 @@ def _run_omnivoice_job(
         task_id=task_id,
     )
     selected_subtitles = _ensure_speaker_ids(selected_subtitles, fallback_rows=source_subtitles)
+    selected_subtitles = _drop_empty_subtitle_rows(selected_subtitles, label="selected")
     source_reference_subtitles = _ensure_speaker_ids(source_subtitles, fallback_rows=selected_subtitles)
     selected_subtitles_path = out_root / "selected_subtitles.srt"
     selected_subtitles_path.write_text(format_srt(selected_subtitles), encoding="utf-8")
@@ -1100,9 +1150,15 @@ def _run_omnivoice_job(
         output_segment_path = segment_dir / f"seg_{index:04d}.wav"
         duration_sec = max(0.05, float(row.get("end", 0.0) or 0.0) - float(row.get("start", 0.0) or 0.0))
         ref_text_for_generation = _build_generation_ref_text(ref_meta)
+        generation_text = str(row.get("text") or "").strip()
+        if not generation_text:
+            raise RuntimeError(
+                f"OmniVoice subtitle #{index:04d} has empty text after filtering; "
+                "cannot synthesize blank content"
+            )
         generated_bytes = _call_remote_generate(
             api_url=omnivoice_api_url,
-            text=str(row.get("text") or "").strip(),
+            text=generation_text,
             language=target_lang,
             ref_audio_path=ref_audio_path,
             ref_text=ref_text_for_generation,
@@ -1123,7 +1179,7 @@ def _run_omnivoice_job(
             "speaker_id": speaker_id,
             "start_sec": float(row.get("start", 0.0) or 0.0),
             "end_sec": float(row.get("end", 0.0) or 0.0),
-            "text": str(row.get("text") or "").strip(),
+            "text": generation_text,
             "ref_audio_path": str(ref_audio_path.resolve()),
             "tts_audio_path": str(final_segment_path.resolve()),
             "duration_sec": round(duration_sec, 3),
@@ -1450,23 +1506,38 @@ async def get_omnivoice_status(task_id: str) -> Dict[str, Any]:
 async def list_omnivoice_batches() -> Dict[str, Any]:
     """列出可恢复的 OmniVoice 结果目录。"""
 
-    items: List[Dict[str, Any]] = []
-    for manifest_path in sorted(OUTPUT_ROOT.glob("web_*/manifest.json"), key=lambda path: path.stat().st_mtime, reverse=True):
+    manifest_paths: List[Path] = []
+    manifest_paths.extend(sorted(OUTPUT_ROOT.glob("omnivoice_*/manifest.json"), key=lambda path: path.stat().st_mtime, reverse=True))
+    manifest_paths.extend(sorted(LEGACY_OUTPUT_ROOT.glob("web_*/manifest.json"), key=lambda path: path.stat().st_mtime, reverse=True))
+    seen_paths = set()
+    collected: List[Tuple[float, Dict[str, Any]]] = []
+    for manifest_path in manifest_paths:
+        if manifest_path in seen_paths:
+            continue
+        seen_paths.add(manifest_path)
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        items.append(
-            {
-                "batch_id": str(manifest.get("batch_id") or manifest.get("task_id") or manifest_path.parent.name.removeprefix("web_")),
-                "task_id": str(manifest.get("task_id") or ""),
-                "project_filename": str(manifest.get("project_filename") or ""),
-                "status": str(manifest.get("status") or ""),
-                "created_at": str(manifest.get("created_at") or ""),
-                "target_lang": str(manifest.get("target_lang") or ""),
-                "subtitle_mode": str(manifest.get("subtitle_mode") or ""),
-            }
+        collected.append(
+            (
+                manifest_path.stat().st_mtime,
+                {
+                    "batch_id": str(
+                        manifest.get("batch_id")
+                        or manifest.get("task_id")
+                        or manifest_path.parent.name.removeprefix("omnivoice_").removeprefix("web_")
+                    ),
+                    "task_id": str(manifest.get("task_id") or ""),
+                    "project_filename": str(manifest.get("project_filename") or ""),
+                    "status": str(manifest.get("status") or ""),
+                    "created_at": str(manifest.get("created_at") or ""),
+                    "target_lang": str(manifest.get("target_lang") or ""),
+                    "subtitle_mode": str(manifest.get("subtitle_mode") or ""),
+                },
+            )
         )
+    items = [item for _, item in sorted(collected, key=lambda pair: pair[0], reverse=True)]
     return {"items": items}
 
 
