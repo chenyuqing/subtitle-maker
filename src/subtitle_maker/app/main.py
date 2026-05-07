@@ -5,6 +5,7 @@ from fastapi.staticfiles import StaticFiles
 
 from subtitle_maker.agent_api import router as agent_router
 from subtitle_maker.dubbing_cli_api import router as dubbing_router
+from subtitle_maker.omnivoice_dub_api import router as omnivoice_dub_router
 from subtitle_maker.speaker_voice_api import router as speaker_voice_router
 from subtitle_maker.streaming_api import router as streaming_router
 
@@ -23,6 +24,7 @@ def create_app() -> FastAPI:
     app.mount("/static", StaticFiles(directory=legacy_runtime.STATIC_DIR), name="static")
     app.include_router(streaming_router)
     app.include_router(dubbing_router)
+    app.include_router(omnivoice_dub_router)
     app.include_router(speaker_voice_router)
     app.include_router(agent_router)
     app.include_router(projects_router)

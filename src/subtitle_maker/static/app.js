@@ -26,7 +26,6 @@ const globalTranslateCard = document.querySelector('.sidebar-translate-card');
 const globalTranslateToggleBtn = document.getElementById('global-translate-toggle');
 const globalTranslateBaseUrlInput = document.getElementById('global-translate-base-url');
 const globalTranslateModelInput = document.getElementById('global-translate-model');
-const globalTtsBackendSelect = document.getElementById('global-tts-backend');
 
 const originalDisplay = document.getElementById('original-subtitles');
 const translatedDisplay = document.getElementById('translated-subtitles');
@@ -55,13 +54,11 @@ const TRANSLATE_COLLAPSED_KEY = 'sm_translateCollapsed';
 const LEGACY_TRANSLATE_COLLAPSED_KEY = 'sm_deepseekCollapsed';
 const TRANSLATE_BASE_URL_KEY = 'sm_translateBaseUrl';
 const TRANSLATE_MODEL_KEY = 'sm_translateModel';
-const GLOBAL_TTS_BACKEND_KEY = 'sm_globalTtsBackend';
 const PROJECT_MEDIA_FILENAME_KEY = 'sm_projectMediaFilename';
 const PROJECT_MEDIA_ORIGINAL_FILENAME_KEY = 'sm_projectMediaOriginalFilename';
 const SHORT_MERGE_TARGET_DEFAULT = 15;
 const SHORT_MERGE_TARGET_MIN = 6;
 const SHORT_MERGE_TARGET_MAX = 20;
-const DEFAULT_GLOBAL_TTS_BACKEND = 'index-tts';
 const DEFAULT_TRANSLATION_PROVIDER = Object.freeze({
     baseUrl: 'https://api.deepseek.com',
     model: 'deepseek-v4-flash',
@@ -187,18 +184,6 @@ function getTranslateModel() {
     return value || DEFAULT_TRANSLATE_MODEL;
 }
 
-// 统一约束侧边栏 TTS backend 值，防止本地存储脏值污染请求参数。
-function normalizeGlobalTtsBackend(value) {
-    const normalized = String(value || '').trim().toLowerCase();
-    // Auto Dubbing 现阶段只保留 index-tts；兼容旧 localStorage 脏值时统一回落。
-    return normalized === 'index-tts' ? 'index-tts' : DEFAULT_GLOBAL_TTS_BACKEND;
-}
-
-// 统一读取侧边栏 TTS backend，Auto Dubbing V1/V2 共用这一处状态。
-function getGlobalTtsBackend() {
-    return normalizeGlobalTtsBackend(globalTtsBackendSelect ? globalTtsBackendSelect.value : DEFAULT_GLOBAL_TTS_BACKEND);
-}
-
 // 统一发布“当前项目上下文已变化”，由 Auto Dubbing 面板按需重新读取详情。
 function notifyProjectContextChanged() {
     window.dispatchEvent(new CustomEvent('subtitle-maker:project-context-changed'));
@@ -209,11 +194,6 @@ function notifyTranslateConfigChanged() {
     window.dispatchEvent(new CustomEvent('subtitle-maker:translate-config-changed'));
     // 兼容旧监听名，避免一次性重命名导致子模块失联。
     window.dispatchEvent(new CustomEvent('subtitle-maker:deepseek-config-changed'));
-}
-
-// 统一发布“全局 TTS backend 已切换”，供 Auto Dubbing 面板即时刷新必填项与文案。
-function notifyTtsBackendChanged() {
-    window.dispatchEvent(new CustomEvent('subtitle-maker:tts-backend-changed'));
 }
 
 // 供 Auto Dubbing 读取当前项目的媒体、任务与字幕状态；避免模块自行维护重复状态。
@@ -322,20 +302,6 @@ function initTranslateSettings() {
     const collapsedValue = savedCollapsed === null ? legacyCollapsed : savedCollapsed;
     applyTranslateCollapsed(collapsedValue === null ? true : collapsedValue === 'true', false);
     syncTranslateSettingsUi();
-}
-
-// 初始化全局 TTS backend 选择器，并持久化用户偏好。
-function initGlobalTtsBackendSetting() {
-    if (!globalTtsBackendSelect) return;
-    const savedBackend = normalizeGlobalTtsBackend(localStorage.getItem(GLOBAL_TTS_BACKEND_KEY));
-    globalTtsBackendSelect.value = savedBackend;
-    globalTtsBackendSelect.addEventListener('change', () => {
-        const normalized = getGlobalTtsBackend();
-        globalTtsBackendSelect.value = normalized;
-        localStorage.setItem(GLOBAL_TTS_BACKEND_KEY, normalized);
-        notifyTtsBackendChanged();
-        notifyTranslateConfigChanged();
-    });
 }
 
 function seekVideo(deltaSeconds) {
@@ -694,7 +660,7 @@ function updateVideoDuration() {
 // --- Navigation Logic ---
 const navButtons = document.querySelectorAll('.nav-item');
 const panels = document.querySelectorAll('.panel');
-const AUTO_DUB_PANEL_IDS = new Set(['panel-auto-dub']);
+const AUTO_DUB_PANEL_IDS = new Set(['panel-auto-dub', 'panel-auto-dub-omnivoice']);
 const PANEL_INTERNAL_SCROLL_IDS = new Set(['panel-transcribe', 'panel-results']);
 
 // 在 Auto Dubbing 面板激活时，为底部操作区预留安全空间，避免被播放器区域或悬浮元素遮挡。
@@ -741,7 +707,7 @@ syncFloatingUiForActivePanel(document.querySelector('.panel.active')?.id || 'pan
  * 在 2/3 面板点击下拉时，临时放开主滚动区 overflow，关闭后自动恢复。
  */
 function initPanelSelectOverflowFix() {
-    const selector = '#panel-transcribe select, #panel-results select';
+    const selector = '#panel-transcribe select, #panel-results select, #panel-auto-dub select, #panel-auto-dub-omnivoice select';
     const selects = Array.from(document.querySelectorAll(selector));
     if (selects.length === 0) return;
 
@@ -1196,7 +1162,6 @@ if (themeToggleBtn) {
 // 初始化共享前端状态：先恢复全局翻译 provider 配置，再恢复项目上下文。
 window.addEventListener('DOMContentLoaded', () => {
     initTranslateSettings();
-    initGlobalTtsBackendSetting();
     loadState();
 });
 
@@ -2061,13 +2026,14 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // --- Auto Dubbing / Agent Modules ---
-    Promise.all([
-        loadFrontendModule('js/dubbingPanel.js'),
-        loadFrontendModule('js/speakerVoicePanel.js'),
-    ]).then(([dubbingPanelModule, speakerVoicePanelModule]) => {
-        dubbingPanelModule.setupDubbingPanels({
-            videoPlayer,
-            videoPlaceholder,
+Promise.all([
+    loadFrontendModule('js/dubbingPanel.js'),
+    loadFrontendModule('js/omnivoiceDubbingPanel.js'),
+    loadFrontendModule('js/speakerVoicePanel.js'),
+]).then(([dubbingPanelModule, omnivoiceDubbingPanelModule, speakerVoicePanelModule]) => {
+    dubbingPanelModule.setupDubbingPanels({
+        videoPlayer,
+        videoPlaceholder,
             shortMergeTargetDefault: SHORT_MERGE_TARGET_DEFAULT,
             shortMergeTargetMin: SHORT_MERGE_TARGET_MIN,
             shortMergeTargetMax: SHORT_MERGE_TARGET_MAX,
@@ -2075,19 +2041,32 @@ document.addEventListener('DOMContentLoaded', () => {
             timeToSeconds,
             formatLineProgress,
             formatEtaAsSegmentProgress,
-            buildAutoDubElapsedLabel,
-            describeAutoStage,
-            normalizeShortMergeTargetSeconds,
-            applyAutoDubSubtitleItems,
-            getTranslateApiKey,
-            getTranslateBaseUrl,
-            getTranslateModel,
-            getGlobalTtsBackend,
-            getProjectDubbingContext,
-        });
-        speakerVoicePanelModule.setupSpeakerVoicePanel({
-            videoPlayer,
-            videoPlaceholder,
+        buildAutoDubElapsedLabel,
+        describeAutoStage,
+        normalizeShortMergeTargetSeconds,
+        applyAutoDubSubtitleItems,
+        getTranslateApiKey,
+        getTranslateBaseUrl,
+        getTranslateModel,
+        getProjectDubbingContext,
+    });
+    omnivoiceDubbingPanelModule.setupOmnivoiceDubbingPanel({
+        videoPlayer,
+        videoPlaceholder,
+        secondsToDisplay,
+        timeToSeconds,
+        formatLineProgress,
+        formatEtaAsSegmentProgress,
+        buildAutoDubElapsedLabel,
+        describeAutoStage,
+        getTranslateApiKey,
+        getTranslateBaseUrl,
+        getTranslateModel,
+        getProjectDubbingContext,
+    });
+    speakerVoicePanelModule.setupSpeakerVoicePanel({
+        videoPlayer,
+        videoPlaceholder,
             secondsToDisplay,
             timeToSeconds,
             getProjectDubbingContext,

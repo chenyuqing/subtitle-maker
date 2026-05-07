@@ -28,6 +28,7 @@ function setupAutoDubbing(config, deps) {
     const {
         videoPlayer,
         videoPlaceholder,
+        sharedDubAudioPlayer,
         shortMergeTargetDefault,
         shortMergeTargetMin,
         shortMergeTargetMax,
@@ -42,7 +43,6 @@ function setupAutoDubbing(config, deps) {
         getTranslateApiKey,
         getTranslateBaseUrl,
         getTranslateModel,
-        getGlobalTtsBackend,
         getProjectDubbingContext,
     } = deps;
 
@@ -518,9 +518,6 @@ function setupAutoDubbing(config, deps) {
         const targetMode = mode === 'dubbed' ? 'dubbed' : 'original';
         const hasDubbed = !!dubbedAudioUrl;
         if (targetMode === 'dubbed' && !hasDubbed) {
-            // 关键修复：V1/V2 双实例都监听同一个音轨选择器时，
-            // 没有配音链接的实例不能把选择器强制回退到 original，
-            // 否则会覆盖另一个实例（有配音）的切换结果。
             return;
         }
 
@@ -535,7 +532,6 @@ function setupAutoDubbing(config, deps) {
         try {
             dubbedAudioPlayer.currentTime = videoPlayer.currentTime || 0;
         } catch (e) {
-            // 某些浏览器在 metadata 未就绪时会抛错，这里忽略即可。
             console.debug('sync dubbed audio time failed', e);
         }
         if (!videoPlayer.paused) {
@@ -817,7 +813,6 @@ function setupAutoDubbing(config, deps) {
         }
     }
 
-    // 绑定主播放器与配音音频的同步：播放/暂停/拖动/倍速都同步。
     if (videoPlayer) {
         videoPlayer.addEventListener('play', () => {
             if (audioTrackModeSelect?.value === 'dubbed' && dubbedAudioUrl) {
@@ -939,9 +934,6 @@ function setupAutoDubbing(config, deps) {
             translatedShortMergeHintOverride = '';
         });
     }
-    window.addEventListener('subtitle-maker:tts-backend-changed', () => {
-        syncDubbingModeUi();
-    });
     window.addEventListener('subtitle-maker:project-context-changed', () => {
         syncDubbingModeUi();
     });

@@ -1,5 +1,56 @@
 # TODO
 
+## 62. 2026-05-07 OmniVoice strict speaker 参考音上传
+- [x] 目标
+  - 5 号 `Auto Dub Omnivoice` 不再默认依赖“从原视频自动聚合参考音”作为主路径
+  - 改为按当前项目字幕里的 `speaker_id` 自动识别 speaker，再由用户逐个上传参考音频
+  - 每个上传参考音统一绑定固定 `ref_text`：`你好，这是我的声音音色，很高兴为你进行配音服务。`
+- [x] 前端
+  - 在 `panel-auto-dub-omnivoice` 增加 speaker 参考音上传区
+  - 自动根据当前项目字幕渲染 `Speaker 1 / Speaker 2 / ...` 上传槽位
+  - 启动前严格校验：有几个 speaker，就必须上传几份参考音
+- [x] 后端
+  - `omnivoice_dub_api.py` 的 `/start-from-project` 接收 `speaker_ref_files` 和 `speaker_ref_speaker_ids_json`
+  - 保存上传参考音并构造 `speaker_id -> {ref_audio, ref_text}` 映射
+  - 生成阶段优先使用上传参考音；第一版 strict 模式下不自动 fallback 到原视频聚合
+- [x] 可观测性与验证
+  - `speaker_ref_map.json` 明确记录本次使用的是上传参考音
+  - `py_compile` / `node --check` 通过
+  - 实际发起一次 OmniVoice 任务，确认输出目录能看到上传参考音映射
+- [x] Review
+  - `node --check src/subtitle_maker/static/js/omnivoiceDubbingPanel.js` 通过
+  - `uv run python -m py_compile src/subtitle_maker/omnivoice_dub_api.py` 通过
+  - 路由级验证：两份上传参考音能创建任务并把文件落到 `outputs/omnivoice_dub_jobs/.../uploaded_speaker_refs/`
+  - strict 负例验证：缺 `Speaker 2` 参考音时，后端返回 `HTTP 400` 和明确缺失 speaker 提示
+
+## 61. 2026-05-07 OmniVoice 3900 自动拉起
+- [x] 5 号 `Auto Dub Omnivoice` 的后端状态轮询会自动拉起本机 3900 服务
+- [x] 3900 不再依赖手工启动，页面打开后会在后台自动变为 ready
+- [x] `stop.sh` 已补 3900 清理，避免灰按钮对应的后台常驻进程残留
+- [x] 验证：`/omnivoice/auto/backend-status` 从 loading 变成 ready，`/model/status` 返回本地 checkpoints
+
+## 60. 2026-05-07 OmniVoice 本地 checkpoints + 去 HF
+- [ ] 目标
+  - 保留 5 号 `Auto Dub Omnivoice` 的翻译功能
+  - 翻译继续复用全局 OpenAI-compatible API，不新增独立翻译服务
+  - OmniVoice TTS 只读本地 `omnivoice/checkpoints`，不再通过 HuggingFace cache / remote repo 拉模型
+- [ ] 本地模型加载
+  - `OmniVoice.from_pretrained()` 仅接受本地 checkpoint 路径
+  - `model_manager.py` 默认 checkpoint 改成本地目录
+  - 删除 `snapshot_download`、`model_info`、HF cache 相关预热逻辑
+- [ ] 5 号链路裁剪
+  - 移除 5 号启动路径里不需要的 ASR 加载
+  - 不把 diarization 接回 5 号链路
+  - 保留 speaker 字幕路由与翻译兜底，不碰用户上传字幕的 speaker 语义
+- [ ] 配置与展示
+  - `system` / `model status` 中展示本地 checkpoint 路径
+  - 删除 3900 启动时对 HF cache 的环境变量依赖
+  - 让“就绪状态”只取决于本地模型文件与进程状态
+- [ ] 验证
+  - `py_compile` / `node --check` 通过
+  - 3900 后端用本地 checkpoints 启动成功
+  - 5 号面板能直接发起配音，翻译仍走全局 OpenAI-compatible API
+
 ## 59. 2026-05-07 独立 OmniVoice 链路重建
 - [ ] 目标
   - 保留 `4. Auto Dubbing` 现有 `index-tts` 主链路，不再共享底座模型切换状态

@@ -90,6 +90,7 @@ run_stop_script "$LOCAL_INDEX_TTS_STOP_SCRIPT" "index-tts(local)"
 
 # 2) 再按 PID 文件兜底，避免脚本异常退出后遗留孤儿进程。
 kill_pid_file "$PROJECT_DIR/index_tts_api.pid" "index-tts api"
+kill_pid_file "$PROJECT_DIR/outputs/omnivoice_backend.pid" "omnivoice api"
 kill_pid_file "$PROJECT_DIR/dubbing.pid" "legacy dubbing server"
 
 # 3) 按进程命令特征清理所有相关后端任务与服务。
@@ -103,11 +104,14 @@ kill_pattern "tools/dub_long_video.py" "long dubbing orchestrator"
 kill_pattern "tools/dub_pipeline.py" "segment dubbing pipeline"
 kill_pattern "tools/repair_bad_segments.py" "repair pipeline"
 kill_pattern "tools/index_tts_fastapi_server.py" "index-tts local api"
+kill_pattern "OmniVoice-Studio-main/.venv/bin/python backend/main.py" "omnivoice backend"
+kill_pattern "python[0-9.]* .*OmniVoice-Studio-main/backend/main.py" "omnivoice backend"
 kill_pattern "llama-server" "local sakura model"
 
 # 4) 最后按端口兜底清理监听者，确保下次 start 不会被端口占用阻塞。
 kill_port 8000 "subtitle-maker web"
 kill_port 8010 "index-tts api"
+kill_port 3900 "omnivoice api"
 kill_port 8081 "sakura llama-server"
 
 # 5) 清理可能残留的 pid 文件，避免下次误判。

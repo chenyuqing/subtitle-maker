@@ -1,5 +1,10 @@
 # Lessons
 
+- 2026-05-07：如果用户已经上传了带 stable `speaker_id` 的字幕，5 号 OmniVoice 的主路径不该再默认从原视频自动聚合参考音；应优先走“speaker 自动识别 + 用户逐个上传参考音 + strict 一一映射”，否则参考音错配很难排障。
+- 2026-05-07：OmniVoice 这类 voice clone 模型里，`ref_audio` 和 `ref_text` 必须始终来自同一套真值来源；如果改成用户上传参考音，`ref_text` 也必须固定绑定那段上传音频的实际文案，不能继续混用视频字幕或自动聚合 transcript。
+- 2026-05-07：5 号 OmniVoice 面板的灰按钮不是前端单点问题，而是 3900 后端未常驻；对这种独立服务，`backend-status` 应该承担本机自动拉起职责，且只在本机地址上自动启动。
+- 2026-05-07：OmniVoice 独立链路里，`/generate` 这类表单接口不要手工拼 multipart boundary；直接用 `requests.post(data=..., files=...)` 这类标准客户端，否则很容易出现 `body.text` 之类的 422 假故障。
+- 2026-05-07：5 号 OmniVoice 服务只保留 TTS 与翻译，不要把 capture ASR / diarization 的 warmup 带进启动链路；这些后台预热会偷偷触发 HuggingFace 相关加载，还会把“服务已就绪”的状态信号污染成 ASR 语义。
 - 2026-05-07：做双配音链路时，面板、localStorage、请求参数和任务状态都必须物理隔离；`Auto Dubbing` 和 `Auto Dub Omnivoice` 不能再共用任何底座模型选择器。
 - 2026-05-07：OmniVoice 这种独立链路优先走“当前项目上下文 + 独立后端桥接”，不要把它硬塞回 index-tts 的共享 runtime，否则后面只会继续串状态。
 
@@ -101,3 +106,5 @@
 - 2026-05-06：凡是会产生外部计费的翻译调用（这里是 DeepSeek），`start` 级运行日志必须直接展示“是否走翻译、翻译 provider、累计调用次数”；不能把成本信息只藏在段内 stdout 里。
 - 2026-05-06：同一个翻译 provider 的默认 system prompt 必须在后端集中构造，前端自定义 prompt 只能作为追加要求合并进去；不能让正常翻译、重试修复、时长改写、坏段修复各自维护一份默认提示词，否则术语规则和计费行为都会漂移。
 - 2026-05-06：当用户要求把某个专用 provider（这里是 DeepSeek）改造成通用 OpenAI-compatible 能力时，不能只在 SDK 层说“已经支持”；必须把前端配置、环境变量回退、CLI 启动注入、错误文案、运行日志标签一起去品牌化，否则表面能配 `base_url`，实际仍被旧语义卡住。
+- 2026-05-07：OmniVoice 的 `ref_text` 会同时参与条件文本拼接和 duration 估计，不能把 speaker 级的整段 transcript 原样继续传下去；speaker clone 阶段可以保留完整 transcript 做调试，但正式生成阶段必须用空串或极短摘要，否则音色和语速都会被长 prompt 带偏。
+- 2026-05-07：OmniVoice 的 `ref_text` 必须和 `ref_audio` 指向同一段原始语音内容；如果 `ref_audio` 切的是原视频英文人声，就绝不能把中文译文字幕塞进 `ref_text`，否则模型会在错误的语音-文本配对上做克隆，直接生成胡话。

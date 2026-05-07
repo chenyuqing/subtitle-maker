@@ -397,47 +397,6 @@ body {
     transform: rotate(-90deg);
 }
 
-.sidebar-tts-card {
-    display: grid;
-    gap: 10px;
-    padding: 12px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius-md);
-    background: var(--bg-primary);
-}
-
-.sidebar-tts-card-head {
-    display: grid;
-    gap: 2px;
-}
-
-.sidebar-tts-kicker {
-    color: var(--accent);
-    font-size: 0.68rem;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    line-height: 1;
-}
-
-.sidebar-tts-title {
-    color: var(--text-primary);
-    font-size: 0.92rem;
-    font-weight: 600;
-    line-height: 1.3;
-}
-
-.sidebar-tts-field {
-    display: grid;
-    gap: 6px;
-}
-
-.sidebar-tts-field label {
-    color: var(--text-secondary);
-    font-size: 0.8rem;
-    font-weight: 500;
-}
-
 @media (min-width: 769px) {
     .app-layout.sidebar-collapsed .sidebar {
         width: var(--sidebar-collapsed-width);
@@ -1533,6 +1492,56 @@ textarea::placeholder {
     line-height: 1.6;
 }
 
+.omnivoice-speaker-ref-list {
+    display: grid;
+    gap: 10px;
+    margin-top: 12px;
+}
+
+.omnivoice-speaker-ref-row {
+    display: grid;
+    grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.4fr);
+    gap: 12px;
+    align-items: center;
+    padding: 10px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--surface);
+}
+
+.omnivoice-speaker-ref-meta {
+    min-width: 0;
+    display: grid;
+    gap: 4px;
+}
+
+.omnivoice-speaker-ref-title {
+    color: var(--text-primary);
+    font-size: 0.88rem;
+    font-weight: 600;
+    line-height: 1.35;
+}
+
+.omnivoice-speaker-ref-copy {
+    color: var(--text-muted);
+    font-size: 0.76rem;
+    line-height: 1.5;
+}
+
+.omnivoice-speaker-ref-input {
+    min-width: 0;
+    width: 100%;
+}
+
+.omnivoice-speaker-ref-status {
+    display: block;
+    margin-top: 6px;
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+    line-height: 1.4;
+    word-break: break-word;
+}
+
 .shared-api-note {
     margin: 10px 0 0;
     color: var(--text-muted);
@@ -2043,6 +2052,10 @@ textarea::placeholder {
     .auto-dub-main-grid,
     .auto-dub-support-grid,
     .auto-dub-config-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .omnivoice-speaker-ref-row {
         grid-template-columns: 1fr;
     }
 
