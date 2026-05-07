@@ -2,6 +2,7 @@ const mediaUploadArea = document.getElementById('upload-area');
 const mediaFileInput = document.getElementById('file-input');
 const srtUploadArea = document.getElementById('srt-upload-area');
 const srtFileInput = document.getElementById('srt-file-input');
+const srtSubtitleKindSelect = document.getElementById('srt-subtitle-kind');
 
 const uploadStatus = document.getElementById('upload-status');
 const videoPlayer = document.getElementById('video-player');
@@ -17,12 +18,14 @@ const themeToggleBtn = document.getElementById('theme-toggle-btn');
 const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
 const appLayout = document.querySelector('.app-layout');
 const dynamicContentSection = document.querySelector('.dynamic-content-section');
-const globalDeepSeekApiKeyInput = document.getElementById('global-deepseek-api-key');
-const globalDeepSeekSaveKeyCheckbox = document.getElementById('global-deepseek-save-key');
-const globalDeepSeekHint = document.getElementById('global-deepseek-hint');
-const deepSeekKeySourceBadge = document.getElementById('deepseek-key-source');
-const globalDeepSeekCard = document.querySelector('.sidebar-deepseek-card');
-const globalDeepSeekToggleBtn = document.getElementById('global-deepseek-toggle');
+const globalTranslateApiKeyInput = document.getElementById('global-translate-api-key');
+const globalTranslateSaveKeyCheckbox = document.getElementById('global-translate-save-key');
+const globalTranslateHint = document.getElementById('global-translate-hint');
+const translateKeySourceBadge = document.getElementById('translate-key-source');
+const globalTranslateCard = document.querySelector('.sidebar-translate-card');
+const globalTranslateToggleBtn = document.getElementById('global-translate-toggle');
+const globalTranslateBaseUrlInput = document.getElementById('global-translate-base-url');
+const globalTranslateModelInput = document.getElementById('global-translate-model');
 const globalTtsBackendSelect = document.getElementById('global-tts-backend');
 
 const originalDisplay = document.getElementById('original-subtitles');
@@ -44,9 +47,14 @@ const SEEK_STEP_SECONDS = 10;
 const SUBTITLE_POSITION_KEY = 'sm_subPosition';
 const THEME_KEY = 'sm_theme';
 const SIDEBAR_COLLAPSED_KEY = 'sm_sidebarCollapsed';
-const DEEPSEEK_API_KEY = 'sm_deepseekApiKey';
-const SAVE_DEEPSEEK_API_KEY = 'sm_saveDeepseekApiKey';
-const DEEPSEEK_COLLAPSED_KEY = 'sm_deepseekCollapsed';
+const TRANSLATE_API_KEY_KEY = 'sm_translateApiKey';
+const LEGACY_TRANSLATE_API_KEY_KEY = 'sm_deepseekApiKey';
+const SAVE_TRANSLATE_API_KEY_KEY = 'sm_saveTranslateApiKey';
+const LEGACY_SAVE_TRANSLATE_API_KEY_KEY = 'sm_saveDeepseekApiKey';
+const TRANSLATE_COLLAPSED_KEY = 'sm_translateCollapsed';
+const LEGACY_TRANSLATE_COLLAPSED_KEY = 'sm_deepseekCollapsed';
+const TRANSLATE_BASE_URL_KEY = 'sm_translateBaseUrl';
+const TRANSLATE_MODEL_KEY = 'sm_translateModel';
 const GLOBAL_TTS_BACKEND_KEY = 'sm_globalTtsBackend';
 const PROJECT_MEDIA_FILENAME_KEY = 'sm_projectMediaFilename';
 const PROJECT_MEDIA_ORIGINAL_FILENAME_KEY = 'sm_projectMediaOriginalFilename';
@@ -54,6 +62,13 @@ const SHORT_MERGE_TARGET_DEFAULT = 15;
 const SHORT_MERGE_TARGET_MIN = 6;
 const SHORT_MERGE_TARGET_MAX = 20;
 const DEFAULT_GLOBAL_TTS_BACKEND = 'index-tts';
+const DEFAULT_TRANSLATION_PROVIDER = Object.freeze({
+    baseUrl: 'https://api.deepseek.com',
+    model: 'deepseek-v4-flash',
+});
+// 兼容现有读取点：前端内部仍可继续使用原常量名。
+const DEFAULT_TRANSLATE_BASE_URL = DEFAULT_TRANSLATION_PROVIDER.baseUrl;
+const DEFAULT_TRANSLATE_MODEL = DEFAULT_TRANSLATION_PROVIDER.model;
 let isAudioMode = false;
 let localMediaPreviewUrl = null;
 
@@ -116,14 +131,14 @@ function setupVideoPlaybackFallback() {
 
 setupVideoPlaybackFallback();
 
-// 控制 DeepSeek 卡片折叠态，默认收起以节省侧边栏空间。
-function applyDeepSeekCollapsed(collapsed, persist = true) {
-    if (!globalDeepSeekCard || !globalDeepSeekToggleBtn) return;
+// 控制翻译 provider 卡片折叠态，默认收起以节省侧边栏空间。
+function applyTranslateCollapsed(collapsed, persist = true) {
+    if (!globalTranslateCard || !globalTranslateToggleBtn) return;
     const nextCollapsed = collapsed === true;
-    globalDeepSeekCard.classList.toggle('collapsed', nextCollapsed);
-    globalDeepSeekToggleBtn.setAttribute('aria-expanded', nextCollapsed ? 'false' : 'true');
+    globalTranslateCard.classList.toggle('collapsed', nextCollapsed);
+    globalTranslateToggleBtn.setAttribute('aria-expanded', nextCollapsed ? 'false' : 'true');
     if (persist) {
-        localStorage.setItem(DEEPSEEK_COLLAPSED_KEY, nextCollapsed ? 'true' : 'false');
+        localStorage.setItem(TRANSLATE_COLLAPSED_KEY, nextCollapsed ? 'true' : 'false');
     }
 }
 
@@ -155,18 +170,28 @@ function loadFrontendModule(modulePath) {
     return import(resolveStaticModuleUrl(modulePath));
 }
 
-// 统一读取左侧侧边栏中的 DeepSeek key；翻译、Auto Dubbing、Agent 共用这一处状态。
-function getDeepSeekApiKey() {
-    return globalDeepSeekApiKeyInput ? globalDeepSeekApiKeyInput.value.trim() : '';
+// 统一读取左侧侧边栏中的翻译 API key；翻译、Auto Dubbing、Agent 共用这一处状态。
+function getTranslateApiKey() {
+    return globalTranslateApiKeyInput ? globalTranslateApiKeyInput.value.trim() : '';
+}
+
+// 统一读取翻译 provider 的 base_url；默认回退到当前默认 provider 地址。
+function getTranslateBaseUrl() {
+    const value = globalTranslateBaseUrlInput ? globalTranslateBaseUrlInput.value.trim() : '';
+    return value || DEFAULT_TRANSLATE_BASE_URL;
+}
+
+// 统一读取翻译 provider 的 model；默认回退到当前稳定默认值。
+function getTranslateModel() {
+    const value = globalTranslateModelInput ? globalTranslateModelInput.value.trim() : '';
+    return value || DEFAULT_TRANSLATE_MODEL;
 }
 
 // 统一约束侧边栏 TTS backend 值，防止本地存储脏值污染请求参数。
 function normalizeGlobalTtsBackend(value) {
     const normalized = String(value || '').trim().toLowerCase();
-    if (normalized === 'omnivoice') {
-        return 'omnivoice';
-    }
-    return DEFAULT_GLOBAL_TTS_BACKEND;
+    // Auto Dubbing 现阶段只保留 index-tts；兼容旧 localStorage 脏值时统一回落。
+    return normalized === 'index-tts' ? 'index-tts' : DEFAULT_GLOBAL_TTS_BACKEND;
 }
 
 // 统一读取侧边栏 TTS backend，Auto Dubbing V1/V2 共用这一处状态。
@@ -179,9 +204,16 @@ function notifyProjectContextChanged() {
     window.dispatchEvent(new CustomEvent('subtitle-maker:project-context-changed'));
 }
 
-// 统一发布“全局 DeepSeek 配置已变化”，便于子模块做只读消费。
-function notifyDeepSeekConfigChanged() {
+// 统一发布“全局翻译 provider 配置已变化”，便于子模块做只读消费。
+function notifyTranslateConfigChanged() {
+    window.dispatchEvent(new CustomEvent('subtitle-maker:translate-config-changed'));
+    // 兼容旧监听名，避免一次性重命名导致子模块失联。
     window.dispatchEvent(new CustomEvent('subtitle-maker:deepseek-config-changed'));
+}
+
+// 统一发布“全局 TTS backend 已切换”，供 Auto Dubbing 面板即时刷新必填项与文案。
+function notifyTtsBackendChanged() {
+    window.dispatchEvent(new CustomEvent('subtitle-maker:tts-backend-changed'));
 }
 
 // 供 Auto Dubbing 读取当前项目的媒体、任务与字幕状态；避免模块自行维护重复状态。
@@ -197,73 +229,99 @@ function getProjectDubbingContext() {
     };
 }
 
-// 统一刷新侧边栏里的全局 DeepSeek 配置提示，避免用户分不清“本地保存 / 当前会话 / 环境变量兜底”。
-function syncDeepSeekSettingsUi() {
-    const hasKey = !!getDeepSeekApiKey();
-    const saved = globalDeepSeekSaveKeyCheckbox ? !!globalDeepSeekSaveKeyCheckbox.checked : false;
-    if (deepSeekKeySourceBadge) {
+// 统一刷新侧边栏里的全局翻译 provider 配置提示，避免用户分不清“本地保存 / 当前会话 / 环境变量兜底”。
+function syncTranslateSettingsUi() {
+    const hasKey = !!getTranslateApiKey();
+    const saved = globalTranslateSaveKeyCheckbox ? !!globalTranslateSaveKeyCheckbox.checked : false;
+    if (translateKeySourceBadge) {
         if (hasKey && saved) {
-            deepSeekKeySourceBadge.textContent = 'Local';
+            translateKeySourceBadge.textContent = 'Local';
         } else if (hasKey) {
-            deepSeekKeySourceBadge.textContent = 'Session';
+            translateKeySourceBadge.textContent = 'Session';
         } else {
-            deepSeekKeySourceBadge.textContent = 'Env';
+            translateKeySourceBadge.textContent = 'Env';
         }
     }
-    if (globalDeepSeekHint) {
+    if (globalTranslateHint) {
         if (hasKey && saved) {
-            globalDeepSeekHint.textContent = '当前浏览器已保存全局 DeepSeek key；翻译、Auto Dubbing、Agent 共用。';
+            globalTranslateHint.textContent = '当前浏览器已保存全局翻译 API 配置；翻译、Auto Dubbing、Agent 共用。';
         } else if (hasKey) {
-            globalDeepSeekHint.textContent = '当前页面正在使用输入的 DeepSeek key；勾选“记住当前浏览器”后会持久化。';
+            globalTranslateHint.textContent = '当前页面正在使用输入的翻译 API key；勾选“记住当前浏览器”后会持久化。';
         } else {
-            globalDeepSeekHint.textContent = '留空时，Agent 与 Auto Dubbing 仍可使用后端环境变量；翻译接口需要这里提供 key。';
+            globalTranslateHint.textContent = '留空时可回退后端环境变量；翻译、Auto Dubbing、Agent 都会复用这里的 base URL 与 model。';
         }
     }
 }
 
-// 初始化并托管全局 DeepSeek key 的本地状态，不再让各面板各自保存一份。
-function initDeepSeekSettings() {
-    if (!globalDeepSeekApiKeyInput) return;
-    const savedKey = localStorage.getItem(DEEPSEEK_API_KEY);
-    const savedChecked = localStorage.getItem(SAVE_DEEPSEEK_API_KEY) === 'true';
+// 初始化并托管全局翻译 provider 配置，不再让各面板各自保存一份。
+function initTranslateSettings() {
+    if (!globalTranslateApiKeyInput) return;
+    const savedKey = localStorage.getItem(TRANSLATE_API_KEY_KEY) || localStorage.getItem(LEGACY_TRANSLATE_API_KEY_KEY);
+    const savedCheckedRaw = localStorage.getItem(SAVE_TRANSLATE_API_KEY_KEY);
+    const legacySavedCheckedRaw = localStorage.getItem(LEGACY_SAVE_TRANSLATE_API_KEY_KEY);
+    const savedChecked = savedCheckedRaw === 'true' || (savedCheckedRaw === null && legacySavedCheckedRaw === 'true');
+    const savedBaseUrl = localStorage.getItem(TRANSLATE_BASE_URL_KEY);
+    const savedModel = localStorage.getItem(TRANSLATE_MODEL_KEY);
     if (savedKey && savedChecked) {
-        globalDeepSeekApiKeyInput.value = savedKey;
+        globalTranslateApiKeyInput.value = savedKey;
     }
-    if (globalDeepSeekSaveKeyCheckbox) {
-        globalDeepSeekSaveKeyCheckbox.checked = savedChecked;
-        globalDeepSeekSaveKeyCheckbox.addEventListener('change', () => {
-            if (globalDeepSeekSaveKeyCheckbox.checked && getDeepSeekApiKey()) {
-                localStorage.setItem(DEEPSEEK_API_KEY, getDeepSeekApiKey());
-            } else if (!globalDeepSeekSaveKeyCheckbox.checked) {
-                localStorage.removeItem(DEEPSEEK_API_KEY);
+    if (globalTranslateBaseUrlInput) {
+        globalTranslateBaseUrlInput.value = savedBaseUrl || DEFAULT_TRANSLATE_BASE_URL;
+    }
+    if (globalTranslateModelInput) {
+        globalTranslateModelInput.value = savedModel || DEFAULT_TRANSLATE_MODEL;
+    }
+    if (globalTranslateSaveKeyCheckbox) {
+        globalTranslateSaveKeyCheckbox.checked = savedChecked;
+        globalTranslateSaveKeyCheckbox.addEventListener('change', () => {
+            if (globalTranslateSaveKeyCheckbox.checked && getTranslateApiKey()) {
+                localStorage.setItem(TRANSLATE_API_KEY_KEY, getTranslateApiKey());
+            } else if (!globalTranslateSaveKeyCheckbox.checked) {
+                localStorage.removeItem(TRANSLATE_API_KEY_KEY);
             }
             localStorage.setItem(
-                SAVE_DEEPSEEK_API_KEY,
-                globalDeepSeekSaveKeyCheckbox.checked ? 'true' : 'false',
+                SAVE_TRANSLATE_API_KEY_KEY,
+                globalTranslateSaveKeyCheckbox.checked ? 'true' : 'false',
             );
-            syncDeepSeekSettingsUi();
-            notifyDeepSeekConfigChanged();
+            syncTranslateSettingsUi();
+            notifyTranslateConfigChanged();
         });
     }
-    globalDeepSeekApiKeyInput.addEventListener('input', () => {
-        if (globalDeepSeekSaveKeyCheckbox?.checked && getDeepSeekApiKey()) {
-            localStorage.setItem(DEEPSEEK_API_KEY, getDeepSeekApiKey());
+    globalTranslateApiKeyInput.addEventListener('input', () => {
+        if (globalTranslateSaveKeyCheckbox?.checked && getTranslateApiKey()) {
+            localStorage.setItem(TRANSLATE_API_KEY_KEY, getTranslateApiKey());
         }
-        if (globalDeepSeekSaveKeyCheckbox?.checked && !getDeepSeekApiKey()) {
-            localStorage.removeItem(DEEPSEEK_API_KEY);
+        if (globalTranslateSaveKeyCheckbox?.checked && !getTranslateApiKey()) {
+            localStorage.removeItem(TRANSLATE_API_KEY_KEY);
         }
-        syncDeepSeekSettingsUi();
-        notifyDeepSeekConfigChanged();
+        syncTranslateSettingsUi();
+        notifyTranslateConfigChanged();
     });
-    if (globalDeepSeekToggleBtn) {
-        globalDeepSeekToggleBtn.addEventListener('click', () => {
-            const isCollapsed = globalDeepSeekCard ? globalDeepSeekCard.classList.contains('collapsed') : false;
-            applyDeepSeekCollapsed(!isCollapsed);
+    if (globalTranslateBaseUrlInput) {
+        globalTranslateBaseUrlInput.addEventListener('input', () => {
+            localStorage.setItem(TRANSLATE_BASE_URL_KEY, getTranslateBaseUrl());
+            syncTranslateSettingsUi();
+            notifyTranslateConfigChanged();
         });
     }
-    const savedCollapsed = localStorage.getItem(DEEPSEEK_COLLAPSED_KEY);
-    applyDeepSeekCollapsed(savedCollapsed === null ? true : savedCollapsed === 'true', false);
-    syncDeepSeekSettingsUi();
+    if (globalTranslateModelInput) {
+        globalTranslateModelInput.addEventListener('input', () => {
+            localStorage.setItem(TRANSLATE_MODEL_KEY, getTranslateModel());
+            syncTranslateSettingsUi();
+            notifyTranslateConfigChanged();
+        });
+    }
+    if (globalTranslateToggleBtn) {
+        globalTranslateToggleBtn.addEventListener('click', () => {
+            const isCollapsed = globalTranslateCard ? globalTranslateCard.classList.contains('collapsed') : false;
+            applyTranslateCollapsed(!isCollapsed);
+        });
+    }
+    const savedCollapsed = localStorage.getItem(TRANSLATE_COLLAPSED_KEY);
+    const legacyCollapsed = localStorage.getItem(LEGACY_TRANSLATE_COLLAPSED_KEY);
+    const collapsedValue = savedCollapsed === null ? legacyCollapsed : savedCollapsed;
+    applyTranslateCollapsed(collapsedValue === null ? true : collapsedValue === 'true', false);
+    syncTranslateSettingsUi();
 }
 
 // 初始化全局 TTS backend 选择器，并持久化用户偏好。
@@ -275,7 +333,8 @@ function initGlobalTtsBackendSetting() {
         const normalized = getGlobalTtsBackend();
         globalTtsBackendSelect.value = normalized;
         localStorage.setItem(GLOBAL_TTS_BACKEND_KEY, normalized);
-        notifyDeepSeekConfigChanged();
+        notifyTtsBackendChanged();
+        notifyTranslateConfigChanged();
     });
 }
 
@@ -491,18 +550,26 @@ function describeAutoStage(stage) {
 
 // --- Time Range Management ---
 
-// Convert MM:SS to seconds
-function timeToSeconds(m, s) {
-    const mNum = parseInt(m) || 0;
-    const sNum = parseInt(s) || 0;
-    return mNum * 60 + sNum;
+// Convert HH:MM:SS (or MM:SS compatibility) to seconds
+function timeToSeconds(h, m, s) {
+    if (arguments.length === 2) {
+        const mm = parseInt(h) || 0;
+        const ss = parseInt(m) || 0;
+        return mm * 60 + ss;
+    }
+    const hh = parseInt(h) || 0;
+    const mm = parseInt(m) || 0;
+    const ss = parseInt(s) || 0;
+    return hh * 3600 + mm * 60 + ss;
 }
 
-// Convert seconds to MM:SS display format
+// Convert seconds to HH:MM:SS display format
 function secondsToDisplay(seconds) {
-    const m = Math.floor(seconds / 60);
-    const s = Math.floor(seconds % 60);
-    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+    const total = Math.max(0, Math.floor(Number(seconds) || 0));
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
 }
 
 function validateTimeRange(startSec, endSec, duration) {
@@ -627,42 +694,17 @@ function updateVideoDuration() {
 // --- Navigation Logic ---
 const navButtons = document.querySelectorAll('.nav-item');
 const panels = document.querySelectorAll('.panel');
-const AUTO_DUB_PANEL_IDS = new Set(['panel-auto-dub', 'panel-auto-dub-v2']);
-const FLOATING_UI_AVOID_PANEL_IDS = new Set(['panel-auto-dub', 'panel-auto-dub-v2', 'panel-transcribe', 'panel-results']);
+const AUTO_DUB_PANEL_IDS = new Set(['panel-auto-dub']);
 const PANEL_INTERNAL_SCROLL_IDS = new Set(['panel-transcribe', 'panel-results']);
 
-/**
- * 在需要“面板优先点击”的页面强制收起 Agent 浮层，
- * 避免 backdrop 残留时吞掉 select/button 的点击事件。
- */
-function forceCloseAgentOverlayIfNeeded(shouldAvoidFloatingUi) {
-    if (!shouldAvoidFloatingUi) return;
-    const drawer = document.getElementById('agent-drawer');
-    const fab = document.getElementById('agent-fab');
-    const backdrop = document.getElementById('agent-backdrop');
-    if (drawer) {
-        drawer.classList.remove('open');
-        drawer.setAttribute('aria-hidden', 'true');
-    }
-    if (fab) {
-        fab.setAttribute('aria-expanded', 'false');
-    }
-    if (backdrop) {
-        backdrop.hidden = true;
-    }
-}
-
-// 在 Auto Dubbing 面板激活时，给右下悬浮控件预留点击安全区，避免遮挡右下操作按钮。
+// 在 Auto Dubbing 面板激活时，为底部操作区预留安全空间，避免被播放器区域或悬浮元素遮挡。
 function syncFloatingUiForActivePanel(panelId) {
     const targetId = String(panelId || '').trim();
     const isAutoDubPanel = AUTO_DUB_PANEL_IDS.has(targetId);
-    const shouldAvoidFloatingUi = FLOATING_UI_AVOID_PANEL_IDS.has(targetId);
     const shouldUsePanelInternalScroll = PANEL_INTERNAL_SCROLL_IDS.has(targetId);
     document.body.classList.toggle('auto-dub-panel-active', isAutoDubPanel);
-    document.body.classList.toggle('floating-ui-avoid-panel-active', shouldAvoidFloatingUi);
     // 2/3 面板需要“容器固定 + 面板内部滚动”，避免长内容撑开整个页面。
     document.body.classList.toggle('panel-internal-scroll-active', shouldUsePanelInternalScroll);
-    forceCloseAgentOverlayIfNeeded(shouldAvoidFloatingUi);
 }
 
 navButtons.forEach(btn => {
@@ -928,9 +970,18 @@ function initPanelCustomSelectFallback() {
 
 initPanelCustomSelectFallback();
 
-function switchTab(stepIndex) {
-    if (stepIndex >= 0 && stepIndex < navButtons.length) {
-        navButtons[stepIndex].click();
+function switchTab(target) {
+    if (typeof target === 'number') {
+        if (target >= 0 && target < navButtons.length) {
+            navButtons[target].click();
+        }
+        return;
+    }
+    const targetId = String(target || '').trim();
+    if (!targetId) return;
+    const button = Array.from(navButtons).find((item) => item.getAttribute('data-target') === targetId);
+    if (button) {
+        button.click();
     }
 }
 
@@ -984,7 +1035,7 @@ function loadState() {
             if (originalSubtitlesData.length > 0) {
                 // Determine which tab to show? 
                 // If we have subtitles, likely show results.
-                switchTab(2);
+                switchTab('panel-results');
             }
         } catch (e) { console.error("Failed to parse saved subtitles", e); }
     }
@@ -1142,9 +1193,9 @@ if (themeToggleBtn) {
     });
 }
 
-// 初始化共享前端状态：先恢复全局 DeepSeek 配置，再恢复项目上下文。
+// 初始化共享前端状态：先恢复全局翻译 provider 配置，再恢复项目上下文。
 window.addEventListener('DOMContentLoaded', () => {
-    initDeepSeekSettings();
+    initTranslateSettings();
     initGlobalTtsBackendSetting();
     loadState();
 });
@@ -1314,7 +1365,7 @@ async function handleMediaUpload(file) {
 
         if (uploadStatus) uploadStatus.textContent = "Upload Complete";
 
-        switchTab(1); // Go to Transcribe
+        switchTab('panel-transcribe');
 
         if (transcribeBtn) transcribeBtn.disabled = false;
 
@@ -1516,7 +1567,7 @@ async function pollStatus() {
                 const segBtn = document.getElementById('export-segments-btn');
                 if (segBtn) segBtn.disabled = false;
 
-                switchTab(2);
+                switchTab('panel-results');
 
             } else if (data.status === 'failed') {
                 clearInterval(interval);
@@ -1533,7 +1584,7 @@ async function pollStatus() {
                     if (progressText) progressText.textContent = `Processing... (${data.subtitles.length} lines generated)`;
                     const resultsPanel = document.getElementById('panel-results');
                     if (resultsPanel && !resultsPanel.classList.contains('active')) {
-                        switchTab(2);
+                        switchTab('panel-results');
                     }
                 } else {
                     if (progressFill) progressFill.style.width = '50%';
@@ -1593,18 +1644,13 @@ if (translateBtn) {
             return;
         }
 
-        const provider = document.getElementById('model-provider').value;
         const targetLang = document.getElementById('target-lang').value; // Get target language
-        const apiKey = getDeepSeekApiKey();
+        const apiKey = getTranslateApiKey();
+        const translateBaseUrl = getTranslateBaseUrl();
+        const translateModel = getTranslateModel();
         const systemPrompt = document.getElementById('system-prompt').value;
 
-        console.log("Provider:", provider, "Target:", targetLang);
-
-        // Validation
-        if (provider === 'deepseek' && !apiKey) {
-            alert("DeepSeek API Key is required.");
-            return;
-        }
+        console.log("Translate target:", targetLang, "Base URL:", translateBaseUrl);
 
         translateBtn.disabled = true;
         translateBtn.textContent = "Translating...";
@@ -1621,8 +1667,9 @@ if (translateBtn) {
         }
 
         formData.append('target_lang', targetLang);
-        formData.append('model_provider', provider);
         formData.append('api_key', apiKey || '');
+        formData.append('translate_base_url', translateBaseUrl);
+        formData.append('translate_model', translateModel);
         if (systemPrompt) formData.append('system_prompt', systemPrompt);
 
         try {
@@ -1803,6 +1850,8 @@ async function handleSrtUpload(file) {
 
     const formData = new FormData();
     formData.append('file', file);
+    const subtitleKind = String(srtSubtitleKindSelect?.value || 'source').trim().toLowerCase();
+    formData.append('subtitle_kind', subtitleKind === 'translated' ? 'translated' : 'source');
 
     // 若当前项目已有媒体，显式把媒体文件名传给后端，避免导入 SRT 后丢失“当前项目对应的视频”。
     if (currentProjectMediaFilename && !currentProjectMediaFilename.toLowerCase().endsWith('.srt')) {
@@ -1821,12 +1870,18 @@ async function handleSrtUpload(file) {
         // Update state
         currentTaskId = data.task_id;
         currentFilename = data.filename;
-        originalSubtitlesData = data.subtitles;
-        translatedSubtitlesData = []; // Clear translation
+        if (data.subtitle_kind === 'translated') {
+            translatedSubtitlesData = Array.isArray(data.translated_subtitles) ? data.translated_subtitles : [];
+            // 保留 source 面板为同一时间轴文本，方便双栏与导出对齐。
+            originalSubtitlesData = Array.isArray(data.subtitles) ? data.subtitles : [];
+        } else {
+            originalSubtitlesData = Array.isArray(data.subtitles) ? data.subtitles : [];
+            translatedSubtitlesData = []; // source 字幕上传时清空旧译文，避免误用
+        }
 
         // Render
         renderSubtitles(originalSubtitlesData, originalDisplay);
-        renderSubtitles([], translatedDisplay); // Clear right side
+        renderSubtitles(translatedSubtitlesData, translatedDisplay);
 
         saveState();
 
@@ -1842,7 +1897,7 @@ async function handleSrtUpload(file) {
         if (segBtn) segBtn.disabled = false;
 
         // Switch to Translate tab (since transcription is skipped)
-        switchTab(2);
+        switchTab('panel-results');
 
     } catch (e) {
         console.error("SRT Upload Error:", e);
@@ -2008,8 +2063,8 @@ document.addEventListener('DOMContentLoaded', () => {
     // --- Auto Dubbing / Agent Modules ---
     Promise.all([
         loadFrontendModule('js/dubbingPanel.js'),
-        loadFrontendModule('js/agentDrawer.js'),
-    ]).then(([dubbingPanelModule, agentDrawerModule]) => {
+        loadFrontendModule('js/speakerVoicePanel.js'),
+    ]).then(([dubbingPanelModule, speakerVoicePanelModule]) => {
         dubbingPanelModule.setupDubbingPanels({
             videoPlayer,
             videoPlaceholder,
@@ -2024,16 +2079,18 @@ document.addEventListener('DOMContentLoaded', () => {
             describeAutoStage,
             normalizeShortMergeTargetSeconds,
             applyAutoDubSubtitleItems,
-            getDeepSeekApiKey,
+            getTranslateApiKey,
+            getTranslateBaseUrl,
+            getTranslateModel,
             getGlobalTtsBackend,
             getProjectDubbingContext,
         });
-        agentDrawerModule.setupAgentDrawer({
-            getCurrentPanelName: () => {
-                const activePanel = document.querySelector('.panel.active');
-                return activePanel?.id || 'unknown';
-            },
-            getDeepSeekApiKey,
+        speakerVoicePanelModule.setupSpeakerVoicePanel({
+            videoPlayer,
+            videoPlaceholder,
+            secondsToDisplay,
+            timeToSeconds,
+            getProjectDubbingContext,
         });
     }).catch((error) => {
         console.error('Frontend module bootstrap failed', error);

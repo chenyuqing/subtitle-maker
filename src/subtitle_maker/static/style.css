@@ -309,7 +309,7 @@ body {
     gap: var(--space-sm);
 }
 
-.sidebar-deepseek-card {
+.sidebar-translate-card {
     display: grid;
     gap: 10px;
     padding: 12px;
@@ -318,20 +318,20 @@ body {
     background: var(--bg-primary);
 }
 
-.sidebar-deepseek-head {
+.sidebar-translate-head {
     display: flex;
     align-items: flex-start;
     justify-content: space-between;
     gap: 10px;
 }
 
-.sidebar-deepseek-head-actions {
+.sidebar-translate-head-actions {
     display: inline-flex;
     align-items: center;
     gap: 6px;
 }
 
-.sidebar-deepseek-kicker {
+.sidebar-translate-kicker {
     color: var(--accent);
     font-size: 0.68rem;
     font-weight: 700;
@@ -341,14 +341,14 @@ body {
     margin-bottom: 4px;
 }
 
-.sidebar-deepseek-title {
+.sidebar-translate-title {
     color: var(--text-primary);
     font-size: 0.92rem;
     font-weight: 600;
     line-height: 1.3;
 }
 
-.sidebar-deepseek-badge {
+.sidebar-translate-badge {
     display: inline-flex;
     align-items: center;
     min-height: 24px;
@@ -361,22 +361,22 @@ body {
     white-space: nowrap;
 }
 
-.sidebar-deepseek-check {
+.sidebar-translate-check {
     margin-top: 0;
 }
 
-.sidebar-deepseek-hint {
+.sidebar-translate-hint {
     color: var(--text-muted);
     font-size: 0.78rem;
     line-height: 1.55;
 }
 
-.sidebar-deepseek-body {
+.sidebar-translate-body {
     display: grid;
     gap: 10px;
 }
 
-.sidebar-deepseek-toggle {
+.sidebar-translate-toggle {
     width: 24px;
     height: 24px;
     border: 1px solid var(--border);
@@ -389,11 +389,11 @@ body {
     font-size: 0.78rem;
 }
 
-.sidebar-deepseek-card.collapsed .sidebar-deepseek-body {
+.sidebar-translate-card.collapsed .sidebar-translate-body {
     display: none;
 }
 
-.sidebar-deepseek-card.collapsed .sidebar-deepseek-toggle {
+.sidebar-translate-card.collapsed .sidebar-translate-toggle {
     transform: rotate(-90deg);
 }
 
@@ -848,7 +848,8 @@ body.panel-select-open #panel-results {
 
 /* Auto Dubbing 面板需要吃满内容区，不能沿用通用 900px 面板宽度 */
 #panel-auto-dub,
-#panel-auto-dub-v2 {
+#panel-auto-dub-v2,
+#panel-auto-dub-v3 {
     width: 100%;
     max-width: none;
     margin: 0;
@@ -1093,6 +1094,29 @@ textarea::placeholder {
 .upload-hint {
     font-size: 0.85rem;
     color: var(--text-muted);
+}
+
+.upload-inline-field {
+    margin-top: var(--space-sm);
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+}
+
+.upload-inline-field label {
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    font-weight: 600;
+}
+
+.upload-inline-field select {
+    flex: 1;
+    background: var(--surface);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 6px 10px;
+    font-size: 0.85rem;
 }
 
 /* Auto Upload Card */
@@ -1434,18 +1458,52 @@ textarea::placeholder {
 }
 
 .auto-dub-toggle-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    display: flex;
+    flex-wrap: wrap;
     gap: 8px;
     margin-top: 12px;
 }
 
 .auto-dub-toggle-card {
+    flex: 0 1 auto;
     margin-top: 0;
-    padding: 10px 12px;
+    padding: 8px 10px;
     border: 1px solid var(--border);
     border-radius: var(--radius-md);
     background: var(--surface);
+    width: fit-content;
+    max-width: 100%;
+}
+
+.auto-dub-toggle-card-with-hint {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 6px;
+}
+
+.auto-dub-toggle-main-row {
+    width: auto;
+    margin-top: 0;
+    flex-wrap: wrap;
+}
+
+.auto-dub-toggle-hint {
+    flex: 0 0 auto;
+    margin: 0;
+    width: auto;
+    max-width: 100%;
+    font-size: 0.8rem;
+    line-height: 1.35;
+}
+
+.auto-dub-toggle-hint-inline {
+    display: inline-flex;
+    align-items: center;
+    margin-left: 6px;
+    font-size: 0.76rem;
+    line-height: 1.2;
+    white-space: nowrap;
 }
 
 .auto-dub-toggle-card label,
@@ -1545,6 +1603,16 @@ textarea::placeholder {
 .auto-dub-range-separator {
     color: var(--text-secondary);
     font-weight: 700;
+}
+
+.auto-dub-range-precision-toggle {
+    padding: 4px 10px;
+    font-size: 0.8rem;
+}
+
+.auto-dub-range-inputs:not(.expanded) .auto-dub-range-hour-field,
+.auto-dub-range-inputs:not(.expanded) .auto-dub-range-hour-separator {
+    display: none;
 }
 
 .auto-dub-restore-row select {
@@ -2091,284 +2159,7 @@ body[data-theme="light"] .auto-upload-card.has-file {
     background: rgba(34, 197, 94, 0.14);
 }
 
-/* Agent V1：右下角使用助手，独立于播放器和主面板布局 */
-.agent-fab {
-    position: fixed;
-    right: 22px;
-    bottom: 22px;
-    z-index: 80;
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    height: 46px;
-    padding: 0 16px 0 10px;
-    border: 1px solid rgba(249, 115, 22, 0.45);
-    border-radius: 999px;
-    color: #fff7ed;
-    background: linear-gradient(135deg, rgba(249, 115, 22, 0.95), rgba(154, 52, 18, 0.92));
-    box-shadow: 0 18px 40px rgba(0, 0, 0, 0.38), 0 0 0 1px rgba(255, 255, 255, 0.08) inset;
-    cursor: pointer;
-    font-family: var(--font-display);
-    font-weight: 700;
-    letter-spacing: 0.01em;
-    transition: transform var(--transition-fast), box-shadow var(--transition-fast), opacity var(--transition-fast);
-}
-
-/* Auto Dubbing 面板右下有 Restore/Review 操作区：激活时给悬浮助手留出避让空间，避免遮挡点击。 */
+/* Auto Dubbing 面板右下有 Restore/Review 操作区：激活时给底部交互区留出安全空间。 */
 body.auto-dub-panel-active .dynamic-content-section {
     padding-bottom: calc(var(--space-xl) + 96px);
-}
-
-body.auto-dub-panel-active .agent-fab {
-    opacity: 0;
-    pointer-events: none;
-    transform: translateY(8px);
-}
-
-body.auto-dub-panel-active .agent-drawer {
-    transform: translateX(calc(100% + 32px));
-    opacity: 0;
-    pointer-events: none;
-}
-
-body.auto-dub-panel-active .agent-backdrop {
-    display: none !important;
-    pointer-events: none !important;
-}
-
-/* 2/3 面板的右下控件也会与悬浮按钮重叠，激活时同样做避让。 */
-body.floating-ui-avoid-panel-active .dynamic-content-section {
-    padding-bottom: calc(var(--space-xl) + 96px);
-}
-
-body.floating-ui-avoid-panel-active .agent-fab {
-    opacity: 0;
-    pointer-events: none;
-    transform: translateY(8px);
-}
-
-body.floating-ui-avoid-panel-active .agent-drawer {
-    transform: translateX(calc(100% + 32px));
-    opacity: 0;
-    pointer-events: none;
-}
-
-body.floating-ui-avoid-panel-active .agent-backdrop {
-    display: none !important;
-    pointer-events: none !important;
-}
-
-.agent-fab:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 22px 48px rgba(0, 0, 0, 0.45), 0 0 24px rgba(249, 115, 22, 0.35);
-}
-
-.agent-fab-mark {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border-radius: 50%;
-    color: var(--accent);
-    background: #fff7ed;
-    font-weight: 800;
-}
-
-.agent-drawer {
-    position: fixed;
-    top: 18px;
-    right: 18px;
-    bottom: 18px;
-    z-index: 90;
-    display: flex;
-    flex-direction: column;
-    width: min(420px, calc(100vw - 28px));
-    padding: 18px;
-    border: 1px solid rgba(249, 115, 22, 0.28);
-    border-radius: 24px;
-    color: var(--text-primary);
-    background:
-        radial-gradient(circle at 18% 0%, rgba(249, 115, 22, 0.18), transparent 34%),
-        linear-gradient(180deg, rgba(34, 34, 40, 0.98), rgba(12, 12, 15, 0.98));
-    box-shadow: 0 30px 90px rgba(0, 0, 0, 0.55);
-    transform: translateX(calc(100% + 32px));
-    opacity: 0;
-    pointer-events: none;
-    transition: transform 220ms ease, opacity 220ms ease;
-}
-
-.agent-drawer.open {
-    transform: translateX(0);
-    opacity: 1;
-    pointer-events: auto;
-}
-
-.agent-drawer-header {
-    display: flex;
-    align-items: flex-start;
-    justify-content: space-between;
-    gap: 14px;
-}
-
-.agent-kicker {
-    margin: 0 0 4px;
-    color: var(--accent);
-    font-size: 0.72rem;
-    font-weight: 800;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-}
-
-.agent-drawer-header h2 {
-    margin: 0;
-    font-size: 1.35rem;
-    line-height: 1.1;
-}
-
-.agent-close-btn {
-    width: 34px;
-    height: 34px;
-    border: 1px solid var(--border-light);
-    border-radius: 50%;
-    color: var(--text-secondary);
-    background: rgba(255, 255, 255, 0.04);
-    cursor: pointer;
-    font-size: 1.35rem;
-    line-height: 1;
-}
-
-.agent-close-btn:hover {
-    color: var(--text-primary);
-    border-color: var(--accent);
-}
-
-.agent-subtitle {
-    margin: 10px 0 14px;
-    color: var(--text-secondary);
-    font-size: 0.9rem;
-}
-
-.agent-shared-key-note,
-.agent-form textarea {
-    width: 100%;
-    border: 1px solid var(--border-light);
-    border-radius: 14px;
-    color: var(--text-primary);
-    background: rgba(10, 10, 11, 0.72);
-}
-
-.agent-shared-key-note {
-    margin: 0 0 12px;
-    padding: 10px 12px;
-    color: var(--text-secondary);
-    font-size: 0.84rem;
-    line-height: 1.55;
-}
-
-.agent-messages {
-    flex: 1;
-    min-height: 160px;
-    overflow-y: auto;
-    padding: 12px;
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    border-radius: 18px;
-    background: rgba(0, 0, 0, 0.18);
-}
-
-.agent-message {
-    max-width: 92%;
-    margin-bottom: 10px;
-    padding: 10px 12px;
-    border-radius: 15px;
-    font-size: 0.9rem;
-    white-space: pre-wrap;
-}
-
-.agent-message.user {
-    margin-left: auto;
-    color: #fff7ed;
-    background: rgba(249, 115, 22, 0.26);
-    border-bottom-right-radius: 5px;
-}
-
-.agent-message.assistant {
-    color: var(--text-primary);
-    background: rgba(255, 255, 255, 0.07);
-    border-bottom-left-radius: 5px;
-}
-
-.agent-message.error {
-    color: #fecaca;
-    background: rgba(220, 38, 38, 0.18);
-}
-
-.agent-actions {
-    margin-top: 8px;
-    padding-left: 18px;
-    color: var(--text-secondary);
-}
-
-.agent-form {
-    display: grid;
-    grid-template-columns: 1fr auto;
-    gap: 10px;
-    margin-top: 12px;
-}
-
-.agent-form textarea {
-    min-height: 64px;
-    max-height: 140px;
-    padding: 10px 12px;
-    resize: vertical;
-}
-
-.agent-form button {
-    align-self: end;
-    min-width: 76px;
-}
-
-.agent-backdrop {
-    position: fixed;
-    inset: 0;
-    z-index: 85;
-    background: rgba(0, 0, 0, 0.32);
-}
-
-body[data-theme="light"] .agent-drawer {
-    background:
-        radial-gradient(circle at 18% 0%, rgba(234, 88, 12, 0.14), transparent 34%),
-        linear-gradient(180deg, rgba(255, 255, 255, 0.99), rgba(246, 248, 251, 0.99));
-    box-shadow: 0 30px 80px rgba(15, 23, 42, 0.22);
-}
-
-body[data-theme="light"] .agent-shared-key-note,
-body[data-theme="light"] .agent-form textarea {
-    background: rgba(255, 255, 255, 0.92);
-}
-
-body[data-theme="light"] .agent-message.assistant {
-    background: rgba(15, 23, 42, 0.06);
-}
-
-@media (max-width: 640px) {
-    .agent-fab {
-        right: 14px;
-        bottom: 14px;
-    }
-
-    .agent-fab-label {
-        display: none;
-    }
-
-    .agent-drawer {
-        inset: 10px;
-        width: auto;
-        padding: 14px;
-        border-radius: 20px;
-    }
-
-    .agent-form {
-        grid-template-columns: 1fr;
-    }
 }

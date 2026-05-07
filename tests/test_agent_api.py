@@ -11,7 +11,7 @@ from subtitle_maker.core.llm_client import ChatResult, LlmClientError
 
 
 class FakeAgentClient:
-    """伪造 Agent LLM 客户端，避免单测访问真实 DeepSeek。"""
+    """伪造 Agent LLM 客户端，避免单测访问真实翻译模型服务。"""
 
     instances = []
 

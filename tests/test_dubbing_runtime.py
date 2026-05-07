@@ -3,31 +3,44 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import numpy as np
-import soundfile as sf
+from types import SimpleNamespace
+RUNTIME_TEST_SKIP_REASON = ""
+try:
+    import soundfile as sf
+except ModuleNotFoundError as exc:  # pragma: no cover - 仅在缺三方依赖的本地环境触发
+    sf = None
+    RUNTIME_TEST_SKIP_REASON = f"missing dependency {exc.name}"
 
-from subtitle_maker.backends import IndexTtsBackend, OmniVoiceBackend, TtsSynthesisRequest, split_text_for_index_tts
-from subtitle_maker.domains.dubbing import (
-    build_atempo_filter_chain,
-    build_synthesis_groups,
-    compute_effective_target_duration,
-    resolve_segment_redub_runtime_options,
-    synthesize_segments,
-    synthesize_segments_grouped,
-    synthesize_text_once,
-    trim_silence_edges,
-)
-from subtitle_maker.domains.media.compose import (
-    build_dubbed_video_two_step,
-    compose_vocals_master,
-    normalize_speech_audio_level,
-)
-from subtitle_maker.manifests import load_segment_manifest
+if not RUNTIME_TEST_SKIP_REASON:
+    try:
+        from subtitle_maker.backends import IndexTtsBackend, TtsSynthesisRequest, split_text_for_index_tts
+        from subtitle_maker.domains.dubbing import (
+            build_atempo_filter_chain,
+            build_synthesis_groups,
+            compute_effective_target_duration,
+            resolve_segment_redub_runtime_options,
+            synthesize_segments,
+            synthesize_segments_grouped,
+            synthesize_text_once,
+            trim_leading_silence_conservative,
+            trim_silence_edges,
+        )
+        from subtitle_maker.domains.media.compose import (
+            build_dubbed_video_two_step,
+            compose_vocals_master,
+            normalize_speech_audio_level,
+        )
+        from subtitle_maker.manifests import load_segment_manifest
+    except ModuleNotFoundError as exc:  # pragma: no cover - 仅在缺三方依赖的本地环境触发
+        RUNTIME_TEST_SKIP_REASON = f"missing dependency {exc.name}"
 
 
+@unittest.skipIf(bool(RUNTIME_TEST_SKIP_REASON), RUNTIME_TEST_SKIP_REASON or "")
 class DubbingAlignmentTests(unittest.TestCase):
     def test_build_atempo_filter_chain_splits_large_ratio(self):
         self.assertEqual(build_atempo_filter_chain(6.0), "atempo=2.000000,atempo=2.000000,atempo=1.500000")
@@ -78,6 +91,55 @@ class DubbingAlignmentTests(unittest.TestCase):
         self.assertAlmostEqual(before_trim, 0.44, places=2)
         # 0.20s 主体 + 前后各 0.08s padding = 0.36s。
         self.assertAlmostEqual(after_trim, 0.36, places=2)
+
+    def test_trim_leading_silence_conservative_only_trims_front(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            input_path = tmp_path / "input.wav"
+            output_path = tmp_path / "output.wav"
+            sample_rate = 1000
+            wav = np.concatenate(
+                [
+                    np.zeros(220, dtype=np.float32),
+                    np.full(200, 0.2, dtype=np.float32),
+                    np.zeros(180, dtype=np.float32),
+                ]
+            )
+            sf.write(str(input_path), wav, sample_rate)
+
+            before_trim, after_trim = trim_leading_silence_conservative(
+                input_path=input_path,
+                output_path=output_path,
+                max_trim_sec=0.35,
+            )
+
+            trimmed, _ = sf.read(str(output_path))
+
+        self.assertAlmostEqual(before_trim, 0.60, places=2)
+        self.assertAlmostEqual(after_trim, 0.46, places=2)
+        self.assertEqual(len(trimmed), 460)
+
+    def test_trim_leading_silence_conservative_respects_max_trim_cap(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            input_path = tmp_path / "input.wav"
+            output_path = tmp_path / "output.wav"
+            sample_rate = 1000
+            wav = np.concatenate(
+                [
+                    np.zeros(600, dtype=np.float32),
+                    np.full(200, 0.2, dtype=np.float32),
+                ]
+            )
+            sf.write(str(input_path), wav, sample_rate)
+
+            _, after_trim = trim_leading_silence_conservative(
+                input_path=input_path,
+                output_path=output_path,
+                max_trim_sec=0.35,
+            )
+
+        self.assertAlmostEqual(after_trim, 0.45, places=2)
 
     def test_compose_vocals_master_resamples_mixed_sample_rates(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -287,7 +349,13 @@ class DubbingAlignmentTests(unittest.TestCase):
             self.assertEqual(run_cmd_mock.call_count, 1)
 
 
+@unittest.skipIf(bool(RUNTIME_TEST_SKIP_REASON), RUNTIME_TEST_SKIP_REASON or "")
 class DubbingPipelineTests(unittest.TestCase):
+    @dataclass(frozen=True)
+    class _TestVoiceReference:
+        audio_path: Path
+        reference_text: str
+
     def test_build_synthesis_groups_sentence_strategy_prefers_sentence_end(self):
         subtitles = [
             {"start": 0.0, "end": 1.0, "text": "Hello."},
@@ -304,6 +372,43 @@ class DubbingPipelineTests(unittest.TestCase):
         )
         self.assertEqual(groups, [[0], [1, 2]])
 
+    def test_build_speaker_aware_synthesis_groups_keeps_same_speaker_together(self):
+        from subtitle_maker.domains.dubbing.pipeline import build_speaker_aware_synthesis_groups
+
+        subtitles = [
+            {"start": 0.0, "end": 1.0, "text": "Hello", "speaker_id": "Speaker 1"},
+            {"start": 1.0, "end": 2.0, "text": "World", "speaker_id": "Speaker 1"},
+            {"start": 2.0, "end": 3.0, "text": "Hi", "speaker_id": "Speaker 2"},
+            {"start": 3.0, "end": 4.0, "text": "There", "speaker_id": "Speaker 2"},
+        ]
+        groups = build_speaker_aware_synthesis_groups(
+            subtitles=subtitles,
+            translated_lines=["你", "好", "啊", "呀"],
+            max_gap_sec=0.35,
+            min_group_duration_sec=0.5,
+            max_group_duration_sec=8.0,
+        )
+
+        self.assertEqual(groups, [[0, 1], [2, 3]])
+
+    def test_build_speaker_aware_synthesis_groups_splits_overlong_runs(self):
+        from subtitle_maker.domains.dubbing.pipeline import build_speaker_aware_synthesis_groups
+
+        subtitles = [
+            {"start": 0.0, "end": 3.0, "text": "A", "speaker_id": "Speaker 1"},
+            {"start": 3.0, "end": 6.0, "text": "B", "speaker_id": "Speaker 1"},
+            {"start": 6.0, "end": 9.5, "text": "C", "speaker_id": "Speaker 1"},
+        ]
+        groups = build_speaker_aware_synthesis_groups(
+            subtitles=subtitles,
+            translated_lines=["甲", "乙", "丙"],
+            max_gap_sec=0.35,
+            min_group_duration_sec=0.5,
+            max_group_duration_sec=5.0,
+        )
+
+        self.assertTrue(all((subtitles[g[-1]]["end"] - subtitles[g[0]]["start"]) <= 5.0 for g in groups))
+
     def test_synthesize_text_once_dispatches_index_backend(self):
         with patch("subtitle_maker.domains.dubbing.pipeline.IndexTtsBackend") as backend_cls:
             backend = backend_cls.return_value
@@ -312,8 +417,6 @@ class DubbingPipelineTests(unittest.TestCase):
                 index_tts_via_api=True,
                 index_tts_api_url="http://127.0.0.1:8010",
                 index_tts_api_timeout_sec=12.0,
-                tts_qwen=None,
-                qwen_prompt_items=None,
                 tts_index=None,
                 ref_audio_path=Path("/tmp/ref.wav"),
                 index_emo_audio_prompt=Path("/tmp/emo.wav"),
@@ -341,22 +444,145 @@ class DubbingPipelineTests(unittest.TestCase):
         self.assertEqual(request.output_path, Path("/tmp/out.wav"))
         self.assertEqual(request.emo_text, "calm")
 
-    def test_synthesize_text_once_falls_back_to_omnivoice_when_primary_fails(self):
-        with patch("subtitle_maker.domains.dubbing.pipeline.IndexTtsBackend") as index_cls, patch(
-            "subtitle_maker.domains.dubbing.pipeline.OmniVoiceBackend"
-        ) as omni_cls:
-            index_backend = index_cls.return_value
-            omni_backend = omni_cls.return_value
-            index_backend.synthesize.side_effect = RuntimeError("primary failed")
+    def test_translate_batch_with_budget_lazy_initializes_translator_client(self):
+        from subtitle_maker.translator import Translator
+        from tools.dub_pipeline import translate_batch_with_budget
 
+        class FakeClient:
+            def __init__(self):
+                self.chat = SimpleNamespace(
+                    completions=SimpleNamespace(
+                        create=Mock(
+                            return_value=SimpleNamespace(
+                                choices=[SimpleNamespace(message=SimpleNamespace(content="1. 你好"))]
+                            )
+                        )
+                    )
+                )
+
+        translator = Translator(api_key="test-key", base_url="http://example.com", model="demo-model")
+        translator.client = None
+
+        with patch.object(Translator, "_ensure_client", return_value=FakeClient()) as ensure_client:
+            translated = translate_batch_with_budget(
+                translator=translator,
+                lines=["hello"],
+                durations=[1.0],
+                target_lang="Chinese",
+                system_prompt=None,
+                chunk_size=1,
+            )
+
+        self.assertEqual(translated, ["你好"])
+        ensure_client.assert_called_once()
+        system_message = ensure_client.return_value.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        self.assertIn("50 翻译成五十", system_message)
+        self.assertIn("不要出现冒号", system_message)
+        self.assertIn("AI 的发展", system_message)
+
+    def test_translator_translate_batch_merges_default_and_custom_system_prompt(self):
+        from subtitle_maker.translator import Translator
+
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=Mock(
+                        return_value=SimpleNamespace(
+                            choices=[SimpleNamespace(message=SimpleNamespace(content="1. 你好"))]
+                        )
+                    )
+                )
+            )
+        )
+        translator = Translator(api_key="test-key", base_url="http://example.com", model="demo-model")
+        translator.client = fake_client
+
+        translated = translator.translate_batch(
+            ["hello"],
+            target_lang="Chinese",
+            system_prompt="名字保留英文。",
+            chunk_size=1,
+        )
+
+        self.assertEqual(translated, ["你好"])
+        system_message = fake_client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        self.assertIn("50 翻译成五十", system_message)
+        self.assertIn("不要出现冒号", system_message)
+        self.assertIn("AI 的发展", system_message)
+        self.assertIn("名字保留英文。", system_message)
+
+    def test_resolve_translation_api_key_prefers_generic_env_then_legacy_env(self):
+        from subtitle_maker.translator import resolve_translation_api_key
+
+        with patch.dict(
+            "os.environ",
+            {"TRANSLATE_API_KEY": "generic-key", "DEEPSEEK_API_KEY": "legacy-key"},
+            clear=False,
+        ):
+            self.assertEqual(resolve_translation_api_key(), "generic-key")
+            self.assertEqual(resolve_translation_api_key(api_key="explicit-key"), "explicit-key")
+
+    def test_get_translate_provider_label_defaults_to_openai_compatible_for_custom_host(self):
+        from subtitle_maker.translator import get_translate_provider_label
+
+        self.assertEqual(get_translate_provider_label("https://api.deepseek.com"), "OpenAI-compatible")
+        self.assertEqual(get_translate_provider_label("https://llm.example.com/v1"), "OpenAI-compatible")
+
+    def test_default_translation_provider_config_keeps_compat_aliases_in_sync(self):
+        from subtitle_maker.translator import (
+            DEFAULT_TRANSLATE_BASE_URL,
+            DEFAULT_TRANSLATE_MODEL,
+            DEFAULT_TRANSLATION_PROVIDER,
+        )
+
+        self.assertEqual(DEFAULT_TRANSLATION_PROVIDER.base_url, DEFAULT_TRANSLATE_BASE_URL)
+        self.assertEqual(DEFAULT_TRANSLATION_PROVIDER.model, DEFAULT_TRANSLATE_MODEL)
+
+    def test_repair_punctuation_only_translations_inherits_merged_system_prompt(self):
+        from subtitle_maker.translator import Translator
+        from tools.dub_pipeline import JsonlLogger, repair_punctuation_only_translations
+
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=Mock(
+                        return_value=SimpleNamespace(
+                            choices=[SimpleNamespace(message=SimpleNamespace(content="1. 人工智能 的发展"))]
+                        )
+                    )
+                )
+            )
+        )
+        translator = Translator(api_key="test-key", base_url="http://example.com", model="demo-model")
+        translator.client = fake_client
+
+        repaired = repair_punctuation_only_translations(
+            subtitles=[{"text": "AI: 50", "start": 0.0, "end": 1.0}],
+            translated_lines=["..."],
+            translator=translator,
+            target_lang="Chinese",
+            logger=JsonlLogger(Path(tempfile.mkdtemp()) / "repair.jsonl", "test-repair"),
+            system_prompt="名字保留英文。",
+        )
+
+        self.assertEqual(repaired, ["人工智能 的发展"])
+        system_message = fake_client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
+        self.assertIn("50 翻译成五十", system_message)
+        self.assertIn("不要出现冒号", system_message)
+        self.assertIn("AI 的发展", system_message)
+        self.assertIn("名字保留英文。", system_message)
+        self.assertIn("Never output only punctuation or ellipsis.", system_message)
+
+    def test_synthesize_text_once_rejects_removed_fallback_backend(self):
+        """Auto Dubbing 收口后，不再允许通过 fallback_tts_backend 切到其他底座。"""
+
+        with self.assertRaises(RuntimeError) as ctx:
             synthesize_text_once(
                 tts_backend="index-tts",
                 fallback_tts_backend="omnivoice",
                 index_tts_via_api=True,
                 index_tts_api_url="http://127.0.0.1:8010",
                 index_tts_api_timeout_sec=12.0,
-                tts_qwen=None,
-                qwen_prompt_items=None,
                 tts_index=None,
                 ref_audio_path=Path("/tmp/ref.wav"),
                 index_emo_audio_prompt=None,
@@ -369,37 +595,25 @@ class DubbingPipelineTests(unittest.TestCase):
                 index_max_text_tokens=120,
                 text="hello world",
                 output_path=Path("/tmp/out.wav"),
-                omnivoice_root="/opt/omnivoice",
-                omnivoice_python_bin="/opt/omnivoice/.venv/bin/python",
-                omnivoice_model="k2-fsa/OmniVoice",
-                omnivoice_device="mps",
                 ref_text="hello",
                 target_lang="English",
                 target_duration_sec=1.9,
             )
 
-        index_backend.synthesize.assert_called_once()
-        omni_cls.assert_called_once()
-        omni_backend.synthesize.assert_called_once()
-        omni_request = omni_backend.synthesize.call_args.args[0]
-        self.assertAlmostEqual(float(omni_request.target_duration_sec), 1.9, places=3)
+        self.assertIn("Unsupported fallback_tts_backend", str(ctx.exception))
 
-    def test_synthesize_text_once_raises_when_primary_and_fallback_both_fail(self):
-        with patch("subtitle_maker.domains.dubbing.pipeline.IndexTtsBackend") as index_cls, patch(
-            "subtitle_maker.domains.dubbing.pipeline.OmniVoiceBackend"
-        ) as omni_cls:
+
+    def test_synthesize_text_once_primary_failure_surfaces_original_error_without_fallback(self):
+        with patch("subtitle_maker.domains.dubbing.pipeline.IndexTtsBackend") as index_cls:
             index_cls.return_value.synthesize.side_effect = RuntimeError("index down")
-            omni_cls.return_value.synthesize.side_effect = RuntimeError("omni down")
 
             with self.assertRaises(RuntimeError) as ctx:
                 synthesize_text_once(
                     tts_backend="index-tts",
-                    fallback_tts_backend="omnivoice",
+                    fallback_tts_backend="none",
                     index_tts_via_api=True,
                     index_tts_api_url="http://127.0.0.1:8010",
                     index_tts_api_timeout_sec=12.0,
-                    tts_qwen=None,
-                    qwen_prompt_items=None,
                     tts_index=None,
                     ref_audio_path=Path("/tmp/ref.wav"),
                     index_emo_audio_prompt=None,
@@ -412,15 +626,40 @@ class DubbingPipelineTests(unittest.TestCase):
                     index_max_text_tokens=120,
                     text="hello world",
                     output_path=Path("/tmp/out.wav"),
-                    omnivoice_root="/opt/omnivoice",
-                    omnivoice_python_bin="/opt/omnivoice/.venv/bin/python",
-                    omnivoice_model="k2-fsa/OmniVoice",
-                    omnivoice_device="mps",
                     ref_text="hello",
                     target_lang="English",
                 )
 
-        self.assertIn("primary backend failed and fallback backend failed", str(ctx.exception))
+        self.assertIn("index down", str(ctx.exception))
+
+    def test_synthesize_text_once_rejects_removed_voxcpm_backend(self):
+        """Auto Dubbing 收口后，旧的 voxcpm-omnivoice backend 不再是有效合同。"""
+
+        with self.assertRaises(RuntimeError) as ctx:
+            synthesize_text_once(
+                tts_backend="voxcpm-omnivoice",
+                fallback_tts_backend="none",
+                index_tts_via_api=True,
+                index_tts_api_url="http://127.0.0.1:8010",
+                index_tts_api_timeout_sec=12.0,
+                tts_index=None,
+                ref_audio_path=Path("/tmp/ref.wav"),
+                index_emo_audio_prompt=None,
+                index_emo_alpha=1.0,
+                index_use_emo_text=False,
+                index_emo_text=None,
+                index_top_p=0.8,
+                index_top_k=30,
+                index_temperature=0.8,
+                index_max_text_tokens=120,
+                text="这是 VoxCPM anchor 测试。",
+                output_path=Path("/tmp/out.wav"),
+                ref_text="This is the source prompt text.",
+                target_lang="Chinese",
+                target_duration_sec=2.0,
+            )
+
+        self.assertIn("Unsupported tts backend", str(ctx.exception))
 
     def test_synthesize_segments_reuses_existing_record_when_line_not_redubbed(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -432,8 +671,6 @@ class DubbingPipelineTests(unittest.TestCase):
                 index_tts_via_api=True,
                 index_tts_api_url="http://127.0.0.1:8010",
                 index_tts_api_timeout_sec=12.0,
-                tts_qwen=None,
-                qwen_prompt_items=None,
                 tts_index=None,
                 ref_audio_path=tmp_path / "ref.wav",
                 ref_audio_selector=None,
@@ -492,8 +729,6 @@ class DubbingPipelineTests(unittest.TestCase):
                     index_tts_via_api=True,
                     index_tts_api_url="http://127.0.0.1:8010",
                     index_tts_api_timeout_sec=12.0,
-                    tts_qwen=None,
-                    qwen_prompt_items=None,
                     tts_index=None,
                     ref_audio_path=tmp_path / "ref.wav",
                     ref_audio_selector=None,
@@ -563,8 +798,6 @@ class DubbingPipelineTests(unittest.TestCase):
                     index_tts_via_api=True,
                     index_tts_api_url="http://127.0.0.1:8010",
                     index_tts_api_timeout_sec=12.0,
-                    tts_qwen=None,
-                    qwen_prompt_items=None,
                     tts_index=None,
                     ref_audio_path=tmp_path / "ref.wav",
                     ref_audio_selector=None,
@@ -604,6 +837,127 @@ class DubbingPipelineTests(unittest.TestCase):
             self.assertGreater(float(np.max(np.abs(wav))), 0.1)
             self.assertEqual(manual_review, [])
 
+    def test_synthesize_segments_short_index_tts_line_skips_leveling_and_edge_fade(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+
+            def fake_synthesize_text_once(**kwargs):
+                output_path = Path(kwargs["output_path"])
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                sf.write(str(output_path), np.full(6400, 0.2, dtype=np.float32), 16000)
+
+            with patch("subtitle_maker.domains.dubbing.pipeline.synthesize_text_once", side_effect=fake_synthesize_text_once), patch(
+                "subtitle_maker.domains.dubbing.pipeline.normalize_speech_audio_level"
+            ) as level_mock, patch(
+                "subtitle_maker.domains.dubbing.pipeline._apply_final_edge_fade"
+            ) as fade_mock:
+                records, manual_review = synthesize_segments(
+                    tts_backend="index-tts",
+                    index_tts_via_api=True,
+                    index_tts_api_url="http://127.0.0.1:8010",
+                    index_tts_api_timeout_sec=12.0,
+                    tts_index=None,
+                    ref_audio_path=tmp_path / "ref.wav",
+                    ref_audio_selector=None,
+                    source_vocals_audio=tmp_path / "source.wav",
+                    source_media_duration_sec=None,
+                    index_emo_audio_prompt=None,
+                    index_emo_alpha=1.0,
+                    index_use_emo_text=False,
+                    index_emo_text=None,
+                    index_top_p=0.8,
+                    index_top_k=30,
+                    index_temperature=0.8,
+                    index_max_text_tokens=120,
+                    force_fit_timing=False,
+                    subtitles=[{"start": 0.0, "end": 0.4, "text": "hello"}],
+                    translated_lines=["你好"],
+                    segment_dir=tmp_path / "segments",
+                    delta_pass_ms=120.0,
+                    delta_rewrite_ms=450.0,
+                    atempo_min=0.92,
+                    atempo_max=1.08,
+                    max_retry=0,
+                    translator=None,
+                    target_lang="Chinese",
+                    allow_rewrite_translation=False,
+                    prefer_translated_text=True,
+                    existing_records_by_id=None,
+                    redub_line_indices=None,
+                    v2_mode=False,
+                    logger=Mock(),
+                )
+
+            level_mock.assert_not_called()
+            fade_mock.assert_not_called()
+            self.assertEqual(records[0]["status"], "done")
+            self.assertFalse(records[0]["audio_leveling_applied"])
+            self.assertEqual(manual_review, [])
+
+    def test_synthesize_segments_trims_edges_before_selecting_best(self):
+        """逐句链路应先做 trim_edges，避免句首瞬态杂音直接进入最终候选。"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+
+            def fake_synthesize_text_once(**kwargs):
+                output_path = Path(kwargs["output_path"])
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                # 前后各 100ms 静音，中间 400ms 有效语音
+                wav = np.concatenate(
+                    [
+                        np.zeros(1600, dtype=np.float32),
+                        np.full(6400, 0.2, dtype=np.float32),
+                        np.zeros(1600, dtype=np.float32),
+                    ]
+                )
+                sf.write(str(output_path), wav, 16000)
+
+            with patch("subtitle_maker.domains.dubbing.pipeline.synthesize_text_once", side_effect=fake_synthesize_text_once):
+                records, manual_review = synthesize_segments(
+                    tts_backend="index-tts",
+                    index_tts_via_api=True,
+                    index_tts_api_url="http://127.0.0.1:8010",
+                    index_tts_api_timeout_sec=12.0,
+                    tts_index=None,
+                    ref_audio_path=tmp_path / "ref.wav",
+                    ref_audio_selector=None,
+                    source_vocals_audio=tmp_path / "source.wav",
+                    source_media_duration_sec=None,
+                    index_emo_audio_prompt=None,
+                    index_emo_alpha=1.0,
+                    index_use_emo_text=False,
+                    index_emo_text=None,
+                    index_top_p=0.8,
+                    index_top_k=30,
+                    index_temperature=0.8,
+                    index_max_text_tokens=120,
+                    force_fit_timing=False,
+                    subtitles=[{"start": 0.0, "end": 0.6, "text": "hello"}],
+                    translated_lines=["你好"],
+                    segment_dir=tmp_path / "segments",
+                    delta_pass_ms=120.0,
+                    delta_rewrite_ms=450.0,
+                    atempo_min=0.92,
+                    atempo_max=1.08,
+                    max_retry=0,
+                    translator=None,
+                    target_lang="Chinese",
+                    allow_rewrite_translation=False,
+                    prefer_translated_text=True,
+                    existing_records_by_id=None,
+                    redub_line_indices=None,
+                    v2_mode=False,
+                    logger=Mock(),
+                    fallback_tts_backend="none",
+                        dub_audio_leveling_enabled=False,
+                )
+
+            self.assertEqual(manual_review, [])
+            self.assertEqual(records[0]["status"], "done")
+            actions = [str(item.get("action") or "") for item in records[0].get("attempt_history", [])]
+            self.assertIn("trim_edges", actions)
+
     def test_synthesize_segments_resume_reuse_skips_releveling_existing_audio(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -616,8 +970,6 @@ class DubbingPipelineTests(unittest.TestCase):
                     index_tts_via_api=True,
                     index_tts_api_url="http://127.0.0.1:8010",
                     index_tts_api_timeout_sec=12.0,
-                    tts_qwen=None,
-                    qwen_prompt_items=None,
                     tts_index=None,
                     ref_audio_path=tmp_path / "ref.wav",
                     ref_audio_selector=None,
@@ -681,8 +1033,6 @@ class DubbingPipelineTests(unittest.TestCase):
                     index_tts_via_api=True,
                     index_tts_api_url="http://127.0.0.1:8010",
                     index_tts_api_timeout_sec=12.0,
-                    tts_qwen=None,
-                    qwen_prompt_items=None,
                     tts_index=None,
                     ref_audio_path=tmp_path / "ref.wav",
                     ref_audio_selector=None,
@@ -748,8 +1098,6 @@ class DubbingPipelineTests(unittest.TestCase):
                     index_tts_via_api=True,
                     index_tts_api_url="http://127.0.0.1:8010",
                     index_tts_api_timeout_sec=12.0,
-                    tts_qwen=None,
-                    qwen_prompt_items=None,
                     tts_index=None,
                     ref_audio_path=tmp_path / "ref.wav",
                     ref_audio_selector=None,
@@ -796,11 +1144,10 @@ class DubbingPipelineTests(unittest.TestCase):
             sf.write(str(ref_audio), np.zeros(16000, dtype=np.float32), 16000)
             records, manual_review = synthesize_segments_grouped(
                 tts_backend="index-tts",
+                dubbing_mode="single",
                 index_tts_via_api=True,
                 index_tts_api_url="http://127.0.0.1:8010",
                 index_tts_api_timeout_sec=12.0,
-                tts_qwen=None,
-                qwen_prompt_items=None,
                 tts_index=None,
                 ref_audio_path=ref_audio,
                 ref_audio_selector=None,
@@ -833,27 +1180,23 @@ class DubbingPipelineTests(unittest.TestCase):
             self.assertTrue(Path(records[0]["tts_audio_path"]).exists())
             self.assertEqual(manual_review, [])
 
-    def test_synthesize_segments_omnivoice_precheck_rejects_too_short_effective_target_before_tts(self):
+    def test_synthesize_text_once_rejects_removed_voxcpm_backend_even_with_reference_prompt(self):
+        """即便传入旧的 VoxCPM 参考文案字段，也应直接报 backend 不支持。"""
+
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
-            seg_dir = tmp_path / "segments"
-            seg_dir.mkdir(parents=True, exist_ok=True)
             ref_audio = tmp_path / "ref.wav"
-            sf.write(str(ref_audio), np.zeros(16000, dtype=np.float32), 16000)
+            sf.write(str(ref_audio), np.full(16000, 0.05, dtype=np.float32), 16000)
 
-            with patch("subtitle_maker.domains.dubbing.pipeline.synthesize_text_once") as synth_mock:
-                records, manual_review = synthesize_segments(
-                    tts_backend="omnivoice",
+            with self.assertRaises(RuntimeError) as ctx:
+                synthesize_text_once(
+                    tts_backend="voxcpm-omnivoice",
+                    fallback_tts_backend="none",
                     index_tts_via_api=True,
                     index_tts_api_url="http://127.0.0.1:8010",
                     index_tts_api_timeout_sec=12.0,
-                    tts_qwen=None,
-                    qwen_prompt_items=None,
                     tts_index=None,
                     ref_audio_path=ref_audio,
-                    ref_audio_selector=None,
-                    source_vocals_audio=tmp_path / "source.wav",
-                    source_media_duration_sec=None,
                     index_emo_audio_prompt=None,
                     index_emo_alpha=1.0,
                     index_use_emo_text=False,
@@ -862,147 +1205,20 @@ class DubbingPipelineTests(unittest.TestCase):
                     index_top_k=30,
                     index_temperature=0.8,
                     index_max_text_tokens=120,
-                    force_fit_timing=False,
-                    subtitles=[{"start": 0.0, "end": 0.8, "text": "hello"}],
-                    translated_lines=["你好"],
-                    segment_dir=seg_dir,
-                    delta_pass_ms=120.0,
-                    delta_rewrite_ms=450.0,
-                    atempo_min=0.92,
-                    atempo_max=1.08,
-                    max_retry=0,
-                    translator=None,
+                    text="这是要配音的字幕正文",
+                    output_path=tmp_path / "out.wav",
+                    target_duration_sec=1.8,
+                    ref_text="这是参考音频对应文本",
                     target_lang="Chinese",
-                    allow_rewrite_translation=False,
-                    prefer_translated_text=True,
-                    existing_records_by_id=None,
-                    redub_line_indices=None,
-                    v2_mode=False,
-                    logger=Mock(),
+                    anchor_output_path=tmp_path / "anchor.wav",
                 )
 
-        synth_mock.assert_not_called()
-        self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["status"], "manual_review")
-        self.assertTrue(records[0]["tts_audio_path"].endswith("_missing.wav"))
-        self.assertEqual(records[0]["attempt_history"][0]["action"], "omnivoice_duration_precheck")
-        self.assertEqual(len(manual_review), 1)
-        self.assertEqual(
-            manual_review[0]["reason_code"],
-            "omnivoice_target_duration_below_safe_floor",
-        )
-        self.assertEqual(manual_review[0]["error_stage"], "tts_precheck")
+        self.assertIn("Unsupported tts backend", str(ctx.exception))
 
-    def test_synthesize_segments_grouped_omnivoice_precheck_marks_all_short_group_members(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            ref_audio = tmp_path / "ref.wav"
-            sf.write(str(ref_audio), np.zeros(16000, dtype=np.float32), 16000)
 
-            with patch("subtitle_maker.domains.dubbing.pipeline.synthesize_text_once") as synth_mock:
-                records, manual_review = synthesize_segments_grouped(
-                    tts_backend="omnivoice",
-                    index_tts_via_api=True,
-                    index_tts_api_url="http://127.0.0.1:8010",
-                    index_tts_api_timeout_sec=12.0,
-                    tts_qwen=None,
-                    qwen_prompt_items=None,
-                    tts_index=None,
-                    ref_audio_path=ref_audio,
-                    ref_audio_selector=None,
-                    source_media_duration_sec=None,
-                    index_emo_audio_prompt=None,
-                    index_emo_alpha=1.0,
-                    index_use_emo_text=False,
-                    index_emo_text=None,
-                    index_top_p=0.8,
-                    index_top_k=30,
-                    index_temperature=0.8,
-                    index_max_text_tokens=120,
-                    force_fit_timing=False,
-                    group_gap_sec=0.35,
-                    group_min_duration_sec=1.8,
-                    group_max_duration_sec=8.0,
-                    subtitles=[
-                        {"start": 0.0, "end": 0.4, "text": "Hello"},
-                        {"start": 0.4, "end": 0.8, "text": "again"},
-                    ],
-                    translated_lines=["你", "好"],
-                    segment_dir=tmp_path / "grouped_short",
-                    delta_pass_ms=120.0,
-                    timing_mode="strict",
-                    balanced_max_tempo_shift=0.08,
-                    balanced_min_line_sec=0.35,
-                    grouping_strategy="sentence",
-                    logger=Mock(),
-                    target_lang="Chinese",
-                )
 
-        synth_mock.assert_not_called()
-        self.assertEqual(len(records), 2)
-        self.assertTrue(all(item["status"] == "manual_review" for item in records))
-        self.assertTrue(all(item["tts_audio_path"].endswith("_missing.wav") for item in records))
-        self.assertTrue(
-            all(
-                item["attempt_history"][0]["action"] == "group_omnivoice_duration_precheck"
-                for item in records
-            )
-        )
-        self.assertEqual(len(manual_review), 2)
-        self.assertTrue(
-            all(
-                item["reason_code"] == "omnivoice_target_duration_below_safe_floor"
-                for item in manual_review
-            )
-        )
 
-    def test_synthesize_segments_grouped_omnivoice_non_speech_still_builds_silence_without_precheck(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            ref_audio = tmp_path / "ref.wav"
-            sf.write(str(ref_audio), np.zeros(16000, dtype=np.float32), 16000)
 
-            with patch("subtitle_maker.domains.dubbing.pipeline.synthesize_text_once") as synth_mock:
-                records, manual_review = synthesize_segments_grouped(
-                    tts_backend="omnivoice",
-                    index_tts_via_api=True,
-                    index_tts_api_url="http://127.0.0.1:8010",
-                    index_tts_api_timeout_sec=12.0,
-                    tts_qwen=None,
-                    qwen_prompt_items=None,
-                    tts_index=None,
-                    ref_audio_path=ref_audio,
-                    ref_audio_selector=None,
-                    source_media_duration_sec=None,
-                    index_emo_audio_prompt=None,
-                    index_emo_alpha=1.0,
-                    index_use_emo_text=False,
-                    index_emo_text=None,
-                    index_top_p=0.8,
-                    index_top_k=30,
-                    index_temperature=0.8,
-                    index_max_text_tokens=120,
-                    force_fit_timing=False,
-                    group_gap_sec=0.35,
-                    group_min_duration_sec=1.8,
-                    group_max_duration_sec=8.0,
-                    subtitles=[{"start": 0.0, "end": 0.8, "text": ""}],
-                    translated_lines=[""],
-                    segment_dir=tmp_path / "grouped_non_speech",
-                    delta_pass_ms=120.0,
-                    timing_mode="strict",
-                    balanced_max_tempo_shift=0.08,
-                    balanced_min_line_sec=0.35,
-                    grouping_strategy="sentence",
-                    logger=Mock(),
-                    target_lang="Chinese",
-                )
-
-        synth_mock.assert_not_called()
-        self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["status"], "done")
-        self.assertFalse(records[0]["tts_audio_path"].endswith("_missing.wav"))
-        self.assertEqual(manual_review, [])
 
     def test_synthesize_segments_index_tts_skips_fit_when_within_threshold(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1020,8 +1236,6 @@ class DubbingPipelineTests(unittest.TestCase):
                         index_tts_via_api=True,
                         index_tts_api_url="http://127.0.0.1:8010",
                         index_tts_api_timeout_sec=12.0,
-                        tts_qwen=None,
-                        qwen_prompt_items=None,
                         tts_index=None,
                         ref_audio_path=tmp_path / "ref.wav",
                         ref_audio_selector=None,
@@ -1077,8 +1291,6 @@ class DubbingPipelineTests(unittest.TestCase):
                     index_tts_via_api=True,
                     index_tts_api_url="http://127.0.0.1:8010",
                     index_tts_api_timeout_sec=12.0,
-                    tts_qwen=None,
-                    qwen_prompt_items=None,
                     tts_index=None,
                     ref_audio_path=tmp_path / "ref.wav",
                     ref_audio_selector=None,
@@ -1133,11 +1345,10 @@ class DubbingPipelineTests(unittest.TestCase):
             with patch("subtitle_maker.domains.dubbing.pipeline.synthesize_text_once", side_effect=fake_synthesize_text_once):
                 records, manual_review = synthesize_segments_grouped(
                     tts_backend="index-tts",
+                    dubbing_mode="single",
                     index_tts_via_api=True,
                     index_tts_api_url="http://127.0.0.1:8010",
                     index_tts_api_timeout_sec=12.0,
-                    tts_qwen=None,
-                    qwen_prompt_items=None,
                     tts_index=None,
                     ref_audio_path=ref_audio,
                     ref_audio_selector=None,
@@ -1173,123 +1384,68 @@ class DubbingPipelineTests(unittest.TestCase):
         self.assertEqual(len(manual_review), 1)
         self.assertEqual(manual_review[0]["reason_code"], "compose_window_overrun")
 
-    def test_synthesize_segments_omnivoice_skips_fit_when_within_threshold(self):
+    def test_synthesize_segments_grouped_index_tts_uses_anchor_window_for_status(self):
+        """grouped 判定应按本组窗口，不因 borrowed gap 未填满而误判 manual_review。"""
+
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
+            ref_audio = tmp_path / "ref.wav"
+            sf.write(str(ref_audio), np.zeros(16000, dtype=np.float32), 16000)
 
             def fake_synthesize_text_once(**kwargs):
                 output_path = Path(kwargs["output_path"])
                 output_path.parent.mkdir(parents=True, exist_ok=True)
-                # 生成 1.25s 的稳定波形，确保高于 precheck 下限且进入“阈值内”分支。
-                sf.write(str(output_path), np.full(20000, 0.05, dtype=np.float32), 16000)
+                # 输出 1.75s：接近本组 target(1.8s)，但显著短于 effective_target(≈3.7s)。
+                sf.write(str(output_path), np.full(28000, 0.05, dtype=np.float32), 16000)
 
             with patch("subtitle_maker.domains.dubbing.pipeline.synthesize_text_once", side_effect=fake_synthesize_text_once):
-                with patch("subtitle_maker.domains.dubbing.pipeline.fit_audio_to_duration") as fit_mock:
-                    records, manual_review = synthesize_segments(
-                        tts_backend="omnivoice",
-                        index_tts_via_api=True,
-                        index_tts_api_url="http://127.0.0.1:8010",
-                        index_tts_api_timeout_sec=12.0,
-                        tts_qwen=None,
-                        qwen_prompt_items=None,
-                        tts_index=None,
-                        ref_audio_path=tmp_path / "ref.wav",
-                        ref_audio_selector=None,
-                        source_vocals_audio=tmp_path / "source.wav",
-                        source_media_duration_sec=None,
-                        index_emo_audio_prompt=None,
-                        index_emo_alpha=1.0,
-                        index_use_emo_text=False,
-                        index_emo_text=None,
-                        index_top_p=0.8,
-                        index_top_k=30,
-                        index_temperature=0.8,
-                        index_max_text_tokens=120,
-                        force_fit_timing=True,
-                        subtitles=[{"start": 0.0, "end": 1.25, "text": "hello"}],
-                        translated_lines=["你好"],
-                        segment_dir=tmp_path / "segments",
-                        delta_pass_ms=120.0,
-                        delta_rewrite_ms=450.0,
-                        atempo_min=0.92,
-                        atempo_max=1.08,
-                        max_retry=0,
-                        translator=None,
-                        target_lang="Chinese",
-                        allow_rewrite_translation=False,
-                        prefer_translated_text=True,
-                        existing_records_by_id=None,
-                        redub_line_indices=None,
-                        v2_mode=False,
-                        logger=Mock(),
-                    )
+                records, manual_review = synthesize_segments_grouped(
+                    tts_backend="index-tts",
+                    dubbing_mode="single",
+                    index_tts_via_api=True,
+                    index_tts_api_url="http://127.0.0.1:8010",
+                    index_tts_api_timeout_sec=12.0,
+                    tts_index=None,
+                    ref_audio_path=ref_audio,
+                    ref_audio_selector=None,
+                    source_media_duration_sec=10.0,
+                    index_emo_audio_prompt=None,
+                    index_emo_alpha=1.0,
+                    index_use_emo_text=False,
+                    index_emo_text=None,
+                    index_top_p=0.8,
+                    index_top_k=30,
+                    index_temperature=0.8,
+                    index_max_text_tokens=120,
+                    force_fit_timing=False,
+                    group_gap_sec=0.35,
+                    group_min_duration_sec=0.5,
+                    group_max_duration_sec=8.0,
+                    subtitles=[{"start": 0.0, "end": 1.8, "text": "hello"}],
+                    translated_lines=["你好世界"],
+                    segment_dir=tmp_path / "grouped_anchor_window",
+                    delta_pass_ms=120.0,
+                    timing_mode="strict",
+                    balanced_max_tempo_shift=0.08,
+                    balanced_min_line_sec=0.35,
+                    grouping_strategy="sentence",
+                    logger=Mock(),
+                    target_lang="Chinese",
+                    fallback_tts_backend="none",
+                )
 
-        fit_mock.assert_not_called()
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["status"], "done")
-        actions = [item.get("action") for item in records[0].get("attempt_history", [])]
-        self.assertIn("fit_timing_skip_tail_preserve", actions)
         self.assertEqual(manual_review, [])
-
-    def test_synthesize_segments_omnivoice_avoids_atempo_to_preserve_sentence_head(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-
-            def fake_synthesize_text_once(**kwargs):
-                output_path = Path(kwargs["output_path"])
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                # 目标 1.25s，实际 1.50s（超出 pass 阈值，但在 rewrite 阈值内）。
-                sf.write(str(output_path), np.full(24000, 0.05, dtype=np.float32), 16000)
-
-            with patch("subtitle_maker.domains.dubbing.pipeline.synthesize_text_once", side_effect=fake_synthesize_text_once):
-                with patch("subtitle_maker.domains.dubbing.pipeline.apply_atempo") as atempo_mock:
-                    records, manual_review = synthesize_segments(
-                        tts_backend="omnivoice",
-                        index_tts_via_api=True,
-                        index_tts_api_url="http://127.0.0.1:8010",
-                        index_tts_api_timeout_sec=12.0,
-                        tts_qwen=None,
-                        qwen_prompt_items=None,
-                        tts_index=None,
-                        ref_audio_path=tmp_path / "ref.wav",
-                        ref_audio_selector=None,
-                        source_vocals_audio=tmp_path / "source.wav",
-                        source_media_duration_sec=None,
-                        index_emo_audio_prompt=None,
-                        index_emo_alpha=1.0,
-                        index_use_emo_text=False,
-                        index_emo_text=None,
-                        index_top_p=0.8,
-                        index_top_k=30,
-                        index_temperature=0.8,
-                        index_max_text_tokens=120,
-                        force_fit_timing=False,
-                        subtitles=[{"start": 0.0, "end": 1.25, "text": "hello"}],
-                        translated_lines=["你好"],
-                        segment_dir=tmp_path / "segments",
-                        delta_pass_ms=120.0,
-                        delta_rewrite_ms=450.0,
-                        atempo_min=0.92,
-                        atempo_max=1.08,
-                        max_retry=0,
-                        translator=None,
-                        target_lang="Chinese",
-                        allow_rewrite_translation=False,
-                        prefer_translated_text=True,
-                        existing_records_by_id=None,
-                        redub_line_indices=None,
-                        v2_mode=False,
-                        logger=Mock(),
-                    )
-
-        atempo_mock.assert_not_called()
-        self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["status"], "done")
-        actions = [item.get("action") for item in records[0].get("attempt_history", [])]
-        self.assertIn("omnivoice_keep_natural_no_atempo", actions)
-        self.assertEqual(manual_review, [])
+        self.assertAlmostEqual(records[0]["anchor_target_duration_sec"], 1.8, places=2)
+        self.assertAlmostEqual(records[0]["borrowed_gap_sec"], 1.8, places=2)
 
 
+
+
+
+
+@unittest.skipIf(bool(RUNTIME_TEST_SKIP_REASON), RUNTIME_TEST_SKIP_REASON or "")
 class DubbingBackendTests(unittest.TestCase):
     def test_split_text_for_index_tts_splits_cjk_on_punctuation(self):
         chunks = split_text_for_index_tts(
@@ -1299,183 +1455,13 @@ class DubbingBackendTests(unittest.TestCase):
         self.assertGreaterEqual(len(chunks), 2)
         self.assertTrue(chunks[0].endswith("。"))
 
-    def test_omnivoice_backend_api_passes_duration(self):
-        backend = OmniVoiceBackend(
-            python_bin="/usr/bin/python3",
-            root_dir="/tmp",
-            model="k2-fsa/OmniVoice",
-            via_api=True,
-            api_url="http://127.0.0.1:8020",
-        )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            ref_audio = tmp_path / "ref.wav"
-            output = tmp_path / "out.wav"
-            sf.write(str(ref_audio), np.full(8000, 0.01, dtype=np.float32), 16000)
-            # 预建一个非空 wav 占位，避免 backend 的输出文件完整性校验失败。
-            output.write_bytes(b"0" * 128)
-            with patch("subtitle_maker.backends.omni_voice._http_json_request", return_value={"ok": True}) as request_mock:
-                backend.synthesize(
-                    TtsSynthesisRequest(
-                        text="hello",
-                        ref_audio_path=ref_audio,
-                        output_path=output,
-                        target_duration_sec=1.75,
-                        language="English",
-                    )
-                )
-
-            request_mock.assert_called_once()
-            payload = request_mock.call_args.kwargs["payload"]
-            self.assertAlmostEqual(float(payload["duration"]), 1.75, places=3)
-            self.assertEqual(payload["language"], "en")
-
-    def test_omnivoice_backend_rejects_too_short_target_duration_before_request(self):
-        backend = OmniVoiceBackend(
-            python_bin="/usr/bin/python3",
-            root_dir="/tmp",
-            model="k2-fsa/OmniVoice",
-            via_api=True,
-            api_url="http://127.0.0.1:8020",
-        )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            ref_audio = tmp_path / "ref.wav"
-            output = tmp_path / "out.wav"
-            sf.write(str(ref_audio), np.full(8000, 0.01, dtype=np.float32), 16000)
-            request = TtsSynthesisRequest(
-                text="hello",
-                ref_audio_path=ref_audio,
-                output_path=output,
-                target_duration_sec=0.8,
-                language="English",
-            )
-
-            with patch("subtitle_maker.backends.omni_voice._http_json_request") as request_mock:
-                with self.assertRaises(RuntimeError) as ctx:
-                    backend.synthesize(request)
-
-        request_mock.assert_not_called()
-        self.assertIn("target duration below safe floor", str(ctx.exception))
-        self.assertIn("0.800s", str(ctx.exception))
-
-    def test_omnivoice_backend_api_restarts_local_service_after_connect_failure(self):
-        backend = OmniVoiceBackend(
-            python_bin="/usr/bin/python3",
-            root_dir="/tmp",
-            model="k2-fsa/OmniVoice",
-            via_api=True,
-            api_url="http://127.0.0.1:8020",
-        )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            ref_audio = tmp_path / "ref.wav"
-            output = tmp_path / "out.wav"
-            sf.write(str(ref_audio), np.full(8000, 0.01, dtype=np.float32), 16000)
-            request = TtsSynthesisRequest(
-                text="hello",
-                ref_audio_path=ref_audio,
-                output_path=output,
-                target_duration_sec=1.25,
-                language="English",
-            )
-
-            with patch.object(
-                backend,
-                "_synthesize_via_api",
-                side_effect=[
-                    RuntimeError("E-TTS-001 omnivoice api connect failed: <urlopen error [Errno 61] Connection refused>"),
-                    None,
-                ],
-            ) as synth_mock, patch.object(backend, "_release_api_model") as release_mock, patch(
-                "subtitle_maker.backends.omni_voice._recover_local_omnivoice_service"
-            ) as recover_mock:
-                backend.synthesize(request)
-
-        self.assertEqual(synth_mock.call_count, 2)
-        release_mock.assert_called_once()
-        recover_mock.assert_called_once_with("http://127.0.0.1:8020", timeout_sec=300.0)
-
-    def test_omnivoice_backend_api_retries_conservative_profile_when_result_is_too_fast(self):
-        backend = OmniVoiceBackend(
-            python_bin="/usr/bin/python3",
-            root_dir="/tmp",
-            model="k2-fsa/OmniVoice",
-            via_api=True,
-            api_url="http://127.0.0.1:8020",
-        )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            ref_audio = tmp_path / "ref.wav"
-            output = tmp_path / "out.wav"
-            sf.write(str(ref_audio), np.full(8000, 0.01, dtype=np.float32), 16000)
-            request = TtsSynthesisRequest(
-                text="hello",
-                ref_audio_path=ref_audio,
-                output_path=output,
-                target_duration_sec=2.0,
-                language="English",
-            )
-
-            with patch.object(
-                backend,
-                "_synthesize_via_api",
-                side_effect=[
-                    {"ok": True, "duration_sec": 0.8, "duration_ratio": 0.4, "retry_profile": "default"},
-                    {"ok": True, "duration_sec": 1.8, "duration_ratio": 0.9, "retry_profile": "conservative"},
-                ],
-            ) as synth_mock:
-                backend.synthesize(request)
-
-        self.assertEqual(synth_mock.call_count, 2)
-        self.assertEqual(synth_mock.call_args_list[0].kwargs["profile_name"], "default")
-        self.assertEqual(synth_mock.call_args_list[1].kwargs["profile_name"], "conservative")
-        self.assertEqual(
-            synth_mock.call_args_list[1].kwargs["runtime_overrides"]["num_step"],
-            48,
-        )
-
-    def test_omnivoice_backend_api_raises_quality_gate_failed_after_conservative_retry(self):
-        backend = OmniVoiceBackend(
-            python_bin="/usr/bin/python3",
-            root_dir="/tmp",
-            model="k2-fsa/OmniVoice",
-            via_api=True,
-            api_url="http://127.0.0.1:8020",
-        )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            ref_audio = tmp_path / "ref.wav"
-            output = tmp_path / "out.wav"
-            sf.write(str(ref_audio), np.full(8000, 0.01, dtype=np.float32), 16000)
-            request = TtsSynthesisRequest(
-                text="hello",
-                ref_audio_path=ref_audio,
-                output_path=output,
-                target_duration_sec=2.0,
-                language="English",
-            )
-
-            with patch.object(
-                backend,
-                "_synthesize_via_api",
-                side_effect=[
-                    {"ok": True, "duration_sec": 0.8, "duration_ratio": 0.4, "retry_profile": "default"},
-                    {"ok": True, "duration_sec": 0.9, "duration_ratio": 0.45, "retry_profile": "conservative"},
-                ],
-            ):
-                with self.assertRaises(RuntimeError) as ctx:
-                    backend.synthesize(request)
-
-        self.assertIn("quality gate failed", str(ctx.exception).lower())
-        self.assertIn("conservative", str(ctx.exception))
 
 
+
+
+
+
+@unittest.skipIf(bool(RUNTIME_TEST_SKIP_REASON), RUNTIME_TEST_SKIP_REASON or "")
 class DubbingReviewTests(unittest.TestCase):
     def test_resolve_segment_redub_runtime_options_prefers_manifest_values(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1484,16 +1470,10 @@ class DubbingReviewTests(unittest.TestCase):
                 json.dumps(
                     {
                         "input_media_path": str(Path(tmpdir) / "segment.wav"),
-                        "pipeline_version": "v2",
                         "rewrite_translation": False,
                         "grouped_synthesis": True,
                         "force_fit_timing": True,
-                        "tts_backend": "qwen-tts",
-                        "fallback_tts_backend": "omnivoice",
-                        "omnivoice_root": "/opt/omnivoice",
-                        "omnivoice_python_bin": "/opt/omnivoice/.venv/bin/python",
-                        "omnivoice_model": "k2-fsa/OmniVoice",
-                        "omnivoice_device": "mps",
+                        "tts_backend": "index-tts",
                         "index_tts_api_url": "http://127.0.0.1:19010",
                         "segments": [{"id": "seg_0001", "translated_text": "你好"}],
                     }
@@ -1504,22 +1484,17 @@ class DubbingReviewTests(unittest.TestCase):
 
         options = resolve_segment_redub_runtime_options(
             segment_manifest=manifest,
-            fallback_pipeline_version="v1",
             fallback_rewrite_translation=True,
             fallback_index_tts_api_url="http://127.0.0.1:8010",
         )
-        self.assertEqual(options.pipeline_version, "v2")
         self.assertFalse(options.rewrite_translation)
         self.assertTrue(options.grouped_synthesis)
         self.assertTrue(options.force_fit_timing)
-        self.assertEqual(options.tts_backend, "qwen-tts")
-        self.assertEqual(options.fallback_tts_backend, "omnivoice")
-        self.assertEqual(options.omnivoice_model, "k2-fsa/OmniVoice")
-        self.assertTrue(options.omnivoice_via_api)
-        self.assertEqual(options.omnivoice_api_url, "http://127.0.0.1:8020")
+        self.assertEqual(options.tts_backend, "index-tts")
         self.assertEqual(options.index_tts_api_url, "http://127.0.0.1:19010")
 
 
+@unittest.skipIf(bool(RUNTIME_TEST_SKIP_REASON), RUNTIME_TEST_SKIP_REASON or "")
 class IndexTtsBackendRecoveryTests(unittest.TestCase):
     def _build_request(self, tmpdir: str) -> TtsSynthesisRequest:
         """构造最小化请求对象，供 Index-TTS API 重试逻辑测试复用。"""
@@ -1588,15 +1563,22 @@ class IndexTtsBackendRecoveryTests(unittest.TestCase):
         release_mock.assert_called_once_with(api_url="http://127.0.0.1:8010", timeout_sec=12.0)
 
 
+@unittest.skipIf(bool(RUNTIME_TEST_SKIP_REASON), RUNTIME_TEST_SKIP_REASON or "")
 class IndexTtsBackendQualityTests(unittest.TestCase):
-    def _build_request(self, tmpdir: str, *, target_duration_sec: float = 2.0) -> TtsSynthesisRequest:
+    def _build_request(
+        self,
+        tmpdir: str,
+        *,
+        target_duration_sec: float = 2.0,
+        text: str = "hello world",
+    ) -> TtsSynthesisRequest:
         """构造带目标时长的请求，供质量反馈测试复用。"""
 
         base = Path(tmpdir)
         ref_audio = base / "ref.wav"
         sf.write(str(ref_audio), np.full(1600, 0.01, dtype=np.float32), 16000)
         return TtsSynthesisRequest(
-            text="hello world",
+            text=text,
             ref_audio_path=ref_audio,
             output_path=base / "out.wav",
             target_duration_sec=target_duration_sec,
@@ -1612,7 +1594,10 @@ class IndexTtsBackendQualityTests(unittest.TestCase):
             local_model=None,
         )
         with tempfile.TemporaryDirectory() as tmpdir:
-            request = self._build_request(tmpdir)
+            request = self._build_request(
+                tmpdir,
+                text="hello world this sentence is long enough for a guarded retry",
+            )
             durations = iter([1.0, 1.82])
             current_duration = {"sec": 0.0}
 
@@ -1644,6 +1629,7 @@ class IndexTtsBackendQualityTests(unittest.TestCase):
         self.assertEqual(backend.last_synthesis_meta["quality_attempt_no"], 2)
         self.assertIsNone(backend.last_synthesis_meta["quality_retry_reason"])
         self.assertAlmostEqual(float(backend.last_synthesis_meta["api_duration_sec"]), 1.82, places=2)
+        self.assertIsNone(backend.last_synthesis_meta["output_duration_sec"])
 
     def test_index_tts_backend_retries_once_when_api_duration_is_too_long(self):
         """API 返回明显偏长时，也应先在后端内部做一次保守重试。"""
@@ -1655,7 +1641,10 @@ class IndexTtsBackendQualityTests(unittest.TestCase):
             local_model=None,
         )
         with tempfile.TemporaryDirectory() as tmpdir:
-            request = self._build_request(tmpdir)
+            request = self._build_request(
+                tmpdir,
+                text="hello world this sentence is long enough for a guarded retry",
+            )
             durations = iter([2.7, 2.04])
             current_duration = {"sec": 0.0}
 
@@ -1687,6 +1676,45 @@ class IndexTtsBackendQualityTests(unittest.TestCase):
         self.assertEqual(backend.last_synthesis_meta["quality_attempt_no"], 2)
         self.assertIsNone(backend.last_synthesis_meta["quality_retry_reason"])
         self.assertAlmostEqual(float(backend.last_synthesis_meta["api_duration_sec"]), 2.04, places=2)
+        self.assertIsNone(backend.last_synthesis_meta["output_duration_sec"])
+
+    def test_index_tts_backend_short_sentence_skips_second_quality_retry(self):
+        """短句即使明显偏短，也不应触发第二轮整句质量重试。"""
+
+        backend = IndexTtsBackend(
+            via_api=True,
+            api_url="http://127.0.0.1:8010",
+            timeout_sec=12.0,
+            local_model=None,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            request = self._build_request(tmpdir, target_duration_sec=1.2, text="hello")
+
+            def fake_synthesize_one(chunk_request: TtsSynthesisRequest) -> dict[str, float | bool]:
+                sf.write(
+                    str(chunk_request.output_path),
+                    np.full(int(0.5 * 16000), 0.01, dtype=np.float32),
+                    16000,
+                )
+                return {"ok": True, "duration_sec": 0.5}
+
+            def fake_concat(part_paths: list[Path], output_path: Path) -> None:
+                del part_paths
+                sf.write(
+                    str(output_path),
+                    np.full(int(0.5 * 16000), 0.01, dtype=np.float32),
+                    16000,
+                )
+
+            with patch.object(backend, "_synthesize_one", side_effect=fake_synthesize_one) as synth_mock, patch(
+                "subtitle_maker.backends.index_tts.concat_generated_wavs",
+                side_effect=fake_concat,
+            ):
+                backend.synthesize(request)
+
+        self.assertEqual(synth_mock.call_count, 1)
+        self.assertEqual(backend.last_synthesis_meta["quality_attempt_no"], 1)
+        self.assertEqual(backend.last_synthesis_meta["quality_retry_reason"], "too_short")
 
 
 if __name__ == "__main__":

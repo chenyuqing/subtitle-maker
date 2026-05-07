@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import shutil
 import tempfile
 import unittest
@@ -39,10 +40,14 @@ class WebLegacyRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn("text/html", response.headers.get("content-type", ""))
         self.assertIn('/static/app.js?v=', response.text)
-        self.assertIn('id="global-deepseek-api-key"', response.text)
-        self.assertIn('id="global-deepseek-save-key"', response.text)
+        self.assertIn('id="global-translate-api-key"', response.text)
+        self.assertIn('id="global-translate-base-url"', response.text)
+        self.assertIn('id="global-translate-model"', response.text)
+        self.assertIn('id="global-translate-save-key"', response.text)
+        self.assertIn('id="auto-dub-translate-system-prompt"', response.text)
         self.assertNotIn('id="agent-api-key"', response.text)
         self.assertNotIn('id="api-key"', response.text)
+        self.assertNotIn('id="save-api-key"', response.text)
 
         upload = self.client.post(
             "/upload",
@@ -74,6 +79,30 @@ class WebLegacyRouteTests(unittest.TestCase):
         self.assertEqual(status_payload["video_filename"], "demo.mp4")
         self.assertEqual(len(status_payload["subtitles"]), 1)
 
+    def test_upload_srt_translated_kind_populates_translated_subtitles(self):
+        response = self.client.post(
+            "/upload_srt",
+            files={"file": ("demo.srt", b"1\n00:00:00,000 --> 00:00:01,000\nni hao\n", "application/x-subrip")},
+            data={"video_filename": "demo.mp4", "subtitle_kind": "translated"},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["subtitle_kind"], "translated")
+        self.assertEqual(len(payload["translated_subtitles"]), 1)
+
+        task = legacy_runtime.tasks[payload["task_id"]]
+        self.assertIsInstance(task.get("translated_subtitles"), list)
+        self.assertEqual(len(task["translated_subtitles"]), 1)
+
+    def test_upload_srt_rejects_invalid_subtitle_kind(self):
+        response = self.client.post(
+            "/upload_srt",
+            files={"file": ("demo.srt", b"1\n00:00:00,000 --> 00:00:01,000\nhello\n", "application/x-subrip")},
+            data={"video_filename": "demo.mp4", "subtitle_kind": "unknown"},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("subtitle_kind", response.json()["detail"])
+
     def test_async_transcribe_status_translate_and_export_still_work(self):
         media_path = self.upload_dir / "demo.mp4"
         media_path.write_bytes(b"video-bytes")
@@ -102,7 +131,13 @@ class WebLegacyRouteTests(unittest.TestCase):
         with patch("subtitle_maker.app.routes.translation.Translator.translate_batch", return_value=["你好"]):
             translated = self.client.post(
                 "/translate",
-                data={"task_id": task_id, "target_lang": "Chinese", "api_key": "dummy"},
+                data={
+                    "task_id": task_id,
+                    "target_lang": "Chinese",
+                    "api_key": "dummy",
+                    "translate_base_url": "https://llm.example.com/v1",
+                    "translate_model": "demo-model",
+                },
             )
         self.assertEqual(translated.status_code, 200)
         translated_payload = translated.json()
@@ -142,6 +177,42 @@ class WebLegacyRouteTests(unittest.TestCase):
         segment = self.client.post("/segment", data={"task_id": "missing", "max_duration": "30"})
         self.assertEqual(segment.status_code, 400)
         self.assertIn("No subtitles found", segment.json()["detail"])
+
+    def test_polling_access_log_filter_suppresses_only_auto_dubbing_status_route(self):
+        access_logger = logging.getLogger("uvicorn.access")
+        original_filters = list(access_logger.filters)
+        try:
+            access_logger.filters[:] = []
+            web._configure_access_log_filters()
+            self.assertEqual(len(access_logger.filters), 1)
+
+            polling_record = logging.LogRecord(
+                name="uvicorn.access",
+                level=logging.INFO,
+                pathname=__file__,
+                lineno=0,
+                msg='127.0.0.1 - "GET /dubbing/auto/status/demo HTTP/1.1" 200 OK',
+                args=(),
+                exc_info=None,
+            )
+            normal_record = logging.LogRecord(
+                name="uvicorn.access",
+                level=logging.INFO,
+                pathname=__file__,
+                lineno=0,
+                msg='127.0.0.1 - "POST /dubbing/auto/start HTTP/1.1" 200 OK',
+                args=(),
+                exc_info=None,
+            )
+
+            access_filter = access_logger.filters[0]
+            self.assertFalse(access_filter.filter(polling_record))
+            self.assertTrue(access_filter.filter(normal_record))
+
+            web._configure_access_log_filters()
+            self.assertEqual(len(access_logger.filters), 1)
+        finally:
+            access_logger.filters[:] = original_filters
 
 
 if __name__ == "__main__":

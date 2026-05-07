@@ -10,9 +10,11 @@ from .alignment import (
     fit_audio_to_duration,
     split_waveform_by_durations,
     trim_audio_to_max_duration,
+    trim_leading_silence_conservative,
     trim_silence_edges,
 )
 from .pipeline import (
+    VoiceReference,
     build_synthesis_groups,
     synthesize_segments,
     synthesize_segments_grouped,
@@ -21,6 +23,7 @@ from .pipeline import (
 from .references import (
     build_subtitle_reference_map,
     extract_reference_audio,
+    extract_reference_audio_from_first_subtitle,
     extract_reference_audio_from_offset,
     extract_reference_audio_from_window,
 )
@@ -37,14 +40,17 @@ __all__ = [
     "compute_effective_target_duration",
     "estimate_line_speech_weight",
     "extract_reference_audio",
+    "extract_reference_audio_from_first_subtitle",
     "extract_reference_audio_from_offset",
     "extract_reference_audio_from_window",
     "fit_audio_to_duration",
     "resolve_segment_redub_runtime_options",
+    "VoiceReference",
     "split_waveform_by_durations",
     "synthesize_segments",
     "synthesize_segments_grouped",
     "synthesize_text_once",
     "trim_audio_to_max_duration",
+    "trim_leading_silence_conservative",
     "trim_silence_edges",
 ]

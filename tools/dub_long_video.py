@@ -53,7 +53,12 @@ from subtitle_maker.manifests import (
     resolve_preferred_segment_subtitle_path,
     write_manifest_json,
 )
-from subtitle_maker.domains.subtitles import merge_short_source_subtitles
+from subtitle_maker.domains.subtitles import (
+    build_segment_speaker_metadata_from_subtitles,
+    merge_short_source_subtitles,
+    normalize_subtitles_with_speakers,
+    parse_speaker_ref_map_json,
+)
 
 # Exit-code contract from tools/dub_pipeline.py
 SEGMENT_EXIT_OK = 0
@@ -67,6 +72,10 @@ DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS = 0.12
 DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB = -35.0
 DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB = 8.0
 DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING = 0.95
+SEGMENT_UNSUPPORTED_FLAG_NAMES = {
+    "--dubbing-mode",
+    "--speaker-ref-map-json",
+}
 
 
 def iso_now() -> str:
@@ -387,10 +396,14 @@ def run_segment_job(
     extra_args: List[str],
     segment_time_ranges: Optional[List[Tuple[float, float]]] = None,
     input_srt_path: Optional[Path] = None,
+    speaker_metadata_path: Optional[Path] = None,
     input_srt_kind: str = "source",
     resume_job_dir: Optional[Path] = None,
+    dubbing_mode: str = "single",
+    speaker_ref_map_json: str = "",
 ) -> Path:
     before = {item.name for item in list_job_dirs(segment_jobs_dir)}
+    forwarded_extra_args = filter_segment_extra_args(extra_args)
 
     cmd = [
         sys.executable,
@@ -401,6 +414,8 @@ def run_segment_job(
         target_lang,
         "--out-dir",
         str(segment_jobs_dir),
+        "--dubbing-mode",
+        str(dubbing_mode or "single"),
     ]
     if resume_job_dir is not None:
         cmd.extend(["--resume-job-dir", str(resume_job_dir)])
@@ -419,11 +434,15 @@ def run_segment_job(
     if input_srt_path is not None:
         cmd.extend(["--input-srt", str(input_srt_path)])
         cmd.extend(["--input-srt-kind", (input_srt_kind or "source")])
+    if speaker_metadata_path is not None:
+        cmd.extend(["--speaker-metadata-path", str(speaker_metadata_path)])
+    if speaker_ref_map_json.strip():
+        cmd.extend(["--speaker-ref-map-json", speaker_ref_map_json])
     # 性能优化：分段阶段默认不导出 mix，避免“每段混音 + 最终再拼接”重复开销。
-    if "--export-mix" not in extra_args:
+    if "--export-mix" not in forwarded_extra_args:
         cmd.extend(["--export-mix", "false"])
-    if extra_args:
-        cmd.extend(extra_args)
+    if forwarded_extra_args:
+        cmd.extend(forwarded_extra_args)
 
     is_real_resume = bool(
         resume_job_dir is not None
@@ -449,6 +468,27 @@ def run_segment_job(
     if not new_dirs:
         raise RuntimeError(f"cannot detect job directory for segment {segment_index}")
     return max(new_dirs, key=lambda item: item.stat().st_mtime)
+
+
+def filter_segment_extra_args(extra_args: List[str]) -> List[str]:
+    """过滤只属于长视频编排层的参数，避免透传给 `dub_pipeline.py`。"""
+
+    filtered: List[str] = []
+    skip_next_value = False
+    for index, value in enumerate(extra_args):
+        if skip_next_value:
+            skip_next_value = False
+            continue
+        flag_name = str(value)
+        if flag_name in SEGMENT_UNSUPPORTED_FLAG_NAMES:
+            # 这些参数只在 long-video 层使用；下游 dub_pipeline 不认识它们。
+            if index + 1 < len(extra_args):
+                next_value = str(extra_args[index + 1])
+                if not next_value.startswith("--"):
+                    skip_next_value = True
+            continue
+        filtered.append(flag_name)
+    return filtered
 
 
 def list_segment_audio_files(segments_dir: Path) -> List[Path]:
@@ -613,10 +653,21 @@ def parse_args(argv: Optional[List[str]] = None) -> Tuple[argparse.Namespace, Li
     parser.add_argument("--out-dir", required=True, help="Output root directory for batch job")
     parser.add_argument("--input-srt", default=None, help="Optional external subtitle file to skip ASR")
     parser.add_argument(
+        "--speaker-metadata-path",
+        default=None,
+        help="Optional speaker sidecar JSON with subtitle_index -> speaker_id metadata",
+    )
+    parser.add_argument(
         "--input-srt-kind",
         default="source",
         choices=["source", "translated"],
         help="Type of input srt: source(need translation) or translated(skip translation)",
+    )
+    parser.add_argument(
+        "--dubbing-mode",
+        default="single",
+        choices=["single", "multi"],
+        help="single: one shared ref audio for all lines; multi: explicit speaker_id -> ref_audio mapping",
     )
     parser.add_argument("--segment-minutes", type=float, default=8.0)
     parser.add_argument("--min-segment-minutes", type=float, default=4.0)
@@ -625,12 +676,15 @@ def parse_args(argv: Optional[List[str]] = None) -> Tuple[argparse.Namespace, Li
     parser.add_argument("--silence-min-dur-sec", type=float, default=0.3)
     parser.add_argument("--single-speaker-ref", default=None, help="Optional shared speaker ref wav")
     parser.add_argument("--single-speaker-ref-seconds", type=float, default=10.0)
+    parser.add_argument(
+        "--speaker-ref-map-json",
+        default="",
+        help="JSON list of {speaker_id, ref_audio_path} used by multi-speaker mode",
+    )
     parser.add_argument("--api-key", default=None, help="Translation API key override")
+    parser.add_argument("--tts-model-path", default="", help="Optional local TTS model path passed through to child jobs")
     parser.add_argument("--merge-track", choices=["auto", "vocals", "mix"], default="auto")
     parser.add_argument("--time-ranges-json", default=None, help="Optional global time ranges JSON list")
-    parser.add_argument("--auto-pick-ranges", default="false")
-    parser.add_argument("--auto-pick-min-silence-sec", type=float, default=0.8)
-    parser.add_argument("--auto-pick-min-speech-sec", type=float, default=1.0)
     parser.add_argument(
         "--resume-batch-dir",
         default=None,
@@ -643,6 +697,49 @@ def parse_args(argv: Optional[List[str]] = None) -> Tuple[argparse.Namespace, Li
     return args, extra_args
 
 
+def load_speaker_metadata_map(path: Optional[Path]) -> Dict[int, Dict[str, Any]]:
+    """按字幕序号加载 speaker sidecar，便于在校验前恢复 speaker_id。"""
+
+    if path is None or not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise RuntimeError("speaker metadata sidecar must be a list")
+    output: Dict[int, Dict[str, Any]] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        try:
+            subtitle_index = int(item.get("subtitle_index") or 0)
+        except (TypeError, ValueError):
+            continue
+        if subtitle_index <= 0:
+            continue
+        output[subtitle_index] = dict(item)
+    return output
+
+
+def merge_speaker_metadata_into_subtitles(
+    *,
+    subtitles: List[Dict[str, Any]],
+    speaker_metadata_map: Dict[int, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """把 speaker sidecar 合并回字幕对象，避免纯文本译文丢失 speaker_id。"""
+
+    if not speaker_metadata_map:
+        return subtitles
+    merged: List[Dict[str, Any]] = []
+    for index, subtitle in enumerate(subtitles, start=1):
+        merged_item = dict(subtitle)
+        metadata = speaker_metadata_map.get(index)
+        if metadata:
+            for key in ("speaker_id", "speaker_track_id", "coverage_ratio", "needs_review"):
+                if key in metadata and metadata.get(key) is not None:
+                    merged_item[key] = metadata.get(key)
+        merged.append(merged_item)
+    return merged
+
+
 def clip_subtitles_for_segment(
     *,
     subtitles: List[Dict[str, Any]],
@@ -650,6 +747,7 @@ def clip_subtitles_for_segment(
     segment_end_sec: float,
 ) -> List[Dict[str, Any]]:
     # 将全局字幕裁到当前分段，并转换为分段局部时间轴（从 0 开始）。
+    # 除 start/end 外，其余元数据（如 speaker_id）尽量原样保留，供多人配音映射继续使用。
     clipped: List[Dict[str, Any]] = []
     segment_duration = max(0.0, float(segment_end_sec) - float(segment_start_sec))
     if segment_duration <= 0:
@@ -665,13 +763,11 @@ def clip_subtitles_for_segment(
         local_end = min(segment_duration, overlap_end - float(segment_start_sec))
         if local_end <= local_start:
             continue
-        clipped.append(
-            {
-                "start": local_start,
-                "end": local_end,
-                "text": (item.get("text") or "").strip(),
-            }
-        )
+        clipped_item = dict(item)
+        clipped_item["start"] = local_start
+        clipped_item["end"] = local_end
+        clipped_item["text"] = (item.get("text") or "").strip()
+        clipped.append(clipped_item)
     return clipped
 
 
@@ -690,13 +786,11 @@ def normalize_input_subtitles_for_segments(
         text = (item.get("text") or "").strip()
         if not text:
             continue
-        prepared.append(
-            {
-                "start": float(item.get("start", 0.0) or 0.0),
-                "end": float(item.get("end", item.get("start", 0.0)) or item.get("start", 0.0) or 0.0),
-                "text": text,
-            }
-        )
+        prepared_item = dict(item)
+        prepared_item["start"] = float(item.get("start", 0.0) or 0.0)
+        prepared_item["end"] = float(item.get("end", item.get("start", 0.0)) or item.get("start", 0.0) or 0.0)
+        prepared_item["text"] = text
+        prepared.append(prepared_item)
     if not prepared:
         return []
 
@@ -719,9 +813,20 @@ def normalize_input_subtitles_for_segments(
             end_sec = min(safe_media_duration, start_sec + float(min_duration_sec))
         if end_sec <= start_sec + 1e-6:
             continue
-        output.append({"start": start_sec, "end": end_sec, "text": item["text"]})
+        normalized_item = dict(item)
+        normalized_item["start"] = start_sec
+        normalized_item["end"] = end_sec
+        normalized_item["text"] = item["text"]
+        output.append(normalized_item)
         cursor = end_sec
     return output
+
+
+def save_srt_items(subtitles: List[Dict[str, Any]], output_srt: Path) -> None:
+    """将字幕列表落盘为标准 SRT 文件。"""
+
+    output_srt.parent.mkdir(parents=True, exist_ok=True)
+    output_srt.write_text(format_srt(subtitles), encoding="utf-8")
 
 
 def maybe_merge_translated_input_subtitles(
@@ -742,21 +847,91 @@ def maybe_merge_translated_input_subtitles(
     return merged_subtitles, merged_pairs
 
 
+def _subtitle_gap_ms(left: Dict[str, Any], right: Dict[str, Any]) -> int:
+    """计算两条字幕之间的静默间隔（毫秒）。"""
+
+    left_end_sec = float(left.get("end", 0.0) or 0.0)
+    right_start_sec = float(right.get("start", 0.0) or 0.0)
+    return int(round((right_start_sec - left_end_sec) * 1000.0))
+
+
+def maybe_merge_translated_input_subtitles_speaker_aware(
+    *,
+    subtitles: List[Dict[str, Any]],
+    translated_short_merge_enabled: bool,
+    translated_short_merge_threshold: int,
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    """speaker-aware 多人链路：先按 speaker 连续 run 重构，再在 run 内执行 short-merge。"""
+
+    if not subtitles:
+        return [], 0, 0
+
+    # 严格合同：speaker-aware 多人链路下，每条字幕都必须有稳定 speaker_id。
+    normalized_rows: List[Dict[str, Any]] = []
+    for row_index, item in enumerate(subtitles, start=1):
+        row = dict(item)
+        speaker_id = str(row.get("speaker_id") or "").strip()
+        if not speaker_id:
+            raise RuntimeError(
+                "multi-speaker translated merge requires speaker_id on every subtitle row; "
+                f"missing at row {row_index}"
+            )
+        row["speaker_id"] = speaker_id
+        normalized_rows.append(row)
+
+    gap_threshold_ms = max(0, int(round(float(DEFAULT_SOURCE_SHORT_MERGE_GAP_SEC) * 1000.0)))
+    speaker_runs: List[List[Dict[str, Any]]] = []
+    current_run: List[Dict[str, Any]] = []
+
+    # 先按 speaker_id + 间隔阈值切分 run，保证后续并句绝不跨 speaker。
+    for row in normalized_rows:
+        if not current_run:
+            current_run = [row]
+            continue
+        current_speaker_id = str(current_run[-1].get("speaker_id") or "").strip()
+        row_speaker_id = str(row.get("speaker_id") or "").strip()
+        row_gap_ms = _subtitle_gap_ms(current_run[-1], row)
+        if row_speaker_id == current_speaker_id and row_gap_ms <= gap_threshold_ms:
+            current_run.append(row)
+            continue
+        speaker_runs.append(current_run)
+        current_run = [row]
+    if current_run:
+        speaker_runs.append(current_run)
+
+    speaker_run_count = len(speaker_runs)
+    if not translated_short_merge_enabled or len(normalized_rows) <= 1:
+        return [dict(item) for item in normalized_rows], 0, speaker_run_count
+
+    merged_subtitles: List[Dict[str, Any]] = []
+    merged_pairs = 0
+    for run in speaker_runs:
+        run_merged_subtitles, run_merged_pairs = merge_short_source_subtitles(
+            subtitles=run,
+            short_merge_target_seconds=translated_short_merge_threshold,
+            gap_threshold_sec=DEFAULT_SOURCE_SHORT_MERGE_GAP_SEC,
+        )
+        run_speaker_id = str(run[0].get("speaker_id") or "").strip()
+        for merged_item in run_merged_subtitles:
+            rebuilt = dict(merged_item)
+            rebuilt["speaker_id"] = run_speaker_id
+            merged_subtitles.append(rebuilt)
+        merged_pairs += run_merged_pairs
+    return merged_subtitles, merged_pairs, speaker_run_count
+
+
 def resolve_translated_short_merge_policy(
     *,
     requested_enabled: bool,
     tts_backend: str,
     resume_batch_dir: Optional[Path],
 ) -> Tuple[bool, str]:
-    """解析 translated short merge 的最终生效态，OmniVoice 初始任务强制开启。"""
+    """解析 translated short merge 的最终生效态。"""
 
     if resume_batch_dir is not None:
         return False, "resume_skipped"
-    normalized_backend = (tts_backend or "").strip().lower()
     if requested_enabled:
         return True, "user"
-    if normalized_backend == "omnivoice":
-        return True, "omnivoice_policy"
     return False, "disabled"
 
 
@@ -788,12 +963,77 @@ def find_flag_value(extra_args: List[str], flag_name: str) -> Optional[str]:
     return None
 
 
+def write_json(path: Path, payload: Any) -> Path:
+    """写出 JSON 产物。"""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def sync_segment_source_input_snapshot(
+    *,
+    segment_input_srt: Optional[Path],
+    job_dir: Path,
+    manifest: Dict[str, Any],
+) -> None:
+    """把 `_input_segment.srt` 回写成真实生效的 `source.srt`，避免快照和实际重构结果不一致。"""
+
+    if segment_input_srt is None:
+        return
+    source_srt = resolve_preferred_segment_subtitle_path(
+        job_dir=job_dir,
+        paths=dict(manifest.get("paths") or {}),
+        subtitle_key="source_srt",
+        repo_root=REPO_ROOT,
+    )
+    if source_srt is None or not source_srt.exists():
+        return
+    subtitles = parse_srt(source_srt.read_text(encoding="utf-8"))
+    segment_input_srt.parent.mkdir(parents=True, exist_ok=True)
+    segment_input_srt.write_text(format_srt(subtitles), encoding="utf-8")
+
+    # source 输入快照的 speaker sidecar 也要同步更新，避免字幕行数变化后元数据仍停留在旧版本。
+    snapshot_speaker_metadata_path = segment_input_srt.parent / "_input_segment.speakers.json"
+    speaker_metadata = build_segment_speaker_metadata_from_subtitles(subtitles)
+    if speaker_metadata:
+        write_json(snapshot_speaker_metadata_path, speaker_metadata)
+    elif snapshot_speaker_metadata_path.exists():
+        snapshot_speaker_metadata_path.unlink(missing_ok=True)
+
+
+def build_segment_speaker_metadata(
+    *,
+    aligned_subtitles: List[Dict[str, Any]],
+    segment_start_sec: float,
+    segment_end_sec: float,
+) -> List[Dict[str, Any]]:
+    """把 batch 级 speaker 对齐结果裁成 segment 局部 sidecar。"""
+
+    metadata: List[Dict[str, Any]] = []
+    for item in aligned_subtitles:
+        start_sec = float(item.get("start_sec", 0.0) or 0.0)
+        end_sec = float(item.get("end_sec", start_sec) or start_sec)
+        overlap_start = max(float(segment_start_sec), start_sec)
+        overlap_end = min(float(segment_end_sec), end_sec)
+        if overlap_end <= overlap_start:
+            continue
+        metadata.append(
+            {
+                "subtitle_index": len(metadata) + 1,
+                "start_sec": round(overlap_start - float(segment_start_sec), 3),
+                "end_sec": round(overlap_end - float(segment_start_sec), 3),
+                "text": str(item.get("text") or "").strip(),
+                "speaker_id": str(item.get("speaker_id") or "unknown").strip() or "unknown",
+                "coverage_ratio": float(item.get("coverage_ratio", 0.0) or 0.0),
+                "needs_review": bool(item.get("needs_review")),
+            }
+        )
+    return metadata
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args, extra_args = parse_args(argv)
-    v2_mode = has_flag_enabled(extra_args, "--v2-mode")
-    rewrite_translation = True
-    if any(item == "--v2-rewrite-translation" for item in extra_args):
-        rewrite_translation = has_flag_enabled(extra_args, "--v2-rewrite-translation")
     timing_mode = find_flag_value(extra_args, "--timing-mode") or "strict"
     grouping_strategy = find_flag_value(extra_args, "--grouping-strategy") or "sentence"
     source_short_merge_enabled = (
@@ -831,20 +1071,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         find_flag_value(extra_args, "--dub-audio-leveling-peak-ceiling") or DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING
     )
     index_tts_api_url = find_flag_value(extra_args, "--index-tts-api-url")
-    tts_backend = (find_flag_value(extra_args, "--tts-backend") or "index-tts").strip() or "index-tts"
-    fallback_tts_backend = (find_flag_value(extra_args, "--fallback-tts-backend") or "none").strip() or "none"
-    omnivoice_root = (find_flag_value(extra_args, "--omnivoice-root") or "").strip()
-    omnivoice_python_bin = (find_flag_value(extra_args, "--omnivoice-python-bin") or "").strip()
-    omnivoice_model = (find_flag_value(extra_args, "--omnivoice-model") or "").strip()
-    omnivoice_device = (find_flag_value(extra_args, "--omnivoice-device") or "auto").strip() or "auto"
-    omnivoice_via_api = (
-        has_flag_enabled(extra_args, "--omnivoice-via-api")
-        if any(item == "--omnivoice-via-api" for item in extra_args)
-        else True
-    )
-    omnivoice_api_url = (
-        find_flag_value(extra_args, "--omnivoice-api-url") or "http://127.0.0.1:8020"
-    ).strip() or "http://127.0.0.1:8020"
+    # Auto Dubbing 长视频编排层已固定只走 index-tts；兼容旧 CLI 字段，但不再接受切换。
+    tts_backend = "index-tts"
     grouped_synthesis = (
         has_flag_enabled(extra_args, "--grouped-synthesis")
         if any(item == "--grouped-synthesis" for item in extra_args)
@@ -860,28 +1088,33 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not input_media.exists():
         raise FileNotFoundError(f"input media not found: {input_media}")
     input_srt_path = Path(args.input_srt).expanduser().resolve() if args.input_srt else None
+    speaker_metadata_path = (
+        Path(args.speaker_metadata_path).expanduser().resolve() if args.speaker_metadata_path else None
+    )
+    speaker_metadata_map = load_speaker_metadata_map(speaker_metadata_path)
     input_subtitles: List[Dict[str, Any]] = []
+    detected_speaker_ids: List[str] = []
     if input_srt_path is not None:
         if not input_srt_path.exists():
             raise FileNotFoundError(f"input srt not found: {input_srt_path}")
         input_subtitles = parse_srt(input_srt_path.read_text(encoding="utf-8"))
+        input_subtitles = merge_speaker_metadata_into_subtitles(
+            subtitles=input_subtitles,
+            speaker_metadata_map=speaker_metadata_map,
+        )
+        input_subtitles, detected_speaker_ids = normalize_subtitles_with_speakers(input_subtitles)
     if args.segment_minutes <= 0:
         raise ValueError("--segment-minutes must be > 0")
     if args.min_segment_minutes <= 0:
         raise ValueError("--min-segment-minutes must be > 0")
     if args.min_segment_minutes > args.segment_minutes:
         raise ValueError("--min-segment-minutes must be <= --segment-minutes")
-    if args.auto_pick_min_silence_sec < 0.1 or args.auto_pick_min_silence_sec > 10.0:
-        raise ValueError("--auto-pick-min-silence-sec must be in [0.1, 10.0]")
-    if args.auto_pick_min_speech_sec < 0.1 or args.auto_pick_min_speech_sec > 30.0:
-        raise ValueError("--auto-pick-min-speech-sec must be in [0.1, 30.0]")
-    omnivoice_primary_selected = (tts_backend or "").strip().lower() == "omnivoice"
     effective_translated_short_merge_enabled, _ = resolve_translated_short_merge_policy(
         requested_enabled=bool(translated_short_merge_enabled),
         tts_backend=tts_backend,
         resume_batch_dir=Path(args.resume_batch_dir).expanduser().resolve() if args.resume_batch_dir else None,
     )
-    if (source_short_merge_enabled or omnivoice_primary_selected) and not (
+    if source_short_merge_enabled and not (
         MIN_SOURCE_SHORT_MERGE_TARGET_SEC <= source_short_merge_threshold <= MAX_SOURCE_SHORT_MERGE_TARGET_SEC
     ):
         raise ValueError(
@@ -903,6 +1136,28 @@ def main(argv: Optional[List[str]] = None) -> int:
         raise ValueError("--dub-audio-leveling-max-gain-db must be in [0.0, 24.0]")
     if dub_audio_leveling_peak_ceiling <= 0.0 or dub_audio_leveling_peak_ceiling > 0.99:
         raise ValueError("--dub-audio-leveling-peak-ceiling must be in (0.0, 0.99]")
+
+    speaker_ref_map_json = str(args.speaker_ref_map_json or "").strip()
+    speaker_ref_map = parse_speaker_ref_map_json(speaker_ref_map_json) if speaker_ref_map_json else {}
+    strict_index_tts_speaker_refs = (
+        (tts_backend or "").strip().lower() == "index-tts"
+        and bool(speaker_ref_map_json)
+    )
+    if args.dubbing_mode == "multi":
+        if not detected_speaker_ids:
+            raise RuntimeError(
+                "multi-speaker mode requires uploaded subtitles with stable speaker prefixes like 'Speaker 1:' "
+                "or a speaker metadata sidecar"
+            )
+        if strict_index_tts_speaker_refs:
+            missing_speakers = [speaker_id for speaker_id in detected_speaker_ids if speaker_id not in speaker_ref_map]
+            if missing_speakers:
+                raise RuntimeError(
+                    "index-tts strict speaker mapping missing reference audio for: " + ", ".join(missing_speakers)
+                )
+        for speaker_id, ref_path in speaker_ref_map.items():
+            if not ref_path.exists():
+                raise RuntimeError(f"speaker reference audio not found for {speaker_id}: {ref_path}")
 
     out_root = Path(args.out_dir).expanduser().resolve()
     resume_batch_dir = Path(args.resume_batch_dir).expanduser().resolve() if args.resume_batch_dir else None
@@ -940,11 +1195,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         extract_source_audio(input_media, source_audio)
     total_duration_sec = ffprobe_duration(source_audio)
     print(f"Source duration: {total_duration_sec:.2f}s")
-    if v2_mode and input_subtitles:
-        input_subtitles = normalize_input_subtitles_for_segments(
-            subtitles=input_subtitles,
-            media_duration_sec=total_duration_sec,
-        )
     if requested_ranges:
         effective_ranges = normalize_time_ranges(
             [
@@ -957,13 +1207,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             ]
         )
         range_strategy = "manual"
-    elif read_bool(args.auto_pick_ranges):
-        effective_ranges = detect_speech_time_ranges(
-            source_audio=source_audio,
-            min_silence_sec=float(args.auto_pick_min_silence_sec),
-            min_speech_sec=float(args.auto_pick_min_speech_sec),
-        )
-        range_strategy = "auto"
 
     existing_segment_files = sorted(segments_dir.glob("segment_*.wav"), key=lambda item: item.name)
     if range_strategy != "all":
@@ -1030,6 +1273,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         shared_ref = batch_dir / "shared_ref.wav"
         shared_ref.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(given_ref, shared_ref)
+    if args.dubbing_mode != "multi" and args.single_speaker_ref is None:
+        print("single-speaker mode without explicit ref: will auto-extract shared reference from vocals")
 
     reusable_jobs = (
         {}
@@ -1050,6 +1295,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         segment_ranges = None
         segment_input_srt: Optional[Path] = None
         canonical_job_dir = segment_jobs_dir / f"segment_{seg_index:04d}"
+        segment_speaker_metadata_path: Optional[Path] = None
         if range_strategy == "all" and effective_ranges:
             segment_ranges = map_global_ranges_to_segment(
                 global_ranges=effective_ranges,
@@ -1065,6 +1311,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             # translated 并句只允许在长视频初始启动阶段执行，且必须以 segment 为边界，避免跨段重复文本。
             if segment_subtitles and args.input_srt_kind == "translated" and resume_batch_dir is None:
                 before_count = len(segment_subtitles)
+                speaker_run_count = 0
                 segment_subtitles, merged_pairs = maybe_merge_translated_input_subtitles(
                     subtitles=segment_subtitles,
                     translated_short_merge_enabled=bool(effective_translated_short_merge_enabled),
@@ -1076,7 +1323,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     f"effective={bool(effective_translated_short_merge_enabled)} "
                     f"reason={translated_short_merge_effective_reason} "
                     f"before={before_count} after={len(segment_subtitles)} "
-                    f"merged_pairs={merged_pairs} target={translated_short_merge_threshold}s ====="
+                    f"merged_pairs={merged_pairs} speaker_run_count={speaker_run_count} "
+                    f"target={translated_short_merge_threshold}s ====="
                 )
             elif segment_subtitles and args.input_srt_kind == "translated":
                 print(
@@ -1085,7 +1333,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     f"effective={bool(effective_translated_short_merge_enabled)} "
                     f"reason={translated_short_merge_effective_reason} "
                     f"before={len(segment_subtitles)} after={len(segment_subtitles)} "
-                    f"merged_pairs=0 target={translated_short_merge_threshold}s ====="
+                    f"merged_pairs=0 speaker_run_count=0 target={translated_short_merge_threshold}s ====="
                 )
             if not segment_subtitles:
                 print(f"===== Segment {seg_index:02d} skip: no clipped subtitles =====")
@@ -1110,6 +1358,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             segment_input_srt = segment_jobs_dir / f"segment_{seg_index:04d}" / "subtitles" / "_input_segment.srt"
             segment_input_srt.parent.mkdir(parents=True, exist_ok=True)
             segment_input_srt.write_text(format_srt(segment_subtitles), encoding="utf-8")
+            segment_metadata = build_segment_speaker_metadata_from_subtitles(segment_subtitles)
+            if segment_metadata:
+                segment_speaker_metadata_path = segment_input_srt.parent / "_input_segment.speakers.json"
+                write_json(segment_speaker_metadata_path, segment_metadata)
         if seg_index in reusable_jobs:
             job_dir, manifest = reusable_jobs[seg_index]
             print(f"===== Segment {seg_index:02d} reuse: {job_dir.name} =====")
@@ -1117,6 +1369,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             # 统一使用固定段目录，保证 segment_xxxx 与 segment_jobs/segment_xxxx 一一对应。
             # 注意：是否“真实续跑”由 run_segment_job 内部按 manifest 存在性判断。
             resume_job_dir = canonical_job_dir
+            run_segment_kwargs: Dict[str, Any] = {}
+            if segment_speaker_metadata_path is not None:
+                run_segment_kwargs["speaker_metadata_path"] = segment_speaker_metadata_path
             job_dir = run_segment_job(
                 segment_index=seg_index,
                 segment_audio=seg_audio,
@@ -1130,11 +1385,20 @@ def main(argv: Optional[List[str]] = None) -> int:
                 input_srt_path=segment_input_srt,
                 input_srt_kind=args.input_srt_kind,
                 resume_job_dir=resume_job_dir,
+                dubbing_mode=args.dubbing_mode,
+                speaker_ref_map_json=speaker_ref_map_json,
+                **run_segment_kwargs,
             )
             manifest_path = job_dir / "manifest.json"
             if not manifest_path.exists():
                 raise RuntimeError(f"missing manifest for segment {seg_index}: {manifest_path}")
             manifest = load_segment_manifest(manifest_path).raw
+            if args.input_srt_kind == "source":
+                sync_segment_source_input_snapshot(
+                    segment_input_srt=segment_input_srt,
+                    job_dir=job_dir,
+                    manifest=manifest,
+                )
 
         if shared_ref is None:
             auto_ref = job_dir / "refs" / "single_speaker_ref.wav"
@@ -1298,13 +1562,13 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     batch_options = BatchReplayOptions(
         target_lang=args.target_lang,
-        pipeline_version="v2" if v2_mode else "v1",
-        rewrite_translation=bool(rewrite_translation),
+        pipeline_version="auto-dubbing",
+        dubbing_mode=str(args.dubbing_mode or "single").strip().lower() or "single",
+        rewrite_translation=True,
         timing_mode=timing_mode,
         grouping_strategy=grouping_strategy,
         input_srt_kind=args.input_srt_kind,
         index_tts_api_url=index_tts_api_url,
-        auto_pick_ranges=str(args.auto_pick_ranges).strip().lower() in {"1", "true", "yes", "on"},
         source_short_merge_enabled=bool(source_short_merge_enabled),
         source_short_merge_threshold=source_short_merge_threshold,
         source_short_merge_threshold_mode="seconds",
@@ -1318,14 +1582,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         dub_audio_leveling_peak_ceiling=float(dub_audio_leveling_peak_ceiling),
         grouped_synthesis=bool(grouped_synthesis),
         force_fit_timing=bool(force_fit_timing),
-        tts_backend=tts_backend,
-        fallback_tts_backend=fallback_tts_backend,
-        omnivoice_root=omnivoice_root,
-        omnivoice_python_bin=omnivoice_python_bin,
-        omnivoice_model=omnivoice_model,
-        omnivoice_device=omnivoice_device,
-        omnivoice_via_api=bool(omnivoice_via_api),
-        omnivoice_api_url=omnivoice_api_url,
+        tts_backend="index-tts",
+        single_ref_audio=str(args.single_speaker_ref or ""),
+        speaker_ref_map=[
+            {"speaker_id": str(speaker_id), "ref_audio_path": str(ref_path)}
+            for speaker_id, ref_path in parse_speaker_ref_map_json(str(args.speaker_ref_map_json or "")).items()
+        ],
+        tts_model_path=str(args.tts_model_path or ""),
     )
     batch_manifest = build_batch_manifest(
         batch_id=batch_id,

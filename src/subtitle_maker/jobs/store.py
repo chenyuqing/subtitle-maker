@@ -125,11 +125,7 @@ class TaskStore:
     def to_public(self, task: TaskPayload) -> PublicJobRecord:
         """将任务记录转换为公开视图，并隐藏本地敏感字段。"""
 
-        public = {
-            key: value
-            for key, value in task.items()
-            if key not in _PUBLIC_HIDDEN_FIELDS
-        }
+        public = _build_public_task(task)
         public.setdefault("artifacts", [])
         return public
 
@@ -140,10 +136,19 @@ class TaskStore:
             task = self._items.get(task_id)
             if task is None:
                 return None
-            public = {
-                key: value
-                for key, value in task.items()
-                if key not in _PUBLIC_HIDDEN_FIELDS
-            }
+            public = _build_public_task(task)
             public.setdefault("artifacts", [])
             return public
+
+
+def _build_public_task(task: TaskPayload) -> PublicJobRecord:
+    """构造公开任务视图，并兼容旧翻译计数字段。"""
+
+    public = {
+        key: value
+        for key, value in task.items()
+        if key not in _PUBLIC_HIDDEN_FIELDS and key != "deepseek_request_count"
+    }
+    if "translate_request_count" not in public and "deepseek_request_count" in task:
+        public["translate_request_count"] = task.get("deepseek_request_count", 0)
+    return public

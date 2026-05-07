@@ -30,48 +30,10 @@ if lsof -Pi :8000 -sTCP:LISTEN -t >/dev/null ; then
     fi
 fi
 
-# 通过统一入口控制“本次启动主要测试哪个 TTS 底座”。
-# 使用方式：
-#   ./start.sh                         # auto：懒汉模式，不预热 TTS，按请求再拉起
-#   TTS_BACKEND=omnivoice ./start.sh  # 偏向 OmniVoice，只默认拉起 OmniVoice
-#   TTS_BACKEND=index-tts ./start.sh  # 偏向 index-tts，只默认拉起 index-tts
-TTS_BACKEND_RAW="${TTS_BACKEND:-auto}"
-TTS_BACKEND="$(echo "$TTS_BACKEND_RAW" | tr '[:upper:]' '[:lower:]')"
-if [[ "$TTS_BACKEND" != "auto" && "$TTS_BACKEND" != "index-tts" && "$TTS_BACKEND" != "omnivoice" && "$TTS_BACKEND" != "qwen" ]]; then
-    echo "Warning: Unsupported TTS_BACKEND=$TTS_BACKEND_RAW, fallback to auto."
-    TTS_BACKEND="auto"
-fi
-echo "TTS backend profile: $TTS_BACKEND"
-
-INDEX_TTS_AUTO_START_DEFAULT="0"
-OMNIVOICE_AUTO_START_DEFAULT="0"
-if [[ "$TTS_BACKEND" == "auto" ]]; then
-    # 默认模式改为“懒汉式”：首启不预热模型，后端按当前选择按需切换。
-    INDEX_TTS_AUTO_START_DEFAULT="0"
-    OMNIVOICE_AUTO_START_DEFAULT="0"
-fi
-if [[ "$TTS_BACKEND" == "omnivoice" ]]; then
-    # OmniVoice 测试模式下，默认只拉起 OmniVoice，避免和 index-tts 混淆。
-    INDEX_TTS_AUTO_START_DEFAULT="0"
-    OMNIVOICE_AUTO_START_DEFAULT="1"
-fi
-if [[ "$TTS_BACKEND" == "index-tts" ]]; then
-    INDEX_TTS_AUTO_START_DEFAULT="1"
-    OMNIVOICE_AUTO_START_DEFAULT="0"
-fi
-if [[ "$TTS_BACKEND" == "qwen" ]]; then
-    # qwen 模式不强依赖本地两套 API，默认都不自动启动。
-    INDEX_TTS_AUTO_START_DEFAULT="0"
-    OMNIVOICE_AUTO_START_DEFAULT="0"
-fi
-
-INDEX_TTS_AUTO_START="${INDEX_TTS_AUTO_START:-$INDEX_TTS_AUTO_START_DEFAULT}"
-INDEX_TTS_URL="${INDEX_TTS_URL:-http://127.0.0.1:8010/health}"
-INDEX_TTS_PROJECT_DIR="${INDEX_TTS_PROJECT_DIR:-/Users/tim/Documents/vibe-coding/MVP/index-tts-1108}"
-INDEX_TTS_START_SCRIPT="${INDEX_TTS_START_SCRIPT:-$INDEX_TTS_PROJECT_DIR/start-api.sh}"
-OMNIVOICE_AUTO_START="${OMNIVOICE_AUTO_START:-$OMNIVOICE_AUTO_START_DEFAULT}"
-OMNIVOICE_URL="${OMNIVOICE_URL:-http://127.0.0.1:8020/health}"
-OMNIVOICE_START_SCRIPT="${OMNIVOICE_START_SCRIPT:-$PROJECT_DIR/start_omnivoice_api.sh}"
+# 当前统一走懒汉式 TTS 运行时：
+# - `./start.sh` 只启动 Subtitle Maker Web
+# - index-tts 由后端在实际请求到来时按需拉起
+echo "TTS runtime mode: lazy on-demand (index-tts is not prewarmed by start.sh)"
 PYANNOTE_LOCAL_MODEL_DIR="${PYANNOTE_LOCAL_MODEL_DIR:-$PROJECT_DIR/models/pyannote-speaker-diarization-community-1}"
 PYANNOTE_EXTERNAL_PYTHON_DEFAULT="$PROJECT_DIR/.venv-pyannote/bin/python"
 PYANNOTE_EXTERNAL_PYTHON_FALLBACK="/Users/tim/Documents/vibe-coding/MVP/index-tts-1108/.venv/bin/python"
@@ -104,62 +66,6 @@ else
     echo "PYANNOTE_PYTHON_BIN preset: $PYANNOTE_PYTHON_BIN"
 fi
 
-if [[ "$INDEX_TTS_AUTO_START" == "1" ]]; then
-    echo "Checking local index-tts API..."
-    if curl -sS "$INDEX_TTS_URL" > /dev/null 2>&1; then
-        echo "index-tts API is already healthy."
-    else
-        echo "index-tts API is offline. Attempting to start it..."
-        # 优先使用 index-tts 项目内独立脚本，保证与手动调试路径一致
-        if [[ -x "$INDEX_TTS_START_SCRIPT" ]]; then
-            if "$INDEX_TTS_START_SCRIPT"; then
-                echo "index-tts API started by external script: $INDEX_TTS_START_SCRIPT"
-            else
-                echo "Warning: Failed to start index-tts API via $INDEX_TTS_START_SCRIPT."
-            fi
-        # 兼容旧脚本：当外部脚本不存在时，回退到当前仓库脚本
-        elif [[ -x "./start_index_tts_api.sh" ]]; then
-            if ./start_index_tts_api.sh; then
-                echo "index-tts API started by local fallback script."
-            else
-                echo "Warning: Failed to start index-tts API via local fallback script."
-            fi
-        else
-            echo "Warning: No index-tts start script found."
-        fi
-    fi
-fi
-if [[ "$INDEX_TTS_AUTO_START" != "1" ]]; then
-    echo "index-tts auto-start is disabled (INDEX_TTS_AUTO_START=$INDEX_TTS_AUTO_START)."
-fi
-
-if [[ "$OMNIVOICE_AUTO_START" == "1" ]]; then
-    echo "Checking local OmniVoice API..."
-    if curl -sS "$OMNIVOICE_URL" > /dev/null 2>&1; then
-        echo "OmniVoice API is already healthy."
-    else
-        echo "OmniVoice API is offline. Attempting to start it..."
-        if [[ -x "$OMNIVOICE_START_SCRIPT" ]]; then
-            if "$OMNIVOICE_START_SCRIPT"; then
-                echo "OmniVoice API started by script: $OMNIVOICE_START_SCRIPT"
-            else
-                echo "Warning: Failed to start OmniVoice API via $OMNIVOICE_START_SCRIPT."
-            fi
-        elif [[ -x "./start_omnivoice_api.sh" ]]; then
-            if ./start_omnivoice_api.sh; then
-                echo "OmniVoice API started by local fallback script."
-            else
-                echo "Warning: Failed to start OmniVoice API via local fallback script."
-            fi
-        else
-            echo "Warning: No OmniVoice start script found."
-        fi
-    fi
-fi
-if [[ "$OMNIVOICE_AUTO_START" != "1" ]]; then
-    echo "OmniVoice auto-start is disabled (OMNIVOICE_AUTO_START=$OMNIVOICE_AUTO_START)."
-fi
-
 # Start the server in background to allow polling
 echo "Launching server..."
 uv run subtitle-maker-web &
@@ -183,10 +89,8 @@ done
 
 echo "Server is ready! Opening browser..."
 open "http://localhost:8000"
-
-if [[ "$TTS_BACKEND" == "omnivoice" ]]; then
-    echo "Tip: 请确认左侧“TTS 底座模型”已切换为 OmniVoice。"
-fi
+echo "Tip: index-tts will auto-start only when Auto Dubbing actually uses it."
+echo "Tip: Auto Dubbing logs now include detailed runtime snapshot: TTS base, dubbing mode, grouping policy, timing mode, merge policy, range policy, and segment sizing."
 
 # Handle script exit to kill server
 trap "kill $SERVER_PID" EXIT

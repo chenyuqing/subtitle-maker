@@ -149,3 +149,27 @@ def build_subtitle_reference_map(
     if not mapping:
         mapping[0] = default_ref
     return mapping
+
+
+def extract_reference_audio_from_first_subtitle(
+    *,
+    vocals_audio: Path,
+    subtitles: List[Dict[str, Any]],
+    out_ref: Path,
+    seconds: float = 10.0,
+) -> Path:
+    """从首条字幕的起始时间点开始截取单人默认参考音。"""
+
+    if not subtitles:
+        return extract_reference_audio(
+            vocals_audio=vocals_audio,
+            out_ref=out_ref,
+            seconds=seconds,
+        )
+    first_start = float(subtitles[0].get("start", 0.0) or 0.0)
+    return extract_reference_audio_from_offset(
+        vocals_audio=vocals_audio,
+        out_ref=out_ref,
+        seconds=seconds,
+        start_sec=first_start,
+    )

@@ -19,19 +19,13 @@ class AutoDubbingCommandConfig:
     min_segment_minutes: float
     timing_mode: str
     grouping_strategy: str
+    dubbing_mode: str
     short_merge_enabled: bool
     short_merge_threshold: int
     translate_base_url: str
     translate_model: str
+    tts_model_path: str
     index_tts_api_url: str
-    fallback_tts_backend: str
-    omnivoice_root: str
-    omnivoice_python_bin: str
-    omnivoice_model: str
-    omnivoice_device: str
-    auto_pick_ranges: bool
-    auto_pick_min_silence_sec: float
-    auto_pick_min_speech_sec: float
     translated_short_merge_enabled: bool = False
     translated_short_merge_threshold: int = 15
     dub_audio_leveling_enabled: bool = True
@@ -41,18 +35,20 @@ class AutoDubbingCommandConfig:
     dub_audio_leveling_peak_ceiling: float = 0.95
     resume_batch_dir: Optional[Path] = None
     input_srt: Optional[Path] = None
+    speaker_metadata_path: Optional[Path] = None
     input_srt_kind: str = "source"
     time_ranges: List[Dict[str, float]] = field(default_factory=list)
     source_lang: str = "auto"
-    pipeline_version: str = "v1"
     rewrite_translation: bool = True
+    translate_system_prompt: str = ""
     merge_track: str = "auto"
     tts_backend: str = "index-tts"
+    single_ref_audio: str = ""
+    single_ref_text: str = ""
+    speaker_ref_map_json: str = ""
     index_tts_via_api: bool = True
     index_tts_api_release_after_job: bool = True
     index_max_text_tokens: int = 40
-    omnivoice_via_api: bool = True
-    omnivoice_api_url: str = "http://127.0.0.1:8020"
     unbuffered: bool = True
 
 
@@ -67,15 +63,8 @@ class SegmentRedubCommandConfig:
     input_media: Path
     target_lang: str
     translated_srt: Path
+    tts_model_path: str
     index_tts_api_url: str
-    fallback_tts_backend: str
-    omnivoice_root: str
-    omnivoice_python_bin: str
-    omnivoice_model: str
-    omnivoice_device: str
-    omnivoice_via_api: bool = True
-    omnivoice_api_url: str = "http://127.0.0.1:8020"
-    pipeline_version: str = "v1"
     rewrite_translation: bool = True
     grouped_synthesis: bool = False
     force_fit_timing: bool = False
@@ -85,21 +74,13 @@ class SegmentRedubCommandConfig:
     index_tts_via_api: bool = True
     index_tts_api_release_after_job: bool = True
     preserve_synthesis_mode: bool = True
+    speaker_metadata_path: Optional[Path] = None
 
 
 def _append_flag(cmd: List[str], flag: str, value: str) -> None:
     """追加标准 `--flag value` 形式参数。"""
 
     cmd.extend([flag, value])
-
-
-def _needs_omnivoice_runtime(tts_backend: str, fallback_tts_backend: str) -> bool:
-    """判断当前命令是否需要透传 OmniVoice 运行参数。"""
-
-    primary = str(tts_backend or "").strip().lower()
-    fallback = str(fallback_tts_backend or "").strip().lower()
-    # 只要主后端或备胎任一使用 OmniVoice，都必须把运行参数透传给 CLI。
-    return primary == "omnivoice" or fallback == "omnivoice"
 
 
 def build_auto_dubbing_command(config: AutoDubbingCommandConfig) -> List[str]:
@@ -128,6 +109,8 @@ def build_auto_dubbing_command(config: AutoDubbingCommandConfig) -> List[str]:
             config.timing_mode,
             "--grouping-strategy",
             config.grouping_strategy,
+            "--dubbing-mode",
+            config.dubbing_mode,
             "--source-short-merge-enabled",
             "true" if config.short_merge_enabled else "false",
             "--source-short-merge-threshold",
@@ -148,8 +131,6 @@ def build_auto_dubbing_command(config: AutoDubbingCommandConfig) -> List[str]:
             str(config.dub_audio_leveling_peak_ceiling),
             "--tts-backend",
             config.tts_backend,
-            "--fallback-tts-backend",
-            config.fallback_tts_backend,
             "--index-tts-via-api",
             "true" if config.index_tts_via_api else "false",
             "--index-tts-api-url",
@@ -162,36 +143,29 @@ def build_auto_dubbing_command(config: AutoDubbingCommandConfig) -> List[str]:
             config.translate_base_url,
             "--translate-model",
             config.translate_model,
-            "--auto-pick-ranges",
-            "true" if config.auto_pick_ranges else "false",
-            "--auto-pick-min-silence-sec",
-            str(config.auto_pick_min_silence_sec),
-            "--auto-pick-min-speech-sec",
-            str(config.auto_pick_min_speech_sec),
         ]
     )
-    if _needs_omnivoice_runtime(config.tts_backend, config.fallback_tts_backend):
-        # 主后端或备胎使用 OmniVoice 时，都要显式透传运行参数，避免命令回放失败。
-        _append_flag(cmd, "--omnivoice-via-api", "true" if config.omnivoice_via_api else "false")
-        _append_flag(cmd, "--omnivoice-api-url", config.omnivoice_api_url)
-        _append_flag(cmd, "--omnivoice-root", config.omnivoice_root)
-        _append_flag(cmd, "--omnivoice-python-bin", config.omnivoice_python_bin)
-        _append_flag(cmd, "--omnivoice-model", config.omnivoice_model)
-        _append_flag(cmd, "--omnivoice-device", config.omnivoice_device)
     if config.resume_batch_dir is not None:
         # 断点续跑时显式透传 batch 目录，复用 long-video CLI 的 resume 逻辑。
         _append_flag(cmd, "--resume-batch-dir", str(config.resume_batch_dir))
     if config.input_srt is not None:
         _append_flag(cmd, "--input-srt", str(config.input_srt))
         _append_flag(cmd, "--input-srt-kind", config.input_srt_kind)
+    if config.speaker_metadata_path is not None:
+        _append_flag(cmd, "--speaker-metadata-path", str(config.speaker_metadata_path))
+    if str(config.single_ref_audio or "").strip():
+        _append_flag(cmd, "--single-speaker-ref", str(config.single_ref_audio).strip())
+    if str(config.single_ref_text or "").strip():
+        _append_flag(cmd, "--single-ref-text", str(config.single_ref_text).strip())
+    if str(config.speaker_ref_map_json or "").strip():
+        _append_flag(cmd, "--speaker-ref-map-json", str(config.speaker_ref_map_json).strip())
+    if str(config.translate_system_prompt or "").strip():
+        # 自定义翻译 system prompt 只在需要翻译的链路生效；translated 输入会在下游自动跳过翻译。
+        _append_flag(cmd, "--translate-system-prompt", str(config.translate_system_prompt).strip())
     if config.time_ranges:
         _append_flag(cmd, "--time-ranges-json", json.dumps(config.time_ranges, ensure_ascii=False))
     if config.source_lang and config.source_lang != "auto":
         _append_flag(cmd, "--asr-language", config.source_lang)
-    if config.pipeline_version == "v2":
-        # V2 仍通过显式开关透传，避免下游默认值漂移。
-        _append_flag(cmd, "--v2-mode", "true")
-        _append_flag(cmd, "--v2-rewrite-translation", "true" if config.rewrite_translation else "false")
     return cmd
 
 
@@ -215,8 +189,6 @@ def build_segment_redub_command(config: SegmentRedubCommandConfig) -> List[str]:
         config.input_srt_kind,
         "--tts-backend",
         config.tts_backend,
-        "--fallback-tts-backend",
-        config.fallback_tts_backend,
         "--index-tts-via-api",
         "true" if config.index_tts_via_api else "false",
         "--index-tts-api-url",
@@ -230,19 +202,11 @@ def build_segment_redub_command(config: SegmentRedubCommandConfig) -> List[str]:
         "--translated-input-preserve-synthesis-mode",
         "true" if config.preserve_synthesis_mode else "false",
     ]
-    if _needs_omnivoice_runtime(config.tts_backend, config.fallback_tts_backend):
-        _append_flag(cmd, "--omnivoice-via-api", "true" if config.omnivoice_via_api else "false")
-        _append_flag(cmd, "--omnivoice-api-url", config.omnivoice_api_url)
-        _append_flag(cmd, "--omnivoice-root", config.omnivoice_root)
-        _append_flag(cmd, "--omnivoice-python-bin", config.omnivoice_python_bin)
-        _append_flag(cmd, "--omnivoice-model", config.omnivoice_model)
-        _append_flag(cmd, "--omnivoice-device", config.omnivoice_device)
+    if config.speaker_metadata_path is not None:
+        _append_flag(cmd, "--speaker-metadata-path", str(config.speaker_metadata_path))
     # grouped 片段共享同一份音频，局部重配必须整段重跑。
     if config.redub_local_indices and not config.grouped_synthesis:
         normalized_indices = sorted({int(index) for index in config.redub_local_indices if int(index) > 0})
         if normalized_indices:
             _append_flag(cmd, "--redub-line-indices-json", json.dumps(normalized_indices))
-    if config.pipeline_version == "v2":
-        _append_flag(cmd, "--v2-mode", "true")
-        _append_flag(cmd, "--v2-rewrite-translation", "true" if config.rewrite_translation else "false")
     return cmd

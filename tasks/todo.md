@@ -1,13 +1,2272 @@
 # TODO
 
+## 59. 2026-05-07 独立 OmniVoice 链路重建
+- [ ] 目标
+  - 保留 `4. Auto Dubbing` 现有 `index-tts` 主链路，不再共享底座模型切换状态
+  - 新增 `5. Auto Dub Omnivoice`，作为一条独立的字幕驱动配音链路
+- [ ] 前端拆分
+  - 移除侧边栏底部的 `底座模型` 控件和对应的全局 backend 状态
+  - `Auto Dubbing` 面板固定使用 `index-tts`
+  - 新增独立的 `Auto Dub Omnivoice` 导航项、面板和 JS 模块
+- [ ] 后端桥接
+  - 新增独立 OmniVoice 路由与任务命名空间
+  - 任务仅复用当前项目媒体、字幕、speaker 元数据
+  - 输出目录、状态轮询、artifact 下载、batch 恢复都使用独立前缀
+- [ ] 运行链路
+  - 参考 `OmniVoice-Studio-main` 的 dubbing 结构，实现“字幕驱动 + speaker 路由参考音 + per-segment 合成 + final mix”
+  - 不把 ASR/diarization 接回主路径
+  - 保持与 `index-tts` 完全隔离，不共享 localStorage / 请求状态 / 结果状态
+- [ ] 验证
+  - 前端确认 4/5 面板互不串台
+  - 后端确认新 OmniVoice 路由能完成 start/status/artifact 的完整闭环
+  - 验证 `index-tts` 回归不受影响
+
+## 52-58. 2026-05-06 翻译 Provider 收口总览
+- [x] 目标
+  - 把翻译链路从 `DeepSeek 专用` 收口为 `OpenAI-compatible` 通用能力
+  - 保留默认实现值与 legacy 兼容，不破坏现有部署和 `index-tts` 链路
+- [x] 已完成范围
+  - 后端翻译入口统一支持 `translate_base_url / translate_model`
+  - API key 解析优先级统一为：显式 `api_key` > `TRANSLATE_API_KEY` > `DEEPSEEK_API_KEY`
+  - 运行摘要、错误提示、前端 UI 文案统一改成 `Translation API / OpenAI-compatible`
+  - 翻译调用计数主字段统一为 `translate_request_count`
+  - 默认翻译供应商配置已在后端 `translator.py` 与前端 `app.js` 各自抽成单一入口
+  - 模板 placeholder 与无业务价值的 `DeepSeek` 命名/测试注释已清理
+- [x] 兼容保留
+  - 默认 `base_url=https://api.deepseek.com`
+  - 默认 `model=deepseek-v4-flash`
+  - 继续兼容 `DEEPSEEK_API_KEY`
+  - 继续兼容旧任务里的 `deepseek_request_count` 读取，但状态接口不再公开该字段
+- [x] 关键文件
+  - `src/subtitle_maker/translator.py`
+  - `src/subtitle_maker/core/llm_client.py`
+  - `src/subtitle_maker/dubbing_cli_api.py`
+  - `src/subtitle_maker/static/app.js`
+  - `src/subtitle_maker/static/js/dubbingPanel.js`
+  - `src/subtitle_maker/templates/index.html`
+  - `tools/dub_pipeline.py`
+  - `tools/repair_bad_segments.py`
+- [x] 验证结论
+  - `python3 -m py_compile` 已覆盖翻译入口、CLI、runtime 与相关测试模块
+  - `node --check` 已覆盖前端 `app.js` 与 `dubbingPanel.js`
+  - `uv run python -m unittest` 已覆盖 `tests.test_dubbing_runtime`、`tests.test_dubbing_cli_api`、`tests.test_web_routes_legacy`、`tests.test_simple_web_legacy`、`tests.test_agent_api`
+  - 当前结论：默认值保持不变，但前后端、运行日志、状态接口和 UI 语义都已完成 provider-neutral 收口
+
+## 49-51. 2026-05-06 字幕输入与翻译编排优化总览
+- [x] 目标
+  - 让上传 `source.srt` 的链路跳过 ASR/source-layout 重排，直接进入纯字幕预处理
+  - 统一翻译默认 prompt 与前端自定义 prompt 的合并逻辑
+  - 让 Auto Dubbing 启动日志直接展示翻译策略，便于判断是否翻译、如何翻译
+- [x] 已完成范围
+  - 上传 `source.srt` 现在走独立的非 ASR 预处理路径，只保留清洗、时间戳校正和可选 short merge
+  - 后端翻译统一使用 `DEFAULT_TRANSLATION_SYSTEM_PROMPT + 用户自定义 prompt` 合并策略
+  - `runtime_brief` 已新增 `translation` 字段，直接显示 `run/skip + prompt 状态 + provider`
+- [x] 关键文件
+  - `tools/dub_pipeline.py`
+  - `src/subtitle_maker/translator.py`
+  - `src/subtitle_maker/dubbing_cli_api.py`
+  - `tools/repair_bad_segments.py`
+  - `tests/test_dub_pipeline_asr_layout.py`
+  - `tests/test_dubbing_runtime.py`
+  - `tests/test_dubbing_cli_api.py`
+- [x] 验证结论
+  - `python3 -m py_compile` 与 `uv run python -m unittest` 已覆盖 uploaded source subtitles、translation prompt merge、runtime brief 三条主合同
+  - 当前结论：上传 `source.srt` 不再被 ASR/source-layout 阻塞；翻译 prompt 来源已统一；启动日志可直接观察翻译策略
+
+## 47-48. 2026-05-06 Auto Dubbing 主合同收口总览
+- [x] 目标
+  - 收掉前端单人/多人手选模式，改为按字幕 speaker 自动推断
+  - 把 `index-tts` 默认策略稳定回用户实测更优的 `grouped synthesis + token=40`
+- [x] 已完成范围
+  - 前端已删除 `Mode` 下拉和单人参考音上传区
+  - 是否显示 speaker 上传参考音控件，改为按 `speaker_id / Speaker N:` 自动判断
+  - 有 speaker 时只允许 `0 上传` 或 `全上传`；部分上传前后端都会拒绝
+  - 后端 `dubbing_mode` 已改为按字幕 speaker 自动推断，旧表单值只保留兼容校验
+  - `index-tts` 已恢复默认 grouped 合成，`index_max_text_tokens` 已统一回退到 `40`
+- [x] 关键文件
+  - `src/subtitle_maker/static/js/dubbingPanel.js`
+  - `src/subtitle_maker/dubbing_cli_api.py`
+  - `src/subtitle_maker/jobs/command_builder.py`
+  - `tools/dub_pipeline.py`
+  - `tools/dub_long_video.py`
+  - `tests/test_dubbing_cli_api.py`
+  - `tests/test_command_builder.py`
+  - `tests/test_job_recovery.py`
+  - `tests/test_manifest_contracts.py`
+- [x] 验证结论
+  - `node --check` 已覆盖前端面板脚本
+  - `python -m py_compile` 与 `uv run python -m unittest` 已覆盖 speaker 自动推断、参考音上传约束、grouped synthesis 和 `token=40` 主合同
+  - 当前结论：Auto Dubbing 模式选择已从手选收口为字幕驱动；`index-tts` 执行策略已回退到当前最稳的默认组合
+
+## 45-46. 2026-05-06 范围选择与字幕短句策略总览
+- [x] 目标
+  - 删除 `Auto pick dubbing ranges` 全链路，统一收口到 `manual / all` 两种范围策略
+  - 让 `Merge short source lines` 在存在 speaker 信息时严格禁止跨 speaker 合并
+- [x] 已完成范围
+  - 前端已物理删除 `Auto pick dubbing ranges` 复选框，启动请求不再发送 `auto_pick_ranges`
+  - `dubbing_cli_api`、任务快照、命令构建、manifest/recovery 与 `dub_pipeline.py` / `dub_long_video.py` 已移除 `auto` 范围策略
+  - `source short merge` 现在会先归一化 `speaker_id / Speaker N:`，只要检测到 speaker 信息就自动切到 speaker-aware short merge
+  - 缺失 speaker 的行会形成独立边界，禁止跨边界并句
+- [x] 关键文件
+  - `src/subtitle_maker/static/js/dubbingPanel.js`
+  - `src/subtitle_maker/dubbing_cli_api.py`
+  - `src/subtitle_maker/jobs/command_builder.py`
+  - `src/subtitle_maker/jobs/models.py`
+  - `src/subtitle_maker/jobs/recovery.py`
+  - `src/subtitle_maker/manifests/schema.py`
+  - `src/subtitle_maker/manifests/readwrite.py`
+  - `tools/dub_pipeline.py`
+  - `tools/dub_long_video.py`
+  - `tests/test_command_builder.py`
+  - `tests/test_job_recovery.py`
+  - `tests/test_manifest_contracts.py`
+  - `tests/test_dubbing_cli_api.py`
+  - `tests/test_dub_pipeline_asr_layout.py`
+- [x] 验证结论
+  - `node --check` 已覆盖前端面板脚本
+  - `python -m py_compile` 与 `uv run python -m unittest` 已覆盖范围策略收口、speaker-aware short merge 与相关 manifest/recovery 主合同
+  - 当前结论：自动配音范围选择已简化为 `manual / all`；source short merge 已禁止跨 speaker 合并
+
+## 44. 2026-05-06 index-tts 单 worker 提效（降内存优先）
+- [x] 现状分析
+  - 单 worker 已吃满 16GB，`segment` 多 worker 并发不现实；提效必须集中在单 worker 内部
+  - `tools/dub_pipeline.py`
+    - strict `speaker_ref_map_json` 多人模式下，仍会先构建 `subtitle_ref_map`，存在多余逐句参考音切片
+  - `src/subtitle_maker/backends/index_tts.py`
+    - API 模式带 `target_duration_sec` 时会最多做 2 轮整句质量尝试；每个 chunk 还可能经历 3 次 API 重试，短句实际开销偏高
+    - chunk 已返回 `duration_sec` 时，仍会再对整句输出做 `audio_duration(...)` 探测
+  - `src/subtitle_maker/domains/dubbing/pipeline.py`
+    - grouped / per-line 最终保留音频默认都会进入 `edge fade + normalize_speech_audio_level(...)`
+    - 极短句也会走同样后处理，存在额外整句读写
+- [x] 实施计划
+  - `tools/dub_pipeline.py`
+    - strict speaker 模式直接使用上传映射，跳过 `build_subtitle_reference_map(...)`
+    - 把多人 strict speaker 参考音选择逻辑抽成独立 helper，便于回归测试
+  - `src/subtitle_maker/backends/index_tts.py`
+    - 收紧第二轮整句质量重试：仅长句/长目标时长保留
+    - 当 chunk 已返回有效 `duration_sec` 时，跳过额外整句输出时长 probe
+  - `src/subtitle_maker/domains/dubbing/pipeline.py`
+    - 为 `index-tts` 极短句增加句级后处理短路：跳过非必要 edge fade / leveling
+    - 保持现有时长对齐、resume、missing 占位和 single-output invariant 不变
+  - 测试
+    - 补 strict speaker 快路径单测
+    - 补 Index-TTS 长句重试 / 短句不重试单测
+    - 补极短句跳过 leveling/edge fade 单测
+- [x] 验证
+  - `uv run python -m py_compile tools/dub_pipeline.py src/subtitle_maker/backends/index_tts.py src/subtitle_maker/domains/dubbing/pipeline.py tests/test_dub_pipeline_references.py tests/test_dubbing_runtime.py`
+  - `uv run python -m unittest -v tests.test_dub_pipeline_references tests.test_dubbing_runtime`
+  - 实际结果
+    - [x] `uv run python -m py_compile tools/dub_pipeline.py src/subtitle_maker/backends/index_tts.py src/subtitle_maker/domains/dubbing/pipeline.py tests/test_dub_pipeline_references.py tests/test_dubbing_runtime.py`
+    - [x] `uv run python -m unittest -v tests.test_dub_pipeline_references`
+    - [x] `uv run python -m unittest -v tests.test_dubbing_runtime`
+  - review
+    - `index-tts + multi + speaker_ref_map_json` 已改成 strict speaker 直通：多人 strict 路径不再构建 `subtitle_ref_map`，直接用上传的 `speaker_ref_map` 选参考音
+    - `IndexTtsBackend` 现在只对长句保留第二轮整句质量重试；短句即使偏短/偏长，也不再放大成双倍整句调用
+    - 当 chunk API 已返回有效 `duration_sec` 时，backend 不再额外 probe 整句输出时长，减少一次文件探测
+    - `index-tts` 极短句现在会跳过句级 `edge fade` 和 `normalize_speech_audio_level(...)`，避免非必要整句读写
+    - 现有 `resume`、`compose window guard`、`translated subtitles`、`single output invariant` 相关回归未被破坏
+
+## 43. 2026-05-05 自动配音只保留 index-tts，删除 OmniVoice / VoxCPM 底座链路
+- [x] 现状分析（仅围绕 Auto Dubbing）
+  - 前端仍暴露多底座入口
+    - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 仍有 `global-tts-backend` 下拉，包含 `index-tts` / `omnivoice`
+    - [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js) 仍有大量 `omnivoice` 条件分支、参考音 UI、多人 refs 处理
+  - Auto Dubbing API 仍维护 OmniVoice 运行参数与服务管理
+    - [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 仍包含：
+      - OmniVoice 参数读取 `_read_omnivoice_runtime_from_request_or_env(...)`
+      - OmniVoice 服务健康检查 / 自动启动 / 停止
+      - `tts_backend` 校验仍接受 `omnivoice`
+  - 命令构建仍透传 OmniVoice / fallback 参数
+    - [src/subtitle_maker/jobs/command_builder.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/jobs/command_builder.py)
+      - `AutoDubbingCommandConfig` / `SegmentRedubCommandConfig` 仍保留 `fallback_tts_backend`、`omnivoice_*`
+      - `build_auto_dubbing_command()` / `build_segment_redub_command()` 仍会追加 `--omnivoice-*`
+  - 运行 pipeline 仍保留 OmniVoice / VoxCPM 分支
+    - [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 仍支持 `--tts-backend` 为 `index-tts` / `omnivoice` / `voxcpm-omnivoice`
+    - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 仍保留大量 OmniVoice/VoxCPM 逻辑
+    - [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py)、[src/subtitle_maker/backends/voxcpm_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/voxcpm_api.py)、[tools/omnivoice_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/omnivoice_fastapi_server.py) 仍在仓库中
+  - 测试仍覆盖 OmniVoice / VoxCPM
+    - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py)
+    - [tests/test_command_builder.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_command_builder.py)
+    - [tests/test_dubbing_runtime.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_runtime.py)
+- [x] 实施计划
+  - 前端层
+    - 删除 Auto Dubbing 中与 OmniVoice 相关的参考音上传 / reference text / 多人 refs UI
+    - 全局 TTS 底座选择改为固定 `index-tts`，或直接移除 Auto Dubbing 对多底座切换的依赖
+  - API / 命令层
+    - `dubbing_cli_api.py` 将 `tts_backend` 固定为 `index-tts`
+    - 删除 Auto Dubbing 请求里的 `fallback_tts_backend`、`omnivoice_*`、`voxcpm_api_url`
+    - `command_builder.py` 删除 OmniVoice/fallback 字段与 CLI flag 透传
+  - Pipeline / Backend 层
+    - `tools/dub_pipeline.py` 的 Auto Dubbing 入口只保留 `index-tts`
+    - `src/subtitle_maker/domains/dubbing/pipeline.py` 删除 OmniVoice / VoxCPM 特化分支，仅保留 `index-tts` 主链路
+    - 删除不再使用的 [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py)、[src/subtitle_maker/backends/voxcpm_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/voxcpm_api.py)、[tools/omnivoice_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/omnivoice_fastapi_server.py) 及相关启动脚本
+  - 测试层
+    - 删除或改写所有 Auto Dubbing 的 OmniVoice / VoxCPM 测试
+    - 保留并强化 `index-tts` 主链路测试
+- [x] 风险与决策
+  - 风险 1：`global-tts-backend` 可能不只被 Auto Dubbing 使用，直接删 UI 可能影响别的页面逻辑
+    - 决策：先确认它在当前仓库是否只服务 Auto Dubbing；若不是，只对 Auto Dubbing 固定为 `index-tts`
+  - 风险 2：`src/subtitle_maker/domains/dubbing/pipeline.py` 现在是共享运行时，粗暴删除 OmniVoice 分支可能误伤 review/save-redub
+    - 决策：只保留 Auto Dubbing 仍会实际调用的 `index-tts` 路径；删除前先确认调用入口
+  - 风险 3：测试当前已混入历史 OmniVoice/VoxCPM 断言，清理时容易把与 `index-tts` 无关的坏测试一起带走
+    - 决策：按文件逐个删改，只保留 `index-tts` 主合同
+- [x] 验证计划
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js`
+  - `uv run python -m py_compile` 覆盖 `dubbing_cli_api.py`、`jobs/command_builder.py`、`domains/dubbing/pipeline.py`、`tools/dub_pipeline.py`
+  - 运行 `tests/test_dubbing_cli_api.py`、`tests/test_command_builder.py`、`tests/test_dubbing_runtime.py` 中保留下来的 `index-tts` 用例
+  - 实际结果
+    - [x] `node --check src/subtitle_maker/static/js/dubbingPanel.js`
+    - [x] `uv run python -m py_compile src/subtitle_maker/jobs/command_builder.py src/subtitle_maker/dubbing_cli_api.py tools/dub_pipeline.py tests/test_command_builder.py tests/test_dubbing_cli_api.py tests/test_dubbing_runtime.py`
+    - [x] `uv run python -m unittest -v tests.test_command_builder tests.test_dubbing_cli_api tests.test_manifest_contracts tests.test_job_recovery`
+    - [x] `uv run python -m unittest tests.test_dubbing_runtime -v`
+  - review
+    - Auto Dubbing 的前端、API、命令构建和 CLI 入口已经固定收口到 `index-tts`
+    - 旧的 OmniVoice / VoxCPM 深层运行时代码与历史测试仍有残留，但已不在 Auto Dubbing 主入口合同内；这次没有继续激进去删，目的是避免误伤现有 `index-tts`
+    - 第二阶段已继续收口 `src/subtitle_maker/dubbing_cli_api.py` 与 `src/subtitle_maker/domains/dubbing/review.py`
+    - `start/start-from-project` 不再声明 OmniVoice / VoxCPM 表单参数，review redub 运行时也统一强制 `index-tts`
+    - 已补跑 `tests.test_dubbing_cli_api`、`tests.test_dubbing_runtime`、`tests.test_command_builder`、`tests.test_manifest_contracts`、`tests.test_job_recovery`
+    - 第三阶段已完成 manifest / recovery / load-batch 合同清理：`BatchReplayOptions`、任务快照与 interrupted-batch 推断都不再携带 `fallback_tts_backend`、`omnivoice_*`、`voxcpm_api_url`，历史 batch 读取时统一归一到 `tts_backend=index-tts`
+    - 第四阶段已完成长视频编排壳层清理：`tools/dub_long_video.py` 不再解析 `fallback_tts_backend`、`omnivoice_*`、`voxcpm_api_url` 等旧参数，执行期固定 `tts_backend=index-tts`；相关 `test_dub_long_video` 已同步改成 index-tts 主合同 / 旧请求归一化断言
+    - 第五阶段已修复 `tools/dub_pipeline.py` 入口 stale args 缺陷：parser 只保留 `index-tts` 后，`main()` 也不再读取已移除的 `args.fallback_tts_backend` / `args.omnivoice_*` / `args.voxcpm_api_url`；新增源码级回归测试防止再次出现 parser 与 main 脱节
+    - 第六阶段已收紧共享运行时 fallback 链路：`src/subtitle_maker/domains/dubbing/pipeline.py` 的 `synthesize_text_once()` 现在直接拒绝 `fallback_tts_backend!=none`，并移除了 grouped / per-line 两处 `fallback_tts_after_invalid_audio` 活分支；相关 runtime 测试已改为断言“拒绝 fallback 配置”而不是“自动切到 OmniVoice”
+    - 第七阶段已删除共享运行时里剩余的 `voxcpm-omnivoice` 宽松验收活分支：`pipeline.py` 的 relaxed timing 只再允许独立 `omnivoice` 命中，相关 `group_voxcpm_omnivoice_relaxed_timing_accept` / `voxcpm_omnivoice_relaxed_timing_accept` 测试与 grouped 包装层 `voxcpm_api_url` 透传坏测试已移除
+    - 已补跑 `uv run python -m py_compile src/subtitle_maker/domains/dubbing/pipeline.py tests/test_dubbing_runtime.py tests/test_dub_pipeline_references.py`
+    - 已补跑 `uv run python -m unittest -v tests.test_dubbing_runtime tests.test_dub_pipeline_references`
+    - 第八阶段计划：继续删除 Auto Dubbing 已不可达的 OmniVoice / VoxCPM 深层残留
+      - 先删 `voxcpm_api_url` 透传、`src/subtitle_maker/backends/voxcpm_api.py` 和相关导出/测试残留
+      - 再删 `tools/omnivoice_fastapi_server.py`、`start_omnivoice_api.sh`、`stop_omnivoice_api.sh`、`tests/test_omnivoice_fastapi_server.py` 以及 `start.sh` / `stop.sh` 中的本地 OmniVoice 服务文案与清理逻辑
+      - 同步清掉 `tools/dub_pipeline.py` 中 parser 已经封死、但源码仍残留的 OmniVoice 专用参考音/分组合成分支与空参数透传
+      - 保留 `index-tts` 主链验证：`tests.test_command_builder`、`tests.test_dubbing_cli_api`、`tests.test_dub_long_video`、`tests.test_dub_pipeline_references`、`tests.test_dubbing_runtime`
+
+## 42. 2026-05-05 修复 OmniVoice 单人 seg_0005~seg_0010 句首吞字/乱音
+- [x] 现状证据确认（只看 `omnivoice + single`）
+  - `outputs/dub_jobs/web_20260505_113045/longdub_20260505_193050/segment_jobs/segment_0001/manifest.json`
+    - `seg_0005/0006/0008` 走 `target_retry + fit_timing`
+    - `seg_0007/0009/0010` 走 `natural accept`
+    - 说明问题同时存在于“自然保留”和“带 duration 重试”两条路径，不是单一 `fit_timing` 问题
+  - `src/subtitle_maker/domains/dubbing/pipeline.py:2385`
+    - 当前 `OmniVoice + single` 明确跳过 `trim_silence_edges()`
+    - 注释是“避免误裁句首辅音”，但副作用是 API 产出的前导脏音也被完整保留
+  - 实际 wav 头部检测
+    - `seg_0007.wav`、`seg_0009.wav` 开头约 `0.47s` 低能量/静音
+    - `seg_0005.wav`、`seg_0006.wav`、`seg_0008.wav` 也有明显前导静音/低能量段
+    - 这与用户听到的“前面吞字/乱读音”一致
+- [ ] 实施计划（待确认后编码）
+  - `src/subtitle_maker/domains/dubbing/alignment.py`
+    - 新增“仅清理句首异常前导”的保守裁剪函数
+    - 规则：只裁前导静音/脏音，不裁句尾；保留 pad；限制最大裁剪长度，避免误伤低能量首字
+  - `src/subtitle_maker/domains/dubbing/pipeline.py`
+    - 仅在 `OmniVoice + single` 路径启用这个“句首保守清理”
+    - 保留现有自然生成优先、超差再 `duration retry` 的策略
+    - 不改 `index-tts`、不改 grouped、多说话人链路不动
+  - `tests/test_dubbing_runtime.py`
+    - 新增单测覆盖“只裁前导、不裁句尾、且仅对 `OmniVoice + single` 生效”
+- [ ] 验证
+  - `uv run python -m py_compile src/subtitle_maker/domains/dubbing/alignment.py src/subtitle_maker/domains/dubbing/pipeline.py tests/test_dubbing_runtime.py`
+  - `uv run python -m unittest tests.test_dubbing_runtime -v`
+  - 如有必要，对问题段做一次本地重跑，确认 `seg_0005~seg_0010` 的前导静音显著下降
+
+## 41. 2026-05-05 修复 OmniVoice 单人“单条配音混音/糊音”根因链路
+- [x] 根因证据确认（非猜测）
+  - `outputs/dub_jobs/web_20260505_051329/longdub_20260505_131335/batch_manifest.json`
+    - `tts_backend=omnivoice`
+    - `dubbing_mode=single`
+    - `grouped_synthesis=true`（此前仍在分组合成）
+    - `paths.preferred_audio` 指向 `dubbed_mix_full.wav`（默认播放混合轨）
+  - `segment_0001/logs/segment_0001.jsonl`
+    - 多次 `group_tts_started`（说明并非逐句原子链路）
+    - 每组都 `edge_fade_applied=true`（会压低句首瞬态）
+  - `outputs/omnivoice_api.log`
+    - API 请求 `text_preview` 是组文本，不是 `ref_text`
+    - 证实 API 没把 `ref_text` 直接当正文念（当前实现重点问题不在这里）
+- [x] 只改 OmniVoice 单人链路（不影响 index-tts）
+  - `src/subtitle_maker/dubbing_cli_api.py`
+    - `omnivoice+single` 启动命令默认 `merge_track=vocals`
+  - `tools/dub_pipeline.py`
+    - `omnivoice` 一律强制逐句（`grouped_synthesis=false`）
+  - `src/subtitle_maker/domains/dubbing/pipeline.py`
+    - `omnivoice` 单/多人都禁用最终 `edge_fade`
+  - `tools/repair_bad_segments.py`
+    - 批次重建时 `omnivoice+single` 的 `preferred_audio` 优先 `vocals`
+  - `src/subtitle_maker/static/js/dubbingPanel.js`
+    - 前端在 `omnivoice+single` 下优先选 `vocals` 音轨回放
+- [ ] 验证
+  - [x] `node --check src/subtitle_maker/static/js/dubbingPanel.js`
+  - [x] `uv run python -m py_compile src/subtitle_maker/dubbing_cli_api.py src/subtitle_maker/domains/dubbing/pipeline.py tools/dub_pipeline.py tools/repair_bad_segments.py`
+  - [ ] 端到端跑一轮 `omnivoice+single`，确认：
+    - `grouped_synthesis=false`
+    - `segment_audio_leveled.data.edge_fade_applied=false`
+    - `paths.preferred_audio` 指向 `dubbed_vocals_full.wav`
+
+## 40. 2026-05-05 Auto Dubbing 的 Optional dubbing windows 升级为 HH:MM:SS
+- [x] 模板输入框升级
+  - `src/subtitle_maker/templates/index.html`
+    - `auto-dub-range-start-*` / `auto-dub-range-end-*` 新增小时位 `HH`
+    - 从 `MM:SS` 改为 `HH:MM:SS`
+- [x] 前端绑定升级
+  - `src/subtitle_maker/static/js/dubbingPanel.js`
+    - 为 Auto Dubbing ranges controller 透传 `startHEl/endHEl`
+    - 继续复用统一 `createTimeRangesController` 与 `timeToSeconds` 三参逻辑
+- [x] 最小验证
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js src/subtitle_maker/templates/index.html`
+
+## 39. 2026-05-05 3号面板升级为 Video & Voice Slice（新增视频切片 + HH:MM:SS 区间）
+- [x] 面板文案与结构
+  - `src/subtitle_maker/templates/index.html`
+    - 导航名：`Get Speaker Voice` -> `Video & Voice Slice`
+    - 标题：`🎤 Get Speaker Voice` -> `🎬 Video & Voice Slice`
+    - 在 `Extract vocals for selected ranges` 右侧新增 `Extract video for selected ranges` 卡片和按钮
+    - 区间输入升级为 `HH:MM:SS`（start/end 都新增 `HH` 输入框）
+- [x] 前端交互
+  - `src/subtitle_maker/static/js/timeRanges.js`
+    - 控制器支持三段时间输入（`startHEl/endHEl`）
+    - `Use Current` 与 `clearInputs` 同步支持小时位
+    - `timeToSeconds` 调用改为三参
+  - `src/subtitle_maker/static/js/speakerVoicePanel.js`
+    - 新增视频切片按钮事件，调用 `/speaker-voice/start-video-from-project`
+    - 复用同一套 ranges
+    - 轮询完成/失败时统一恢复两个按钮状态
+  - `src/subtitle_maker/static/app.js`
+    - `timeToSeconds` 升级兼容 `HH:MM:SS`（同时兼容旧两参调用）
+    - `secondsToDisplay` 升级为 `HH:MM:SS`
+- [x] 后端接口
+  - `src/subtitle_maker/speaker_voice_api.py`
+    - 新增视频切片任务执行器 `_run_speaker_video_task`
+    - 新增任务入口 `/speaker-voice/start-video-from-project`
+    - 新增视频任务队列 `_queue_video_task`
+    - 下载接口支持 `video_range_*` 对应 `video_slice_*.mp4`
+- [x] 最小验证
+  - `node --check src/subtitle_maker/static/js/timeRanges.js src/subtitle_maker/static/js/speakerVoicePanel.js src/subtitle_maker/static/app.js`
+  - `uv run python -m py_compile src/subtitle_maker/speaker_voice_api.py tests/test_speaker_voice_api.py`
+  - `uv run python -m unittest tests.test_speaker_voice_api.SpeakerVoiceApiTests.test_start_video_from_project_creates_video_slice_task -v`
+
+## 38. 2026-05-05 OmniVoice 收口为“仅单人 + 强制手动参考音”
+- [x] 后端硬限制
+  - `src/subtitle_maker/dubbing_cli_api.py`
+    - `tts_backend=omnivoice` 时强制 `dubbing_mode=single`
+    - 若请求显式传 `dubbing_mode=multi`，直接 400：`omnivoice only supports single mode now; multi mode is disabled`
+    - 保留单人强校验：必须提供 `single_ref_audio`
+    - 删除/停用 OmniVoice multi 的 `speaker_ref_map` 校验分支（不再走多人链路）
+- [x] 前端限制
+  - `src/subtitle_maker/static/js/dubbingPanel.js`
+    - OmniVoice 模式下强制 `dubbing_mode=single`
+    - Mode 下拉在 OmniVoice 时禁用并提示“仅支持单人模式”
+    - 不再显示 OmniVoice 多人参考音区域
+    - 提交时 OmniVoice 一律发送 `dubbing_mode=single`
+- [x] 验证
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js`
+  - `uv run python -m py_compile src/subtitle_maker/dubbing_cli_api.py tests/test_dubbing_cli_api.py`
+  - `uv run python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_auto_dubbing_requires_manual_reference_for_single_omnivoice -v`
+  - `uv run python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_auto_dubbing_rejects_multi_mode_for_omnivoice -v`
+  - `uv run python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_from_project_omnivoice_forces_single_mode_even_with_multi_speaker_subtitles -v`
+
+## 37. 2026-05-05 修复 Auto Dubbing 自定义翻译 Prompt 在布局重排阶段丢失
+- [x] 根因定位
+  - `tools/dub_pipeline.py` 的 `reflow_cluster_with_llm()` 之前写死了 system prompt：
+    - `"You are a subtitle layout editor for dubbing."`
+  - 即使前面翻译阶段已经使用了 `translate_system_prompt`，重排阶段仍可能二次覆盖术语/人名策略
+- [x] 实施修复
+  - `tools/dub_pipeline.py`
+    - `reflow_cluster_with_llm(...)` 新增 `system_prompt` 参数，并优先使用用户传入值
+    - `smart_layout_translated_lines(...)` 新增 `system_prompt` 参数并透传给 `reflow_cluster_with_llm(...)`
+    - `main()` 调用 `smart_layout_translated_lines(...)` 时传入 `args.translate_system_prompt`
+- [x] 回归测试
+  - `tests/test_dub_pipeline_asr_layout.py`
+    - 新增 `test_reflow_cluster_with_llm_uses_custom_translate_system_prompt`
+    - 断言重排 LLM 调用的 system message 等于用户自定义 prompt
+- [x] 验证
+  - `uv run python -m py_compile tools/dub_pipeline.py tests/test_dub_pipeline_asr_layout.py`
+  - `uv run python -m unittest tests.test_dub_pipeline_asr_layout.DubPipelineAsrLayoutTests.test_reflow_cluster_with_llm_uses_custom_translate_system_prompt -v`
+  - `uv run python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_from_project_passes_translate_system_prompt_into_command -v`
+  - `uv run python -m unittest tests.test_web_routes_legacy.WebLegacyRouteTests.test_index_upload_and_stream_keep_working -v`
+
+## 35. 2026-05-05 Auto Dubbing 增加翻译自定义 Prompt（Current Project/Standalone 共用）
+- [x] 前端 UI
+  - `src/subtitle_maker/templates/index.html` 的 Auto Dubbing 配置区新增 `Custom System Prompt (Optional)` 输入框
+  - 文案明确：仅 source 字幕需翻译时生效，translated 字幕会跳过翻译
+- [x] 前端提交流程
+  - `src/subtitle_maker/static/js/dubbingPanel.js` 在启动请求里追加 `translate_system_prompt`（非空时）
+- [x] 后端参数链打通
+  - `src/subtitle_maker/dubbing_cli_api.py`：
+    - `start` / `start-from-project` 接收 `translate_system_prompt`
+    - `_normalize_auto_dubbing_request` 归一化并写入 options
+    - 任务快照持久化该字段
+    - `resume` 回放参数时继续携带该字段
+    - `load-batch` 的中断批次字段推断保留该字段
+- [x] 命令透传
+  - `src/subtitle_maker/jobs/command_builder.py`：
+    - `AutoDubbingCommandConfig` 增加 `translate_system_prompt`
+    - 非空时追加 `--translate-system-prompt`
+- [x] Manifest / recovery 回放兼容
+  - `src/subtitle_maker/manifests/schema.py`、`readwrite.py`、`src/subtitle_maker/jobs/recovery.py` 增加 `translate_system_prompt` 读写
+- [ ] 验证
+  - [x] `uv run python -m unittest tests.test_command_builder -v`
+  - [x] `uv run python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_from_project_passes_translate_system_prompt_into_command -v`
+  - [x] `node --check src/subtitle_maker/static/js/dubbingPanel.js`
+  - [x] `uv run python -m py_compile src/subtitle_maker/dubbing_cli_api.py src/subtitle_maker/jobs/command_builder.py src/subtitle_maker/manifests/readwrite.py src/subtitle_maker/jobs/recovery.py src/subtitle_maker/manifests/schema.py`
+
+## 36. 2026-05-05 修复 Auto Dubbing custom prompt 未生效（前端字段丢失）
+- [x] 根因定位
+  - `src/subtitle_maker/templates/index.html` 的输入框 id 是 `auto-dub-translate-system-prompt`
+  - `src/subtitle_maker/static/js/dubbingPanel.js` 读取的是 `auto-dub-translate-system-prompt` 的简写后缀 `translate-system-prompt`（拼接后实际查找 `auto-dub-translate-system-prompt`）
+  - 同时兼容修复：当用户习惯在翻译面板 `#system-prompt` 填写时，Auto Dubbing 请求此前不会读取该值
+- [x] 实施修复
+  - `src/subtitle_maker/static/js/dubbingPanel.js`
+    - `buildCommonStartFormData()` 中 `translate_system_prompt` 读取逻辑改为：
+      1) 先读 Auto Dubbing 面板输入框
+      2) 若为空，回退读取翻译面板 `#system-prompt`
+    - 非空才追加 `translate_system_prompt`
+- [x] 回归测试
+  - `tests/test_web_routes_legacy.py` 增加首页断言：`id="auto-dub-translate-system-prompt"` 必须存在，防止模板回退时再丢字段
+- [x] 验证
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js`
+  - `uv run python -m unittest tests.test_command_builder.CommandBuilderTests.test_build_auto_dubbing_command_keeps_optional_replay_flags -v`
+  - `uv run python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_from_project_passes_translate_system_prompt_into_command -v`
+  - `uv run python -m unittest tests.test_web_routes_legacy.WebLegacyRouteTests.test_index_upload_and_stream_keep_working -v`
+
+## 33. 2026-05-05 修复 OmniVoice 多人首句超时长与句首发糊
+- [ ] 根因确认
+  - `seg_0001` 目标 14s，实际 17s；manifest 显示 `synthesis_duration_control=natural` 且命中 `voxcpm_omnivoice_relaxed_timing_accept`
+  - 说明当前多人链路未向 OmniVoice 传入时长目标，并且超时长仍被“宽松放行”
+- [ ] 代码修复（仅 `OmniVoice + multi`）
+  - 长句启用 `target_duration_sec`（短句保留自然时长）
+  - 关闭 `relaxed_timing_accept` 宽松放行
+  - 关闭最终 `edge_fade`，避免句首进一步被淡入压低
+- [ ] 最小验证
+  - `tests/test_dubbing_runtime.py` 相关用例通过
+  - 不改 `index-tts` 逻辑与测试合同
+
+## 34. 2026-05-05 增强 start.sh 启动后的 Auto Dubbing 运行日志（TTS底座+分组策略）
+- [x] 运行时日志增强
+  - `src/subtitle_maker/dubbing_cli_api.py` 在 `[auto-dubbing]` 摘要中新增 `runtime_brief`
+  - 新增字段：`tts_base`、`dubbing_mode`、`grouping`、`timing_mode`、`merge`、`range`、`segment`
+  - `OmniVoice + multi` 分组摘要明确显示 `speaker-aware-rebuild+per-line` 及 `grouped/force_fit` 生效值
+- [x] 任务快照补充
+  - 任务状态中新增 `grouped_synthesis_effective`、`force_fit_timing_effective`、`effective_range_strategy`
+  - 创建任务时即计算并保存 `runtime_brief`，并触发一次额外日志输出
+- [x] 启动脚本文案
+  - `start.sh` 增加提示：Auto Dubbing 日志会打印底座、分组、时长、merge、范围策略等快照
+- [x] 验证
+  - `python3 -m py_compile src/subtitle_maker/dubbing_cli_api.py src/subtitle_maker/jobs/command_builder.py` 通过
+  - `python3 -m unittest tests.test_dubbing_cli_api -v` 本地因缺依赖全量 skip（无失败）
+
+## 32. 2026-05-05 修正 OmniVoice 多人 source 链路未生效的字幕重构合并
+- [x] 根因核对
+  - 生产批次 `web_20260504_152356/longdub_20260504_232401` 为 `input_srt_kind=source`
+  - 历史实现只在 `translated` 分支做 speaker-aware 合并，导致 source 主链路未触发
+- [x] 实施修复
+  - `tools/dub_pipeline.py` 新增 `merge_short_source_subtitles_speaker_aware(...)`
+  - 在 `main()` 中 `tts_backend=omnivoice && dubbing_mode=multi && input_srt_kind=source` 时，
+    在翻译前执行真实重构并落盘 `source.srt`
+  - 保留 strict：任一行缺 `speaker_id` 直接失败
+- [x] 回归验证
+  - `PYTHONPATH=src python3 -m unittest tests.test_dub_pipeline_references tests.test_dub_long_video -v` 通过（23 tests）
+  - 新增用例：`test_main_omnivoice_multi_source_applies_speaker_aware_source_merge`
+
+### Review（2026-05-05 修正 source 链路未生效）
+- 结论：
+  - 之前你说“没重构”是对的：source 主链路没有用到这套逻辑；
+  - 现在已接入 source 主链路，合并后是新字幕行（行数会下降，时间戳按首尾重建）。
+- 风险边界：
+  - 只影响 `OmniVoice + multi + source`；
+  - `index-tts` 与其他分支不变。
+
+## 31. 2026-05-04 OmniVoice 多人模式 speaker-aware 字幕重构合并
+- [x] 仅在 `OmniVoice + multi + translated` 启用 speaker-aware 重构合并
+  - `tools/dub_long_video.py` 新增 `maybe_merge_translated_input_subtitles_speaker_aware(...)`
+  - 先按 `speaker_id + gap` 切 run，再在 run 内复用 `merge_short_source_subtitles(...)`
+  - 产出真实重构后的字幕行（减少行数、更新时间戳、保留 `speaker_id`）
+- [x] strict 合同
+  - OmniVoice 多人下任一行缺 `speaker_id` 直接报错
+  - 不拼回 `Speaker N:` 前缀，正文保持纯文本
+- [x] 作用范围保护
+  - 只改 `OmniVoice + multi` 分支
+  - `index-tts` / `single` / 其他链路不变
+- [x] 日志增强
+  - translated merge 日志新增 `speaker_run_count`
+- [x] 测试与回归
+  - 新增 4 条 speaker-aware 专项测试（不跨 speaker、同 speaker 合并并重构时间戳、缺 `speaker_id` 失败、文本无前缀）
+  - `PYTHONPATH=src python3 -m unittest tests.test_dub_long_video tests.test_dub_pipeline_references -v` 全部通过（22 tests）
+
+### Review（2026-05-04 OmniVoice speaker-aware merge）
+- 根因与修复：
+  - 旧逻辑只按时间窗并句，可能把不同 speaker 的短句拼入同一合成上下文；
+  - 新逻辑先按 speaker 重构 run，再在 run 内并句，避免跨 speaker 污染。
+- 结果：
+  - 多人 OmniVoice 的 segment 输入字幕会先真实重构（非仅组内组合）；
+  - `speaker_id` 元数据全程保留，用于后续严格 reference 映射。
+- 回归结论：
+  - `tests.test_dub_long_video` 与 `tests.test_dub_pipeline_references` 均通过；
+  - `index-tts` 相关测试未出现行为回退。
+
+## 30. 2026-05-04 修复 translating 阶段的 Translator 懒初始化
+- [x] 修复翻译调用点
+  - `tools/dub_pipeline.py` / `src/subtitle_maker/domains/dubbing/pipeline.py` 改为先 `_ensure_client()` 再发起 LLM 请求
+  - 避免 `translator.client` 为空时直接触发 `NoneType.chat`
+- [x] 回归测试
+  - 新增 `translate_batch_with_budget` 的懒初始化测试
+- [x] 验证
+  - `PYTHONPATH=src python3 -m py_compile tools/dub_pipeline.py src/subtitle_maker/domains/dubbing/pipeline.py tests/test_dubbing_runtime.py`
+  - `.venv/bin/python -m unittest tests.test_dubbing_runtime.DubbingPipelineTests.test_translate_batch_with_budget_lazy_initializes_translator_client -v`
+
+### Review（2026-05-04 修复 Translator 懒初始化）
+- 已完成：
+  - 所有直接访问 `translator.client.chat` 的翻译/重写点已改为先 `_ensure_client()`
+  - `Translator.client=None` 时也能正常进入翻译流程
+- 影响范围：
+  - 仅修复 LLM client 初始化方式
+  - 不改 `index-tts` / OmniVoice 参考音策略
+
+## 29. 2026-05-04 修复 start-from-project 的 speaker sidecar 早于多人校验
+- [x] 修复 long-video 入口
+  - `tools/dub_long_video.py` 新增 `--speaker-metadata-path`
+  - 在多人模式校验前先把 `speaker_id` sidecar 合回字幕
+  - 允许 `start-from-project` 只靠 sidecar 维持多 speaker 语义
+- [x] 回归测试
+  - 新增纯文本字幕 + sidecar 的多人模式测试
+- [x] 验证
+  - `PYTHONPATH=src python3 -m py_compile tools/dub_long_video.py tests/test_dub_long_video.py`
+  - `PYTHONPATH=src python3 -m unittest tests.test_dub_long_video.DubLongVideoTests.test_main_multi_mode_accepts_sidecar_speaker_metadata_without_text_prefixes -v`
+
+### Review（2026-05-04 修复 start-from-project speaker sidecar）
+- 已完成：
+  - `tools/dub_long_video.py`
+    - 接收 `--speaker-metadata-path`
+    - 在 `multi` 校验前先把 sidecar 合回输入字幕
+    - 多人模式不再只认正文里的 `Speaker 1:` 前缀
+  - `tests/test_dub_long_video.py`
+    - 新增纯文本字幕 + sidecar 的回归测试
+- 未影响：
+  - `index-tts` 的逐句参考音链路
+  - OmniVoice 手动参考音输入合同
+
+## 28. 2026-05-04 插入 3.Get Speaker Voice 功能
+- [x] 独立后端接口
+  - 新增 `/speaker-voice/start`
+  - 新增 `/speaker-voice/start-from-project`
+  - 新增 `/speaker-voice/status/{task_id}`
+  - 新增 `/speaker-voice/artifact/{task_id}/{artifact}`
+- [x] 前端导航与面板
+  - 左侧菜单插入 `3. Get Speaker Voice`
+  - `Auto Dubbing` 顺延为第 `4` 项
+  - 新增 `Current Project` + `Standalone Upload` 双模式面板
+- [x] `Ranges` 复用
+  - 抽出共享 `timeRanges.js`
+  - `Auto Dubbing` 改走共享 ranges 控制器
+  - `Get Speaker Voice` 复用同一套区间交互与校验
+- [x] 导出合同
+  - 每个 range 单独导出一个 wav
+  - 结果写入 `outputs/speaker_voice/web_<task_id>/...`
+  - 人声分离失败直接任务失败，不回退原混音
+- [ ] 验证
+  - `node --check src/subtitle_maker/static/app.js`
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js`
+  - `node --check src/subtitle_maker/static/js/speakerVoicePanel.js`
+  - `node --check src/subtitle_maker/static/js/timeRanges.js`
+  - `PYTHONPATH=src python3 -m py_compile src/subtitle_maker/speaker_voice_api.py src/subtitle_maker/app/main.py`
+  - `PYTHONPATH=src python3 -m unittest tests.test_speaker_voice_api -v`
+
+### Review（2026-05-04 Get Speaker Voice）
+- 已完成：
+  - 新增独立 `speaker_voice_api`，与 Auto Dubbing 任务流分离
+  - 新增 `Get Speaker Voice` 主菜单与面板
+  - 抽出共享 `timeRanges.js`，避免 ranges 逻辑在两个面板漂移
+  - 导出结果按每个 range 一段 wav 落到独立 `outputs/speaker_voice` 目录
+- 约束保持：
+  - 不依赖字幕
+  - 不进入翻译 / 配音 / speaker 识别逻辑
+  - `index-tts` / `omnivoice` 现有链路不应受影响
+
+## 27. 2026-05-04 修复 start_auto_dubbing 里的过期 voxcpm_api_url 传参崩溃
+- [x] 复核 `500` traceback 对应代码路径
+  - `src/subtitle_maker/dubbing_cli_api.py::_queue_auto_dubbing_task`
+  - `AutoDubbingCommandConfig.__init__()` 已不再接受 `voxcpm_api_url`
+- [x] 修复真实运行时调用链
+  - Auto Dubbing 启动命令不再给 `AutoDubbingCommandConfig` 传 `voxcpm_api_url`
+  - review/save-and-redub 路径不再给 `_switch_tts_runtime_on_demand` 和 `SegmentRedubCommandConfig` 传过期字段
+  - 保留 `DEFAULT_VOXCPM_API_URL` 常量仅作历史 task/manifest 兼容读取，避免旧恢复路径直接 `NameError`
+- [ ] 验证
+  - `PYTHONPATH=src python3 -m py_compile src/subtitle_maker/dubbing_cli_api.py`
+  - `./stop.sh && ./start.sh`
+
+### Review（2026-05-04 修复过期 voxcpm_api_url 崩溃）
+- 根因：
+  - `src/subtitle_maker/jobs/command_builder.py` 里的 `AutoDubbingCommandConfig` / `SegmentRedubCommandConfig` 已删掉 `voxcpm_api_url`
+  - 但 `src/subtitle_maker/dubbing_cli_api.py` 的启动与 redub 路径还在继续传这个字段，导致运行时 `TypeError`
+- 本次收口：
+  - 只清理会进入真实执行路径的过期传参
+  - 不大拆历史 manifest / task 字段，避免旧批次读取时再引入新回归
+
+## 26. 2026-05-04 OmniVoice 按字幕自动判单/多人，并强制手动参考音
+- [x] 前端交互收口
+  - `tts_backend=omnivoice` 时，不再依赖用户手动切 `single/multi`
+  - 根据当前字幕是否存在多个 `speaker_id` / `Speaker N:` 自动判定模式
+  - 单人显示单参考音上传区；多人列出每个 speaker 的参考音上传控件
+  - 删除 OmniVoice 文案中的“默认自动截取”描述，明确为“必须手动上传”
+- [x] 后端合同收口
+  - `tts_backend=omnivoice` 时，根据解析出的 `detected_speaker_ids` 自动推断 `dubbing_mode`
+  - 单人必须有 `single_ref_audio`
+  - 多人必须每个 speaker 都有手动上传参考音
+  - 不再允许 OmniVoice 走自动截取参考音兜底
+- [x] 保持 `index-tts` 不受影响
+  - `index-tts` 仍保留原来的手动 `single/multi` 选择
+  - `index-tts` 仍保留自动截取参考音逻辑
+- [x] 验证
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js`
+  - `PYTHONPATH=src python3 -m py_compile src/subtitle_maker/dubbing_cli_api.py`
+
+### Review（2026-05-04 OmniVoice 自动判单/多人 + 强制手动参考音）
+- 已完成：
+  - `src/subtitle_maker/static/js/dubbingPanel.js`
+    - `omnivoice` 选中时，根据字幕里的 `speaker_id` / `Speaker N:` 自动把模式切成 `single` 或 `multi`
+    - 多人时会自动渲染每个 speaker 的参考音上传控件
+    - `omnivoice` 文案已删除“自动截取参考音”描述，统一改为“必须手动上传”
+  - `src/subtitle_maker/templates/index.html`
+    - 单人 / 多人 OmniVoice 参考音标题与提示已改成强制手动上传语义
+  - `src/subtitle_maker/dubbing_cli_api.py`
+    - `tts_backend=omnivoice` 时，后端按 `detected_speaker_ids` 自动推断 `dubbing_mode`
+    - 检测到多 speaker 时，不再允许落回单人参考音逻辑
+- 未影响：
+  - `index-tts` 的手动 `single/multi` 选择仍保留
+  - `index-tts` 的自动截取参考音逻辑未动
+- 已验证：
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js`
+  - `PYTHONPATH=src python3 -m py_compile src/subtitle_maker/dubbing_cli_api.py`
+
+## 25. 2026-05-04 删除 voxcpm-omnivoice 链路
+- [x] 收口产品入口
+  - 左侧 TTS 下拉删除 `VoxCPM + OmniVoice`
+  - Auto Dubbing 前端不再出现 `voxcpm-omnivoice` 分支文案与提交流程
+- [x] 收口后端主合同
+  - `tts_backend` 白名单移除 `voxcpm-omnivoice`
+  - API normalize / runtime lazy-start / command builder 不再处理 `voxcpm_api_url`
+  - `pipeline.py` 不再保留 `voxcpm-omnivoice` 合成分支
+- [x] 保留历史兼容最小化
+  - manifest/schema/readwrite 中旧 `voxcpm_api_url` 字段先不强拆，避免历史任务读取崩溃
+  - 但新任务不再生成、不再使用这条链路
+- [x] 验证
+  - `node --check src/subtitle_maker/static/app.js`
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js`
+  - `PYTHONPATH=src python3 -m py_compile src/subtitle_maker/dubbing_cli_api.py src/subtitle_maker/domains/dubbing/pipeline.py src/subtitle_maker/jobs/command_builder.py`
+
+### Review（2026-05-04 删除 voxcpm-omnivoice 链路）
+- 已完成：
+  - `src/subtitle_maker/templates/index.html`
+    - 左侧 TTS 下拉已删除 `VoxCPM + OmniVoice`
+  - `src/subtitle_maker/static/app.js`
+    - 全局 TTS 归一化只保留 `index-tts` / `omnivoice`
+  - `src/subtitle_maker/static/js/dubbingPanel.js`
+    - 删除 `voxcpm-omnivoice` UI 分支、提示文案、禁用逻辑和提交流程特判
+  - `src/subtitle_maker/dubbing_cli_api.py`
+    - `tts_backend` 白名单移除 `voxcpm-omnivoice`
+    - 移除 VoxCPM 自动探活 / 自启动 / 停止逻辑
+    - `start` / `start-from-project` 不再按 `voxcpm-omnivoice` 特判上传参考音
+  - `src/subtitle_maker/domains/dubbing/pipeline.py`
+    - 删除 `synthesize_text_once()` 中 `voxcpm-omnivoice` 分支
+    - 运行时不再构造 anchor-only 特判
+  - `src/subtitle_maker/jobs/command_builder.py`
+    - 不再构造 `--voxcpm-api-url`
+    - 不再识别 `voxcpm-omnivoice` 特判
+  - `start.sh` / `stop.sh`
+    - 日志与停服脚本不再提及/管理 VoxCPM
+- 保留但未强拆：
+  - manifest/schema/models/recovery/readwrite 中旧 `voxcpm_api_url` 字段仍保留，只为避免历史任务读取崩溃
+  - 测试文件和 `tasks/todo.md` 的历史记录里仍有旧 `voxcpm-omnivoice` 文本
+- 已验证：
+  - `node --check src/subtitle_maker/static/app.js`
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js`
+  - `PYTHONPATH=src python3 -m py_compile src/subtitle_maker/dubbing_cli_api.py src/subtitle_maker/domains/dubbing/pipeline.py src/subtitle_maker/jobs/command_builder.py`
+
+## 24. 2026-05-04 VoxCPM+OmniVoice 直出 anchor，停掉劣化的二段 OmniVoice 重配
+- [x] 复核最新 `web_20260504_040928/longdub_20260504_120934` 产物与代码链路
+  - 确认 `group_*_anchor.wav` 是 VoxCPM 正常产物
+  - 确认 `group_*_raw.wav` / `group_*_trim.wav` 的劣化发生在第二段 OmniVoice 重配
+- [x] 修改 `src/subtitle_maker/domains/dubbing/pipeline.py`
+  - `voxcpm-omnivoice` 改为直接使用 VoxCPM 产出的 `anchor` 作为正式输出
+  - 停止把 `anchor` 再送入 OmniVoice 做二次重配
+  - 保留既有 `anchor_ref_path` / `anchor_text` manifest 语义，方便追溯
+- [x] 更新 `tests/test_dubbing_runtime.py`
+  - `synthesize_text_once()` 对 `voxcpm-omnivoice` 只调用 VoxCPM，不再调用 OmniVoice
+  - grouped/runtime 测试按新直出语义校正
+- [x] 验证
+  - `PYTHONPATH=src python3 -m py_compile src/subtitle_maker/domains/dubbing/pipeline.py tests/test_dubbing_runtime.py`
+  - `PYTHONPATH=src python3 -m unittest tests.test_dubbing_runtime -v`
+
+### Review（2026-05-04 VoxCPM+OmniVoice 直出 anchor）
+- 结论：
+  - 最新批次 `web_20260504_040928/longdub_20260504_120934` 里，`group_*_anchor.wav` 是 VoxCPM 产出的正常语音；
+  - `group_*_raw.wav` / `group_*_trim.wav` 的“垃圾感”来自第二段 OmniVoice 把已正确的 anchor 再重配一次，不是 trim 本身导致。
+- 已完成：
+  - `src/subtitle_maker/domains/dubbing/pipeline.py`
+    - `voxcpm-omnivoice` 现在只跑 VoxCPM anchor 生成
+    - 生成完成后直接把 `anchor` 复制为正式 `output_path`
+    - `final_backend` 改为 `voxcpm`
+  - `tests/test_dubbing_runtime.py`
+    - 原“VoxCPM 后继续调用 OmniVoice”的断言已改为“不再调用 OmniVoice”
+    - 保留 `anchor_ref_path` / `anchor_text` 合同校验
+- 已验证：
+  - `PYTHONPATH=src python3 -m py_compile src/subtitle_maker/domains/dubbing/pipeline.py tests/test_dubbing_runtime.py`
+  - `PYTHONPATH=src python3 -m unittest tests.test_dubbing_runtime.DubbingPipelineTests.test_synthesize_text_once_voxcpm_omnivoice_uses_anchor_as_final_output tests.test_dubbing_runtime.DubbingPipelineTests.test_synthesize_text_once_voxcpm_omnivoice_uses_reference_prompt_only_for_voxcpm tests.test_dubbing_runtime.DubbingPipelineTests.test_synthesize_segments_grouped_voxcpm_omnivoice_passes_anchor_output_path -v`
+    - 本机因缺 `soundfile`，3 条显式 `skipped`
+
+## 22. 2026-05-04 共享 OmniVoice API 同时兼容 omnivoice 与 voxcpm-omnivoice
+- [x] 核对共享 OmniVoice API 的当前实现与两条调用链：
+  - `tools/omnivoice_fastapi_server.py::ServerState.synthesize`
+  - `src/subtitle_maker/backends/omni_voice.py::OmniVoiceBackend._synthesize_via_api`
+  - `src/subtitle_maker/domains/dubbing/pipeline.py::synthesize_text_once`
+- [x] 修正共享 API 逻辑：
+  - `omnivoice` 直连时不再把 `ref_text` 混入正式 `text`
+  - `voxcpm-omnivoice` 走同一 API 时保持 anchor 语义正确
+- [x] 补服务端定向测试：
+  - 有 `ref_audio/ref_text` 时通过 `create_voice_clone_prompt()` 构造克隆提示
+  - `generate()` 只吃正式 `text` + `voice_clone_prompt`
+  - 不再把 `ref_audio/ref_text` 直接透传给 `generate()`
+- [x] 跑定向编译与单测：
+  - `py_compile`
+  - `tests.test_omnivoice_fastapi_server`
+  - 必要时补跑 `tests.test_dubbing_runtime`
+
+### Review（2026-05-04 共享 OmniVoice API 双兼容）
+- 结论：
+  - 共享 `tools/omnivoice_fastapi_server.py` 现在按“先 `create_voice_clone_prompt()`，清空 `voice_clone_prompt.ref_text`，再 `generate(text=正式正文, voice_clone_prompt=...)`”工作。
+  - 关键根因：OmniVoice 本体会把 `voice_clone_prompt.ref_text + text` 放进文本条件；只是不直接传 `ref_text` 参数还不够，必须清掉 prompt 内部的 `ref_text`。
+  - 这能同时支持两种上游：
+    - `omnivoice`：`ref_audio=手动参考音`，`ref_text=参考音真实文本`
+    - `voxcpm-omnivoice`：`ref_audio=VoxCPM 产出的 anchor`，`ref_text=anchor 实际文本`
+- 已补测试：
+  - `tests/test_omnivoice_fastapi_server.py`
+    - 覆盖“有参考音时只把 `ref_text` 用于构造 clone prompt，不进入正式 `text`”
+    - 覆盖“传给 `generate()` 的 `voice_clone_prompt.ref_text` 已清空”
+    - 覆盖“无参考音时不构造 clone prompt”
+    - 同时把测试改成缺 `numpy/soundfile/torch` 时类级别 skip，避免导入期假失败
+- 已验证：
+  - `PYTHONPATH=src python3 -m py_compile tools/omnivoice_fastapi_server.py tests/test_omnivoice_fastapi_server.py`
+  - `PYTHONPATH=src python3 -m unittest tests.test_omnivoice_fastapi_server -v`
+    - 本机因缺 `numpy/soundfile/torch`，`4` 条显式 `skipped`
+  - `PYTHONPATH=src python3 -m unittest tests.test_dubbing_runtime -v`
+    - 本机因缺 `soundfile`，`47` 条显式 `skipped`
+
+## 23. 2026-05-04 OmniVoice 短字幕与时长偏差不再丢内容
+- [x] 复核最新失败批次：
+  - `web_20260504_034718/longdub_20260504_114723`
+  - 16 条字幕被合成成 7 个 TTS group
+  - `seg_0016` 因 1.12s 低于 1.2s 安全线被写成 missing
+- [x] 修改 plain `omnivoice` 策略：
+  - 有可发音文本时不再因目标时长低于 1.2s 直接写 `_missing.wav`
+  - `synthesize_text_once()` 对 plain `omnivoice` 打开 relaxed validation，避免后端二次拦截短句
+  - plain `omnivoice` 也复用 OmniVoice family 宽松时长接受策略
+- [x] 更新测试语义：
+  - 短句应尝试 TTS
+  - grouped 短句应尝试 TTS
+  - 有音频时不写 missing
+- [x] 验证：
+  - `PYTHONPATH=src python3 -m py_compile src/subtitle_maker/domains/dubbing/pipeline.py tests/test_dubbing_runtime.py`
+  - `PYTHONPATH=src python3 -m unittest tests.test_dubbing_runtime.DubbingPipelineTests.test_synthesize_segments_omnivoice_short_text_still_attempts_tts tests.test_dubbing_runtime.DubbingPipelineTests.test_synthesize_segments_grouped_omnivoice_short_group_still_attempts_tts -v`
+    - 本机因缺 `soundfile`，2 条显式 `skipped`
+
+## 21. 2026-05-04 OmniVoice / VoxCPM+OmniVoice 语义收口与首句预热
+- [x] 收口 API 上传入口：
+  - `voxcpm-omnivoice` 不再接收/落盘手动 `single_ref_audio_file`
+  - `voxcpm-omnivoice` 不再接收/落盘手动 `speaker_ref_files`
+- [x] 收口命令与恢复合同：
+  - `voxcpm-omnivoice` 不再透传 `single_ref_audio/single_ref_text/speaker_ref_map`
+  - manifest / recovery / replay 保持同一语义
+- [x] 收口 CLI 运行时语义：
+  - `omnivoice` 的 `ref_text` 仅表示手动参考音频真实文本
+  - `voxcpm-omnivoice` 只走自动截取参考音
+- [x] 在 runtime TTS 调用层补 `omnivoice` 首句预热双跑：
+  - 首条真实语音句先预热一次
+  - 正式只保留第二次结果
+- [x] 补定向测试并验证：
+  - API
+  - command builder
+  - runtime
+
+### Review（2026-05-04 OmniVoice / VoxCPM+OmniVoice 语义收口）
+- 已完成：
+  - `src/subtitle_maker/dubbing_cli_api.py`
+    - `start/start-from-project` 在 `tts_backend=voxcpm-omnivoice` 时，不再落盘手动 single / multi 参考音上传
+    - `normalize` 仍保持最终兜底：组合链路统一清空 `single_ref_audio/single_ref_text/speaker_ref_map`
+  - `src/subtitle_maker/jobs/command_builder.py`
+    - `voxcpm-omnivoice` 不再构造 `--single-speaker-ref` / `--single-ref-text` / `--speaker-ref-map-json`
+    - 仅保留 `--voxcpm-api-url` 与 OmniVoice runtime 参数
+  - `tools/dub_pipeline.py`
+    - manifest replay 对 `voxcpm-omnivoice` 不再写回手动参考音字段
+    - 真实运行时 `multi` 分支对 `voxcpm-omnivoice` 显式忽略手动 speaker refs
+  - `src/subtitle_maker/domains/dubbing/pipeline.py`
+    - 独立 `omnivoice` 新增首条真实语音句预热双跑
+    - 预热只发生一次，且只记录 `omnivoice_warmup` attempt，正式输出只取第二次
+- 已验证：
+  - `PYTHONPATH=src python3 -m py_compile src/subtitle_maker/dubbing_cli_api.py src/subtitle_maker/jobs/command_builder.py src/subtitle_maker/domains/dubbing/pipeline.py tools/dub_pipeline.py tests/test_dubbing_cli_api.py tests/test_command_builder.py tests/test_dubbing_runtime.py`
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js`
+  - `PYTHONPATH=src python3 -m unittest tests.test_command_builder tests.test_dubbing_cli_api tests.test_dubbing_runtime -v`
+    - `Ran 75 tests ... OK`
+    - 其中 `66` 条因本机缺 `ffmpeg/soundfile` 被显式 `skipped`
+
+## 20. 2026-05-04 新增独立 OmniVoice 模式（强制手动参考音 + 文字 prompt）
+- [x] 现状分析：梳理前端 TTS 选项、后端白名单、CLI 参数与 OmniVoice 现有 reference_text 语义
+- [x] Spec 2/3：定义新模式的前端输入契约与后端字段契约
+- [x] Spec 3/3：风险、关键决策、推荐实现路径
+- [x] HARD-GATE 后再编码
+- [x] 前端新增第三个 `omnivoice` 选项，并补单人 / 多人 prompt 输入控件
+- [x] API / CLI / command builder 放开 `omnivoice` 白名单并新增 `single_ref_text` / `speaker_ref_texts_json`
+- [x] manifest / recovery / review-redub 持久化 `ref_text`，保证 restore / resume / 重跑不丢 prompt
+- [x] 底层运行时收紧 `omnivoice` 语义：必须显式 ref_text，不再偷偷回退 source_text
+- [x] 补充并跑通定向测试：前端参数归一化、命令构造、CLI 校验、manifest/recovery
+
+### Review（2026-05-04 独立 OmniVoice 模式）
+- 目标方向：
+  - 在 `index-tts` 和 `VoxCPM + OmniVoice` 之间新增单独 `OmniVoice` 选项
+  - 该模式不走自动截取参考音
+  - 必须手动上传参考音频
+  - 必须提供与参考音频一一对应的文字 prompt
+- 已完成：
+  - 左侧全局 TTS 下拉新增 `omnivoice`
+  - `Auto Dubbing` 单人模式新增 `single_ref_text`
+  - 多人模式每个 speaker 新增 `ref_text` 输入，并通过 `speaker_ref_texts_json` 透传
+  - 后端/API/CLI/manifest/recovery 已支持 `single_ref_text` 与 `speaker_ref_map[].ref_text`
+  - 独立 `omnivoice` 已收紧成“必须手动 ref 音频 + prompt”，不再回退字幕正文
+  - `voxcpm-omnivoice` 与 `index-tts` 保持默认自动截取参考音的原语义
+- 验证：
+  - `PYTHONPATH=src python3 -m py_compile src/subtitle_maker/dubbing_cli_api.py src/subtitle_maker/domains/dubbing/pipeline.py src/subtitle_maker/jobs/command_builder.py src/subtitle_maker/manifests/readwrite.py src/subtitle_maker/manifests/schema.py src/subtitle_maker/jobs/recovery.py src/subtitle_maker/domains/subtitles/__init__.py src/subtitle_maker/domains/subtitles/speakers.py tools/dub_pipeline.py`
+  - `node --check src/subtitle_maker/static/app.js`
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js`
+  - `PYTHONPATH=src python3 -m unittest tests.test_command_builder tests.test_dubbing_cli_api tests.test_manifest_contracts -v`
+    - 通过
+    - 其中 `19` 条因本机缺 `ffmpeg` / `soundfile` 被显式 `skipped`
+
+## 19. 2026-05-04 启停脚本收敛到懒汉式 TTS 运行时
+- [x] 复核 `start.sh/stop.sh` 与 `dubbing_cli_api.py` 的自动拉起/释放语义是否一致
+- [x] 修改 `start.sh`：默认不预热 `voxcpm` / `omnivoice`，只保留 Web 服务启动
+- [x] 修改 `stop.sh`：补齐 `voxcpm` 停止脚本、pid、端口和进程模式清理
+- [x] 跑脚本语法检查与关键 Python 测试，确认没有把现有懒汉式运行时打坏
+
+### Review（2026-05-04 启停脚本收敛）
+- 目标改动：
+  - 脚本层与后端运行时层统一成同一套懒汉式心智
+  - `index-tts`、`voxcpm`、`omnivoice` 都只在实际使用时自动拉起
+  - `stop.sh` 一次性释放相关本地服务
+- 已完成：
+  - `start.sh`
+    - 删除旧的 `TTS_BACKEND=index-tts/omnivoice/qwen` 预热分支
+    - 明确改成“只启动 Web，TTS 由后端按需拉起”
+  - `stop.sh`
+    - 新增 `VOXCPM_ROOT` / `VOXCPM_STOP_SCRIPT`
+    - 新增 `voxcpm_api.pid` 清理
+    - 新增 `tools/voxcpm_api_server.py` 进程特征清理
+    - 新增 `8030` 端口兜底清理
+- 说明：
+  - `src/subtitle_maker/dubbing_cli_api.py` 里原本就有懒汉式 `_switch_tts_runtime_on_demand()`：
+    - `index-tts`：先停 `omnivoice`
+    - `voxcpm-omnivoice`：先停 `index-tts`，再按需拉起 `voxcpm` 和 `omnivoice`
+  - 这次主要是把脚本层收口到和后端一致，不再出现“脚本预热一套、后端懒启动另一套”的双重语义
+- 验证：
+  - `bash -n start.sh stop.sh`
+  - `PYTHONPATH=src python3 -m py_compile src/subtitle_maker/dubbing_cli_api.py`
+  - `PYTHONPATH=src python3 -m unittest tests.test_dubbing_cli_api -v`
+    - `12` 条因本机缺 `ffmpeg` 被显式 `skipped`
+
+## 18. 2026-05-04 参考音默认自动截取，手动上传保留为覆盖选项
+- [x] 复核当前 single / multi 参考音生成链路的默认值和校验点
+- [x] 改后端默认策略为自动截取参考音：
+  - single 模式默认从首条字幕开始后截 10 秒
+  - multi 模式默认按每条字幕自动截对应原音频
+- [x] 保留手动上传入口，但语义改成“覆盖默认自动参考音”
+- [x] 更新前端文案与交互提示，避免用户误以为手动上传是必填
+- [x] 补充单人 / 多人参考音默认策略的定向测试
+- [x] 跑编译与定向单测验证默认自动截取行为
+
+### Review（2026-05-04 参考音默认自动截取）
+- 目标改动：
+  - 默认不再要求用户先上传参考音
+  - 手动上传只作为覆盖默认截取结果的可选项
+  - 单人和多人分别采用不同的自动截取策略
+- 已完成：
+  - `src/subtitle_maker/dubbing_cli_api.py`
+    - multi 模式不再要求 `speaker_ref_map` 全量必填
+    - 仍保留已上传 speaker ref 的存在性和 speaker_id 合法性校验
+  - `src/subtitle_maker/domains/dubbing/references.py`
+    - 新增 `extract_reference_audio_from_first_subtitle()`
+  - `tools/dub_pipeline.py`
+    - single 模式默认从首条字幕起点自动截取共享参考音
+    - multi 模式默认按每条字幕自动截参考音，手动 `speaker_ref_map` 只覆盖对应 speaker
+  - `src/subtitle_maker/static/js/dubbingPanel.js`
+    - 去掉多人模式“必须逐个上传参考音”的前端阻断
+    - 表单仅在用户真的上传覆盖参考音时才提交 speaker ref 字段
+  - `src/subtitle_maker/templates/index.html`
+    - 单人 / 多人参考音文案已改成“默认自动截取，可手动覆盖”
+- 验证：
+  - `PYTHONPATH=src python3 -m py_compile src/subtitle_maker/dubbing_cli_api.py src/subtitle_maker/domains/dubbing/__init__.py src/subtitle_maker/domains/dubbing/references.py tools/dub_pipeline.py tests/test_dubbing_cli_api.py tests/test_dub_pipeline_references.py`
+  - `PYTHONPATH=src python3 -m unittest tests.test_dub_pipeline_references -v`
+    - `Ran 5 tests ... OK`
+  - `PYTHONPATH=src python3 -m unittest tests.test_dubbing_cli_api -v`
+    - `12` 条因本机缺 `torch` 被显式 `skipped`
+
+## 17. 2026-05-04 第三轮收口：彻底移除 long-video 历史版本残留
+- [x] 删除 `src/subtitle_maker/dubbing_cli_api.py` 中无主链路引用的 ASD 自启动/停止残留：
+  - `ASD_PIPELINE_ROOT`
+  - `ASD_PIPELINE_START_SCRIPT`
+  - `ASD_PIPELINE_STOP_SCRIPT`
+  - `_check_asd_pipeline_service()`
+  - `_auto_start_local_asd_pipeline()`
+  - `_ensure_asd_pipeline_service()`
+  - `_stop_asd_pipeline_service_if_local()`
+- [x] 删除 `tools/dub_long_video.py` 中历史 V3/V4 编排 helper：
+  - `transcribe_source_subtitles_for_v3()`
+  - `resolve_v3_input_subtitles()`
+  - `prepare_v3_speaker_segment_subtitles()`
+  - `prepare_v4_speaker_diarization_subtitles()`
+  - 移除独立 `omnivoice` 的 translated merge 特判
+- [x] 重写 `tests/test_dub_long_video.py` 为当前主合同测试：
+  - `filter_segment_extra_args()` 仅过滤 long-video 专属字段
+  - `clip_subtitles_for_segment()` 保留 `speaker_id`
+  - 多人模式缺失 `speaker_ref_map` 时拒绝启动
+  - 多人模式正确透传 `speaker_ref_map_json` 与 `speaker metadata`
+  - batch manifest 写出 `pipeline_version=auto-dubbing`
+- [ ] 跑编译与定向单测验证本轮收口
+
+### Review（2026-05-04 第三轮收口）
+- 已完成：
+  - `src/subtitle_maker/dubbing_cli_api.py`
+    - 删除已经失效的 `asd-pipeline` 自动启停壳，避免 API 层继续保留错误心智
+  - `tools/dub_long_video.py`
+    - 物理移除 `V3/V4` helper 与 `omnivoice_policy`
+    - `clip_subtitles_for_segment()` 注释改成当前 `speaker_id` 语义
+  - `tests/test_dub_long_video.py`
+    - 从历史 `v3/v4/asd/fluidaudio` 大杂烩，重写成当前 `single/multi + index-tts/voxcpm-omnivoice` 主合同
+- 待验证：
+  - `py_compile`
+  - `tests.test_dub_long_video`
+  - 与上一轮已通过的新合同测试集合联跑
+
+## 16. 2026-05-04 第二轮收口：旧后端壳与历史测试清理
+- [x] 清理 review/redub 的旧版本语义：
+  - `src/subtitle_maker/domains/dubbing/review.py` 删除 `pipeline_version` 运行时依赖
+  - `src/subtitle_maker/dubbing_cli_api.py` 的 `_execute_review_redub/_rerun_segment_with_translated_srt` 不再透传 `pipeline_version`
+- [x] 清理 manifest replay 构造残留：
+  - `tools/dub_pipeline.py` 的 `_build_manifest_replay_options()` 改为写入 `dubbing_mode/single_ref_audio/speaker_ref_map/tts_model_path`
+  - 删除其中 `diarization_backend/fluidaudio_*` 空壳字段
+  - `tools/dub_long_video.py` 的 batch manifest 构造改为写入 `dubbing_mode/single_ref_audio/speaker_ref_map/tts_model_path`
+  - 删除其中 `v3_asd_api_url/v3_speaker_segment_mode/diarization_backend/fluidaudio_*` 空壳字段
+- [x] 重写关键测试到新主合同：
+  - `tests/test_job_recovery.py`
+  - `tests/test_manifest_contracts.py`
+  - `tests/test_dubbing_cli_api.py`
+  - `tests/test_dubbing_runtime.py` 中 review redub runtime 断言同步更新
+- [x] 为缺少本机重依赖的测试补显式 skip：
+  - `soundfile` 缺失时跳过 `tests/test_manifest_contracts.py` / `tests/test_dubbing_runtime.py`
+  - `torch` 缺失时跳过 `tests/test_dubbing_cli_api.py`
+- [x] 继续物理删除旧功能文件与调用链：
+  - `src/subtitle_maker/domains/dubbing/diarization.py`
+  - `src/subtitle_maker/domains/dubbing/speaker_segments.py`
+  - `tools/pyannote_diarize_worker.py`
+  - `tools/dub_long_video.py` 中未引用但仍在文件内的 `resolve_v3_input_subtitles/prepare_v3_speaker_segment_subtitles/prepare_v4_speaker_diarization_subtitles`
+
+### Review（2026-05-04 第二轮收口）
+- 已完成：
+  - `src/subtitle_maker/domains/dubbing/review.py`
+    - `SegmentRedubRuntimeOptions` 不再保存 `pipeline_version`
+    - `resolve_segment_redub_runtime_options()` 不再接受 `fallback_pipeline_version`
+  - `src/subtitle_maker/dubbing_cli_api.py`
+    - review/redub 主路径彻底改成只依赖当前 auto dubbing 合同
+    - `SegmentRedubCommandConfig` 不再注入旧版本字段
+  - `tools/dub_pipeline.py` / `tools/dub_long_video.py`
+    - 新写入 manifest 已统一成 `auto-dubbing + single/multi + speaker refs`
+    - 停止把 `diarization/fluidaudio/v3/v4` 空壳字段写入 manifest
+  - `tests/test_job_recovery.py`
+    - 改为断言 `dubbing_mode/speaker_ref_map/voxcpm-omnivoice`
+  - `tests/test_manifest_contracts.py`
+    - 改为断言 `pipeline_version=auto-dubbing` 与新 replay 字段
+  - `tests/test_dubbing_cli_api.py`
+    - 改为覆盖当前主能力：single/multi、speaker ref、load/resume、review/redub
+- 已验证：
+  - `PYTHONPATH=src python3 -m py_compile src/subtitle_maker/dubbing_cli_api.py src/subtitle_maker/domains/dubbing/review.py src/subtitle_maker/jobs/recovery.py src/subtitle_maker/manifests/readwrite.py src/subtitle_maker/manifests/schema.py tools/dub_pipeline.py tools/dub_long_video.py`
+  - `PYTHONPATH=src python3 -m unittest tests.test_command_builder tests.test_subtitle_speakers tests.test_job_recovery tests.test_manifest_contracts tests.test_dubbing_runtime tests.test_dubbing_cli_api -v`
+    - `Ran 72 tests ... OK`
+    - `59` 条因本机缺 `soundfile/torch` 被显式 `skipped`
+- 当前仍未收口：
+  - `tools/dub_long_video.py` 文件内仍保留旧 V3/V4 helper 实现，虽然已不再写入新 manifest，但还没物理删除
+  - `src/subtitle_maker/domains/dubbing/__init__.py` 仍导出 `diarization/speaker_segments` 相关符号
+  - 旧 `tests/test_dub_long_video.py` 仍保留大量 V3/V4 历史断言，尚未重写
+
+## 15. 2026-05-04 Subtitle-Maker 收敛重构：翻译 + 配音（单人 / 多人）
+- [x] 收缩前端主菜单与 Auto Dubbing 面板：
+  - 左侧顶部只保留 `Upload Videos & SRT` / `Subtitles & Translation` / `Auto Dubbing`
+  - 删除 `Auto Dubbing V2/V3` 导航与面板心智
+  - `TTS` 下拉只保留 `index-tts` 与 `VoxCPM + OmniVoice`
+- [x] 收缩 Auto Dubbing 请求契约：
+  - 统一为 `mode=single|multi`
+  - 统一为 `tts_backend=index-tts|voxcpm-omnivoice`
+  - 增加 `single_ref_audio` / `speaker_ref_map`
+  - 删除 `pipeline_version`、`v3/v4`、`asd/diarization/qwen3` 相关字段
+- [x] 重构字幕 speaker 解析与配音主链路：
+  - 解析 `Speaker N:` 前缀并保留 `speaker_id`
+  - 单人模式统一使用单参考音
+  - 多人模式严格按 `speaker_id -> ref_audio` 路由
+  - 多人模式缺映射时直接拒绝启动
+- [ ] 删除废弃链路与项目内引用：
+  - 移除 ASD tracked / FluidAudio / pyannote / Qwen3 ASR / ForcedAligner / 独立 OmniVoice 主底座
+  - 删除相关代码、测试、manifest 字段与默认模型路径
+  - 删除项目内 `models/Qwen3-ASR-0.6B` 与 `models/Qwen3-ForcedAligner-0.6B`
+- [ ] 补回归测试并验证：
+  - `Speaker N:` 解析
+  - single/multi 模式校验
+  - 两条 TTS 在 single/multi 下的路由
+  - API / command / manifest 不再出现旧 `v3/v4/diarization/qwen3` 参数
+- [x] 更新 `tasks/lessons.md`，沉淀这次收敛重构的教训
+
+### Review（2026-05-04 Subtitle-Maker 收敛重构：第一轮收口）
+- 已完成：
+  - `src/subtitle_maker/dubbing_cli_api.py`
+    - `start/start-from-project` 改为新主契约：`dubbing_mode`、`single_ref_audio_file`、`speaker_ref_files + speaker_ref_speaker_ids_json`
+    - 后端会落盘单人/多人参考音文件，并在多人模式下做 `speaker_id -> ref_audio_path` 显式映射校验
+    - `_queue_auto_dubbing_task()` 不再构建旧 `pipeline_version/v3/v4/diarization/fluidaudio` 主链路参数
+    - `resume/load-batch` 已切到 `dubbing_mode/single_ref_audio/speaker_ref_map` 主字段
+  - `src/subtitle_maker/manifests/schema.py` / `src/subtitle_maker/manifests/readwrite.py`
+    - manifest 主读取/写入保留 `pipeline_version=auto-dubbing` 兼容壳
+    - 新主字段为 `dubbing_mode/single_ref_audio/speaker_ref_map`
+    - 不再把 `v3_asd/diarization/fluidaudio` 写入新 manifest
+  - `src/subtitle_maker/static/app.js`
+    - 全局 TTS 只保留 `index-tts` / `voxcpm-omnivoice`
+    - Auto Dubbing 面板集合收缩为单面板
+    - `switchTab()` 改为支持按 panelId 切换，避免菜单数量变更后错位
+  - `src/subtitle_maker/static/js/dubbingPanel.js`
+    - 停止初始化历史 V2/V3 面板
+    - 新增 `single/multi` 模式切换
+    - 单人模式支持上传一个参考音
+    - 多人模式从字幕中提取 `Speaker N:` 列表，为每个 speaker 渲染参考音上传槽
+    - 表单提交改为新字段，不再提交 `pipeline_version`
+  - `src/subtitle_maker/templates/index.html`
+    - 左侧顶部主菜单已固定为 3 个
+    - 全局 TTS 下拉已收缩
+    - 历史 `panel-auto-dub-v2/panel-auto-dub-v3` 整块 DOM 已删除
+    - `panel-auto-dub` 已加入 single/multi 参考音配置区
+  - 新增：
+    - `tests/test_subtitle_speakers.py`
+- 已验证：
+  - `PYTHONPATH=src python3 -m py_compile src/subtitle_maker/dubbing_cli_api.py src/subtitle_maker/jobs/command_builder.py src/subtitle_maker/jobs/recovery.py src/subtitle_maker/manifests/schema.py src/subtitle_maker/manifests/readwrite.py tools/dub_pipeline.py tools/dub_long_video.py`
+  - `node --check src/subtitle_maker/static/app.js`
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js`
+  - `PYTHONPATH=src python3 -m unittest tests.test_command_builder tests.test_subtitle_speakers -v`
+    - `Ran 11 tests ... OK`
+- 当前未收口：
+  - 旧 `test_dubbing_cli_api.py` / `test_manifest_contracts.py` / `test_dub_long_video.py` 中仍有大量 V2/V3/V4 历史断言，尚未整体迁移到新产品合同
+  - `review/redub` 内部恢复逻辑仍保留 `pipeline_version` 兼容壳，但不再影响新主启动流程
+  - 项目内历史 diarization / qwen3 / fluidaudio 残留文件和测试还未做第二轮物理清理
+
+## 14. 2026-05-03 V4 Speaker Diarization 实施收尾
+- [x] 新增 `src/subtitle_maker/domains/dubbing/diarization.py`，落地 V4 diarization domain：
+  - `run_diarization_cli`
+  - `load_diarization_turns`
+  - `align_subtitles_to_speakers`
+  - `merge_adjacent_subtitles_by_speaker`
+  - `extract_speaker_reference_audio`
+  - `prepare_v4_diarization_artifacts`
+- [x] 打通 V4 参数链路：
+  - `src/subtitle_maker/dubbing_cli_api.py`
+  - `src/subtitle_maker/jobs/command_builder.py`
+  - `src/subtitle_maker/jobs/models.py`
+  - `src/subtitle_maker/jobs/recovery.py`
+  - `src/subtitle_maker/manifests/schema.py`
+  - `src/subtitle_maker/manifests/readwrite.py`
+- [x] 打通 long-video V4 编排：
+  - `tools/dub_long_video.py` 新增 `v4_mode`
+  - 批次级写出 `speaker_turns.json`
+  - 批次级写出 `subtitle_segments_by_speaker.json`
+  - 批次级写出 `speaker_inventory.json`
+  - segment 级写出 `subtitles/_input_segment.speakers.json`
+- [x] 打通 segment 级 speaker metadata 回灌：
+  - `tools/dub_pipeline.py` 支持 `--speaker-metadata-path`
+  - 字幕 sidecar 合并回 subtitle items
+  - 参考音复用主键升级为优先 `speaker_id`，兼容回退 `speaker_track_id/track_id`
+- [x] 补齐 V4 最小测试覆盖：
+  - `tests/test_command_builder.py`
+  - `tests/test_dub_pipeline_references.py`
+  - `tests/test_dubbing_cli_api.py`
+  - `tests/test_dub_long_video.py`
+- [x] 收尾 `tests.test_dub_long_video` 最后一个失败用例：
+  - `test_main_v3_with_time_ranges_only_runs_windowed_asr_and_asd`
+  - 补齐 `build_full_timeline_bgm/build_full_timeline_mix` 测试桩，避免误落到真实媒体读取
+- [x] 核对 `FluidAudio process --output` 真实输出契约，并修正 V4 适配层：
+  - 官方输出是 `ProcessingResult` 包装对象
+  - 实际 speaker 段字段是 `segments[].speakerId/startTimeSeconds/endTimeSeconds`
+  - 不是先前假设的 `turns[].speaker_id/start_sec/end_sec`
+- [x] 增强 `fluidaudio_root` 路径解析：
+  - 允许直接指向 `FluidAudio` 源码仓库根目录
+  - 自动解析 `.build/release/fluidaudiocli`
+  - 自动解析 `.build/arm64-apple-macosx/release/fluidaudiocli`
+- [x] 重新稳定落一本地 `FluidAudio` 源码目录，并保留可复用 CLI 路径：
+  - 源码目录：`/Users/tim/Documents/vibe-coding/MVP/FluidAudio-src`
+  - 可执行文件：`/Users/tim/Documents/vibe-coding/MVP/FluidAudio-src/.build/arm64-apple-macosx/release/fluidaudiocli`
+- [x] 真实接通本机 `FluidAudio CLI` 做一次 smoke，确认第三方输出契约与当前适配层一致
+- [ ] 用真实离线视频跑一条 V4 端到端，确认 `speaker_id -> reference -> TTS` 主链路可用
+- [ ] 视 smoke 结果决定是否补 `speaker_inventory` 质量阈值与 `needs_review` 标记
+
+### Review
+- 已验证：
+  - `PYTHONPATH=src ./.venv/bin/python -m unittest tests.test_dub_long_video.DubLongVideoTests.test_main_v3_with_time_ranges_only_runs_windowed_asr_and_asd -v`
+  - `PYTHONPATH=src ./.venv/bin/python -m unittest tests.test_command_builder tests.test_dub_pipeline_references tests.test_dubbing_cli_api tests.test_dub_long_video -v`
+  - `PYTHONPATH=src ./.venv/bin/python -m unittest tests.test_diarization -v`
+  - `PYTHONPATH=src ./.venv/bin/python -m unittest tests.test_command_builder tests.test_dubbing_cli_api tests.test_dub_long_video -v`
+  - `swift build -c release --product fluidaudiocli` in `/Users/tim/Documents/vibe-coding/MVP/FluidAudio-src`
+  - `ffmpeg -y -i test-0003-multi-person-17s.mp4 -vn -ac 1 -ar 16000 tmp/fluidaudio_smoke/test-0003-17s.wav`
+  - `/Users/tim/Documents/vibe-coding/MVP/FluidAudio-src/.build/arm64-apple-macosx/release/fluidaudiocli process /Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tmp/fluidaudio_smoke/test-0003-17s.wav --mode offline --threshold 0.6 --output /Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tmp/fluidaudio_smoke/result.json`
+- 验证结果：
+  - V4 参数透传通过
+  - V4 批次 manifest 能写出 `speaker_turns/subtitle_segments_by_speaker/speaker_inventory`
+  - segment 目录能写出 `_input_segment.speakers.json`
+  - `FluidAudio process --output` 新契约字段兼容通过
+  - `fluidaudio_root` 指向源码仓库时的 CLI 自动解析通过
+  - `FluidAudio` 本机 offline diarization 实跑成功，17.02s 音频处理耗时约 `1.26s`，`RTFx≈13.54x`
+  - `tmp/fluidaudio_smoke/result.json` 能被 `load_diarization_turns()` 正确解析为 `4` 个 speaker turns
+  - 最小回归共 `94` 条测试通过
+- 当前剩余风险：
+  - 还没做真实视频端到端验证
+  - 当前 smoke 样例 `test-0003-multi-person-17s.wav` 只分出了 `1` 个 speaker，说明“能跑通”和“分人质量满足业务目标”还不是一回事
+  - 还需要用真正的 V4 批处理主链路跑一条端到端，验证 `speaker_id -> reference -> TTS`
+
+## Spec-11（2026-05-03 V4 Speaker Diarization 主链路）1/3 现状分析
+- 目标：把当前 `Auto Dubbing V3` 从“可见说话人 focus 驱动的配音”收敛成真正服务最终目标的链路：
+  - 先得到整条视频里稳定的 `speaker_id`
+  - 再让每个 `speaker_id` 绑定自己的参考音 / 音色
+  - 最终完成“不同的人用到自己的音色，然后把翻译内容配音”
+- 用户真实目标不是“当前谁在说话的框”，而是“整条视频里谁是谁，并且同一个人始终用同一个音色”。这意味着主真值必须是 `speaker diarization`，不是 `active speaker focus`。
+
+- 现状 1：当前 V3 的主分人输入仍然是 `asd-pipeline /run-tracked` 的 focus 结果，不是全局 speaker diarization。
+  - 依据：
+    - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 顶部直接引入：
+      - `call_tracked_asd_api`
+      - `load_focus_predictions_from_response`
+      - `assign_speakers_to_subtitles`
+      - `merge_assigned_subtitles_to_speaker_segments`
+    - [src/subtitle_maker/domains/dubbing/speaker_segments.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/speaker_segments.py) 中：
+      - `call_tracked_asd_api()` 直接请求 `asd-pipeline /run-tracked`
+      - `load_focus_predictions_from_response()` 读取 `focus_predictions.json`
+      - `assign_speakers_to_subtitles()` 是把 focus 轨迹覆盖回字幕时间窗
+  - 结论：
+    - 当前 V3 的“speaker segment”本质是“focus 轨迹驱动的可见说话人切段”，不是音频主导的全局 diarization。
+
+- 现状 2：当前 `speaker_track_id` 是窗口级/轨迹级 ID，不是可跨整条视频复用的稳定人物身份。
+  - 依据：
+    - [src/subtitle_maker/domains/dubbing/speaker_segments.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/speaker_segments.py) 里的 `SpeakerSegment.speaker_track_id` 只保存 `track_xxxx`
+    - `assign_speakers_to_subtitles()` 的判定逻辑只看某个字幕窗内哪条 `track_id` 覆盖最多
+    - `merge_assigned_subtitles_to_speaker_segments()` 也只是把相邻同 `speaker_track_id` 的字幕合并
+  - 结论：
+    - 当前 ID 语义是“这段窗口里的一条视觉 track”，不是“这个人是全片的 Speaker 1 / Speaker 2”
+    - 对“同一个人整条片子始终绑定同一音色”这个目标不够用
+
+- 现状 3：当前 V3 仍然把视觉可见性当作主前提，画面无人脸时只能继承上一条 track，不能给出可靠 speaker identity。
+  - 依据：
+    - [src/subtitle_maker/domains/dubbing/speaker_segments.py::assign_speakers_to_subtitles()](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/speaker_segments.py)：
+      - 只基于 `focus_predictions` 的时间覆盖做 speaker 归属
+      - 没有音频 embedding / speaker clustering
+      - 无脸时仅通过 `last_confirmed_speaker_track_id` 延续上一位
+  - 结论：
+    - 这条逻辑只能缓解“断脸切碎”，不能建立真正的多人 speaker identity
+    - 一旦离脸、转场、旁白、背身、插画、无脸镜头变长，就会失去可靠 speaker 真值
+
+- 现状 4：当前 TTS 参考音链路是“按 segment/group 找参考音”，不是“按全局 speaker_id 固定音色”。
+  - 依据：
+    - 当前实现和测试都围绕 `ref_audio_path` / `ref_text` 组织，而不是 `speaker_id -> voice_profile`
+    - [tests/test_dubbing_runtime.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_runtime.py) 多处断言：
+      - `ref_audio_path`
+      - `ref_text`
+      - `voxcpm-omnivoice` 先生成 anchor，再把 anchor 交给 OmniVoice
+    - [tools/repair_bad_segments.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/repair_bad_segments.py) 仍以 `refs/single_speaker_ref.wav` 这类 segment/job 级参考音为核心
+  - 结论：
+    - 当前系统本质上还是“这句/这组字幕找一段参考音来配”
+    - 不是“先把全片 speaker 归一，再让每个 speaker 用自己的固定 voice profile”
+
+- 现状 5：当前工程里已有 diarization 相关历史尝试，但没有成为当前主链路，而且历史 refactor 可信度不足。
+  - 依据：
+    - `/Users/tim/.codex/memories/MEMORY.md` 已记录：
+      - `speaker-routing refactor looks present but is untrustworthy`
+      - `do not claim success until speaker-route wiring is verified`
+  - 结论：
+    - 不能在现有 V3 上继续堆 patch 假装得到 diarization
+    - 应当把 diarization 明确抬升成新的主编排阶段，重新定义输入输出契约
+
+- 现状 6：从产品目标倒推，当前 V3/ASD 路线最多只能当“视觉辅助”，不能当“多人配音主路由器”。
+  - 依据：
+    - `run-tracked` 产物聚焦的是 `focus_predictions` / `focus_overlay`
+    - 它解决的是“当前该看谁”
+    - 它没有给出“整片稳定 speaker inventory + per-speaker reference bank + subtitle-to-speaker global alignment”
+  - 结论：
+    - 当前 V3/ASD 继续修下去，最多得到“框更稳”
+    - 但不会自然演化成“不同的人始终使用自己的音色”的最终方案
+
+- 现状 7：对当前用户目标，最合理的新主链路应是“ASR -> diarization -> subtitle/speaker alignment -> per-speaker refs -> TTS”，而不是“ASD -> focus -> subtitle mapping -> TTS”。
+  - 依据：
+    - 当前 [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 已具备：
+      - 抽音频
+      - 生成/复用 `source.srt`
+      - 分段编排
+      - 调用不同 TTS backend
+    - 缺的不是“再画一个框”，而是“在进入 TTS 前先确定谁是谁”
+- 结论：
+    - V4 应把 diarization 提到主编排层
+    - ASD 只保留为辅助能力：映射屏幕人物、挑更干净参考音、修正同框开口归属
+
+## Spec-11（2026-05-03 V4 Speaker Diarization 主链路）2/3 功能点与改动边界
+- 设计目标：把当前 `Auto Dubbing V3` 的主分人逻辑从 `ASD focus` 切换为 `speaker diarization`，让后续 TTS 的核心语义变成：
+  - 先确定整条视频有哪些 `speaker_id`
+  - 再让每个 `speaker_id` 绑定固定参考音/固定音色
+  - 最后所有字幕都按 `speaker_id` 路由到对应音色
+
+- 推荐主方案：接入 `FluidAudio` 的 `offline diarization pipeline`，而不是继续以 `run-tracked` 为主。
+  - 依据：
+    - `FluidAudio` README 明确提供 `Offline Speaker Diarization Pipeline`，并说明“Use this for most use cases”；
+    - CLI 入口就是 `swift run fluidaudiocli process path/to/audio.wav`；
+    - benchmark 文档明确写 `Both offline and online versions use the community-1 model`，但 offline 是主推默认路线；
+    - `pyannote community-1` 提供 `exclusive_speaker_diarization`，官方明确说它就是为了更容易和 transcription timestamps 对齐。
+  - 结论：
+    - 对 `Apple + 离线视频 + 后续配音` 这个场景，`FluidAudio offline community-1` 是最贴合的新主链路底座。
+
+- 功能点 1：在 long-video 编排层新增独立的 `speaker diarization` 阶段，位置放在“拿到 source subtitles 之后、进入 TTS 之前”。
+  - 目标顺序：
+    1. 抽取窗口音频 / 全片音频
+    2. 生成或复用 `source.srt`
+    3. 跑 `speaker diarization`
+    4. 把字幕对齐到 `speaker_id`
+    5. 为每个 `speaker_id` 提取参考音
+    6. 按 `speaker_id` 进入 TTS
+  - 接入点：
+    - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py)
+  - 边界：
+    - 不重写 segment 级 TTS/mix 主流程
+    - 先改 batch/long-video orchestration
+
+- 功能点 2：新增“speaker diarization 结果产物层”，它要成为后续所有 speaker 路由的唯一真值。
+  - 最小新增产物建议：
+    - `speaker_turns.json`
+    - `subtitle_segments_by_speaker.json`
+    - `speaker_refs/speaker_001.wav`
+    - `speaker_refs/speaker_002.wav`
+    - `speaker_inventory.json`
+  - 语义：
+    - `speaker_turns.json`：原始 diarization 时间段
+    - `subtitle_segments_by_speaker.json`：字幕和 `speaker_id` 的对齐结果
+    - `speaker_refs/*`：每个 speaker 的参考音集合或最终首选参考音
+    - `speaker_inventory.json`：`speaker_id -> ref_audio -> 统计信息`
+  - 接入点：
+    - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py)
+    - [src/subtitle_maker/manifests/](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/)
+
+- 功能点 3：新增一个独立的 `speaker diarization domain`，不要把它继续塞在当前 `speaker_segments.py` 的 ASD 语义里。
+  - 推荐新增模块职责：
+    - `run_diarization(...)`
+    - `load_diarization_turns(...)`
+    - `align_subtitles_to_speakers(...)`
+    - `merge_adjacent_subtitles_by_speaker(...)`
+    - `extract_speaker_reference_audio(...)`
+  - 推荐目录：
+    - `src/subtitle_maker/domains/dubbing/diarization.py`
+    - 或拆成：
+      - `domains/dubbing/diarization_runtime.py`
+      - `domains/dubbing/diarization_alignment.py`
+      - `domains/dubbing/diarization_refs.py`
+  - 边界：
+    - 现有 [speaker_segments.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/speaker_segments.py) 保留给 V3/ASD 辅助路径
+    - 不强行把 diarization 逻辑混进 focus 语义文件
+
+- 功能点 4：把现有 TTS 请求的主键从“当前 group 的 ref”升级成“全局 speaker_id 的 voice profile”。
+  - 目标行为：
+    - 对每个字幕段，先确定 `speaker_id`
+    - 再由 `speaker_id` 查到：
+      - `preferred_ref_audio`
+      - `preferred_ref_text`（若底座需要）
+      - `tts_backend runtime hints`
+    - `voxcpm-omnivoice` / `omnivoice` / `index-tts` 只消费统一的 speaker profile
+  - 接入点：
+    - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py)
+    - [src/subtitle_maker/backends/](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/)
+  - 边界：
+    - 首轮不追求“同 speaker 跨多 segment 的 embedding 自适应更新”
+    - 先做到“同一批次内 speaker_id 稳定绑定固定 ref”
+
+- 功能点 5：为 `FluidAudio` 新增本地运行入口，但先以“离线单文件命令调用”方式接入，不先做复杂服务化。
+  - 推荐首轮接法：
+    - Python 在 `dub_long_video.py` 里调用一个本地 CLI/脚本
+    - 输入：音频路径
+    - 输出：JSON 结果文件
+  - 推荐原因：
+    - `FluidAudio` 本体是 Swift SDK / macOS CLI
+    - 先走 CLI 子进程是最小侵入接法
+    - 比先搭一个 Swift HTTP 服务风险更低
+  - 二阶段可选：
+    - 稳定后再做 `FluidAudio diarization API service`
+
+- 功能点 6：字幕和 diarization 的对齐策略优先走“exclusive speaker diarization -> subtitle window overlap”，而不是重新发明对齐算法。
+  - 依据：
+    - `community-1` 官方明确提供 `exclusive_speaker_diarization`
+    - 目标就是简化 diarization 与 transcription timestamps 的 reconciliation
+  - 目标行为：
+    - 每条字幕先按时间窗和 exclusive speaker turn 做 overlap
+    - 必要时允许相邻同 speaker 合并为更大段
+    - 无法可靠归属时显式标记 `needs_review`
+  - 边界：
+    - 首轮不做复杂的词级强制对齐 + speaker jointly optimize
+    - 先用“字幕窗 -> speaker turn”映射跑通主链路
+
+- 功能点 7：参考音提取从“当前句附近找一段音频”升级成“按 speaker_id 维护 reference bank，再选首选 ref”。
+  - 目标行为：
+    - 每个 `speaker_id` 收集若干候选 reference clips
+    - 根据时长、纯净度、是否单人、是否非静音等规则选出 `preferred_ref_audio`
+    - 所有属于该 `speaker_id` 的后续 TTS 默认复用同一音色
+  - 接入点：
+    - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py)
+    - [src/subtitle_maker/domains/media/](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/media/)
+  - 边界：
+    - 首轮先做“每 speaker 一个首选 ref”
+    - 不做更复杂的 multi-ref blending
+
+- 功能点 8：前端/UI 第一轮不需要新增复杂交互，只需要在现有 Auto Dubbing 面板暴露“speaker diarization backend / 开关 / 结果查看”最小入口。
+  - 目标行为：
+    - 允许选择：
+      - `speaker_routing_mode = asd_v3 | diarization_v4`
+      - `diarization_backend = fluidaudio-community1`
+    - 允许查看产物：
+      - `speaker_turns.json`
+      - `speaker_inventory.json`
+  - 接入点：
+    - [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js)
+    - [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py)
+  - 边界：
+    - 第一轮不做新页面
+    - 不做 speaker 可视化编辑器
+
+- 明确不做：
+  - 不继续把 `focus_overlay.mp4` 修到主链路可用再作为最终分人方案
+  - 不把 `FluidInference/diar-streaming-sortformer-coreml` 作为主后端
+  - 不先做 Swift HTTP 服务
+  - 不先做“跨整部视频的人脸身份库 + 音频 speaker 自动绑定人物头像”的重系统
+  - 不在首轮引入云端 pyannote API；优先本机离线
+
+- 推荐改动范围（首轮）：
+  - orchestration：
+    - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py)
+  - domain：
+    - `src/subtitle_maker/domains/dubbing/diarization*.py`（新增）
+    - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py)
+  - API/参数：
+    - [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py)
+    - [src/subtitle_maker/jobs/command_builder.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/jobs/command_builder.py)
+  - manifest：
+    - `src/subtitle_maker/manifests/*`
+- UI：
+    - [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js)
+
+## Spec-11（2026-05-03 V4 Speaker Diarization 主链路）3/3 风险、关键决策与推荐方案
+- 核心决策 1：主分人方案选 `FluidAudio offline community-1`，不选当前 `ASD focus`，也不选 `streaming sortformer`。
+  - 原因：
+    - 当前用户目标是“离线视频里不同的人绑定自己的音色配音”，核心是稳定 `speaker_id`
+    - `ASD focus` 解决的是“当前该看谁”，不是“全片谁是谁”
+    - `streaming sortformer` 的优势在实时低延迟，不在离线视频配音质量
+    - `community-1` 的 `exclusive speaker diarization` 更适合和 `source.srt` 时间戳对齐
+  - 推荐结论：
+    - V4 主链路以 `FluidAudio offline community-1` 为准
+    - `ASD` 仅保留为辅助，不再承担主路由职责
+
+- 核心决策 2：首轮接入方式选本地 CLI 子进程，不先做 Swift HTTP 服务。
+  - 原因：
+    - 当前主工程是 Python
+    - `FluidAudio` 本体是 Swift SDK / Apple 侧运行时
+    - CLI 子进程是最小侵入接法，最容易先跑通一条完整链路
+  - 推荐结论：
+    - 第一阶段只要求：
+      - Python 调本地 `fluidaudiocli`
+      - 输入音频文件
+      - 输出 diarization JSON
+    - 等产物契约稳定后，再考虑二阶段服务化
+
+- 核心决策 3：首轮先做“稳定 speaker_id + 固定音色绑定”，不追求“人物画面身份一致性”。
+  - 原因：
+    - 用户当前目标是配音音色一致，不是人物可视化追踪
+    - 如果一开始把“人脸身份库 / 画面人物映射 / 可视化编辑”一并纳入，会显著放大实现面
+  - 推荐结论：
+    - V4 第一阶段只保证：
+      - 同一 speaker 在整条批次里稳定使用同一音色
+      - 字幕段被正确分配到 speaker
+    - 画面人物映射放到后续增强阶段
+
+- 风险 1：`FluidAudio` 实际输出契约未必和 `subtitle-maker` 当前假设一致。
+  - 风险点：
+    - CLI 输出字段名、时间单位、speaker 命名规则、是否直接给 exclusive turns，都可能和当前 Python 侧预期不同
+  - 对策：
+    - 第一刀先做一个“结果适配层”，不要在 orchestration 里直接硬编码第三方 JSON
+    - 约束内部统一产物为：
+      - `speaker_turns.json`
+      - `speaker_inventory.json`
+      - `subtitle_segments_by_speaker.json`
+
+- 风险 2：字幕和 diarization 的时间对齐会有边界误差，导致一条字幕跨两个 speaker。
+  - 风险点：
+    - ASR 句子边界和 diarization turn 边界天然不会完全一致
+    - 特别是抢话、插话、句中切 speaker 时，简单 overlap 可能误归属
+  - 对策：
+    - 首轮明确采用“字幕窗对 exclusive speaker turn 的 overlap”作为主规则
+    - 对低覆盖度或冲突窗显式打 `needs_review`
+    - 不在第一轮做复杂词级重对齐
+
+- 风险 3：参考音提取容易再次把“英语原声污染 / 多人混音 / 无脸段”带回 TTS。
+  - 风险点：
+    - 即便 speaker diarization 正确，如果 reference bank 建得脏，最终音色仍会漂
+  - 对策：
+    - 第一轮 reference 规则要单独定义：
+      - 最小时长
+      - 最大时长
+      - 单 speaker 纯净度优先
+      - 非静音 / 非过强背景音
+    - 先输出候选列表和首选 ref，便于后验检查
+
+- 风险 4：当前 repo 里已有 V3/ASD、omnivoice、voxcpm-omnivoice、review/redub 等多条路径，容易把新逻辑掺进旧逻辑导致回归。
+  - 风险点：
+    - 如果直接在现有 `speaker_segments.py` / V3 参数里继续叠 patch，很容易出现模式语义漂移
+  - 对策：
+    - 新能力明确命名成 `V4 diarization route`
+    - 参数、产物、manifest 字段和 V3 分开
+    - V3 继续可用，但不和 V4 共享主语义
+
+- 风险 5：本机 Apple 离线跑 `FluidAudio` 虽然方向对，但工程化第一步可能卡在环境、编译或模型准备。
+  - 风险点：
+    - Swift toolchain、CoreML 运行环境、模型下载位置、CLI 参数形态可能需要一次性打通
+  - 对策：
+    - 在真正改 `subtitle-maker` 之前，先单独跑通：
+      - 输入一段 wav
+      - 输出 diarization JSON
+    - 只有这个基础验证通过，再进入主工程接线
+
+- 推荐实施顺序：
+  1. 先在本机单独验证 `FluidAudio offline community-1` 能对单个 wav 输出可用 diarization 结果
+  2. 定义 `subtitle-maker` 内部统一 diarization JSON 契约
+  3. 在 `dub_long_video.py` 中接入新阶段：`source.srt -> diarization -> subtitle/speaker alignment`
+  4. 增加 `speaker_refs` 生成与 `speaker_inventory` 产物
+  5. 改 TTS 路由，让 `speaker_id` 成为固定音色主键
+  6. 最后再补最小 UI 参数透传和结果查看
+
+- 首轮验证标准：
+  - 给定一条离线视频，能产出：
+    - `source.srt`
+    - `speaker_turns.json`
+    - `subtitle_segments_by_speaker.json`
+    - `speaker_inventory.json`
+    - 至少一个 `speaker_refs/speaker_xxx.wav`
+  - 同一 `speaker_id` 的多条字幕在最终 manifest 中使用同一参考音/同一 voice profile
+  - 不要求首轮就解决“画面里谁是谁”的可视化问题
+
+- 推荐方案结论：
+  - 停止把当前 V3/ASD 路线继续当最终方向修补
+  - 以 `FluidAudio offline community-1` 为新主分人方案
+  - 以 `CLI 子进程 + 内部契约适配层 + per-speaker reference bank` 为第一阶段实现路线
+  - 等 V4 主链路稳定后，再决定是否保留 `ASD` 作为人物映射辅助模块
+
+## 12. 2026-05-03 start.sh 日志可观测性优化
+- [ ] 定位 `./start.sh` 启动后 `/dubbing/auto/status/{task_id}` 刷屏日志来源
+- [ ] 过滤高频轮询 access log，避免控制台被重复 `200 OK` 淹没
+- [ ] 增加 Auto Dubbing 任务状态/阶段变化摘要日志，让运行中阶段可见
+- [ ] 验证：启动 Web 后轮询 `/dubbing/auto/status/{task_id}` 不再刷屏
+- [ ] 验证：真实任务运行时控制台能看到阶段推进日志
+
+## 13. 2026-05-03 V3 ASD focus_predictions 契约兼容修复
+- [x] 定位 `focus_predictions.json must be a list` 根因
+- [x] 兼容 `asd-pipeline /run-tracked` 新版 `focus_predictions.json`（顶层 dict + predictions）
+- [x] 把新版逐帧 focus 结构归一化为 speaker assignment 可消费的时间窗
+- [ ] 验证：`01.mp4 120-180s` 这类 V3 任务不再因 `focus_predictions.json` 结构报错
+- [x] 验证：`speaker_segments` 对新版 focus 数据能产出非空说话人映射
+
+## 11. 2026-05-03 Qwen3-TTS 清理与 V3 时间窗口修正
+- [x] 删除 `qwen-omnivoice / qwen-tts / qwen3-tts` 相关生产代码入口，保留 `index-tts / omnivoice / voxcpm-omnivoice`
+- [x] 删除 `src/subtitle_maker/qwen_tts/` 目录
+- [x] 修正 `tools/dub_long_video.py` 的 V3 编排顺序：先计算 `effective_ranges`，再按窗口做 source subtitles / tracked ASD
+- [x] 新增 V3 回归测试：`time_ranges_json=[{\"start_sec\":120,\"end_sec\":180}]` 时，只对窗口做 ASR/ASD
+- [x] 同步修正 `tests/test_dubbing_runtime.py`、`tests/test_command_builder.py`、`tests/test_manifest_contracts.py`、`tests/test_dubbing_cli_api.py`、`tests/test_dub_pipeline_references.py`
+- [x] 验证：`PYTHONPATH=src ./.venv/bin/python -m unittest tests.test_dubbing_runtime -v` 通过
+- [x] 验证：`PYTHONPATH=src ./.venv/bin/python -m unittest tests.test_command_builder tests.test_manifest_contracts tests.test_dub_pipeline_references -v` 通过
+- [ ] 验证：`tests.test_dub_long_video` 仅剩 `test_main_v3_with_time_ranges_only_runs_windowed_asr_and_asd` 的测试 stub 收尾
+
+
+## Spec-10（2026-05-03 V3 默认 ASD 正确修法）1/3 现状分析
+- 目标：修正当前 `Auto Dubbing V3` 的编排语义，让 V3 不再依赖“必须先有外部输入字幕文件”才触发 ASD，而是按正确顺序执行：
+  - 先拿媒体生成或复用 source subtitles
+  - 再调用 tracked ASD
+  - 再把字幕映射到 speaker segments
+  - 最后进入现有 TTS 链路
+- 直接问题证据：
+  - 最新批次 [batch_manifest.json](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/web_20260503_114219/longdub_20260503_194227/batch_manifest.json) 显示：
+    - `pipeline_version = v3`
+    - `tts_backend = voxcpm-omnivoice`
+    - `v3_asd_api_url = http://127.0.0.1:8001`
+    - `input_srt_kind = source`
+    - 但同时 `input_srt = None`
+  - 同批次 [web_cli_stdout.log](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/web_20260503_114219/web_cli_stdout.log) 没有出现 `Step V3/0: call tracked ASD and build speaker segments`；
+  - 最终 segment 日志 [segment_0001.jsonl](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/web_20260503_114219/longdub_20260503_194227/segment_jobs/segment_0001/logs/segment_0001.jsonl) 走的是：
+    - `asr_started`
+    - `translation_started`
+    - `sentence_reference_mode_enabled`
+    - `group_tts_started`
+    - 没有任何 `speaker_segments` / ASD 映射痕迹。
+- 现状 1：`dub_long_video.py` 当前把 V3/ASD 绑定在 `v3_mode and input_subtitles`，而不是绑定在 `v3_mode`。
+  - 依据：
+    - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 中：
+      - `input_subtitles` 只在 `args.input_srt` 存在时由 `parse_srt(...)` 初始化；
+      - 只有 `if v3_mode and input_subtitles:` 才会执行 `call_tracked_asd_api(...)`、`assign_speakers_to_subtitles(...)`、`merge_assigned_subtitles_to_speaker_segments(...)`。
+  - 结论：
+    - 只要 `--input-srt` 没传进来，即使 `pipeline_version = v3`，ASD 也完全不会跑。
+- 现状 2：Current Project 模式下，前端和 API 已支持把当前项目字幕落成 `input_srt`，但这条链路并不可靠，不能作为 V3/ASD 的唯一前提。
+  - 依据：
+    - 前端 [dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js) `buildCurrentProjectRequest()` 会在 `requestedMode == source/translated` 时传 `subtitles_json`；
+    - 后端 [dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_write_subtitles_json_to_srt()` 会把 `subtitles_json` 落为 `project_source.srt / project_translated.srt`；
+    - 但这次实际上传目录 [uploads/dubbing/20260503_114219](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/uploads/dubbing/20260503_114219) 只有视频，没有任何 `project_source.srt`，说明这条链路在真实运行中可能为空、失效或不稳定。
+  - 结论：
+    - V3 不能依赖“前端必须先把字幕喂进来”这个脆弱前置条件。
+- 现状 3：当前 V3 speaker segmentation 的后处理是建立在“已有字幕时间窗”之上的，而不是直接从 ASD 输出生成完整文本。
+  - 依据：
+    - [src/subtitle_maker/domains/dubbing/speaker_segments.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/speaker_segments.py)：
+      - `call_tracked_asd_api()` 只拿 focus 结果；
+      - `assign_speakers_to_subtitles()` 需要 `subtitles` 输入；
+      - `merge_assigned_subtitles_to_speaker_segments()` 也是按字幕窗合并 speaker；
+      - `build_subtitles_from_speaker_segments()` 最终仍输出标准字幕结构给后续配音链路。
+  - 结论：
+    - 正确顺序必须是“先有 source subtitles，再跑 ASD 映射”，而不是相反。
+- 现状 4：当前 long-video 主流程已经能在没有 `input_srt` 的情况下正常生成 source subtitles，因此 V3 正确修法不需要重写 ASR。
+  - 依据：
+    - 同批次日志已证明 segment 内层 [dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 能稳定跑 `ASR -> translation -> TTS`；
+    - `segment_0001/subtitles/source.srt` 已实际生成。
+  - 结论：
+    - 需要调整的是 V3 的编排时机，不是新增另一套字幕生成能力。
+- 现状 5：当前“很零散”并不是 ASD 分人造成，而是因为没走 ASD 后退化成了 sentence grouping。
+  - 依据：
+    - [segment_0001.jsonl](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/web_20260503_114219/longdub_20260503_194227/segment_jobs/segment_0001/logs/segment_0001.jsonl) 显示：
+      - `after_count = 16`
+      - `sentence_blocks = 14`
+      - `short_merge_effective = false`
+    - 结果是 60 秒被切成 16 条字幕、14 个 group，导致 TTS 路径很碎。
+  - 结论：
+    - 若 V3 正确命中 ASD speaker segments，这个“很碎”的主症状本身就应先明显改善。
+
+## Spec-10（2026-05-03 V3 默认 ASD 正确修法）2/3 功能点与改动边界
+- 设计目标：让 `pipeline_version = v3` 的 long-video 编排不再依赖外部 `input_srt` 才能调用 ASD，而是始终在“拿到 source subtitles 之后”执行 tracked ASD 和 speaker segmentation。
+- 推荐执行顺序：
+  1. 先确定 source subtitles 来源
+  2. 若已有 `input_srt_kind=source`，可直接复用
+  3. 若没有 source subtitles，则先从媒体生成 source subtitles
+  4. 再统一调用 tracked ASD
+  5. 再把 source subtitles 映射为 speaker segments
+  6. 再按 speaker segments 驱动分段 TTS
+- 功能点 1：V3 触发条件从 `v3_mode and input_subtitles` 改为“V3 且能拿到 source subtitles”。
+  - 目标行为：
+    - `pipeline_version=v3` 时，不再把 ASD 绑定在“必须传入 `--input-srt`”这个前置条件上；
+    - 只要能在 long-video 编排层拿到 source subtitles，就应该跑 ASD；
+    - Current Project / Standalone Upload / 无字幕上传 三种入口都遵循同一套 V3 语义。
+  - 依据：
+    - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 当前问题点就在 `if v3_mode and input_subtitles:`
+    - 这条条件把“V3 speaker segmentation 能力”错误降格成了“附属可选优化”。
+- 功能点 2：为 V3 引入“source subtitles 获取阶段”，但不重写 segment 内层 ASR/TTS。
+  - 目标行为：
+    - 若 batch 入口已提供 `input_srt_kind=source`，直接作为 V3 映射输入；
+    - 若 batch 入口没有 source subtitles，则在 long-video 层先产一份 source subtitles，再交给 ASD；
+    - segment 级 `dub_pipeline.py` 仍沿用现有 TTS 和混音逻辑，不另造第二套 segment pipeline。
+  - 依据：
+    - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 已经负责分段编排、字幕切片和产物 merge；
+    - `speaker_segments.py` 的输入天然就是字幕列表，最小正确修法应发生在 long-video 编排层。
+- 功能点 3：V3 speaker segments 应在 batch 层落盘并成为后续 segment 切片的主输入。
+  - 目标行为：
+    - 保留并强化当前 `speaker_segments.json` 落盘；
+    - `input_subtitles` 在进入 segment 切片前应被重写为 `build_subtitles_from_speaker_segments(...)` 的结果；
+    - segment 级 `_input_segment.srt` 应来自 speaker segments 重写后的字幕，而不是原始 sentence blocks。
+  - 依据：
+    - 当前 [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 已有这套落盘和重写骨架，只是触发时机不对。
+- 功能点 4：manifest / task 记录要能区分“请求的 V3”和“实际命中的 V3 speaker segmentation”。
+  - 目标行为：
+    - batch manifest 除了保留 `pipeline_version=v3`，还应明确记录：
+      - 是否实际跑了 tracked ASD
+      - source subtitles 来源（external source srt / generated source srt）
+      - `speaker_segments.json` 路径
+      - 生成后的 `speaker_segments_total`
+    - 避免再次出现“请求层是 V3，但运行结果看起来像 V1”的黑盒状态。
+  - 依据：
+    - 当前批次 manifest 只有 `pipeline_version=v3`，但 `input_srt=None`，无法直观看出“为何没进 ASD”。
+- 功能点 5：Current Project 模式的 `subtitles_json` 仍保留，但不再作为 V3 的单点前提。
+  - 目标行为：
+    - 现有 `_write_subtitles_json_to_srt()` 链路继续保留；
+    - 若它成功，V3 可直接用已有 source subtitles，减少额外 ASR 成本；
+    - 若它失败或为空，V3 仍应继续执行，通过先生成 source subtitles 再跑 ASD，而不是直接退化成 V1 句子分组。
+  - 依据：
+    - 当前这次真实批次已经证明 project subtitle 传入链路并不稳定，不能成为唯一入口。
+- 计划改动文件边界：
+  - 核心必改：
+    - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py)
+  - 配套可能改：
+    - [src/subtitle_maker/manifests/readwrite.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/readwrite.py)
+    - [src/subtitle_maker/manifests/schema.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/schema.py)
+    - [tests/test_dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dub_long_video.py)
+    - 如需 API 状态补充，再改 [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py)
+- 本轮明确不做：
+  - 不改 `speaker_segments.py` 的核心分配算法
+  - 不改 `asd-pipeline` 服务端协议
+  - 不改 `voxcpm-omnivoice` / `omnivoice` / `index-tts` 的 TTS 合成算法
+  - 不顺手优化 `seg_0005_missing.wav` 的 TTS 质量门控逻辑
+
+## Spec-10（2026-05-03 V3 默认 ASD 正确修法）3/3 风险、关键决策与推荐方案
+- 风险 1：如果直接把 “先产 source subtitles” 硬塞进 segment 内层，而不是 batch 编排层，会把现有 `dub_pipeline.py` 的职责搞乱。
+  - 依据：
+    - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 当前负责 batch 级分段、切片、字幕输入裁剪、manifest 汇总；
+    - [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 当前负责单段 `ASR -> 翻译 -> TTS -> review` 执行；
+    - [src/subtitle_maker/domains/dubbing/speaker_segments.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/speaker_segments.py) 依赖的输入就是“已有字幕 + ASD focus”，不是单独生成文本。
+  - 风险结论：
+    - 若把 V3 修法下沉到 segment 层，会导致“谁负责准备 source subtitles、谁负责调用 ASD、谁负责重写 segment 输入”边界混乱，后续恢复跑批也更难对齐。
+- 风险 2：如果只把 `if v3_mode and input_subtitles` 改成 `if v3_mode`，但不补“source subtitles 获取阶段”，会把 V3 从“完全不跑 ASD”变成“拿空字幕去跑 ASD 映射”。
+  - 依据：
+    - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 第 `991-1006` 行附近当前直接把 `input_subtitles` 送进 `assign_speakers_to_subtitles(...)`；
+    - 该函数的输入前提在 [speaker_segments.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/speaker_segments.py) 中就是已有字幕列表。
+  - 风险结论：
+    - 正确修法不是简单放宽条件，而是补一段显式的“source subtitles resolved”步骤。
+- 风险 3：如果实现后仍不把“V3 是否实际命中 ASD”写入 manifest，会继续出现“请求是 V3，运行结果像 V1，但用户看不出来为什么”的黑盒问题。
+  - 依据：
+    - 当前真实批次 [batch_manifest.json](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/web_20260503_114219/longdub_20260503_194227/batch_manifest.json) 虽有 `pipeline_version=v3`、`v3_asd_api_url`，但没有任何 “asd actually executed” 或 “source subtitles source” 字段；
+    - 现有 schema [schema.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/schema.py) 与读写 [readwrite.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/readwrite.py) 当前只持久化配置，不持久化 V3 运行命中状态。
+  - 风险结论：
+    - 这次 bug 的排查成本高，核心原因之一就是 manifest 只能看到“请求意图”，看不到“实际运行路径”。
+- 关键决策 1：V3 的触发语义定义为“只要 batch 层拿到 source subtitles，就必须跑 tracked ASD”，而不是“只有外部 `input_srt` 存在才跑”。
+  - 推荐原因：
+    - 这和 [speaker_segments.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/speaker_segments.py) 的真实数据依赖一致；
+    - 也和用户对 `V3` 的产品预期一致：选了 V3 就应该优先走 speaker segmentation，而不是静默退化成句子分组。
+- 关键决策 2：首选最小正确修法放在 `tools/dub_long_video.py`，不重构 `speaker_segments.py`，也不重写 `dub_pipeline.py`。
+  - 推荐原因：
+    - 根因就在 [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的 V3 触发条件和编排顺序；
+    - 现有测试 [tests/test_dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dub_long_video.py) 也已经覆盖了 “V3 重写输入字幕后再进入 segment run” 的骨架，扩展这一层成本最低。
+- 关键决策 3：Current Project 的 `subtitles_json -> project_source.srt` 继续保留，但只视为 source subtitles 的一个可选来源，不再作为 V3 唯一依赖。
+  - 推荐原因：
+    - [dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_write_subtitles_json_to_srt()` 仍然有价值，成功时可以省一次 batch 级 source subtitle 生成；
+    - 但真实上传目录 [uploads/dubbing/20260503_114219](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/uploads/dubbing/20260503_114219) 已证明这条链路并不稳定。
+- 验证方案：
+  1. 单测补齐 “V3 + 有 `input_srt`” 与 “V3 + 无 `input_srt`” 两条路径。
+  2. 验证 `input_srt=None` 时，`tools/dub_long_video.py` 仍会先解析或生成 source subtitles，再调用 `call_tracked_asd_api(...)`。
+  3. 验证生成的 batch manifest 会显式记录：
+     - `pipeline_version = v3`
+     - `v3_asd_applied = true/false`
+     - `v3_source_subtitles_origin`
+     - `speaker_segments_total`
+     - `paths.speaker_segments`
+  4. 验证 segment 输入 `_input_segment.srt` 已来自重写后的 speaker segments，而不是原始 sentence blocks。
+  5. 用真实批次命令做 smoke：
+     - 目标场景就是这次失败的 `Current Project + pipeline_version=v3 + voxcpm-omnivoice + 无外部 input_srt`
+     - 期望看到 `web_cli_stdout.log` 出现 `Step V3/0: call tracked ASD and build speaker segments`
+     - 期望 `batch_manifest.json` 不再出现“请求是 V3 但 `input_srt=None` 且无 ASD 痕迹”的状态。
+- 推荐实施顺序：
+  1. 先改 [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py)，抽出 “解析或生成 source subtitles” 的 batch 级步骤。
+  2. 再把 V3 分支改成基于 “resolved source subtitles” 触发 tracked ASD 和 speaker segments 重写。
+  3. 再补 [tests/test_dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dub_long_video.py) 的无 `input_srt` 回归。
+  4. 最后按需补 manifest schema/readwrite，让运行命中状态可观测。
+- 推荐方案：
+  - 采用“batch 层先拿 source subtitles，再统一跑 ASD，再重写 segment 输入”的最小闭环修法；
+  - 不接受“简单放宽 if 条件”这种半修；
+  - 不接受“把问题丢给前端一定要传 `subtitles_json`”这种脆弱修法；
+  - 只有这样，`V3` 才能真正变成一个稳定语义，而不是偶然命中的分支。
+
+## Review（2026-05-03 V3 默认 ASD 正确修法）
+- 根因确认：
+  - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 原先把 `V3` 绑定在 `if v3_mode and input_subtitles:`；
+  - 这导致 `pipeline_version=v3` 但 `input_srt=None` 时，tracked ASD 根本不会执行，整批静默退化成 sentence grouping。
+- 已实现：
+  - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 新增 batch 级 `resolve_v3_input_subtitles()` 与 `transcribe_source_subtitles_for_v3()`；
+  - `V3` 现在会先统一拿到 batch 级字幕输入：
+    - 有 source `input_srt` 时复用并规整；
+    - 无 `input_srt` 时直接在 long-video 层先生成一份 `v3_source_input.srt`；
+  - 之后再统一调用 tracked ASD，并把重写后的 speaker subtitles 送进 segment run；
+  - batch manifest 新增：
+    - `v3_asd_applied`
+    - `v3_source_subtitles_origin`
+  - 现有 `input_srt` 字段也会在 V3 无外部字幕时指向 batch 内实际生成的 `v3_source_input.srt`，避免 manifest 继续显示 `None` 黑盒状态。
+- 验证证据：
+  - 定向回归：
+    - `PYTHONPATH=src python3 -m unittest tests.test_dub_long_video.DubLongVideoTests.test_main_v3_rewrites_input_subtitles_by_speaker_segments_before_segment_run tests.test_dub_long_video.DubLongVideoTests.test_main_v3_without_input_srt_generates_source_subtitles_before_asd -v`
+    - 结果：`2 tests OK`
+  - 全量 long-video 单测：
+    - `PYTHONPATH=src python3 -m unittest tests.test_dub_long_video -v`
+    - 结果：`Ran 11 tests ... OK`
+- 当前边界：
+  - 这一步只修正 `V3` 编排语义和可观测性；
+  - 没有顺手改 `speaker_segments.py` 归属算法；
+  - 没有处理 `seg_0005_missing.wav` 这类纯 TTS 质量门控问题。
+
+## 0. Review（2026-05-03 修复 voxcpm-omnivoice grouped 包装层漏参）
+- 问题：
+  - 最新失败批次 `web_20260503_104033` 在进入 TTS grouped 路径后立刻报错：
+  - `synthesize_segments_grouped() got an unexpected keyword argument 'voxcpm_api_url'`
+- 根因：
+  - `tools/dub_pipeline.py` 已经把 `--voxcpm-api-url` 解析并传给 `synthesize_segments_grouped(...)`
+  - 但 `tools/dub_pipeline.py` 里的兼容包装函数 `synthesize_segments_grouped()` 自己的函数签名漏了 `voxcpm_api_url`
+  - 结果是命令行参数到达编排层后，在包装层直接抛 `TypeError`，还没真正进入新实现
+- 已完成：
+  - [x] 给 [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 的 grouped 兼容包装层补上 `voxcpm_api_url`
+  - [x] 补回归测试 [tests/test_dub_pipeline_references.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dub_pipeline_references.py)
+  - [x] 用原失败命令对 `segment_0001` 做真实复现验证
+- 验证证据：
+  - 单测：
+    - `test_grouped_wrapper_forwards_voxcpm_api_url ... ok`
+    - `test_synthesize_text_once_voxcpm_omnivoice_generates_anchor_then_calls_omnivoice ... ok`
+  - 真实复现：
+    - 同一批次日志已从原先的 `unexpected keyword argument` 越过，进入：
+      - `group_0001` 合成成功
+      - `group_0002` 合成成功
+      - 当前继续跑到 `group_0003`
+  - 关键日志文件：
+    - [segment_0001.jsonl](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/web_20260503_104033/longdub_20260503_184038/segment_jobs/segment_0001/logs/segment_0001.jsonl)
+
+## 1. Review（2026-05-03 VoxCPM API 落地与真实组合 smoke）
+- 已完成：
+  - [x] 在 `/Users/tim/Documents/vibe-coding/MVP/VoxCPM` 新增精简服务 `tools/voxcpm_api_server.py`
+  - [x] 新增 `start_api.sh` / `stop_api.sh`
+  - [x] 新增最小回归 `tests/test_voxcpm_api_server.py`
+  - [x] 验证 `subtitle-maker` 侧 `voxcpm-omnivoice` 关键单测
+  - [x] 验证真实 `VoxCPM -> OmniVoice` 两跳组合 smoke
+- 验证证据：
+  - `VoxCPM` 最小接口单测：`/Users/tim/Documents/vibe-coding/MVP/VoxCPM/tests/test_voxcpm_api_server.py`
+    - 结果：`3 passed`
+  - `VoxCPM` 真实接口输出：
+    - anchor 文件：[anchor.wav](/Users/tim/Documents/vibe-coding/MVP/VoxCPM/outputs/api_smoke/anchor.wav)
+    - 请求返回：`ok=true duration_sec=1.92 sample_rate=44100`
+  - `subtitle-maker` 关键链路测试：
+    - `PYTHONPATH=src .venv/bin/python -m unittest ...`
+    - 结果：`22 tests OK`
+  - 真实组合 smoke 输出：
+    - 最终文件：[final.wav](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/voxcpm_omnivoice_smoke/final.wav)
+    - `OmniVoice` 服务日志显示：
+      - `target_duration_sec=3.0`
+      - `actual_duration_sec=3.15`
+      - `duration_ratio=1.05`
+- 当前结论：
+  - `VoxCPM` 作为中文 anchor 生成服务已经落地并真实可调；
+  - `subtitle-maker` 中 `voxcpm-omnivoice` 接线与关键恢复/manifest/command 链路已通过回归；
+  - 在真实服务条件下，`VoxCPM -> OmniVoice` 两跳组合已成功生成最终 wav。
+
+## Spec-9（2026-05-03 VoxCPM + OmniVoice 切换）1/3 现状分析
+- 目标：放弃当前 `Qwen3-TTS + OmniVoice` 作为优先试验路线，改为 `VoxCPM + OmniVoice`，原因是 `Qwen3-TTS` 在真实运行中作为中文 anchor 生成器明显过慢。
+- 直接现状证据：
+  - 最新运行批次 `outputs/dub_jobs/web_20260503_092700` 已经顺利通过 `ASR -> 翻译 -> reference 提取`，但长时间停在 `tts:group_tts_started - synthesizing group_0001`；
+  - `segment_0001` 日志停在 [segment_0001.jsonl](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/web_20260503_092700/longdub_20260503_172706/segment_jobs/segment_0001/logs/segment_0001.jsonl)，没有继续写入 `group_0001` 完成或失败事件；
+  - `sample 52459` 显示热点卡在本地 `Qwen3-TTS` 的 `torch scaled_dot_product_attention` / MPS 路径，说明当前瓶颈在 Qwen anchor 生成，不在翻译，也不在 OmniVoice API。
+- 现状 1：`subtitle-maker` 当前已经正式接入 `qwen-omnivoice` 作为组合 backend，但这条链路的第一跳就是本地加载并运行 `Qwen3-TTS`。
+  - 依据：
+    - [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 的 `_normalize_auto_dubbing_request()` 已接受 `tts_backend in {"index-tts", "qwen", "omnivoice", "qwen-omnivoice"}`；
+    - [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 在 `args.tts_backend in {"qwen", "qwen-omnivoice"}` 时会走 `load_tts_model(...)` 加载本地 Qwen 模型；
+    - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的 `synthesize_text_once()` 在 `normalized == "qwen-omnivoice"` 分支里，先 `_synthesize_qwen_anchor(...)`，后才调用 `OmniVoiceBackend.synthesize(...)`。
+- 现状 2：当前系统里还没有任何 `voxcpm` backend 接线，`VoxCPM` 仍然只是外部仓库，不是 `subtitle-maker` 的可选底座。
+  - 依据：
+    - [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 当前白名单里没有 `voxcpm` 或 `voxcpm-omnivoice`；
+    - [src/subtitle_maker/jobs/command_builder.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/jobs/command_builder.py) 的 `_needs_qwen_runtime()` / `_needs_omnivoice_runtime()` 只识别 `qwen`、`qwen-omnivoice`、`omnivoice`；
+    - 当前仓库 `src/`、`tools/`、`tests/` 下没有已接入的 `voxcpm` runtime 分支。
+- 现状 3：现有主链路已经具备“组合 backend”所需的大部分骨架，因此切到 `VoxCPM + OmniVoice` 不需要重做整条自动配音流程。
+  - 依据：
+    - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的 `synthesize_text_once()` 已经是统一单次合成入口；
+    - 同文件逐句与 grouped 路径都通过 `synthesize_text_once()` 发起真正 TTS；
+    - [src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py) 已经稳定承担“最终控时合成”职责。
+- 现状 4：`VoxCPM` 更适合作为“中文 anchor 生成器”，而不是直接替代 `OmniVoice` 的控时职责。
+  - 依据：
+    - 你当前要求是“换掉过慢的 Qwen anchor 生成”，不是放弃 `OmniVoice` 的句级时长控制；
+    - 当前项目里真正把 `target_duration_sec` 透传进最终生成阶段的是 `OmniVoiceBackend.synthesize()`，不是 `Qwen3-TTS` 路径。
+- 现状 5：当前最自然的切换方式，不是把 `VoxCPM` 做成 `fallback_tts_backend`，而是新增 `tts_backend=voxcpm-omnivoice`。
+  - 依据：
+    - `fallback_tts_backend` 在当前系统中的语义仍是“主 backend 失败后的备胎”，见 [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 与 [src/subtitle_maker/manifests/schema.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/schema.py)；
+    - `qwen-omnivoice` 已证明组合语义适合作为新的主 backend 标识，而不是滥用 fallback 字段。
+
+## TODO（2026-05-03 VoxCPM + OmniVoice 切换）
+- [x] 完成 Spec 2/3：功能点与改动边界
+- [x] 完成 Spec 3/3：风险、关键决策与推荐方案
+- [x] HARD-GATE：等待你确认后再开始编码
+- [x] 在 `VoxCPM` 仓库新增精简 TTS API 服务，只保留 `/health` 与 `/tts`
+- [x] 在 `subtitle-maker` 接入 `tts_backend=voxcpm-omnivoice`
+- [x] 为 `voxcpm-omnivoice` 补 reference text / anchor 记录链路
+- [x] 补最小测试与语法验证
+
+## Spec-9（2026-05-03 VoxCPM + OmniVoice 切换）2/3 功能点与改动边界
+- 设计目标：新增 `voxcpm-omnivoice` 组合 backend，用 `VoxCPM` 替换当前过慢的 `Qwen3-TTS` anchor 生成步骤，再继续复用 `OmniVoice` 做最终句级控时合成。
+- 推荐能力边界：
+  - 输入仍沿用现有自动配音请求参数、批次结构、review 流程和长视频编排；
+  - 输出仍是当前 segment/job manifest、review 面板、最终成片与中间产物目录；
+  - 新增的是一个新的主 backend 模式，不新增独立产品入口，不改 V1/V2/V3 工作流语义。
+- 功能点 1：新增 `tts_backend=voxcpm-omnivoice`，打通 Web / CLI / runtime / manifest 白名单。
+  - 目标行为：
+    - 前端底座下拉可选择 `VoxCPM + OmniVoice`；
+    - API 归一化、命令拼装、manifest 存取、review redub 恢复都能识别这个 backend；
+    - 不滥用 `fallback_tts_backend` 表达组合语义。
+  - 依据：
+    - [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 当前 `tts_backend` 白名单已扩到 `qwen-omnivoice`，说明主 backend 扩展是现成模式；
+    - [src/subtitle_maker/jobs/command_builder.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/jobs/command_builder.py) 已围绕 `tts_backend` / `fallback_tts_backend` 构建 CLI；
+    - [src/subtitle_maker/manifests/schema.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/schema.py) 与 [src/subtitle_maker/manifests/readwrite.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/readwrite.py) 已持久化这些字段。
+- 功能点 2：新增 `VoxCPM` anchor 生成步骤，但只在 `voxcpm-omnivoice` 模式生效。
+  - 目标行为：
+    - 对每个待合成单元，先用当前 `ref_audio_path` 和对应 `ref_text` 调 `VoxCPM` 生成一段中文 anchor；
+    - 再把生成出的中文 anchor 作为 `OmniVoice` 的 `ref_audio_path` 做最终合成；
+    - `target_duration_sec` 只约束最终 `OmniVoice` 阶段，不要求 `VoxCPM` 先精确控时。
+  - 依据：
+    - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的 `synthesize_text_once()` 已经是组合 backend 最适合收敛的位置；
+    - [VoxCPM README](/Users/tim/Documents/vibe-coding/MVP/VoxCPM/README.md) 与 [VoxCPM app.py](/Users/tim/Documents/vibe-coding/MVP/VoxCPM/app.py) 都表明 `VoxCPM.generate(text=..., prompt_wav_path=..., prompt_text=...)` 是标准克隆入口。
+- 功能点 3：`VoxCPM` 必须消费“参考音频 + 参考文本”成对输入，不能像当前 Qwen 一样只吃音频 embedding。
+  - 目标行为：
+    - 组合 backend 在挑选 `ref_audio_path` 的同时，需要为 `VoxCPM` 提供同一段参考音对应的 `prompt_text`；
+    - 若缺少可靠 `prompt_text`，要么回退到该字幕原文，要么直接记为 `manual_review`，不能静默传空。
+  - 依据：
+    - [VoxCPM app.py](/Users/tim/Documents/vibe-coding/MVP/VoxCPM/app.py) 的 `/api/tts` 明确要求 `prompt_audio` 存在时必须同时提供 `prompt_text`；
+    - [src/voxcpm/core.py](/Users/tim/Documents/vibe-coding/MVP/VoxCPM/src/voxcpm/core.py) 明确要求 `prompt_wav_path` 和 `prompt_text` 成对出现，否则报错。
+- 功能点 4：首版优先复用 `VoxCPM` 现有 API 风格，而不是直接把整套模型硬塞进 `subtitle-maker` 进程内。
+  - 目标行为：
+    - 在 `/Users/tim/Documents/vibe-coding/MVP/VoxCPM` 侧补一个轻量 TTS API，协议尽量向 `subtitle-maker` 友好；
+    - `subtitle-maker` 通过 HTTP 调用该服务生成 anchor；
+    - 不把 `voxcpm` 的模型加载、依赖和 ASR/denoise 逻辑直接并入当前 web/API 进程。
+  - 依据：
+    - 当前 `Qwen3-TTS` 是直接进 `subtitle-maker` 进程，已经暴露出速度和资源占用问题；
+    - [VoxCPM app.py](/Users/tim/Documents/vibe-coding/MVP/VoxCPM/app.py) 本身已有 Flask 服务骨架与 `/api/tts` 风格入口，说明走 API 化复用最自然；
+    - `OmniVoice` 在本项目中也是通过 API/CLI 运行时隔离接入，现有模式可复用。
+- 功能点 5：保留当前 reference selector 和 `speaker_track_id` 逻辑，不在本轮重写 speaker segmentation。
+  - 目标行为：
+    - `voxcpm-omnivoice` 直接消费当前主链路已经选出的 `ref_audio_path`；
+    - V3 若已有更干净的 `speaker_track_id` 参考音，新的组合 backend 自动继承；
+    - 不在本轮顺手改 ASD、track continuity、字幕切句或前端预览。
+  - 依据：
+    - [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 当前 `build_backend_reference_selector()` 已是统一 reference 入口；
+    - 当前 V3 已经把 `speaker_track_id` 贯穿到后续 reference 复用链路。
+- 功能点 6：运行记录必须显式标记 `voice_ref_path -> voxcpm_anchor_path -> final_backend=omnivoice`。
+  - 目标行为：
+    - 每个成功/失败 record 至少写出：
+      - 原始 `voice_ref_path`
+      - `anchor_ref_path`
+      - `anchor_backend=voxcpm`
+      - `final_backend=omnivoice`
+      - 如失败，区分是 `voxcpm anchor` 失败还是 `omnivoice` 最终合成失败
+  - 依据：
+    - 当前 `qwen-omnivoice` 已在 [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 记录 `anchor_ref_path` / `final_backend`；
+    - 这套结构可以直接复制到 `voxcpm-omnivoice`，避免排障又回到黑盒状态。
+- 功能点 7：前端只新增一个 backend 选项，不新增复杂参数面板。
+  - 目标行为：
+    - 底座模型下拉增加 `VoxCPM + OmniVoice`；
+    - 继续复用当前 OmniVoice 运行参数；
+    - VoxCPM 的模型路径、API URL、timesteps 等首版先走后端默认值或环境变量，不先暴露给前端。
+  - 依据：
+    - 用户当前诉求是“换底座”，不是做一套 VoxCPM 调参工作台；
+    - 当前前端已经因为多模型配置复杂度偏高，首版应控制变量。
+- 本轮明确不做：
+  - 不继续优化 `Qwen3-TTS + OmniVoice` 的速度；
+  - 不让 `VoxCPM` 直接替代 `OmniVoice` 的最终控时；
+- 不改 V3 的 speaker segmentation、ASD tracked API 或前端产品结构；
+- 不顺手做多底座自动基准测试平台。
+
+## Spec-9（2026-05-03 VoxCPM + OmniVoice 切换）3/3 风险、关键决策与推荐方案
+- 风险 1：`VoxCPM` 和当前 Qwen 路径最大的不同，是它不能只吃参考音频，必须同时有匹配的 `prompt_text`。
+  - 依据：
+    - [VoxCPM app.py](/Users/tim/Documents/vibe-coding/MVP/VoxCPM/app.py) 的 `/api/tts` 明确要求 `prompt_audio` 存在时必须同时提供 `prompt_text`；
+    - [src/voxcpm/core.py](/Users/tim/Documents/vibe-coding/MVP/VoxCPM/src/voxcpm/core.py) 直接在 runtime 中校验：`prompt_wav_path` 和 `prompt_text` 必须成对出现。
+  - 影响：
+    - 当前 `subtitle-maker` 的 reference selector 主要产出的是 `Path`，不是“音频+转写”对；
+    - 如果把错的字幕文本配给参考音，VoxCPM 可能会学到错误内容或质量明显下降。
+  - 结论：
+    - 首版必须同时建立 `reference audio -> reference text` 选择策略，不能只复用现有音频 selector。
+- 风险 2：如果直接把 `VoxCPM` 模型嵌进 `subtitle-maker` 主进程，可能只是把当前 Qwen 的资源问题换一个模型重演。
+  - 依据：
+    - 当前 `Qwen3-TTS` 直接嵌入 `subtitle-maker` 后，真实运行已经暴露出卡在本地推理的问题；
+    - [src/voxcpm/core.py](/Users/tim/Documents/vibe-coding/MVP/VoxCPM/src/voxcpm/core.py) 初始化时默认会 warm-up，而且推理侧也包含 prompt cache、可选 denoise 等额外逻辑。
+  - 影响：
+    - 主进程内存、启动时间、模型切换和异常隔离都会变差；
+    - 出问题时更难区分是 `subtitle-maker` orchestration 问题还是 `VoxCPM` runtime 问题。
+  - 结论：
+    - 推荐走独立 API 服务，不走 in-process 嵌入。
+- 风险 3：如果直接复用 `VoxCPM/app.py` 当前 WebUI 接口，不做瘦身，依赖面会过大。
+  - 依据：
+    - [VoxCPM/app.py](/Users/tim/Documents/vibe-coding/MVP/VoxCPM/app.py) 当前不仅做 TTS，还带有 ASR、audiobook、上传、WebUI 等逻辑；
+    - `subtitle-maker` 当前需要的只是一个稳定的 “text + prompt_audio + prompt_text -> wav” 能力。
+  - 影响：
+    - 接口语义过宽，后续排障会混入无关路径；
+    - 自动启动、健康检查、release 语义也不如 `OmniVoice` 当前这套轻服务模式清晰。
+  - 结论：
+    - 应在 `VoxCPM` 仓库侧单独做一个精简 API 服务，而不是直接拿现有 WebUI 服务硬接。
+- 风险 4：若 `voxcpm-omnivoice` 的 runtime 配置直接暴露给前端，UI 复杂度会继续膨胀。
+  - 影响：
+    - 用户现在只是要求“换底座”，不是要管理另一套模型的细粒度推理参数；
+    - 一旦前端暴露过多 `model_path / api_url / timesteps / cfg`，很快又会回到配置混乱状态。
+  - 结论：
+    - 首版只暴露 `tts_backend=voxcpm-omnivoice` 这个选择，VoxCPM 参数走后端默认值或环境变量。
+- 风险 5：如果新的 anchor 链路不进 manifest / record，后续一样没法解释“英文原声为什么还混进来”。
+  - 影响：
+    - 你看到的还是“成片坏了”，但无法区分是原始 ref 脏、reference text 配错、VoxCPM anchor 脏，还是 OmniVoice 最终阶段出问题；
+    - review redub 也无法做定向重跑。
+  - 结论：
+    - `voice_ref_path / reference_text / anchor_ref_path / anchor_backend / final_backend` 必须都落盘。
+
+- 关键决策 1：组合模式命名
+  - 选项 A：`tts_backend=voxcpm-omnivoice`
+  - 选项 B：保留 `tts_backend=omnivoice`，再加布尔开关 `use_voxcpm_anchor=true`
+  - 推荐：选 A
+  - 原因：
+    - 和现有 `qwen-omnivoice` 一致，语义明确；
+    - manifest、恢复和 review 重跑更容易看懂；
+    - 避免把 `omnivoice` 这个已有 backend 悄悄改成另一条链路。
+
+- 关键决策 2：VoxCPM 接入方式
+  - 选项 A：直接在 `subtitle-maker` 进程内 import `voxcpm`
+  - 选项 B：在 `VoxCPM` 仓库内补一个轻量 API 服务，由 `subtitle-maker` 调用
+  - 推荐：选 B
+  - 原因：
+    - 隔离模型依赖、启动时间和异常；
+    - 复用当前 `OmniVoice` 的服务化经验；
+    - 避免把主进程进一步做重。
+
+- 关键决策 3：reference text 来源
+  - 选项 A：优先使用参考音频对应的原文字幕文本
+  - 选项 B：直接用当前待配音的中文译文作为 `prompt_text`
+  - 推荐：首版采用 A
+  - 原因：
+    - `prompt_text` 语义本来就是“参考音频对应文本”；
+    - 用错文本会破坏 voice cloning 对齐；
+    - 当前待配音译文更适合作为 `target text`，不是 `prompt_text`。
+
+- 关键决策 4：验证顺序
+  - 选项 A：直接接全链路，跑长视频 V3
+  - 选项 B：先做单段 `60s` 定向样本验证，再接回 V3
+  - 推荐：选 B
+  - 原因：
+    - 当前最大不确定性在 `VoxCPM anchor` 的速度和质量，不在 orchestration；
+    - 先缩小到单段验证，更容易比较：
+      - 生成速度
+      - 英文泄漏是否下降
+      - 时长控制是否仍由 OmniVoice 保住
+
+- 推荐方案（实施顺序）：
+  - 第 1 步：在 `/Users/tim/Documents/vibe-coding/MVP/VoxCPM` 增加一个精简 TTS API 服务，只保留：
+    - `/health`
+    - `/tts`
+    - 输入：`text`, `prompt_audio`, `prompt_text`
+    - 输出：wav 文件路径或音频文件
+  - 第 2 步：在 `subtitle-maker` 增加 `tts_backend=voxcpm-omnivoice` 白名单，打通前端、API normalize、command builder、manifest、review redub 恢复。
+  - 第 3 步：在 `synthesize_text_once()` 新增 `voxcpm-omnivoice` 分支：
+    - 先调 `VoxCPM API` 生成 anchor；
+    - 再调 `OmniVoiceBackend` 做最终控时合成。
+  - 第 4 步：补 reference text 选择与 anchor 落盘：
+    - 为 reference selector 增加对应文本来源；
+    - 在 record/attempt/manifest 写入 `reference_text`、`anchor_ref_path`、`anchor_backend=voxcpm`。
+  - 第 5 步：先拿单段样本做 smoke test，只比较三件事：
+    - 比 `qwen-omnivoice` 快多少；
+    - 英文原声泄漏是否减少；
+    - 最终配音是否仍卡进字幕时间窗。
+
+## Review（2026-05-03 VoxCPM + OmniVoice 切换 Spec）
+- 已完成：
+  - [x] Spec 1/3：现状分析
+  - [x] Spec 2/3：功能点与改动边界
+  - [x] Spec 3/3：风险、关键决策与推荐方案
+- 当前状态：
+  - 方案阶段已完成，尚未开始编码；
+  - 按仓库 HARD-GATE 规则，下一步必须等你确认后才能实施。
+
+## Review（2026-05-03 Qwen3-TTS + OmniVoice 真实运行复盘）
+- 结论：
+  - `qwen-omnivoice` 语义链路已接通，但真实运行速度不可接受；
+  - 当前主要瓶颈不是 `OmniVoice API`，而是 `Qwen3-TTS` 生成中文 anchor 的首跳推理。
+- 证据：
+  - 批次目录： [outputs/dub_jobs/web_20260503_092700](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/web_20260503_092700)
+  - 运行日志： [web_cli_stdout.log](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/web_20260503_092700/web_cli_stdout.log)
+  - Segment 日志： [segment_0001.jsonl](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/web_20260503_092700/longdub_20260503_172706/segment_jobs/segment_0001/logs/segment_0001.jsonl)
+
+## Spec-8（2026-05-03 Qwen3-TTS + OmniVoice 组合底座）1/3 现状分析
+- 目标：在 `subtitle-maker` 中优先试验 `Qwen3-TTS + OmniVoice` 组合底座，用 `Qwen3-TTS` 解决零样本中文音色锚点问题，再由 `OmniVoice` 负责句级时长控制。
+- 目标语义：
+  - 先从英文参考音频生成一段更干净的中文 anchor；
+  - 再把该中文 anchor 作为 `OmniVoice` 的参考音频；
+  - 最终仍输出落在字幕时间窗内的句级中文配音。
+- 现状 1：当前项目已经内置本地 `Qwen3-TTS` 推理链路，但它现在是直接作为主 TTS backend 出声，不是“先生成 anchor，再交给别的 backend”。
+  - 依据：
+    - `[tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py)` 中 `load_tts_model()` 会加载 `Qwen3-TTS`；
+    - 同文件当前 `args.tts_backend == "qwen"` 时，会先 `create_voice_clone_prompt(...)`，后续直接走 `generate_voice_clone(...)`。
+- 现状 2：当前项目里 `Qwen3-TTS` 的 clone 模式是 `x_vector_only_mode=True`，即只抽说话人嵌入，不依赖 `ref_text`。
+  - 依据：
+    - `[tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py)` 构造 prompt 时显式传入 `ref_text=None, x_vector_only_mode=True`；
+    - `[src/subtitle_maker/qwen_tts/inference/qwen3_tts_model.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/qwen_tts/inference/qwen3_tts_model.py)` 的 `create_voice_clone_prompt()` 明确说明 `x_vector_only_mode=True` 时只使用 speaker embedding。
+- 现状 3：当前项目的 `Qwen3-TTS` 路径没有直接消费 `target_duration_sec`，因此它不适合单独承担严格卡时长职责。
+  - 依据：
+    - `[src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py)` 的 `_synthesize_text_to_audio()` 虽然统一构建了含 `target_duration_sec` 的 `TtsSynthesisRequest`；
+    - 但 `normalized == "qwen"` 分支里实际只调用 `tts_qwen.generate_voice_clone(...)`，没有把 `target_duration_sec` 传进 Qwen 路径。
+- 现状 4：当前项目里真正负责“按目标时长生成”的是 `OmniVoiceBackend`，它已经稳定接入 API/CLI 双路径。
+  - 依据：
+    - `[src/subtitle_maker/backends/base.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/base.py)` 的 `TtsSynthesisRequest` 已定义 `target_duration_sec`；
+    - `[src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py)` 在 `synthesize()` 中会把 `request.target_duration_sec` 显式透传为 `--duration`。
+- 现状 5：当前后端参数与前端表单都只支持“单主 backend + 可选备胎 backend”，没有“组合 backend”这个一等公民概念。
+  - 依据：
+    - `[src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py)` 只接受 `tts_backend in {"index-tts", "qwen", "omnivoice"}`，`fallback_tts_backend in {"none", "omnivoice"}`；
+    - `[src/subtitle_maker/jobs/command_builder.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/jobs/command_builder.py)` 也是围绕这两个字段拼装 CLI；
+    - `[src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js)` 前端状态也是按单主底座组织。
+- 现状 6：从现有架构看，`Qwen3-TTS + OmniVoice` 最自然的落点不是新增第四个平行 backend，而是新增一个“组合 backend / 组合模式”。
+  - 推论依据：
+    - `Qwen3-TTS` 负责“生成中文音色锚点”；
+    - `OmniVoice` 负责“按句级目标时长生成最终中文配音”；
+    - 两者职责不重叠，属于前后串联，而不是二选一替换关系。
+
+## TODO（2026-05-03 Qwen3-TTS + OmniVoice 组合底座）
+- [ ] 完成 Spec 2/3：功能点与改动边界
+- [ ] 完成 Spec 3/3：风险、关键决策与推荐方案
+- [ ] HARD-GATE：等待你确认后再开始编码
+
+## Spec-8（2026-05-03 Qwen3-TTS + OmniVoice 组合底座）2/3 功能点与改动边界
+- 设计目标：把 `Qwen3-TTS` 从“直接最终出声的主 backend”改造成“中文 anchor 生成器”，再把生成出的 anchor 交给 `OmniVoice` 做最终控时合成。
+- 推荐能力边界：
+  - 输入仍沿用现有自动配音参数，不新增新的上传入口、任务类型或独立页面；
+  - 输出仍沿用现有批次目录结构、segment manifest、review 面板和最终成片产物；
+  - 新增的是一种 backend 运行模式，而不是新增一套平行工作流。
+- 功能点 1：新增一个组合 backend 标识，供 Web / CLI / runtime 统一识别。
+  - 建议形态：新增 `tts_backend=qwen-omnivoice`，而不是把它塞进 `fallback_tts_backend`。
+  - 依据：
+    - `[src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py)` 的 `_normalize_auto_dubbing_request()` 当前只接受 `index-tts/qwen/omnivoice` 三个主 backend；
+    - `[src/subtitle_maker/jobs/command_builder.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/jobs/command_builder.py)` 的 `build_auto_dubbing_command()` 直接透传 `--tts-backend`，说明 backend 标识是贯穿前后端的一级参数；
+    - `fallback_tts_backend` 当前语义是“主 backend 失败时切换备胎”，不适合表达“先 Qwen 后 OmniVoice”的串联流程。
+- 功能点 2：在句级/组级合成前增加“anchor 参考音生成”步骤，但只在 `qwen-omnivoice` 模式生效。
+  - 目标行为：
+    - 对每个待配音单元先根据当前 `ref_audio_path` 生成一段中文 anchor；
+    - 再以这段 anchor 作为 `OmniVoice` 的 `ref_audio_path` 去做最终合成；
+    - `target_duration_sec` 只作用于最终 `OmniVoice` 合成，不要求 Qwen anchor 先控时。
+  - 依据：
+    - `[src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py)` 的 `synthesize_text_once()` 已经是单次合成的统一入口，当前在函数内部按 backend 分支；
+    - 同文件 `run_sentence_synthesis_loop()` / `run_grouped_synthesis_loop()` 都通过 `synthesize_text_once()` 发起真正 TTS，因此组合逻辑应尽量收敛在该入口附近，而不是散到各个上层循环里。
+- 功能点 3：新增 anchor 缓存，避免同一参考音反复调用 Qwen 生成相同中文 anchor。
+  - 目标行为：
+    - 缓存 key 以当前参考音路径为主，必要时附带 `speaker_track_id` 或字幕索引；
+    - 同一 track / 同一参考音命中缓存时直接复用 anchor，不重复生成；
+    - anchor 文件作为中间产物落到 batch/segment 目录，便于排障。
+  - 依据：
+    - `[src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py)` 的 `run_sentence_synthesis_loop()` 当前已经维护 `ref_fp_cache`，说明运行时已经接受“按参考音做缓存”这类局部缓存模式；
+    - `[tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py)` 的 `build_backend_reference_selector()` 已支持按 `speaker_track_id` 选择/复用参考音，组合 backend 可以直接站在现有 reference selector 之上。
+- 功能点 4：保留现有 reference selector 逻辑，不重写 ASD / clean ref / speaker track 流程。
+  - 目标行为：
+    - `qwen-omnivoice` 直接消费当前主链路选出来的 `ref_audio_path`；
+    - V3 若已产出 `speaker_track_id` 并命中 track-level clean ref，则组合 backend 自动继承这套更干净的参考音；
+    - 不在本轮顺手改 speaker segmentation、ASD API、前端播放器或 review 机制。
+  - 依据：
+    - `[tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py)` 的 `build_backend_reference_selector()` 已是 reference 选择的统一出口；
+    - `[src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py)` 的句级/组级循环都统一通过 `ref_audio_selector` 拿到 `seg_ref_audio_path / group_ref_audio_path`。
+- 功能点 5：前端只新增一个可选 backend，不新增新的复杂表单。
+  - 目标行为：
+    - 底座模型下拉中增加 `Qwen3-TTS + OmniVoice`；
+    - 继续复用现有 OmniVoice runtime 参数区；
+    - 不新增第二套“Qwen anchor 参数面板”，首版固定使用当前项目已验证的 `x_vector_only_mode=True`。
+  - 依据：
+    - `[src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html)` 当前已有统一的 backend 下拉；
+    - `[src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js)` 在提交时统一写入 `tts_backend`；
+    - `[src/subtitle_maker/static/app.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js)` 已有 backend 名称归一化逻辑，需要一并扩展，但不需要新交互模型。
+- 功能点 6：运行日志与 manifest 需要显式标记“原参考音 -> Qwen anchor -> OmniVoice 最终配音”的链路，便于排查英文原声混入问题。
+  - 目标行为：
+    - segment 级 record 至少记录：
+      - 原始 `voice_ref_path`
+      - 生成后的 `anchor_ref_path`
+      - `anchor_backend=qwen`
+      - `final_backend=omnivoice`
+    - 如果 anchor 生成失败，要能区分是“Qwen anchor 失败”还是“OmniVoice 最终合成失败”。
+  - 依据：
+    - `[src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py)` 当前逐句记录里已经保存 `voice_ref_path`、失败码、attempts 等信息，扩展这层记录最顺手。
+- 本轮明确不做：
+  - 不引入 `VoxCPM`；
+  - 不改 `ASD` 服务与 tracked speaker 逻辑；
+  - 不顺手重做前端；
+- 不尝试让 `Qwen3-TTS` 直接控时；
+- 不新增新的独立 API 服务进程，优先复用现有本地 `Qwen3-TTS` 模型加载方式与现有 `OmniVoice` 服务。
+
+## Spec-8（2026-05-03 Qwen3-TTS + OmniVoice 组合底座）3/3 风险、关键决策与推荐方案
+- 风险 1：anchor 也是模型生成音，不是真人原声，因此无法从架构上保证一定比当前直接英文 ref 更干净。
+  - 影响：
+    - 如果 `Qwen3-TTS` 生成的中文 anchor 自身带不稳定停顿、气口或音色漂移，`OmniVoice` 会继续学习这些误差；
+    - 所以这条路线解决的是“参考音语言不匹配”问题，不是自动消灭全部脏 ref 问题。
+  - 结论：
+    - 这不是否决项，但必须把产物链路暴露出来，让我们能区分“原始 ref 脏”还是“Qwen anchor 脏”。
+- 风险 2：运行耗时和显存压力会上升，因为组合 backend 至少多了一跳生成。
+  - 依据：
+    - 当前本地 `Qwen3-TTS` 是在 `tools/dub_pipeline.py` 中直接加载模型并本地推理；
+    - `OmniVoice` 又是另一套本地运行时 / API 服务。
+  - 影响：
+    - 若按“每句都即时生成 anchor”做，长视频会明显变慢；
+    - 若不做缓存，成本会高到不可用。
+  - 结论：
+    - anchor 缓存不是优化项，而是首版必须项。
+- 风险 3：如果组合语义硬塞到 `fallback_tts_backend`，后续 manifest、恢复、review redub、前端展示都会语义错乱。
+  - 依据：
+    - `[src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py)` 当前把 `fallback_tts_backend` 当作失败备胎；
+    - `[src/subtitle_maker/manifests/schema.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/schema.py)` 与 `[src/subtitle_maker/manifests/readwrite.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/manifests/readwrite.py)` 都按这个语义存取；
+    - 相关单测也都围绕“备胎”语义写死，如 [tests/test_command_builder.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_command_builder.py)。
+  - 结论：
+    - 必须把 `qwen-omnivoice` 作为新的主 backend 标识，不要滥用 fallback 字段。
+- 风险 4：前端全局 backend 下拉当前只接受 `omnivoice` 和默认值，若不一起改归一化逻辑，会出现 UI 选了新值但请求被前端 silently 改回默认。
+  - 依据：
+    - `[src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html)` 当前下拉只有 `index-tts` / `omnivoice`；
+    - `[src/subtitle_maker/static/app.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js)` 的 `normalizeGlobalTtsBackend()` 目前只有 `omnivoice` 显式白名单，其他值会退回默认。
+  - 结论：
+    - 前端不是可选项，至少要同步加 backend 选项与归一化白名单。
+- 风险 5：如果 anchor 文件不进 manifest / record，后续很难解释“为什么这句还是混进英文原声”。
+  - 影响：
+    - 用户看到的只有最终配音坏了，但不知道坏在原始 ref、Qwen anchor、还是 OmniVoice；
+    - review redub 也无法有针对性地重跑或比对。
+  - 结论：
+    - manifest / attempts / segment records 必须保留 anchor 路径与 backend 链路字段。
+
+- 关键决策 1：组合模式命名
+  - 选项 A：`tts_backend=qwen-omnivoice`
+  - 选项 B：保留 `tts_backend=qwen`，再加布尔开关 `use_omnivoice_refit=true`
+  - 推荐：选 A
+  - 原因：
+    - 语义清晰；
+    - manifest/replay/review 更容易看懂；
+    - 避免 `qwen` 这个既有 backend 语义被悄悄改变。
+
+- 关键决策 2：anchor 生成粒度
+  - 选项 A：每句生成一个 anchor
+  - 选项 B：按参考音 / track 复用 anchor
+  - 推荐：首版采用 B
+  - 原因：
+    - 长视频成本可控；
+    - 与现有 `speaker_track_id` / reference selector 路径自然兼容；
+    - 更符合“同一个人一段内音色一致”的目标。
+
+- 关键决策 3：Qwen anchor 文本来源
+  - 选项 A：直接用当前待配音的中文译文生成 anchor
+  - 选项 B：固定短中文模板句生成 anchor
+  - 推荐：首版采用 A
+  - 原因：
+    - 不需要新增模板管理；
+    - 生成出的 anchor 语言、发音风格更贴近最终句子；
+    - 如果后面发现 anchor 太长导致不稳，再收敛为短模板句是可逆优化。
+
+- 关键决策 4：首版验证范围
+  - 选项 A：直接接进 V1/V2/V3 全链路并默认可用
+  - 选项 B：先接成一个可选 backend，只做定向样本验证
+  - 推荐：选 B
+  - 原因：
+    - 这是新组合链路，风险主要在实际音频质量，不在语法层；
+    - 应先验证 `Qwen anchor -> OmniVoice` 是否真的减少英文泄漏，再决定是否扩大默认使用面。
+
+- 推荐方案（实施顺序）：
+  - 第 1 步：新增 `qwen-omnivoice` 主 backend 标识，打通前端下拉、API 归一化、CLI 参数校验、manifest 存取、command builder。
+  - 第 2 步：在 `synthesize_text_once()` 附近收敛组合逻辑：
+    - 先用当前 `ref_audio_path` 生成中文 anchor；
+    - 再把 anchor 交给 `OmniVoiceBackend`，并继续传 `target_duration_sec`。
+  - 第 3 步：增加 anchor 缓存与中间产物落盘，并把 `voice_ref_path` / `anchor_ref_path` / `final_backend` 写入 record。
+  - 第 4 步：补最小测试：
+    - backend 值校验；
+    - command builder 透传；
+    - manifest round-trip；
+    - 组合模式下的 runtime 行为单测。
+  - 第 5 步：只拿你当前问题样本做 smoke test，对比：
+    - 原 `omnivoice`
+    - 新 `qwen-omnivoice`
+    - 关注点只看三项：英文原声是否减少、音色一致性、时长是否仍卡住。
+
+## Review（2026-05-03 Qwen3-TTS + OmniVoice 组合底座 Spec）
+- 已完成：
+  - [x] Spec 1/3：现状分析
+  - [x] Spec 2/3：功能点与改动边界
+  - [x] Spec 3/3：风险、关键决策与推荐方案
+- 当前状态：
+  - 已完成方案阶段，尚未开始编码；
+  - 按仓库 HARD-GATE 规则，下一步必须等确认后才能实施。
+
+## Spec-7（2026-05-03 VoxCPM + OmniVoice 第三底座）1/3 现状分析
+- 目标：在 `subtitle-maker` 中新增第三个 TTS 底座选项 `VoxCPM + OmniVoice`。
+- 目标语义：
+  - 先用 `/Users/tim/Documents/vibe-coding/MVP/VoxCPM` 做零样本中文音色锚点生成；
+  - 再把该中文锚点音频作为 OmniVoice 的参考音频，让 OmniVoice 负责句级时长控制；
+  - 最终作为现有 `tts_backend` 的第三个可选项接入前后端与任务编排。
+- 现状 1：`subtitle-maker` 当前只接受 `index-tts` / `qwen` / `omnivoice` 三个主底座。
+  - 依据：`[src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py)` 中参数归一化逻辑明确校验 `tts_backend in {"index-tts", "qwen", "omnivoice"}`。
+- 现状 2：OmniVoice 已有完整的本地 API 服务化接入，协议与自动拉起链路都在 `subtitle-maker` 内部。
+  - 依据：
+    - `[tools/omnivoice_fastapi_server.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/omnivoice_fastapi_server.py)` 已提供 `/health` / `/synthesize` / `/release` 风格的 HTTP 服务；
+    - `[src/subtitle_maker/backends/omni_voice.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/omni_voice.py)` 已封装 API/CLI 双路径、质量重试与本地服务恢复；
+    - `[src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py)` 已有 OmniVoice runtime 参数透传与自动启动脚本配置。
+- 现状 3：前端当前“底座模型”控件也只围绕 `index-tts` / `omnivoice` / `qwen` 组织。
+  - 依据：`[src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html)` 与 `[src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js)` 中 `tts_backend` 相关选项和表单提交逻辑。
+- 现状 4：`VoxCPM` 仓库目前有可直接复用的推理入口，但它不是现成的 `subtitle-maker` API 兼容服务。
+  - 依据：
+    - `[VoxCPM/app.py](/Users/tim/Documents/vibe-coding/MVP/VoxCPM/app.py)` 是 Flask WebUI/接口风格实现，不是 `subtitle-maker` 当前 OmniVoice 那种轻量 TTS API；
+    - `[VoxCPM/launch_wrapper.py](/Users/tim/Documents/vibe-coding/MVP/VoxCPM/launch_wrapper.py)` 只是启动 Flask app；
+    - `[VoxCPM/README.md](/Users/tim/Documents/vibe-coding/MVP/VoxCPM/README.md)` 公开了 `voxcpm.VoxCPM.generate(...)` 的直接 Python 调用方式，说明最稳的复用层是“新增一个 subtitle-maker 风格的 VoxCPM API 服务”。
+- 现状 5：现有 dubbing 主链路对“参考音频”这一抽象已经有明确入口，新增第三底座不需要推翻整条配音流水线。
+  - 依据：
+    - `[src/subtitle_maker/backends/base.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/base.py)` 的 `TtsSynthesisRequest` 已包含 `ref_audio_path` / `ref_text` / `target_duration_sec` 等关键字段；
+    - `[src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py)` 现有句级/组级合成都通过 backend 抽象进入，不要求前端理解底层细节。
+- 现状 6：本需求不是“替换 OmniVoice”，而是“在 OmniVoice 前增加一层 VoxCPM 中文锚点生成”，所以它更像新增一个组合 backend，而不是单独再加一个平行底座。
+  - 推论依据：
+    - OmniVoice 现有职责已经是“句级生成 + 时长控制”；
+    - VoxCPM 更适合承担“零样本中文音色锚点生成”；
+    - 因此最自然的实现边界是：新增 `voxcpm-omnivoice` 组合 backend，内部先调 VoxCPM，再调 OmniVoice。
+
+## TODO（2026-05-03 VoxCPM + OmniVoice 第三底座）
+- [ ] 完成 Spec 2/3：功能点与改动边界
+- [ ] 完成 Spec 3/3：风险、关键决策与推荐方案
+- [ ] HARD-GATE：等待你确认后再开始编码
+
+## TODO（2026-05-03 V3 track-level clean ref）
+- [x] 长视频分段裁剪时保留 `speaker_track_id` 元数据，不在 segment 层丢失
+- [x] OmniVoice 参考音选择层接入 `speaker_track_id`，同一 track 复用首个合格 ref
+- [x] 补轻量回归测试，覆盖 segment 保字段与 track ref 复用
+
+## Review（2026-05-03 V3 track-level clean ref）
+- 已实现：
+  - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 的 `clip_subtitles_for_segment()` 现在会保留除 `start/end/text` 之外的元数据，`speaker_track_id` 不会在 segment 层被裁掉；
+  - [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 的 `build_backend_reference_selector()` 现在会在 `tts_backend=omnivoice` 时优先按 `speaker_track_id` 复用同一 track 的首个合格 ref，减少每条字幕都各吃自己英文时间窗 ref 的概率；
+  - 统计字段新增 `track_reference_count`，便于直接从 reference strategy 结果看是否发生了 track 级复用。
+- 已验证：
+  - [tests/test_dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dub_long_video.py) 新增 `test_clip_subtitles_for_segment_preserves_speaker_track_id_metadata`；
+  - [tests/test_dub_pipeline_references.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dub_pipeline_references.py) 新增 `test_build_backend_reference_selector_reuses_first_track_reference_for_same_speaker`，并把旧的 vocals-stem 检查收敛为当前主链路源码断言；
+  - `PYTHONPATH=src python3 -m unittest tests.test_dub_pipeline_references`：`Ran 2 tests ... OK`
+  - `PYTHONPATH=src python3 -m unittest tests.test_dub_long_video.DubLongVideoTests.test_clip_subtitles_for_segment_preserves_speaker_track_id_metadata`：`Ran 1 test ... OK`
+  - `python3 -m py_compile src/subtitle_maker/domains/dubbing/speaker_segments.py tools/dub_long_video.py tools/dub_pipeline.py tests/test_speaker_segments.py tests/test_dub_long_video.py tests/test_dub_pipeline_references.py`
+- 边界：
+  - 这一步仍然不是完整的“clean ref 提取器”，只是先做到“同一 track 不要反复吃各自字幕窗 ref”；
+  - 下一步真实验证重点是：`group_0003/0004` 这种断脸场景里，英文泄漏是否明显下降。
+
+## TODO（2026-05-03 V3 断脸继承 speaker track）
+- [x] V3 `assign_speakers_to_subtitles()` 在无人脸/无 track 字幕窗里继承上一个 `speaker_track_id`
+- [x] V3 重写后的字幕结构保留 `speaker_track_id`，为后续 track-level ref 铺路
+- [x] 补回归测试，覆盖断脸继承与字幕结构保留
+
+## Review（2026-05-03 V3 断脸继承 speaker track）
+- 已实现：
+  - [src/subtitle_maker/domains/dubbing/speaker_segments.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/speaker_segments.py) 的 `assign_speakers_to_subtitles()` 现在会在当前字幕窗完全没有可见 `speaker_track_id` 时，继承上一位已确认说话人的 `speaker_track_id`，避免短暂断脸把 speaker segment 切碎；
+  - 同文件 `build_subtitles_from_speaker_segments()` 现在会把 `speaker_track_id` 保留到重写后的字幕结构里，给后续 track-level reference 选择提供输入。
+- 验证：
+  - [tests/test_speaker_segments.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_speaker_segments.py) 新增“无人脸时继承上一 track”用例；
+  - 同时更新“重写字幕结构保留 `speaker_track_id`”断言；
+  - `PYTHONPATH=src python3 -m unittest tests.test_speaker_segments`：`Ran 5 tests ... OK`
+- 边界：
+  - 这一步只解决 speaker continuity，不直接解决英文原声混入；
+  - 下一步仍需要基于保留下来的 `speaker_track_id` 做 track-level clean ref，才能真正减少脏 ref 导致的英文泄漏。
+
 ## TODO（2026-05-03 Auto Dubbing V3）
 - [x] 新建 `docs/plans/0002-auto-dubbing-v3-2026-05-03.md` 并落档 V3 计划书
-- [ ] 创建本地 checkpoint commit，作为 V3 实现前可回滚锚点
-- [ ] 左侧栏新增 `Auto Dubbing V3` 与 `panel-auto-dub-v3`
-- [ ] 后端允许 `pipeline_version=v3`，并透传 V3 CLI 参数
-- [ ] 接入 `asd-pipeline /run-tracked`，生成 `speaker_segments.json`
-- [ ] 复用 OmniVoice 时长控制链路完成 V3 配音
+- [x] 创建本地 checkpoint commit，作为 V3 实现前可回滚锚点
+- [x] 左侧栏新增 `Auto Dubbing V3` 与 `panel-auto-dub-v3`
+- [x] 后端允许 `pipeline_version=v3`，并透传 V3 CLI 参数
+- [x] 接入 `asd-pipeline /run-tracked`，生成 `speaker_segments.json`
+- [x] 复用现有长视频链路，将 speaker segment 重写后的字幕送入后续配音流程
+- [x] V3 默认本地 `asd-pipeline` 服务增加自动探活与自动启动
 - [ ] 补测试并验证 V1/V2 不回归
+
+## Review（2026-05-03 Auto Dubbing V3）
+- 已实现：
+  - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 新增 `Auto Dubbing V3` 菜单与 `panel-auto-dub-v3`；
+  - [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js) 新增第三套 `setupAutoDubbing()` 实例，提交 `pipeline_version=v3`；
+  - [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 接受 `v3`，并透传 `v3_asd_api_url` / `v3_speaker_segment_mode`；
+  - [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) 现已在 `pipeline_version=v3` 时先探活 `asd-pipeline`，默认本地地址失败会自动调用 `/Users/tim/Documents/vibe-coding/huayang/asd-pipeline/start.sh`；
+  - [src/subtitle_maker/jobs/command_builder.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/jobs/command_builder.py) 增加 `--v3-mode`、`--v3-asd-api-url`、`--v3-speaker-segment-mode`；
+  - [src/subtitle_maker/domains/dubbing/speaker_segments.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/speaker_segments.py) 新增 tracked ASD 调用、focus 归属、speaker segment 合并，以及把 speaker segment 重写为后续配音字幕的逻辑；
+  - [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 在 V3 模式下先调用 ASD，生成 `speaker_segments.json`，并把按 speaker segment 重写后的字幕送入现有长视频配音链路。
+- 失败复盘与修复：
+  - 真实运行 `web_20260503_050151 / longdub_20260503_130157` 失败的根因，不是 `segment_0001` 内部没写 manifest，而是 `dub_long_video.py` 把 `--v3-mode` / `--v3-asd-api-url` / `--v3-speaker-segment-mode` 原样透传给了 [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py)；
+  - `dub_pipeline.py` 不认识这些参数，`Segment 01` 启动即报 `unrecognized arguments` 并退出，随后 `dub_long_video.py` 才在读取 `segment_jobs/segment_0001/manifest.json` 时抛出 `missing manifest`；
+  - 已在 [tools/dub_long_video.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_long_video.py) 新增 `filter_segment_extra_args()`，把只属于 long-video V3 编排层的参数过滤掉，不再传给 `dub_pipeline.py`。
+- 已验证：
+  - `python3 -m py_compile src/subtitle_maker/domains/dubbing/speaker_segments.py tools/dub_long_video.py tests/test_speaker_segments.py tests/test_dub_long_video.py`
+  - `PYTHONPATH=src python3 -m unittest tests.test_speaker_segments`：`Ran 4 tests ... OK`
+  - `python3 -m py_compile tools/dub_long_video.py tests/test_dub_long_video.py`
+  - `python3 -m py_compile src/subtitle_maker/dubbing_cli_api.py tests/test_dubbing_cli_api.py`
+  - `node --check src/subtitle_maker/static/js/dubbingPanel.js && node --check src/subtitle_maker/static/app.js`
+- 当前阻塞：
+  - `python3 -m unittest tests.test_dub_long_video` 在当前环境因缺少 `soundfile` 无法导入 `tools/dub_long_video.py`，属于环境缺包，不是本轮新增逻辑的语法错误。
+  - `PYTHONPATH=src python3 -m unittest tests.test_dubbing_cli_api...` 在当前环境因缺少 `torch` 无法导入 `subtitle_maker.transcriber`，因此本轮新增的 ASD 自动启动测试未能在该环境实际执行。
 
 ## TODO（2026-05-02 Index-TTS 吞字修复）
 - [x] 新建 `docs/plans/0001-index-tts-timing-fix-2026-05-02.md` 并落档本轮实施计划
@@ -2866,3 +5125,9 @@
   - 强制短句合并、reference 策略收紧、`<1.2s` 前置拦截、段级音量归一已经共同进入生产路径；
   - 最新实测任务 `done=3 failed=0 manual_review=0`，用户听感反馈“效果好多了”与日志结果一致；
   - 下一阶段应优先盯音量上限是否偏紧，以及最终视频封装层是否完整落盘。
+- [x] 修正 `voxcpm-omnivoice` 链路中的 `ref_text` 语义：VoxCPM 使用原参考音对应文本，OmniVoice 使用 anchor 音频对应文本，避免把原参考 prompt 错喂给最终时长控制。
+
+    - 第九阶段计划：直接删除/重写残留的 OmniVoice/VoxCPM 旧测试，随后收掉 `domains/dubbing/pipeline.py`、`backends/omni_voice.py`、`tools/repair_bad_segments.py`、`tools/dub_long_video.py` 中仍然活着的 OmniVoice 分支，最终让 Auto Dubbing 运行时只剩 `index-tts`。
+
+    - 第九阶段已完成 index-tts 单底座收口：删除 `src/subtitle_maker/backends/omni_voice.py` 与导出，`domains/dubbing/pipeline.py` 的真实运行时已强制只走 `IndexTtsBackend`，工具层/前端中的 OmniVoice 偏好逻辑与文案残留已同步清掉；保留少量兼容形参仅用于旧调用不炸。
+    - 第九阶段验证：`node --check src/subtitle_maker/static/js/dubbingPanel.js`、`uv run python -m py_compile src/subtitle_maker/backends/__init__.py src/subtitle_maker/domains/dubbing/pipeline.py tools/dub_pipeline.py tools/dub_long_video.py tools/repair_bad_segments.py`、`uv run python -m unittest -v tests.test_dub_pipeline_asr_layout tests.test_dub_long_video tests.test_dubbing_runtime tests.test_dubbing_cli_api` 全部通过。

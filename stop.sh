@@ -10,7 +10,6 @@ cd "$PROJECT_DIR"
 INDEX_TTS_PROJECT_DIR="${INDEX_TTS_PROJECT_DIR:-/Users/tim/Documents/vibe-coding/MVP/index-tts-1108}"
 INDEX_TTS_STOP_SCRIPT="${INDEX_TTS_STOP_SCRIPT:-$INDEX_TTS_PROJECT_DIR/stop-api.sh}"
 LOCAL_INDEX_TTS_STOP_SCRIPT="$PROJECT_DIR/stop_index_tts_api.sh"
-LOCAL_OMNIVOICE_STOP_SCRIPT="$PROJECT_DIR/stop_omnivoice_api.sh"
 
 say() {
     # 统一日志前缀，便于在终端快速识别 stop 阶段输出。
@@ -36,7 +35,7 @@ kill_pattern() {
 }
 
 kill_pid_file() {
-    # 通过 PID 文件停止进程，适配 index-tts / OmniVoice / legacy dubbing 脚本。
+    # 通过 PID 文件停止进程，适配 index-tts / legacy dubbing 脚本。
     local pid_file="$1"
     local label="$2"
     if [ ! -f "$pid_file" ]; then
@@ -88,11 +87,9 @@ say "Stopping Subtitle Maker and related services..."
 # 1) 先调用子系统 stop 脚本，优先走各自定义的停机逻辑。
 run_stop_script "$INDEX_TTS_STOP_SCRIPT" "index-tts(external)"
 run_stop_script "$LOCAL_INDEX_TTS_STOP_SCRIPT" "index-tts(local)"
-run_stop_script "$LOCAL_OMNIVOICE_STOP_SCRIPT" "omnivoice(local)"
 
 # 2) 再按 PID 文件兜底，避免脚本异常退出后遗留孤儿进程。
 kill_pid_file "$PROJECT_DIR/index_tts_api.pid" "index-tts api"
-kill_pid_file "$PROJECT_DIR/omnivoice_api.pid" "omnivoice api"
 kill_pid_file "$PROJECT_DIR/dubbing.pid" "legacy dubbing server"
 
 # 3) 按进程命令特征清理所有相关后端任务与服务。
@@ -106,16 +103,14 @@ kill_pattern "tools/dub_long_video.py" "long dubbing orchestrator"
 kill_pattern "tools/dub_pipeline.py" "segment dubbing pipeline"
 kill_pattern "tools/repair_bad_segments.py" "repair pipeline"
 kill_pattern "tools/index_tts_fastapi_server.py" "index-tts local api"
-kill_pattern "tools/omnivoice_fastapi_server.py" "omnivoice local api"
 kill_pattern "llama-server" "local sakura model"
 
 # 4) 最后按端口兜底清理监听者，确保下次 start 不会被端口占用阻塞。
 kill_port 8000 "subtitle-maker web"
 kill_port 8010 "index-tts api"
-kill_port 8020 "omnivoice api"
 kill_port 8081 "sakura llama-server"
 
 # 5) 清理可能残留的 pid 文件，避免下次误判。
-rm -f "$PROJECT_DIR/index_tts_api.pid" "$PROJECT_DIR/omnivoice_api.pid" "$PROJECT_DIR/dubbing.pid"
+rm -f "$PROJECT_DIR/index_tts_api.pid" "$PROJECT_DIR/dubbing.pid"
 
 say "Done."

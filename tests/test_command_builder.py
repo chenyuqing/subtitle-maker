@@ -25,28 +25,24 @@ class CommandBuilderTests(unittest.TestCase):
                 min_segment_minutes=4.0,
                 timing_mode="balanced",
                 grouping_strategy="sentence",
+                dubbing_mode="multi",
                 short_merge_enabled=True,
                 short_merge_threshold=12,
                 translate_base_url="https://api.deepseek.com",
                 translate_model="deepseek-v4-flash",
+                tts_model_path="",
                 tts_backend="index-tts",
-                fallback_tts_backend="omnivoice",
-                omnivoice_root="/opt/omnivoice",
-                omnivoice_python_bin="/opt/omnivoice/.venv/bin/python",
-                omnivoice_model="k2-fsa/OmniVoice",
-                omnivoice_device="mps",
                 index_tts_api_url="http://127.0.0.1:8010",
-                auto_pick_ranges=True,
-                auto_pick_min_silence_sec=0.8,
-                auto_pick_min_speech_sec=1.0,
                 translated_short_merge_enabled=True,
                 translated_short_merge_threshold=11,
                 input_srt=Path("/tmp/manual.srt"),
                 input_srt_kind="translated",
                 time_ranges=[{"start_sec": 1.0, "end_sec": 5.5}],
                 source_lang="English",
-                pipeline_version="v2",
                 rewrite_translation=False,
+                translate_system_prompt="你是专业中文译者，请优先保留术语一致性。",
+                single_ref_text="hello world",
+                speaker_ref_map_json='[{"speaker_id":"Speaker 1","ref_audio_path":"/tmp/s1.wav"}]',
             )
         )
 
@@ -74,22 +70,19 @@ class CommandBuilderTests(unittest.TestCase):
         self.assertEqual(json.loads(cmd[ranges_index + 1]), [{"start_sec": 1.0, "end_sec": 5.5}])
         self.assertIn("--asr-language", cmd)
         self.assertIn("English", cmd)
-        self.assertIn("--v2-mode", cmd)
-        self.assertIn("--v2-rewrite-translation", cmd)
-        rewrite_index = cmd.index("--v2-rewrite-translation")
-        self.assertEqual(cmd[rewrite_index + 1], "false")
-        self.assertIn("--fallback-tts-backend", cmd)
-        fallback_index = cmd.index("--fallback-tts-backend")
-        self.assertEqual(cmd[fallback_index + 1], "omnivoice")
-        self.assertIn("--omnivoice-root", cmd)
-        omni_root_index = cmd.index("--omnivoice-root")
-        self.assertEqual(cmd[omni_root_index + 1], "/opt/omnivoice")
-        self.assertIn("--omnivoice-via-api", cmd)
-        via_api_index = cmd.index("--omnivoice-via-api")
-        self.assertEqual(cmd[via_api_index + 1], "true")
-        self.assertIn("--omnivoice-api-url", cmd)
-        api_url_index = cmd.index("--omnivoice-api-url")
-        self.assertEqual(cmd[api_url_index + 1], "http://127.0.0.1:8020")
+        self.assertIn("--dubbing-mode", cmd)
+        dubbing_mode_index = cmd.index("--dubbing-mode")
+        self.assertEqual(cmd[dubbing_mode_index + 1], "multi")
+        self.assertIn("--speaker-ref-map-json", cmd)
+        self.assertIn("--single-ref-text", cmd)
+        single_ref_text_index = cmd.index("--single-ref-text")
+        self.assertEqual(cmd[single_ref_text_index + 1], "hello world")
+        self.assertIn("--translate-system-prompt", cmd)
+        translate_prompt_index = cmd.index("--translate-system-prompt")
+        self.assertEqual(cmd[translate_prompt_index + 1], "你是专业中文译者，请优先保留术语一致性。")
+        self.assertNotIn("--omnivoice-root", cmd)
+        self.assertNotIn("--omnivoice-via-api", cmd)
+        self.assertNotIn("--omnivoice-api-url", cmd)
 
     def test_build_segment_redub_command_skips_line_indices_for_grouped_segments(self):
         cmd = build_segment_redub_command(
@@ -101,13 +94,8 @@ class CommandBuilderTests(unittest.TestCase):
                 input_media=Path("/tmp/segment.wav"),
                 target_lang="English",
                 translated_srt=Path("/tmp/segment_0001/subtitles/translated.srt"),
+                tts_model_path="",
                 index_tts_api_url="http://127.0.0.1:8010",
-                fallback_tts_backend="none",
-                omnivoice_root="",
-                omnivoice_python_bin="",
-                omnivoice_model="",
-                omnivoice_device="auto",
-                pipeline_version="v2",
                 rewrite_translation=False,
                 grouped_synthesis=True,
                 force_fit_timing=True,
@@ -121,9 +109,6 @@ class CommandBuilderTests(unittest.TestCase):
         self.assertIn("--force-fit-timing", cmd)
         force_fit_index = cmd.index("--force-fit-timing")
         self.assertEqual(cmd[force_fit_index + 1], "true")
-        self.assertIn("--v2-mode", cmd)
-        self.assertIn("--v2-rewrite-translation", cmd)
-        self.assertIn("--fallback-tts-backend", cmd)
         self.assertNotIn("--redub-line-indices-json", cmd)
         self.assertNotIn("--translated-short-merge-enabled", cmd)
 
@@ -137,12 +122,8 @@ class CommandBuilderTests(unittest.TestCase):
                 input_media=Path("/tmp/segment.wav"),
                 target_lang="English",
                 translated_srt=Path("/tmp/segment_0001/subtitles/translated.srt"),
+                tts_model_path="",
                 index_tts_api_url="http://127.0.0.1:8010",
-                fallback_tts_backend="none",
-                omnivoice_root="",
-                omnivoice_python_bin="",
-                omnivoice_model="",
-                omnivoice_device="auto",
                 grouped_synthesis=False,
                 force_fit_timing=False,
                 redub_local_indices=[3, 1, 3, 0],
@@ -150,11 +131,10 @@ class CommandBuilderTests(unittest.TestCase):
         )
 
         self.assertIn("--redub-line-indices-json", cmd)
-        self.assertIn("--fallback-tts-backend", cmd)
         indices_index = cmd.index("--redub-line-indices-json")
         self.assertEqual(json.loads(cmd[indices_index + 1]), [1, 3])
 
-    def test_build_auto_dubbing_command_keeps_omnivoice_runtime_flags_for_primary_backend(self):
+    def test_build_auto_dubbing_command_uses_index_tts_backend_only(self):
         cmd = build_auto_dubbing_command(
             AutoDubbingCommandConfig(
                 python_executable="/usr/bin/python3",
@@ -166,30 +146,59 @@ class CommandBuilderTests(unittest.TestCase):
                 min_segment_minutes=4.0,
                 timing_mode="strict",
                 grouping_strategy="sentence",
+                dubbing_mode="single",
                 short_merge_enabled=False,
                 short_merge_threshold=15,
                 translate_base_url="https://api.deepseek.com",
                 translate_model="deepseek-v4-flash",
-                tts_backend="omnivoice",
-                fallback_tts_backend="none",
-                omnivoice_root="/opt/omnivoice",
-                omnivoice_python_bin="/opt/omnivoice/.venv/bin/python",
-                omnivoice_model="k2-fsa/OmniVoice",
-                omnivoice_device="mps",
+                tts_model_path="",
+                tts_backend="index-tts",
                 index_tts_api_url="http://127.0.0.1:8010",
-                auto_pick_ranges=False,
-                auto_pick_min_silence_sec=0.8,
-                auto_pick_min_speech_sec=1.0,
             )
         )
 
         self.assertIn("--tts-backend", cmd)
         backend_index = cmd.index("--tts-backend")
-        self.assertEqual(cmd[backend_index + 1], "omnivoice")
-        self.assertIn("--omnivoice-root", cmd)
-        self.assertIn("--omnivoice-python-bin", cmd)
-        self.assertIn("--omnivoice-via-api", cmd)
-        self.assertIn("--omnivoice-api-url", cmd)
+        self.assertEqual(cmd[backend_index + 1], "index-tts")
+        self.assertNotIn("--omnivoice-root", cmd)
+        self.assertNotIn("--omnivoice-python-bin", cmd)
+        self.assertNotIn("--omnivoice-via-api", cmd)
+        self.assertNotIn("--omnivoice-api-url", cmd)
+        self.assertIn("--index-max-text-tokens", cmd)
+        token_index = cmd.index("--index-max-text-tokens")
+        self.assertEqual(cmd[token_index + 1], "40")
+
+    def test_build_auto_dubbing_command_keeps_single_reference_audio_for_index_tts(self):
+        cmd = build_auto_dubbing_command(
+            AutoDubbingCommandConfig(
+                python_executable="/usr/bin/python3",
+                tool_path=Path("/repo/tools/dub_long_video.py"),
+                input_media=Path("/tmp/input.mp4"),
+                target_lang="Chinese",
+                out_dir=Path("/tmp/out"),
+                segment_minutes=8.0,
+                min_segment_minutes=4.0,
+                timing_mode="strict",
+                grouping_strategy="sentence",
+                dubbing_mode="single",
+                short_merge_enabled=False,
+                short_merge_threshold=15,
+                translate_base_url="https://api.deepseek.com",
+                translate_model="deepseek-v4-flash",
+                tts_model_path="",
+                tts_backend="index-tts",
+                index_tts_api_url="http://127.0.0.1:8010",
+                single_ref_audio="/tmp/ref.wav",
+                single_ref_text="hello reference",
+            )
+        )
+
+        self.assertIn("--tts-backend", cmd)
+        backend_index = cmd.index("--tts-backend")
+        self.assertEqual(cmd[backend_index + 1], "index-tts")
+        self.assertIn("--single-speaker-ref", cmd)
+        self.assertIn("/tmp/ref.wav", cmd)
+        self.assertIn("--single-ref-text", cmd)
 
     def test_build_auto_dubbing_command_includes_resume_batch_dir_when_provided(self):
         cmd = build_auto_dubbing_command(
@@ -203,20 +212,14 @@ class CommandBuilderTests(unittest.TestCase):
                 min_segment_minutes=4.0,
                 timing_mode="strict",
                 grouping_strategy="sentence",
+                dubbing_mode="single",
                 short_merge_enabled=False,
                 short_merge_threshold=15,
                 translate_base_url="https://api.deepseek.com",
                 translate_model="deepseek-v4-flash",
+                tts_model_path="",
                 tts_backend="index-tts",
-                fallback_tts_backend="none",
-                omnivoice_root="",
-                omnivoice_python_bin="",
-                omnivoice_model="",
-                omnivoice_device="auto",
                 index_tts_api_url="http://127.0.0.1:8010",
-                auto_pick_ranges=False,
-                auto_pick_min_silence_sec=0.8,
-                auto_pick_min_speech_sec=1.0,
                 resume_batch_dir=Path("/tmp/out/longdub_20260427_123000"),
             )
         )
@@ -224,6 +227,32 @@ class CommandBuilderTests(unittest.TestCase):
         self.assertIn("--resume-batch-dir", cmd)
         resume_index = cmd.index("--resume-batch-dir")
         self.assertEqual(cmd[resume_index + 1], "/tmp/out/longdub_20260427_123000")
+
+    def test_build_auto_dubbing_command_omits_translate_system_prompt_when_blank(self):
+        cmd = build_auto_dubbing_command(
+            AutoDubbingCommandConfig(
+                python_executable="/usr/bin/python3",
+                tool_path=Path("/repo/tools/dub_long_video.py"),
+                input_media=Path("/tmp/input.mp4"),
+                target_lang="Chinese",
+                out_dir=Path("/tmp/out"),
+                segment_minutes=8.0,
+                min_segment_minutes=4.0,
+                timing_mode="strict",
+                grouping_strategy="sentence",
+                dubbing_mode="single",
+                short_merge_enabled=False,
+                short_merge_threshold=15,
+                translate_base_url="https://api.deepseek.com",
+                translate_model="deepseek-v4-flash",
+                translate_system_prompt="   ",
+                tts_model_path="",
+                tts_backend="index-tts",
+                index_tts_api_url="http://127.0.0.1:8010",
+            )
+        )
+        self.assertNotIn("--translate-system-prompt", cmd)
+
 
 
 if __name__ == "__main__":

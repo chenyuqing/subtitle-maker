@@ -8,6 +8,7 @@ generation, translation, or export flows.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import signal
@@ -44,6 +45,20 @@ from subtitle_maker.jobs import (
 )
 from subtitle_maker.manifests import load_batch_manifest, load_segment_manifest, write_manifest_json
 from subtitle_maker.transcriber import format_srt, parse_srt
+from subtitle_maker.translator import (
+    DEFAULT_TRANSLATE_BASE_URL,
+    DEFAULT_TRANSLATE_MODEL,
+    LEGACY_TRANSLATE_API_KEY_ENV,
+    TRANSLATE_API_KEY_ENV,
+    get_translate_provider_label,
+    resolve_translation_api_key,
+)
+from subtitle_maker.domains.subtitles import (
+    build_segment_speaker_metadata_from_subtitles,
+    normalize_subtitles_with_speakers,
+    parse_speaker_ref_map_json,
+    parse_speaker_reference_specs_json,
+)
 
 router = APIRouter(prefix="/dubbing/auto", tags=["dubbing"])
 
@@ -53,8 +68,6 @@ OUTPUT_ROOT = REPO_ROOT / "outputs" / "dub_jobs"
 TOOL_PATH = REPO_ROOT / "tools" / "dub_long_video.py"
 INDEX_TTS_START_SCRIPT = REPO_ROOT / "start_index_tts_api.sh"
 INDEX_TTS_STOP_SCRIPT = REPO_ROOT / "stop_index_tts_api.sh"
-OMNIVOICE_START_SCRIPT = REPO_ROOT / "start_omnivoice_api.sh"
-OMNIVOICE_STOP_SCRIPT = REPO_ROOT / "stop_omnivoice_api.sh"
 
 UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -63,18 +76,7 @@ _task_store = TaskStore()
 # 保留旧全局名，兼容现有测试与少量尚未迁移的代码。
 _tasks: Dict[str, TaskPayload] = _task_store.items
 _lock = _task_store.lock
-DEFAULT_TRANSLATE_BASE_URL = "https://api.deepseek.com"
-DEFAULT_TRANSLATE_MODEL = "deepseek-v4-flash"
 DEFAULT_INDEX_TTS_API_URL = "http://127.0.0.1:8010"
-DEFAULT_OMNIVOICE_API_URL = "http://127.0.0.1:8020"
-DEFAULT_OMNIVOICE_MODEL = "k2-fsa/OmniVoice"
-DEFAULT_OMNIVOICE_DEVICE = "auto"
-OMNIVOICE_ROOT_ENV = "OMNIVOICE_ROOT"
-OMNIVOICE_PYTHON_BIN_ENV = "OMNIVOICE_PYTHON_BIN"
-OMNIVOICE_MODEL_ENV = "OMNIVOICE_MODEL"
-OMNIVOICE_DEVICE_ENV = "OMNIVOICE_DEVICE"
-OMNIVOICE_VIA_API_ENV = "OMNIVOICE_VIA_API"
-OMNIVOICE_API_URL_ENV = "OMNIVOICE_API_URL"
 DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC = 15
 MIN_SOURCE_SHORT_MERGE_TARGET_SEC = 6
 MAX_SOURCE_SHORT_MERGE_TARGET_SEC = 20
@@ -84,6 +86,8 @@ DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB = 8.0
 DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING = 0.95
 DEFAULT_SEGMENT_MINUTES = 8.0
 DEFAULT_MIN_SEGMENT_MINUTES = 4.0
+
+logger = logging.getLogger(__name__)
 
 
 def _index_tts_target_lang_supported(target_lang: str) -> bool:
@@ -104,52 +108,8 @@ def _index_tts_target_lang_supported(target_lang: str) -> bool:
     ]
     return any(marker in lowered for marker in supported_markers)
 
-
 def _iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-def _read_omnivoice_runtime_from_request_or_env(
-    *,
-    omnivoice_root: str,
-    omnivoice_python_bin: str,
-    omnivoice_model: str,
-    omnivoice_device: str,
-    omnivoice_via_api: str,
-    omnivoice_api_url: str,
-) -> Dict[str, Any]:
-    """解析 OmniVoice 运行参数：优先请求值，缺失时回退环境变量。"""
-
-    normalized_omnivoice_root = (omnivoice_root or "").strip() or os.environ.get(OMNIVOICE_ROOT_ENV, "").strip()
-    normalized_omnivoice_python_bin = (omnivoice_python_bin or "").strip() or os.environ.get(
-        OMNIVOICE_PYTHON_BIN_ENV,
-        "",
-    ).strip()
-    normalized_omnivoice_model = (omnivoice_model or "").strip() or os.environ.get(
-        OMNIVOICE_MODEL_ENV,
-        DEFAULT_OMNIVOICE_MODEL,
-    ).strip()
-    normalized_omnivoice_device = (omnivoice_device or "").strip() or os.environ.get(
-        OMNIVOICE_DEVICE_ENV,
-        DEFAULT_OMNIVOICE_DEVICE,
-    ).strip()
-    normalized_omnivoice_via_api = _read_bool_form(
-        (omnivoice_via_api or "").strip() or os.environ.get(OMNIVOICE_VIA_API_ENV, "true"),
-        field_name="omnivoice_via_api",
-    )
-    normalized_omnivoice_api_url = (
-        (omnivoice_api_url or "").strip()
-        or os.environ.get(OMNIVOICE_API_URL_ENV, DEFAULT_OMNIVOICE_API_URL).strip()
-        or DEFAULT_OMNIVOICE_API_URL
-    )
-    return {
-        "omnivoice_root": normalized_omnivoice_root,
-        "omnivoice_python_bin": normalized_omnivoice_python_bin,
-        "omnivoice_model": normalized_omnivoice_model,
-        "omnivoice_device": normalized_omnivoice_device or DEFAULT_OMNIVOICE_DEVICE,
-        "omnivoice_via_api": normalized_omnivoice_via_api,
-        "omnivoice_api_url": normalized_omnivoice_api_url,
-    }
 
 
 def _normalize_short_merge_target_seconds_for_display(
@@ -180,6 +140,20 @@ def _sanitize_filename(name: str) -> str:
     safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._-") or "media"
     safe_suffix = suffix if re.fullmatch(r"\.[A-Za-z0-9]{1,8}", suffix or "") else ""
     return f"{safe_stem}{safe_suffix}"
+
+
+def _store_uploaded_reference_file(*, upload_dir: Path, file: Optional[UploadFile], fallback_name: str) -> str:
+    """把前端上传的参考音频落盘，并返回可供 CLI 使用的绝对路径。"""
+
+    if file is None or not file.filename:
+        return ""
+    safe_name = _sanitize_filename(file.filename or fallback_name)
+    if not Path(safe_name).suffix:
+        safe_name = f"{Path(safe_name).stem or fallback_name}.wav"
+    target_path = upload_dir / safe_name
+    with target_path.open("wb") as handle:
+        shutil.copyfileobj(file.file, handle)
+    return str(target_path.resolve())
 
 
 def _vtt_token_to_srt_time(token: str) -> str:
@@ -472,20 +446,20 @@ def _build_readable_task_id() -> str:
 def _normalize_auto_dubbing_request(
     *,
     subtitle_mode: str,
+    dubbing_mode: str,
     source_lang: str,
     target_lang: str,
     api_key: str,
     translate_base_url: str,
     translate_model: str,
+    translate_system_prompt: str,
     tts_backend: str,
-    fallback_tts_backend: str,
-    omnivoice_root: str,
-    omnivoice_python_bin: str,
-    omnivoice_model: str,
-    omnivoice_device: str,
-    omnivoice_via_api: str,
-    omnivoice_api_url: str,
+    tts_model_path: str,
     index_tts_api_url: str,
+    single_ref_audio: str,
+    single_ref_text: str,
+    speaker_ref_map_json: str,
+    detected_speaker_ids: Optional[List[str]],
     segment_minutes: float,
     min_segment_minutes: float,
     timing_mode: str,
@@ -495,10 +469,6 @@ def _normalize_auto_dubbing_request(
     translated_short_merge_enabled: str,
     translated_short_merge_threshold: int,
     time_ranges: str,
-    auto_pick_ranges: str,
-    auto_pick_min_silence_sec: float,
-    auto_pick_min_speech_sec: float,
-    pipeline_version: str,
     rewrite_translation: str,
     has_subtitle_input: bool,
     dub_audio_leveling_enabled: bool = True,
@@ -543,10 +513,6 @@ def _normalize_auto_dubbing_request(
         MIN_SOURCE_SHORT_MERGE_TARGET_SEC <= translated_short_merge_threshold <= MAX_SOURCE_SHORT_MERGE_TARGET_SEC
     ):
         raise HTTPException(status_code=400, detail="Invalid translated_short_merge_threshold")
-    if auto_pick_min_silence_sec < 0.1 or auto_pick_min_silence_sec > 10.0:
-        raise HTTPException(status_code=400, detail="Invalid auto_pick_min_silence_sec")
-    if auto_pick_min_speech_sec < 0.1 or auto_pick_min_speech_sec > 30.0:
-        raise HTTPException(status_code=400, detail="Invalid auto_pick_min_speech_sec")
     if dub_audio_leveling_target_rms <= 0.0 or dub_audio_leveling_target_rms > 0.5:
         raise HTTPException(status_code=400, detail="Invalid dub_audio_leveling_target_rms")
     if dub_audio_leveling_activity_threshold_db > -5.0 or dub_audio_leveling_activity_threshold_db < -80.0:
@@ -559,93 +525,96 @@ def _normalize_auto_dubbing_request(
     normalized_subtitle_mode = (subtitle_mode or "").strip().lower() or "source"
     if normalized_subtitle_mode not in {"source", "translated"}:
         raise HTTPException(status_code=400, detail="Invalid subtitle_mode")
-    normalized_tts_backend = (tts_backend or "").strip().lower() or "index-tts"
-    if normalized_tts_backend not in {"index-tts", "qwen", "omnivoice"}:
-        raise HTTPException(status_code=400, detail="Invalid tts_backend")
-    normalized_fallback_tts_backend = (fallback_tts_backend or "").strip().lower() or "none"
-    if normalized_fallback_tts_backend not in {"none", "omnivoice"}:
-        raise HTTPException(status_code=400, detail="Invalid fallback_tts_backend")
-    normalized_pipeline_version = (pipeline_version or "").strip().lower() or "v1"
-    if normalized_pipeline_version not in {"v1", "v2"}:
-        raise HTTPException(status_code=400, detail="Invalid pipeline_version")
-
+    requested_dubbing_mode = (dubbing_mode or "").strip().lower() or "single"
+    if requested_dubbing_mode not in {"single", "multi"}:
+        raise HTTPException(status_code=400, detail="Invalid dubbing_mode")
+    # Auto Dubbing 现阶段固定只走 index-tts，兼容旧字段但不再接受切换。
+    normalized_tts_backend = "index-tts"
+    # `dubbing_mode` 不再以表单选择为真值，而是按字幕里是否存在稳定 speaker 信息自动推断。
+    normalized_detected_speaker_ids = [
+        str(speaker_id or "").strip()
+        for speaker_id in (detected_speaker_ids or [])
+        if str(speaker_id or "").strip()
+    ]
+    normalized_dubbing_mode = "multi" if normalized_detected_speaker_ids else "single"
     rewrite_translation_enabled = _read_bool_form(rewrite_translation, field_name="rewrite_translation")
-    auto_pick_ranges_enabled = _read_bool_form(auto_pick_ranges, field_name="auto_pick_ranges")
     parsed_time_ranges = _parse_time_ranges_form(time_ranges)
     normalized_translate_base_url = (translate_base_url or "").strip() or DEFAULT_TRANSLATE_BASE_URL
     normalized_translate_model = (translate_model or "").strip() or DEFAULT_TRANSLATE_MODEL
+    normalized_translate_system_prompt = str(translate_system_prompt or "").strip()
+    normalized_tts_model_path = (tts_model_path or "").strip()
     normalized_index_tts_api_url = (index_tts_api_url or "").strip() or DEFAULT_INDEX_TTS_API_URL
-    omnivoice_runtime_options = _read_omnivoice_runtime_from_request_or_env(
-        omnivoice_root=omnivoice_root,
-        omnivoice_python_bin=omnivoice_python_bin,
-        omnivoice_model=omnivoice_model,
-        omnivoice_device=omnivoice_device,
-        omnivoice_via_api=omnivoice_via_api,
-        omnivoice_api_url=omnivoice_api_url,
-    )
-    normalized_omnivoice_root = omnivoice_runtime_options["omnivoice_root"]
-    normalized_omnivoice_python_bin = omnivoice_runtime_options["omnivoice_python_bin"]
-    normalized_omnivoice_model = omnivoice_runtime_options["omnivoice_model"]
-    normalized_omnivoice_device = omnivoice_runtime_options["omnivoice_device"]
-    normalized_omnivoice_via_api = bool(omnivoice_runtime_options["omnivoice_via_api"])
-    normalized_omnivoice_api_url = str(omnivoice_runtime_options["omnivoice_api_url"] or "").strip() or DEFAULT_OMNIVOICE_API_URL
-    if normalized_fallback_tts_backend == "omnivoice" or normalized_tts_backend == "omnivoice":
-        if normalized_omnivoice_via_api:
-            if not normalized_omnivoice_api_url:
-                raise HTTPException(status_code=400, detail="omnivoice_api_url is required when omnivoice_via_api=true")
-        else:
-            if not normalized_omnivoice_root:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "omnivoice_root is required when tts_backend=omnivoice or fallback_tts_backend=omnivoice. "
-                        f"Set form field or env {OMNIVOICE_ROOT_ENV}."
-                    ),
-                )
-            if not normalized_omnivoice_python_bin:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "omnivoice_python_bin is required when tts_backend=omnivoice or fallback_tts_backend=omnivoice. "
-                        f"Set form field or env {OMNIVOICE_PYTHON_BIN_ENV}."
-                    ),
-                )
-            if not normalized_omnivoice_model:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "omnivoice_model is required when tts_backend=omnivoice or fallback_tts_backend=omnivoice. "
-                        f"Set form field or env {OMNIVOICE_MODEL_ENV}."
-                    ),
-                )
-    effective_api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
+    effective_api_key = resolve_translation_api_key(api_key=api_key)
     skip_translation_by_subtitle = bool(has_subtitle_input and normalized_subtitle_mode == "translated")
-    if (not skip_translation_by_subtitle) and (not effective_api_key) and normalized_translate_base_url == DEFAULT_TRANSLATE_BASE_URL:
+    if (not skip_translation_by_subtitle) and (not effective_api_key):
         raise HTTPException(
             status_code=400,
-            detail="Translation API key is required. Provide api_key or configure a custom translate_base_url.",
+            detail=(
+                "Translation API key is required. Provide api_key or configure "
+                f"{TRANSLATE_API_KEY_ENV} / {LEGACY_TRANSLATE_API_KEY_ENV}."
+            ),
         )
     _switch_tts_runtime_on_demand(
         tts_backend=normalized_tts_backend,
         index_tts_api_url=normalized_index_tts_api_url,
-        omnivoice_via_api=normalized_omnivoice_via_api,
-        omnivoice_api_url=normalized_omnivoice_api_url,
     )
+    normalized_single_ref_audio = str(single_ref_audio or "").strip()
+    normalized_single_ref_text = str(single_ref_text or "").strip()
+    normalized_speaker_ref_specs = (
+        parse_speaker_reference_specs_json(speaker_ref_map_json or "")
+        if str(speaker_ref_map_json or "").strip()
+        else {}
+    )
+    normalized_speaker_ref_map = (
+        parse_speaker_ref_map_json(speaker_ref_map_json or "")
+        if str(speaker_ref_map_json or "").strip()
+        else {}
+    )
+    if normalized_dubbing_mode == "single":
+        if len(normalized_speaker_ref_map) > 0:
+            raise HTTPException(status_code=400, detail="speaker_ref_map_json is only allowed when subtitles contain speaker metadata")
+    else:
+        missing_speakers = [
+            speaker_id
+            for speaker_id in normalized_detected_speaker_ids
+            if speaker_id not in normalized_speaker_ref_map
+        ]
+        # 当前产品规则：有 speaker 时，只允许 0 上传或全上传，不允许部分上传。
+        if normalized_speaker_ref_map and missing_speakers:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Detected speaker subtitles only allow zero uploaded references or a full set for every speaker. "
+                    f"Missing: {', '.join(missing_speakers)}"
+                ),
+            )
+        for speaker_id, ref_path in normalized_speaker_ref_map.items():
+            if speaker_id not in normalized_detected_speaker_ids:
+                raise HTTPException(status_code=400, detail=f"unknown speaker_id in speaker_ref_map_json: {speaker_id}")
+            if not ref_path.exists():
+                raise HTTPException(status_code=400, detail=f"speaker reference audio not found for {speaker_id}: {ref_path}")
     return {
         "subtitle_mode": normalized_subtitle_mode,
+        "dubbing_mode": normalized_dubbing_mode,
         "source_lang": source_lang,
         "target_lang": target_lang,
         "tts_backend": normalized_tts_backend,
-        "fallback_tts_backend": normalized_fallback_tts_backend,
-        "omnivoice_root": normalized_omnivoice_root,
-        "omnivoice_python_bin": normalized_omnivoice_python_bin,
-        "omnivoice_model": normalized_omnivoice_model,
-        "omnivoice_device": normalized_omnivoice_device,
-        "omnivoice_via_api": normalized_omnivoice_via_api,
-        "omnivoice_api_url": normalized_omnivoice_api_url,
+        "single_ref_audio": normalized_single_ref_audio,
+        "single_ref_text": normalized_single_ref_text,
+        "speaker_ref_map": [
+            {
+                "speaker_id": speaker_id,
+                "ref_audio_path": str(spec.get("ref_audio_path") or ""),
+                "ref_text": str(spec.get("ref_text") or "").strip(),
+            }
+            for speaker_id, spec in normalized_speaker_ref_specs.items()
+            if str(spec.get("ref_audio_path") or "").strip()
+        ],
+        "tts_model_path": normalized_tts_model_path,
         "effective_api_key": effective_api_key,
         "translate_base_url": normalized_translate_base_url,
         "translate_model": normalized_translate_model,
+        "translate_system_prompt": normalized_translate_system_prompt,
         "index_tts_api_url": normalized_index_tts_api_url,
         "segment_minutes": segment_minutes,
         "min_segment_minutes": min_segment_minutes,
@@ -661,10 +630,6 @@ def _normalize_auto_dubbing_request(
         "dub_audio_leveling_max_gain_db": float(dub_audio_leveling_max_gain_db),
         "dub_audio_leveling_peak_ceiling": float(dub_audio_leveling_peak_ceiling),
         "time_ranges": parsed_time_ranges,
-        "auto_pick_ranges": auto_pick_ranges_enabled,
-        "auto_pick_min_silence_sec": auto_pick_min_silence_sec,
-        "auto_pick_min_speech_sec": auto_pick_min_speech_sec,
-        "pipeline_version": normalized_pipeline_version,
         "rewrite_translation": rewrite_translation_enabled,
     }
 
@@ -710,12 +675,14 @@ def _write_subtitles_json_to_srt(
                 "start": start_value,
                 "end": end_value,
                 "text": text,
+                "speaker_id": str(item.get("speaker_id") or "").strip(),
             }
         )
 
     if not subtitle_items:
         raise HTTPException(status_code=400, detail="Invalid subtitles_json: no valid subtitle rows")
 
+    subtitle_items, _ = normalize_subtitles_with_speakers(subtitle_items)
     srt_path = upload_dir / f"project_{subtitle_mode}.srt"
     srt_path.write_text(format_srt(subtitle_items), encoding="utf-8")
     return srt_path
@@ -760,6 +727,7 @@ def _queue_auto_dubbing_task(
     filename: str,
     input_path: Path,
     input_srt_path: Optional[Path],
+    input_speaker_metadata_path: Optional[Path],
     options: Dict[str, Any],
     resume_batch_dir: Optional[Path] = None,
     out_root_override: Optional[Path] = None,
@@ -778,9 +746,28 @@ def _queue_auto_dubbing_task(
     )
     out_root.mkdir(parents=True, exist_ok=True)
 
-    auto_pick_ranges_enabled = bool(options["auto_pick_ranges"])
-    if input_srt_path is not None and auto_pick_ranges_enabled:
-        auto_pick_ranges_enabled = False
+    normalized_backend = str(options.get("tts_backend") or "").strip().lower() or "index-tts"
+    normalized_mode = str(options.get("dubbing_mode") or "").strip().lower() or "single"
+    grouped_synthesis_effective, grouped_synthesis_effective_reason = _derive_grouped_synthesis_effective_state(
+        {
+            "subtitle_mode": options.get("subtitle_mode"),
+            "source_short_merge_enabled": options.get("short_merge_enabled"),
+        }
+    )
+    force_fit_timing_effective, force_fit_timing_effective_reason = _derive_force_fit_timing_effective_state(
+        {
+            "subtitle_mode": options.get("subtitle_mode"),
+        }
+    )
+    if options.get("time_ranges"):
+        effective_range_strategy = "manual"
+    else:
+        effective_range_strategy = "all"
+    speaker_ref_map_payload = list(options.get("speaker_ref_map") or [])
+
+    merge_track = "auto"
+    # index-tts 的自动配音实测以较短文本块更稳定；统一回退到 40，避免长文本导致时长和韵律明显漂移。
+    index_max_text_tokens = 40
 
     cmd = build_auto_dubbing_command(
         AutoDubbingCommandConfig(
@@ -793,6 +780,7 @@ def _queue_auto_dubbing_task(
             min_segment_minutes=options["min_segment_minutes"],
             timing_mode=options["timing_mode"],
             grouping_strategy=options["grouping_strategy"],
+            dubbing_mode=options["dubbing_mode"],
             short_merge_enabled=options["short_merge_enabled"],
             short_merge_threshold=options["short_merge_threshold"],
             translated_short_merge_enabled=options["translated_short_merge_enabled"],
@@ -804,34 +792,29 @@ def _queue_auto_dubbing_task(
             dub_audio_leveling_peak_ceiling=options["dub_audio_leveling_peak_ceiling"],
             translate_base_url=options["translate_base_url"],
             translate_model=options["translate_model"],
+            translate_system_prompt=options["translate_system_prompt"],
+            tts_model_path=options["tts_model_path"],
             tts_backend=options["tts_backend"],
-            fallback_tts_backend=options["fallback_tts_backend"],
-            omnivoice_root=options["omnivoice_root"],
-            omnivoice_python_bin=options["omnivoice_python_bin"],
-            omnivoice_model=options["omnivoice_model"],
-            omnivoice_device=options["omnivoice_device"],
-            omnivoice_via_api=options["omnivoice_via_api"],
-            omnivoice_api_url=options["omnivoice_api_url"],
             index_tts_api_url=options["index_tts_api_url"],
-            auto_pick_ranges=auto_pick_ranges_enabled,
-            auto_pick_min_silence_sec=options["auto_pick_min_silence_sec"],
-            auto_pick_min_speech_sec=options["auto_pick_min_speech_sec"],
             resume_batch_dir=resume_batch_dir,
             input_srt=input_srt_path,
+            speaker_metadata_path=input_speaker_metadata_path,
             input_srt_kind=options["subtitle_mode"],
             time_ranges=options["time_ranges"],
             source_lang=options["source_lang"],
-            pipeline_version=options["pipeline_version"],
             rewrite_translation=options["rewrite_translation"],
+            single_ref_audio=options["single_ref_audio"],
+            single_ref_text=options["single_ref_text"],
+            speaker_ref_map_json=json.dumps(speaker_ref_map_payload, ensure_ascii=False) if speaker_ref_map_payload else "",
+            merge_track=merge_track,
+            index_max_text_tokens=index_max_text_tokens,
         )
     )
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     if options["effective_api_key"]:
-        env["DEEPSEEK_API_KEY"] = options["effective_api_key"]
-    elif options["translate_base_url"] != DEFAULT_TRANSLATE_BASE_URL:
-        env["DEEPSEEK_API_KEY"] = "sk-no-key-required"
+        env[TRANSLATE_API_KEY_ENV] = options["effective_api_key"]
 
     task = {
         "id": resolved_task_id,
@@ -864,33 +847,42 @@ def _queue_auto_dubbing_task(
         ),
         "translate_base_url": options["translate_base_url"],
         "translate_model": options["translate_model"],
+        "translate_system_prompt": options["translate_system_prompt"],
+        "dubbing_mode": options["dubbing_mode"],
         "tts_backend": options["tts_backend"],
-        "fallback_tts_backend": options["fallback_tts_backend"],
-        "omnivoice_root": options["omnivoice_root"],
-        "omnivoice_python_bin": options["omnivoice_python_bin"],
-        "omnivoice_model": options["omnivoice_model"],
-        "omnivoice_device": options["omnivoice_device"],
-        "omnivoice_via_api": options["omnivoice_via_api"],
-        "omnivoice_api_url": options["omnivoice_api_url"],
+        "single_ref_audio": options["single_ref_audio"],
+        "single_ref_text": options["single_ref_text"],
+        "speaker_ref_map": options["speaker_ref_map"],
+        "tts_model_path": options["tts_model_path"],
         "index_tts_api_url": options["index_tts_api_url"],
         "time_ranges": options["time_ranges"],
-        "auto_pick_ranges": auto_pick_ranges_enabled,
-        "pipeline_version": options["pipeline_version"],
         "rewrite_translation": options["rewrite_translation"],
-        "auto_pick_min_silence_sec": options["auto_pick_min_silence_sec"],
-        "auto_pick_min_speech_sec": options["auto_pick_min_speech_sec"],
+        "translate_request_count": 0,
+        "index_max_text_tokens": index_max_text_tokens,
+        "grouped_synthesis_effective": grouped_synthesis_effective,
+        "grouped_synthesis_effective_reason": grouped_synthesis_effective_reason,
+        "force_fit_timing_effective": force_fit_timing_effective,
+        "force_fit_timing_effective_reason": force_fit_timing_effective_reason,
+        "effective_range_strategy": effective_range_strategy,
         "processed_segments": 0,
         "total_segments": None,
         "artifacts": [],
         "stdout_tail": [],
         "input_path": str(input_path),
         "input_srt": str(input_srt_path) if input_srt_path else None,
+        "input_speaker_metadata": str(input_speaker_metadata_path) if input_speaker_metadata_path else None,
         "upload_dir": str(input_path.parent),
         "out_root": str(out_root),
         "resume_batch_dir": str(resume_batch_dir) if resume_batch_dir else None,
         "command": [part if part != options["effective_api_key"] else "***" for part in cmd],
     }
+    task["runtime_brief"] = _build_task_runtime_brief(task)
     _task_store.create(resolved_task_id, task)
+    _set_task(
+        resolved_task_id,
+        runtime_brief=task["runtime_brief"],
+        _runtime_brief_changed=True,
+    )
 
     thread = threading.Thread(target=_run_cli_task, args=(resolved_task_id, cmd, env, out_root), daemon=True)
     thread.start()
@@ -898,7 +890,19 @@ def _queue_auto_dubbing_task(
 
 
 def _set_task(task_id: str, **updates: Any) -> None:
-    _task_store.update(task_id, updated_at=_iso_now(), **updates)
+    """更新任务状态，并在关键字段变化时输出一次摘要日志。"""
+
+    previous = _task_store.get_copy(task_id) or {}
+    payload = dict(updates)
+    runtime_brief_changed = bool(payload.pop("_runtime_brief_changed", False))
+    payload.setdefault("updated_at", _iso_now())
+    updated = _task_store.update(task_id, **payload)
+    if not updated:
+        return
+    log_updates = dict(updates)
+    if runtime_brief_changed:
+        log_updates["_runtime_brief_changed"] = True
+    _log_task_state_change(task_id, previous=previous, current=updated, updates=log_updates)
 
 
 def _append_stdout(task_id: str, line: str) -> None:
@@ -916,10 +920,204 @@ def _progress_for_segment(processed: int, total: Optional[int]) -> float:
 
 
 def _bump_stage(task_id: str, stage: str, minimum_progress: float) -> None:
-    _task_store.set_stage(task_id, stage, minimum_progress, updated_at=_iso_now())
+    """在任务进入新阶段时推进进度，并输出一次阶段摘要日志。"""
+
+    previous = _task_store.get_copy(task_id) or {}
+    updated = _task_store.set_stage(task_id, stage, minimum_progress, updated_at=_iso_now())
+    if not updated:
+        return
+    _log_task_state_change(
+        task_id,
+        previous=previous,
+        current=updated,
+        updates={"stage": stage, "progress": updated.get("progress")},
+    )
+
+
+def _format_progress_value(value: Any) -> str:
+    """将任务进度格式化为易读百分比字符串。"""
+
+    try:
+        return f"{float(value):.1f}%"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def _derive_task_tts_base(task: Dict[str, Any]) -> str:
+    """根据任务快照生成当前使用的 TTS 底座说明。"""
+
+    api_url = str(task.get("index_tts_api_url") or "").strip() or "-"
+    return f"index-tts(api={api_url})"
+
+
+def _derive_grouped_synthesis_effective_state(task: Dict[str, Any]) -> tuple[bool, str]:
+    """根据任务快照推导 grouped synthesis 的最终状态与原因。"""
+
+    subtitle_mode = str(task.get("subtitle_mode") or "source").strip().lower() or "source"
+    if subtitle_mode == "translated":
+        return False, "input_translated_strict_alignment"
+    return True, "user"
+
+
+def _derive_force_fit_timing_effective_state(task: Dict[str, Any]) -> tuple[bool, str]:
+    """根据任务快照推导 force-fit timing 的最终状态与原因。"""
+
+    subtitle_mode = str(task.get("subtitle_mode") or "source").strip().lower() or "source"
+    if subtitle_mode == "translated":
+        return False, "input_translated_natural_ending"
+    return True, "user"
+
+
+def _derive_task_grouping_policy(task: Dict[str, Any]) -> str:
+    """根据任务快照生成分组策略摘要。"""
+
+    grouping_strategy = str(task.get("grouping_strategy") or "").strip() or "sentence"
+    grouped_effective = bool(task.get("grouped_synthesis_effective", True))
+    grouped_reason = str(task.get("grouped_synthesis_effective_reason") or "user").strip() or "user"
+    fit_effective = bool(task.get("force_fit_timing_effective", True))
+    fit_reason = str(task.get("force_fit_timing_effective_reason") or "user").strip() or "user"
+    grouped_label = str(grouped_effective).lower()
+    fit_label = str(fit_effective).lower()
+    if grouped_reason != "user":
+        grouped_label = f"{grouped_label}[{grouped_reason}]"
+    if fit_reason != "user":
+        fit_label = f"{fit_label}[{fit_reason}]"
+    return (
+        f"{grouping_strategy}("
+        f"grouped={grouped_label},force_fit={fit_label})"
+    )
+
+
+def _derive_task_range_policy(task: Dict[str, Any]) -> str:
+    """根据任务快照生成范围选择策略摘要。"""
+
+    effective = str(task.get("effective_range_strategy") or "").strip().lower()
+    if effective in {"all", "manual"}:
+        strategy = effective
+    elif task.get("time_ranges"):
+        strategy = "manual"
+    else:
+        strategy = "all"
+    ranges = task.get("time_ranges") or []
+    if isinstance(ranges, list):
+        return f"{strategy}(ranges={len(ranges)})"
+    return f"{strategy}(ranges=0)"
+
+
+def _derive_task_translation_policy(task: Dict[str, Any]) -> str:
+    """根据任务快照生成翻译策略摘要。"""
+
+    subtitle_mode = str(task.get("subtitle_mode") or "source").strip().lower() or "source"
+    rewrite_translation = bool(task.get("rewrite_translation", True))
+    custom_prompt = bool(str(task.get("translate_system_prompt") or "").strip())
+    prompt_label = "custom" if custom_prompt else "default"
+    translate_base_url = str(task.get("translate_base_url") or "").strip()
+    provider_label = get_translate_provider_label(translate_base_url)
+    if subtitle_mode == "translated":
+        return f"skip(input=translated,via={provider_label})"
+    rewrite_label = "on" if rewrite_translation else "off"
+    return f"run(input=source,via={provider_label},rewrite={rewrite_label},prompt={prompt_label})"
+
+
+def _build_task_runtime_brief(task: Dict[str, Any]) -> Dict[str, str]:
+    """提炼 Auto Dubbing 任务的关键运行配置，供状态日志打印。"""
+
+    source_merge = (
+        f"{'on' if bool(task.get('source_short_merge_enabled')) else 'off'}"
+        f"({task.get('source_short_merge_threshold', '-')}s)"
+    )
+    translated_merge = (
+        f"{'on' if bool(task.get('translated_short_merge_enabled')) else 'off'}"
+        f"({task.get('translated_short_merge_threshold', '-')}s)"
+    )
+    segment_minutes = task.get("segment_minutes")
+    min_segment_minutes = task.get("min_segment_minutes")
+    return {
+        "tts_base": _derive_task_tts_base(task),
+        "dubbing_mode": str(task.get("dubbing_mode") or "single"),
+        "grouping": _derive_task_grouping_policy(task),
+        "timing_mode": str(task.get("timing_mode") or "strict"),
+        "translation": _derive_task_translation_policy(task),
+        "merge": f"source={source_merge},translated={translated_merge}",
+        "range": _derive_task_range_policy(task),
+        "segment": f"{segment_minutes}m/{min_segment_minutes}m",
+    }
+
+
+def _log_task_state_change(
+    task_id: str,
+    *,
+    previous: Dict[str, Any],
+    current: Dict[str, Any],
+    updates: Dict[str, Any],
+) -> None:
+    """仅在状态、阶段或关键计数变化时输出任务摘要日志。"""
+
+    runtime_brief_changed = bool(updates.get("_runtime_brief_changed"))
+    previous_status = str(previous.get("status") or "")
+    current_status = str(current.get("status") or "")
+    previous_stage = str(previous.get("stage") or "")
+    current_stage = str(current.get("stage") or "")
+    previous_processed = previous.get("processed_segments")
+    current_processed = current.get("processed_segments")
+    previous_total = previous.get("total_segments")
+    current_total = current.get("total_segments")
+    status_changed = previous_status != current_status
+    stage_changed = previous_stage != current_stage
+    processed_changed = previous_processed != current_processed and current_processed is not None
+    total_changed = previous_total != current_total and current_total is not None
+    should_log = status_changed or stage_changed or processed_changed or total_changed or runtime_brief_changed
+    if not should_log:
+        return
+
+    short_id = str(current.get("short_id") or task_id[-8:] or task_id)
+    progress_text = _format_progress_value(current.get("progress"))
+    summary = [f"[auto-dubbing] task={short_id}", f"status={current_status or '-'}"]
+    if current_stage:
+        summary.append(f"stage={current_stage}")
+    summary.append(f"progress={progress_text}")
+
+    if current_processed is not None and current_total:
+        summary.append(f"segments={current_processed}/{current_total}")
+    elif current_processed is not None:
+        summary.append(f"segments={current_processed}")
+    elif total_changed:
+        summary.append(f"total_segments={current_total}")
+
+    if "error" in updates and updates.get("error"):
+        summary.append(f"error={updates['error']}")
+
+    runtime_brief = current.get("runtime_brief")
+    if isinstance(runtime_brief, dict):
+        summary.append(f"tts={runtime_brief.get('tts_base', '-')}")
+        summary.append(f"dubbing_mode={runtime_brief.get('dubbing_mode', '-')}")
+        summary.append(f"grouping={runtime_brief.get('grouping', '-')}")
+        summary.append(f"timing={runtime_brief.get('timing_mode', '-')}")
+        summary.append(f"translation={runtime_brief.get('translation', '-')}")
+        translate_calls = int(current.get("translate_request_count", current.get("deepseek_request_count", 0)) or 0)
+        summary.append(f"translate_calls={translate_calls}")
+        summary.append(f"merge={runtime_brief.get('merge', '-')}")
+        summary.append(f"range={runtime_brief.get('range', '-')}")
+        summary.append(f"segment={runtime_brief.get('segment', '-')}")
+
+    # 状态摘要之间加一空行，避免与 access log 粘连在一起难以阅读。
+    logger.info("%s\n", " | ".join(summary))
 
 
 def _update_from_stdout(task_id: str, line: str) -> None:
+    if "HTTP Request:" in line and "/chat/completions" in line:
+        with _lock:
+            task = _task_store.get(task_id)
+            if task:
+                base_count = int(task.get("translate_request_count", task.get("deepseek_request_count", 0)) or 0)
+                next_count = base_count + 1
+                if "deepseek_request_count" in task:
+                    task.pop("deepseek_request_count", None)
+            else:
+                next_count = None
+        if next_count is not None:
+            _set_task(task_id, translate_request_count=next_count)
+
     planned_match = re.search(r"Planned segments:\s*(\d+)", line)
     existing_match = re.search(r"Existing segments:\s*(\d+)", line)
     if planned_match or existing_match:
@@ -943,8 +1141,9 @@ def _update_from_stdout(task_id: str, line: str) -> None:
         _set_task(task_id, stage="dubbing:merging", progress=94.0)
         return
 
+    # 旧 transcribing 阶段已从前端面板移除：这些日志并入 dubbing 高亮。
     if "[INFO] extract_audio:" in line or "[INFO] asr_align:" in line:
-        _bump_stage(task_id, "transcribing", 34.0)
+        _bump_stage(task_id, "dubbing", 34.0)
         return
     if "[INFO] translate:" in line:
         _bump_stage(task_id, "translating", 52.0)
@@ -987,6 +1186,7 @@ def _normalize_cli_failure_line(line: str, max_length: int = 500) -> str:
 
 
 def _extract_cli_failure_detail(stdout_tail: List[str]) -> Optional[str]:
+    # 第一优先级：直接抽取 pipeline 明确给出的失败原因，避免被 traceback 包装信息覆盖。
     for raw_line in reversed(stdout_tail):
         line = (raw_line or "").strip()
         if not line:
@@ -999,6 +1199,11 @@ def _extract_cli_failure_detail(stdout_tail: List[str]) -> Optional[str]:
                 message = parts[1].strip()
                 if message and message.lower() not in {"pipeline failed", "job failed"}:
                     return _normalize_cli_failure_line(message)
+
+    # 第二优先级：回退到最后一条“非包装噪音”日志行。
+    for raw_line in reversed(stdout_tail):
+        line = (raw_line or "").strip()
+        if not line:
             continue
         if line.startswith("[INFO]") or line.startswith("HTTP Request:"):
             continue
@@ -1006,9 +1211,22 @@ def _extract_cli_failure_detail(stdout_tail: List[str]) -> Optional[str]:
             continue
         if line.startswith("During handling of the above exception"):
             continue
+        if line.startswith("^"):
+            continue
+        # traceback 里的源码行（如 `raise RuntimeError(...)`）是包装噪音，不作为根因输出。
+        if line.startswith("raise ") or line.startswith("... raise "):
+            continue
         if re.match(r'^File ".+", line \d+, in .+', line):
             continue
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\s*=\s*.+$", line):
+            continue
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*\(.+\)$", line):
+            continue
+        if line.startswith("raise RuntimeError("):
+            continue
         if line.startswith("RuntimeError: command failed"):
+            continue
+        if "command failed (" in line:
             continue
         return _normalize_cli_failure_line(line)
     return None
@@ -1211,44 +1429,42 @@ def _build_resume_options(
 
     return _normalize_auto_dubbing_request(
         subtitle_mode=pick_text(task.get("subtitle_mode"), getattr(batch_options, "input_srt_kind", None), default="source"),
+        dubbing_mode=pick_text(task.get("dubbing_mode"), getattr(batch_options, "dubbing_mode", None), default="single"),
         source_lang=pick_text(task.get("source_lang"), default="auto"),
         target_lang=pick_text(task.get("target_lang"), getattr(batch_options, "target_lang", None)),
         api_key=str(api_key or ""),
         translate_base_url=pick_text(task.get("translate_base_url"), default=DEFAULT_TRANSLATE_BASE_URL),
         translate_model=pick_text(task.get("translate_model"), default=DEFAULT_TRANSLATE_MODEL),
+        translate_system_prompt=pick_text(
+            task.get("translate_system_prompt"),
+            getattr(batch_options, "translate_system_prompt", None),
+            default="",
+        ),
         tts_backend=pick_text(task.get("tts_backend"), getattr(batch_options, "tts_backend", None), default="index-tts"),
-        fallback_tts_backend=pick_text(
-            task.get("fallback_tts_backend"),
-            getattr(batch_options, "fallback_tts_backend", None),
-            default="none",
+        tts_model_path=pick_text(
+            task.get("tts_model_path"),
+            getattr(batch_options, "tts_model_path", None),
+            default="",
         ),
-        omnivoice_root=pick_text(task.get("omnivoice_root"), getattr(batch_options, "omnivoice_root", None)),
-        omnivoice_python_bin=pick_text(
-            task.get("omnivoice_python_bin"),
-            getattr(batch_options, "omnivoice_python_bin", None),
+        single_ref_audio=pick_text(
+            task.get("single_ref_audio"),
+            getattr(batch_options, "single_ref_audio", None),
+            default="",
         ),
-        omnivoice_model=pick_text(
-            task.get("omnivoice_model"),
-            getattr(batch_options, "omnivoice_model", None),
-            default=DEFAULT_OMNIVOICE_MODEL,
+        single_ref_text=pick_text(
+            task.get("single_ref_text"),
+            getattr(batch_options, "single_ref_text", None),
+            default="",
         ),
-        omnivoice_device=pick_text(
-            task.get("omnivoice_device"),
-            getattr(batch_options, "omnivoice_device", None),
-            default=DEFAULT_OMNIVOICE_DEVICE,
+        speaker_ref_map_json=json.dumps(
+            list(task.get("speaker_ref_map") or getattr(batch_options, "speaker_ref_map", []) or []),
+            ensure_ascii=False,
         ),
-        omnivoice_via_api="true"
-        if pick_bool(
-            task.get("omnivoice_via_api"),
-            getattr(batch_options, "omnivoice_via_api", None),
-            default=True,
-        )
-        else "false",
-        omnivoice_api_url=pick_text(
-            task.get("omnivoice_api_url"),
-            getattr(batch_options, "omnivoice_api_url", None),
-            default=DEFAULT_OMNIVOICE_API_URL,
-        ),
+        detected_speaker_ids=[
+            str(item.get("speaker_id") or "").strip()
+            for item in list(task.get("speaker_ref_map") or getattr(batch_options, "speaker_ref_map", []) or [])
+            if str(item.get("speaker_id") or "").strip()
+        ],
         index_tts_api_url=pick_text(
             task.get("index_tts_api_url"),
             getattr(batch_options, "index_tts_api_url", None),
@@ -1295,20 +1511,6 @@ def _build_resume_options(
             default=DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC,
         ),
         time_ranges=time_ranges_form,
-        auto_pick_ranges="true"
-        if pick_bool(
-            task.get("auto_pick_ranges"),
-            getattr(batch_options, "auto_pick_ranges", None),
-            default=False,
-        )
-        else "false",
-        auto_pick_min_silence_sec=pick_float(task.get("auto_pick_min_silence_sec"), default=0.8),
-        auto_pick_min_speech_sec=pick_float(task.get("auto_pick_min_speech_sec"), default=1.0),
-        pipeline_version=pick_text(
-            task.get("pipeline_version"),
-            getattr(batch_options, "pipeline_version", None),
-            default="v1",
-        ),
         rewrite_translation="true"
         if pick_bool(
             task.get("rewrite_translation"),
@@ -1446,20 +1648,15 @@ def _infer_incomplete_batch_task_fields(batch_dir: Path) -> Dict[str, Any]:
         "dub_audio_leveling_peak_ceiling": DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING,
         "translate_base_url": DEFAULT_TRANSLATE_BASE_URL,
         "translate_model": DEFAULT_TRANSLATE_MODEL,
+        "translate_system_prompt": "",
+        "dubbing_mode": "single",
         "tts_backend": "index-tts",
-        "fallback_tts_backend": "none",
-        "omnivoice_root": "",
-        "omnivoice_python_bin": "",
-        "omnivoice_model": DEFAULT_OMNIVOICE_MODEL,
-        "omnivoice_device": DEFAULT_OMNIVOICE_DEVICE,
-        "omnivoice_via_api": True,
-        "omnivoice_api_url": DEFAULT_OMNIVOICE_API_URL,
+        "single_ref_audio": "",
+        "single_ref_text": "",
+        "speaker_ref_map": [],
+        "tts_model_path": "",
         "index_tts_api_url": DEFAULT_INDEX_TTS_API_URL,
         "time_ranges": [],
-        "auto_pick_ranges": False,
-        "auto_pick_min_silence_sec": 0.8,
-        "auto_pick_min_speech_sec": 1.0,
-        "pipeline_version": "v1",
         "rewrite_translation": True,
     }
     # 先尝试回溯原始上传媒体，避免续跑时把 segment_0001.wav 当输入媒体。
@@ -1527,16 +1724,14 @@ def _infer_incomplete_batch_task_fields(batch_dir: Path) -> Dict[str, Any]:
                 defaults[key] = float(raw.get(key) or defaults[key])
             except (TypeError, ValueError):
                 pass
-        defaults["pipeline_version"] = str(raw.get("pipeline_version") or defaults["pipeline_version"])
+        defaults["dubbing_mode"] = str(raw.get("dubbing_mode") or defaults["dubbing_mode"])
         defaults["rewrite_translation"] = _coerce_bool(raw.get("rewrite_translation"), default=True)
-        defaults["tts_backend"] = str(raw.get("tts_backend") or defaults["tts_backend"])
-        defaults["fallback_tts_backend"] = str(raw.get("fallback_tts_backend") or defaults["fallback_tts_backend"])
-        defaults["omnivoice_root"] = str(raw.get("omnivoice_root") or defaults["omnivoice_root"])
-        defaults["omnivoice_python_bin"] = str(raw.get("omnivoice_python_bin") or defaults["omnivoice_python_bin"])
-        defaults["omnivoice_model"] = str(raw.get("omnivoice_model") or defaults["omnivoice_model"])
-        defaults["omnivoice_device"] = str(raw.get("omnivoice_device") or defaults["omnivoice_device"])
-        defaults["omnivoice_via_api"] = _coerce_bool(raw.get("omnivoice_via_api"), default=True)
-        defaults["omnivoice_api_url"] = str(raw.get("omnivoice_api_url") or defaults["omnivoice_api_url"])
+        defaults["tts_backend"] = "index-tts"
+        defaults["single_ref_audio"] = str(raw.get("single_ref_audio") or defaults["single_ref_audio"])
+        defaults["single_ref_text"] = str(raw.get("single_ref_text") or defaults["single_ref_text"])
+        defaults["speaker_ref_map"] = list(raw.get("speaker_ref_map") or defaults["speaker_ref_map"])
+        defaults["translate_system_prompt"] = str(raw.get("translate_system_prompt") or defaults["translate_system_prompt"])
+        defaults["tts_model_path"] = str(raw.get("tts_model_path") or defaults["tts_model_path"])
         defaults["index_tts_api_url"] = str(raw.get("index_tts_api_url") or defaults["index_tts_api_url"])
         break
     return defaults
@@ -1604,180 +1799,15 @@ def _ensure_index_tts_service(api_url: str) -> None:
             raise exc
 
 
-def _check_omnivoice_service(api_url: str, timeout_sec: float = 2.0) -> None:
-    """探测 OmniVoice HTTP 服务健康状态。"""
-
-    url = api_url.rstrip("/") + "/health"
-    request = urllib.request.Request(url, method="GET")
-    try:
-        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.URLError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"omnivoice service unavailable: {exc}. Run ./start_omnivoice_api.sh first.",
-        ) from exc
-    except Exception as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"omnivoice health check failed: {exc}. Run ./start_omnivoice_api.sh first.",
-        ) from exc
-    if not isinstance(payload, dict) or not payload.get("ok"):
-        raise HTTPException(
-            status_code=503,
-            detail=f"omnivoice service unhealthy: {payload}. Run ./start_omnivoice_api.sh first.",
-        )
-
-
-def _auto_start_local_omnivoice(api_url: str) -> None:
-    """在默认本地 URL 下自动拉起 OmniVoice 服务。"""
-
-    normalized = api_url.rstrip("/")
-    if normalized != DEFAULT_OMNIVOICE_API_URL:
-        return
-    if not OMNIVOICE_START_SCRIPT.exists():
-        return
-
-    # OmniVoice 冷启动（首次 import / 环境慢盘）可能超过 120s。
-    # 允许通过环境变量调大等待上限，避免父进程超时误杀启动脚本。
-    startup_timeout_raw = str(os.environ.get("OMNIVOICE_AUTO_START_TIMEOUT_SEC", "420") or "420").strip()
-    try:
-        startup_timeout_sec = int(startup_timeout_raw)
-    except ValueError:
-        startup_timeout_sec = 420
-    startup_timeout_sec = max(60, min(1800, startup_timeout_sec))
-    env = os.environ.copy()
-    # 让 shell 启动脚本的轮询窗口和父进程超时保持一致，避免脚本过早返回失败。
-    env.setdefault("OMNIVOICE_START_WAIT_SEC", str(max(60, startup_timeout_sec - 30)))
-    try:
-        proc = subprocess.run(
-            [str(OMNIVOICE_START_SCRIPT)],
-            cwd=str(REPO_ROOT),
-            capture_output=True,
-            text=True,
-            timeout=startup_timeout_sec,
-            env=env,
-        )
-    except subprocess.TimeoutExpired as exc:
-        # 超时后再做一次探活：若服务实际已起来，不阻断主流程。
-        try:
-            _check_omnivoice_service(api_url, timeout_sec=2.0)
-            return
-        except HTTPException:
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "omnivoice auto-start timeout after "
-                    f"{startup_timeout_sec}s. Run ./start_omnivoice_api.sh manually."
-                ),
-            ) from exc
-    if proc.returncode != 0:
-        # 脚本可能因父进程/信号退出非 0，但服务已经可用，先探活再决定是否报错。
-        try:
-            _check_omnivoice_service(api_url, timeout_sec=2.0)
-            return
-        except HTTPException:
-            pass
-        stderr = (proc.stderr or "").strip()
-        stdout = (proc.stdout or "").strip()
-        details = stderr or stdout or "unknown error"
-        raise HTTPException(
-            status_code=503,
-            detail=f"omnivoice auto-start failed: {details}. Run ./start_omnivoice_api.sh manually.",
-        )
-
-
-def _ensure_omnivoice_service(api_url: str) -> None:
-    """确保 OmniVoice API 可用：先探活，失败时尝试本地自启动。"""
-
-    try:
-        _check_omnivoice_service(api_url)
-    except HTTPException as exc:
-        _auto_start_local_omnivoice(api_url)
-        try:
-            _check_omnivoice_service(api_url)
-        except HTTPException:
-            raise exc
-
-
-def _normalize_api_base_url(api_url: str, default_url: str) -> str:
-    """统一规范 API 地址，避免 trailing slash 导致比较失效。"""
-
-    normalized = str(api_url or "").strip().rstrip("/")
-    if normalized:
-        return normalized
-    return default_url.rstrip("/")
-
-
-def _run_local_service_script(script_path: Path, *, timeout_sec: int, action_name: str) -> None:
-    """执行本地服务脚本；失败时抛出可读错误，便于前端提示。"""
-
-    if not script_path.exists():
-        return
-    proc = subprocess.run(
-        [str(script_path)],
-        cwd=str(REPO_ROOT),
-        capture_output=True,
-        text=True,
-        timeout=timeout_sec,
-    )
-    if proc.returncode == 0:
-        return
-    stderr = (proc.stderr or "").strip()
-    stdout = (proc.stdout or "").strip()
-    details = stderr or stdout or "unknown error"
-    raise HTTPException(status_code=503, detail=f"{action_name} failed: {details}")
-
-
-def _stop_index_tts_service_if_local(api_url: str) -> None:
-    """仅在本地默认 index-tts URL 时停止服务，避免误操作远端服务。"""
-
-    if _normalize_api_base_url(api_url, DEFAULT_INDEX_TTS_API_URL) != DEFAULT_INDEX_TTS_API_URL:
-        return
-    _run_local_service_script(
-        INDEX_TTS_STOP_SCRIPT,
-        timeout_sec=30,
-        action_name="index-tts stop",
-    )
-
-
-def _stop_omnivoice_service_if_local(api_url: str) -> None:
-    """仅在本地默认 OmniVoice URL 时停止服务，避免误操作远端服务。"""
-
-    if _normalize_api_base_url(api_url, DEFAULT_OMNIVOICE_API_URL) != DEFAULT_OMNIVOICE_API_URL:
-        return
-    _run_local_service_script(
-        OMNIVOICE_STOP_SCRIPT,
-        timeout_sec=30,
-        action_name="omnivoice stop",
-    )
-
-
 def _switch_tts_runtime_on_demand(
     *,
     tts_backend: str,
     index_tts_api_url: str,
-    omnivoice_via_api: bool,
-    omnivoice_api_url: str,
 ) -> None:
-    """懒汉式切换 TTS：先停当前模型，再按请求拉起目标模型。"""
+    """Auto Dubbing 现阶段固定只保 index-tts 运行时。"""
 
-    normalized_backend = (tts_backend or "").strip().lower()
-    if normalized_backend == "index-tts":
-        # 切到 index-tts 前先释放 OmniVoice，避免双模型并驻导致内存峰值过高。
-        _stop_omnivoice_service_if_local(omnivoice_api_url)
-        _ensure_index_tts_service(index_tts_api_url)
-        return
-    if normalized_backend == "omnivoice":
-        # 切到 OmniVoice 前先释放 index-tts，保持单模型驻留。
-        _stop_index_tts_service_if_local(index_tts_api_url)
-        if omnivoice_via_api:
-            _ensure_omnivoice_service(omnivoice_api_url)
-        return
-    if normalized_backend == "qwen":
-        # qwen 不依赖本地 TTS API，顺手释放两侧服务避免占用显存/内存。
-        _stop_index_tts_service_if_local(index_tts_api_url)
-        _stop_omnivoice_service_if_local(omnivoice_api_url)
+    del tts_backend
+    _ensure_index_tts_service(index_tts_api_url)
 
 
 def _build_artifacts(task_id: str, manifest_path: Path) -> List[Dict[str, str]]:
@@ -1875,21 +1905,24 @@ def _run_cli_task(task_id: str, cmd: List[str], env: Dict[str, str], out_root: P
 @router.post("/start")
 async def start_auto_dubbing(
     video: UploadFile = File(...),
-    subtitle_file: UploadFile | None = File(None),
+    subtitle_file: Optional[UploadFile] = File(None),
+    single_ref_audio_file: Optional[UploadFile] = File(None),
+    speaker_ref_files: List[UploadFile] = File([]),
+    speaker_ref_speaker_ids_json: str = Form(""),
+    single_ref_text: str = Form(""),
+    speaker_ref_texts_json: str = Form(""),
     subtitle_mode: str = Form("source"),
+    dubbing_mode: str = Form("single"),
     source_lang: str = Form("auto"),
     target_lang: str = Form(...),
     api_key: str = Form(""),
     translate_base_url: str = Form(DEFAULT_TRANSLATE_BASE_URL),
     translate_model: str = Form(DEFAULT_TRANSLATE_MODEL),
+    translate_system_prompt: str = Form(""),
     tts_backend: str = Form("index-tts"),
-    fallback_tts_backend: str = Form("none"),
-    omnivoice_root: str = Form(""),
-    omnivoice_python_bin: str = Form(""),
-    omnivoice_model: str = Form(DEFAULT_OMNIVOICE_MODEL),
-    omnivoice_device: str = Form(DEFAULT_OMNIVOICE_DEVICE),
-    omnivoice_via_api: str = Form("true"),
-    omnivoice_api_url: str = Form(DEFAULT_OMNIVOICE_API_URL),
+    tts_model_path: str = Form(""),
+    single_ref_audio: str = Form(""),
+    speaker_ref_map_json: str = Form(""),
     index_tts_api_url: str = Form(DEFAULT_INDEX_TTS_API_URL),
     segment_minutes: float = Form(8.0),
     min_segment_minutes: float = Form(4.0),
@@ -1900,10 +1933,6 @@ async def start_auto_dubbing(
     translated_short_merge_enabled: str = Form("false"),
     translated_short_merge_threshold: int = Form(DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC),
     time_ranges: str = Form(""),
-    auto_pick_ranges: str = Form("false"),
-    auto_pick_min_silence_sec: float = Form(0.8),
-    auto_pick_min_speech_sec: float = Form(1.0),
-    pipeline_version: str = Form("v1"),
     rewrite_translation: str = Form("true"),
 ):
     task_id = _build_readable_task_id()
@@ -1942,21 +1971,67 @@ async def start_auto_dubbing(
             input_srt_path.write_text(srt_text, encoding="utf-8")
         else:
             raise HTTPException(status_code=400, detail="subtitle_file must be .srt, .vtt or .md")
+    if input_srt_path is None:
+        raise HTTPException(status_code=400, detail="Auto dubbing requires subtitle_file (.srt/.vtt/.md)")
+    detected_speaker_ids: List[str] = []
+    if input_srt_path is not None:
+        parsed_subtitles = parse_srt(input_srt_path.read_text(encoding="utf-8"))
+        _, detected_speaker_ids = normalize_subtitles_with_speakers(parsed_subtitles)
+    normalized_single_ref_audio = single_ref_audio
+    if single_ref_audio_file is not None and single_ref_audio_file.filename:
+        normalized_single_ref_audio = _store_uploaded_reference_file(
+            upload_dir=upload_dir,
+            file=single_ref_audio_file,
+            fallback_name="single_ref_audio.wav",
+        )
+    normalized_speaker_ref_map_json = speaker_ref_map_json
+    if speaker_ref_speaker_ids_json.strip():
+        try:
+            speaker_ids_payload = json.loads(speaker_ref_speaker_ids_json)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid speaker_ref_speaker_ids_json: {exc}") from exc
+        if not isinstance(speaker_ids_payload, list):
+            raise HTTPException(status_code=400, detail="speaker_ref_speaker_ids_json must be a list")
+        if len(speaker_ids_payload) != len(speaker_ref_files):
+            raise HTTPException(status_code=400, detail="speaker_ref_speaker_ids_json count must match speaker_ref_files")
+        try:
+            speaker_texts_payload = json.loads(speaker_ref_texts_json) if speaker_ref_texts_json.strip() else {}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid speaker_ref_texts_json: {exc}") from exc
+        if speaker_ref_texts_json.strip() and not isinstance(speaker_texts_payload, dict):
+            raise HTTPException(status_code=400, detail="speaker_ref_texts_json must be an object")
+        speaker_file_specs: List[Dict[str, str]] = []
+        for speaker_id, ref_file in zip(speaker_ids_payload, speaker_ref_files):
+            stored_path = _store_uploaded_reference_file(
+                upload_dir=upload_dir,
+                file=ref_file,
+                fallback_name=f"{_sanitize_filename(str(speaker_id)) or 'speaker'}_ref.wav",
+            )
+            if not stored_path:
+                continue
+            speaker_file_specs.append(
+                {
+                    "speaker_id": str(speaker_id or "").strip(),
+                    "ref_audio_path": stored_path,
+                    "ref_text": str(speaker_texts_payload.get(str(speaker_id or "").strip()) or "").strip(),
+                }
+            )
+        normalized_speaker_ref_map_json = json.dumps(speaker_file_specs, ensure_ascii=False)
     options = _normalize_auto_dubbing_request(
         subtitle_mode=subtitle_mode,
+        dubbing_mode=dubbing_mode,
         source_lang=source_lang,
         target_lang=target_lang,
         api_key=api_key,
         translate_base_url=translate_base_url,
         translate_model=translate_model,
+        translate_system_prompt=translate_system_prompt,
         tts_backend=tts_backend,
-        fallback_tts_backend=fallback_tts_backend,
-        omnivoice_root=omnivoice_root,
-        omnivoice_python_bin=omnivoice_python_bin,
-        omnivoice_model=omnivoice_model,
-        omnivoice_device=omnivoice_device,
-        omnivoice_via_api=omnivoice_via_api,
-        omnivoice_api_url=omnivoice_api_url,
+        tts_model_path=tts_model_path,
+        single_ref_audio=normalized_single_ref_audio,
+        single_ref_text=single_ref_text,
+        speaker_ref_map_json=normalized_speaker_ref_map_json,
+        detected_speaker_ids=detected_speaker_ids,
         index_tts_api_url=index_tts_api_url,
         segment_minutes=segment_minutes,
         min_segment_minutes=min_segment_minutes,
@@ -1967,10 +2042,6 @@ async def start_auto_dubbing(
         translated_short_merge_enabled=translated_short_merge_enabled,
         translated_short_merge_threshold=translated_short_merge_threshold,
         time_ranges=time_ranges,
-        auto_pick_ranges=auto_pick_ranges,
-        auto_pick_min_silence_sec=auto_pick_min_silence_sec,
-        auto_pick_min_speech_sec=auto_pick_min_speech_sec,
-        pipeline_version=pipeline_version,
         rewrite_translation=rewrite_translation,
         has_subtitle_input=input_srt_path is not None,
     )
@@ -1979,6 +2050,7 @@ async def start_auto_dubbing(
         filename=filename,
         input_path=input_path,
         input_srt_path=input_srt_path,
+        input_speaker_metadata_path=None,
         options=options,
     )
 
@@ -1989,20 +2061,23 @@ async def start_auto_dubbing_from_project(
     original_filename: str = Form(""),
     task_id: str = Form(""),
     subtitles_json: str = Form(""),
+    single_ref_audio_file: Optional[UploadFile] = File(None),
+    speaker_ref_files: List[UploadFile] = File([]),
+    speaker_ref_speaker_ids_json: str = Form(""),
+    single_ref_text: str = Form(""),
+    speaker_ref_texts_json: str = Form(""),
     subtitle_mode: str = Form("source"),
+    dubbing_mode: str = Form("single"),
     source_lang: str = Form("auto"),
     target_lang: str = Form(...),
     api_key: str = Form(""),
     translate_base_url: str = Form(DEFAULT_TRANSLATE_BASE_URL),
     translate_model: str = Form(DEFAULT_TRANSLATE_MODEL),
+    translate_system_prompt: str = Form(""),
     tts_backend: str = Form("index-tts"),
-    fallback_tts_backend: str = Form("none"),
-    omnivoice_root: str = Form(""),
-    omnivoice_python_bin: str = Form(""),
-    omnivoice_model: str = Form(DEFAULT_OMNIVOICE_MODEL),
-    omnivoice_device: str = Form(DEFAULT_OMNIVOICE_DEVICE),
-    omnivoice_via_api: str = Form("true"),
-    omnivoice_api_url: str = Form(DEFAULT_OMNIVOICE_API_URL),
+    tts_model_path: str = Form(""),
+    single_ref_audio: str = Form(""),
+    speaker_ref_map_json: str = Form(""),
     index_tts_api_url: str = Form(DEFAULT_INDEX_TTS_API_URL),
     segment_minutes: float = Form(8.0),
     min_segment_minutes: float = Form(4.0),
@@ -2013,10 +2088,6 @@ async def start_auto_dubbing_from_project(
     translated_short_merge_enabled: str = Form("false"),
     translated_short_merge_threshold: int = Form(DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC),
     time_ranges: str = Form(""),
-    auto_pick_ranges: str = Form("false"),
-    auto_pick_min_silence_sec: float = Form(0.8),
-    auto_pick_min_speech_sec: float = Form(1.0),
-    pipeline_version: str = Form("v1"),
     rewrite_translation: str = Form("true"),
 ):
     """基于主 workflow 当前项目状态启动 Auto Dubbing，避免前端重新上传同一份媒体。"""
@@ -2027,28 +2098,115 @@ async def start_auto_dubbing_from_project(
 
     source_media_path = _resolve_project_media_path(filename, task_id)
     display_name = _sanitize_filename(original_filename or source_media_path.name)
-    input_path = upload_dir / display_name
-    shutil.copy2(source_media_path, input_path)
+    # Current Project 模式直接复用原始上传媒体，避免在 uploads/dubbing 下重复拷贝整段视频。
+    input_path = source_media_path.resolve()
+    normalized_subtitles: List[Dict[str, Any]] = []
+    if subtitles_json.strip():
+        try:
+            parsed_subtitles_payload = json.loads(subtitles_json)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid subtitles_json: {exc}") from exc
+        if not isinstance(parsed_subtitles_payload, list):
+            raise HTTPException(status_code=400, detail="Invalid subtitles_json: must be a list")
+        for item in parsed_subtitles_payload:
+            if not isinstance(item, dict):
+                continue
+            start_sec = item.get("start", item.get("start_sec"))
+            end_sec = item.get("end", item.get("end_sec"))
+            text = str(item.get("text", "") or "").strip()
+            if start_sec is None or end_sec is None or not text:
+                continue
+            try:
+                start_value = float(start_sec)
+                end_value = float(end_sec)
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid subtitles_json timing: {exc}") from exc
+            if end_value <= start_value:
+                continue
+            normalized_subtitles.append(
+                {
+                    "start": start_value,
+                    "end": end_value,
+                    "text": text,
+                    "speaker_id": str(item.get("speaker_id") or "").strip(),
+                }
+            )
+    normalized_subtitles, _ = normalize_subtitles_with_speakers(normalized_subtitles)
+
     input_srt_path = _write_subtitles_json_to_srt(
         upload_dir=upload_dir,
         subtitles_json=subtitles_json,
         subtitle_mode=subtitle_mode,
     )
+    if input_srt_path is None:
+        raise HTTPException(status_code=400, detail="Auto dubbing requires subtitles_json from current project")
+    detected_speaker_ids: List[str] = []
+    if normalized_subtitles:
+        _, detected_speaker_ids = normalize_subtitles_with_speakers(normalized_subtitles)
+
+    input_speaker_metadata_path: Optional[Path] = None
+    segment_speaker_metadata = build_segment_speaker_metadata_from_subtitles(normalized_subtitles)
+    if segment_speaker_metadata:
+        input_speaker_metadata_path = input_srt_path.parent / "_input_project.speakers.json"
+        input_speaker_metadata_path.write_text(
+            json.dumps(segment_speaker_metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    normalized_single_ref_audio = single_ref_audio
+    if single_ref_audio_file is not None and single_ref_audio_file.filename:
+        normalized_single_ref_audio = _store_uploaded_reference_file(
+            upload_dir=upload_dir,
+            file=single_ref_audio_file,
+            fallback_name="single_ref_audio.wav",
+        )
+    normalized_speaker_ref_map_json = speaker_ref_map_json
+    if speaker_ref_speaker_ids_json.strip():
+        try:
+            speaker_ids_payload = json.loads(speaker_ref_speaker_ids_json)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid speaker_ref_speaker_ids_json: {exc}") from exc
+        if not isinstance(speaker_ids_payload, list):
+            raise HTTPException(status_code=400, detail="speaker_ref_speaker_ids_json must be a list")
+        if len(speaker_ids_payload) != len(speaker_ref_files):
+            raise HTTPException(status_code=400, detail="speaker_ref_speaker_ids_json count must match speaker_ref_files")
+        try:
+            speaker_texts_payload = json.loads(speaker_ref_texts_json) if speaker_ref_texts_json.strip() else {}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid speaker_ref_texts_json: {exc}") from exc
+        if speaker_ref_texts_json.strip() and not isinstance(speaker_texts_payload, dict):
+            raise HTTPException(status_code=400, detail="speaker_ref_texts_json must be an object")
+        speaker_file_specs: List[Dict[str, str]] = []
+        for speaker_id, ref_file in zip(speaker_ids_payload, speaker_ref_files):
+            stored_path = _store_uploaded_reference_file(
+                upload_dir=upload_dir,
+                file=ref_file,
+                fallback_name=f"{_sanitize_filename(str(speaker_id)) or 'speaker'}_ref.wav",
+            )
+            if not stored_path:
+                continue
+            speaker_file_specs.append(
+                {
+                    "speaker_id": str(speaker_id or "").strip(),
+                    "ref_audio_path": stored_path,
+                    "ref_text": str(speaker_texts_payload.get(str(speaker_id or "").strip()) or "").strip(),
+                }
+            )
+        normalized_speaker_ref_map_json = json.dumps(speaker_file_specs, ensure_ascii=False)
     options = _normalize_auto_dubbing_request(
         subtitle_mode=subtitle_mode,
+        dubbing_mode=dubbing_mode,
         source_lang=source_lang,
         target_lang=target_lang,
         api_key=api_key,
         translate_base_url=translate_base_url,
         translate_model=translate_model,
+        translate_system_prompt=translate_system_prompt,
         tts_backend=tts_backend,
-        fallback_tts_backend=fallback_tts_backend,
-        omnivoice_root=omnivoice_root,
-        omnivoice_python_bin=omnivoice_python_bin,
-        omnivoice_model=omnivoice_model,
-        omnivoice_device=omnivoice_device,
-        omnivoice_via_api=omnivoice_via_api,
-        omnivoice_api_url=omnivoice_api_url,
+        tts_model_path=tts_model_path,
+        single_ref_audio=normalized_single_ref_audio,
+        single_ref_text=single_ref_text,
+        speaker_ref_map_json=normalized_speaker_ref_map_json,
+        detected_speaker_ids=detected_speaker_ids,
         index_tts_api_url=index_tts_api_url,
         segment_minutes=segment_minutes,
         min_segment_minutes=min_segment_minutes,
@@ -2059,10 +2217,6 @@ async def start_auto_dubbing_from_project(
         translated_short_merge_enabled=translated_short_merge_enabled,
         translated_short_merge_threshold=translated_short_merge_threshold,
         time_ranges=time_ranges,
-        auto_pick_ranges=auto_pick_ranges,
-        auto_pick_min_silence_sec=auto_pick_min_silence_sec,
-        auto_pick_min_speech_sec=auto_pick_min_speech_sec,
-        pipeline_version=pipeline_version,
         rewrite_translation=rewrite_translation,
         has_subtitle_input=input_srt_path is not None,
     )
@@ -2071,6 +2225,7 @@ async def start_auto_dubbing_from_project(
         filename=input_path.name,
         input_path=input_path,
         input_srt_path=input_srt_path,
+        input_speaker_metadata_path=input_speaker_metadata_path,
         options=options,
     )
     response["project_filename"] = source_media_path.name
@@ -2116,20 +2271,13 @@ async def load_auto_dubbing_batch(batch_id: str = Form(...)):
             "dub_audio_leveling_peak_ceiling": inferred["dub_audio_leveling_peak_ceiling"],
             "translate_base_url": inferred["translate_base_url"],
             "translate_model": inferred["translate_model"],
+            "translate_system_prompt": inferred["translate_system_prompt"],
+            "dubbing_mode": inferred["dubbing_mode"],
             "tts_backend": inferred["tts_backend"],
-            "fallback_tts_backend": inferred["fallback_tts_backend"],
-            "omnivoice_root": inferred["omnivoice_root"],
-            "omnivoice_python_bin": inferred["omnivoice_python_bin"],
-            "omnivoice_model": inferred["omnivoice_model"],
-            "omnivoice_device": inferred["omnivoice_device"],
-            "omnivoice_via_api": inferred["omnivoice_via_api"],
-            "omnivoice_api_url": inferred["omnivoice_api_url"],
+            "single_ref_audio": inferred["single_ref_audio"],
+            "speaker_ref_map": inferred["speaker_ref_map"],
             "index_tts_api_url": inferred["index_tts_api_url"],
             "time_ranges": inferred["time_ranges"],
-            "auto_pick_ranges": inferred["auto_pick_ranges"],
-            "auto_pick_min_silence_sec": inferred["auto_pick_min_silence_sec"],
-            "auto_pick_min_speech_sec": inferred["auto_pick_min_speech_sec"],
-            "pipeline_version": inferred["pipeline_version"],
             "rewrite_translation": inferred["rewrite_translation"],
             "processed_segments": 0,
             "total_segments": None,
@@ -2217,6 +2365,7 @@ async def resume_auto_dubbing(task_id: str, api_key: str = Form("")):
         filename=Path(str(task_copy.get("filename") or input_path.name)).name,
         input_path=input_path,
         input_srt_path=input_srt_path,
+        input_speaker_metadata_path=None,
         options=options,
         resume_batch_dir=resume_batch_dir,
         out_root_override=resume_out_root,
@@ -2677,23 +2826,6 @@ def _execute_review_redub(
     batch_manifest = load_batch_manifest(manifest_path)
     target_lang = str(task_copy.get("target_lang") or batch_manifest.options.target_lang)
     index_tts_api_url = str(task_copy.get("index_tts_api_url") or batch_manifest.options.index_tts_api_url)
-    fallback_tts_backend = str(task_copy.get("fallback_tts_backend") or batch_manifest.options.fallback_tts_backend or "none")
-    omnivoice_root = str(task_copy.get("omnivoice_root") or batch_manifest.options.omnivoice_root or "")
-    omnivoice_python_bin = str(
-        task_copy.get("omnivoice_python_bin") or batch_manifest.options.omnivoice_python_bin or ""
-    )
-    omnivoice_model = str(task_copy.get("omnivoice_model") or batch_manifest.options.omnivoice_model or "")
-    omnivoice_device = str(task_copy.get("omnivoice_device") or batch_manifest.options.omnivoice_device or "auto")
-    omnivoice_via_api = _coerce_bool(
-        task_copy.get("omnivoice_via_api"),
-        default=batch_manifest.options.omnivoice_via_api,
-    )
-    omnivoice_api_url = str(
-        task_copy.get("omnivoice_api_url")
-        or batch_manifest.options.omnivoice_api_url
-        or DEFAULT_OMNIVOICE_API_URL
-    )
-    pipeline_version = str(task_copy.get("pipeline_version") or batch_manifest.options.pipeline_version)
     rewrite_translation = _coerce_bool(
         task_copy.get("rewrite_translation"),
         default=batch_manifest.options.rewrite_translation,
@@ -2740,16 +2872,8 @@ def _execute_review_redub(
                 segment_job_dir=segment_job_dir,
                 target_lang=target_lang,
                 index_tts_api_url=index_tts_api_url,
-                pipeline_version=pipeline_version,
                 rewrite_translation=rewrite_translation,
                 redub_local_indices=redub_local_indices,
-                fallback_tts_backend=fallback_tts_backend,
-                omnivoice_root=omnivoice_root,
-                omnivoice_python_bin=omnivoice_python_bin,
-                omnivoice_model=omnivoice_model,
-                omnivoice_device=omnivoice_device,
-                omnivoice_via_api=omnivoice_via_api,
-                omnivoice_api_url=omnivoice_api_url,
             )
             redubbed_segments += 1
             # 局部进度回写：让前端状态轮询可见“重配进行中”。
@@ -2882,16 +3006,8 @@ def _rerun_segment_with_translated_srt(
     segment_job_dir: Path,
     target_lang: str,
     index_tts_api_url: str,
-    pipeline_version: str,
     rewrite_translation: bool,
     redub_local_indices: List[int],
-    fallback_tts_backend: str = "none",
-    omnivoice_root: str = "",
-    omnivoice_python_bin: str = "",
-    omnivoice_model: str = "",
-    omnivoice_device: str = "auto",
-    omnivoice_via_api: bool = True,
-    omnivoice_api_url: str = DEFAULT_OMNIVOICE_API_URL,
 ) -> None:
     # 仅重跑单个 segment（跳过 ASR/翻译），实现局部重配而非全量重跑。
     segment_manifest_path = segment_job_dir / "manifest.json"
@@ -2903,25 +3019,17 @@ def _rerun_segment_with_translated_srt(
         raise RuntimeError("segment input_media_path missing")
     runtime_options = resolve_segment_redub_runtime_options(
         segment_manifest=segment_manifest,
-        fallback_pipeline_version=pipeline_version,
         fallback_rewrite_translation=rewrite_translation,
         fallback_index_tts_api_url=index_tts_api_url,
-        fallback_tts_backend=fallback_tts_backend,
-        fallback_omnivoice_root=omnivoice_root,
-        fallback_omnivoice_python_bin=omnivoice_python_bin,
-        fallback_omnivoice_model=omnivoice_model,
-        fallback_omnivoice_device=omnivoice_device,
-        fallback_omnivoice_via_api=omnivoice_via_api,
-        fallback_omnivoice_api_url=omnivoice_api_url,
     )
+    tts_model_path = str(segment_manifest.raw.get("tts_model_path") or "")
     _switch_tts_runtime_on_demand(
         tts_backend=runtime_options.tts_backend,
         index_tts_api_url=runtime_options.index_tts_api_url,
-        omnivoice_via_api=runtime_options.omnivoice_via_api,
-        omnivoice_api_url=runtime_options.omnivoice_api_url,
     )
 
     translated_srt = segment_job_dir / "subtitles" / "translated.srt"
+    speaker_metadata_path = segment_job_dir / "subtitles" / "_input_segment.speakers.json"
     if not translated_srt.exists():
         raise RuntimeError(f"translated.srt missing: {translated_srt}")
 
@@ -2934,20 +3042,14 @@ def _rerun_segment_with_translated_srt(
             input_media=Path(str(input_media_path)).expanduser().resolve(),
             target_lang=target_lang or "Chinese",
             translated_srt=translated_srt,
+            tts_model_path=tts_model_path,
             index_tts_api_url=runtime_options.index_tts_api_url,
-            fallback_tts_backend=runtime_options.fallback_tts_backend,
-            omnivoice_root=runtime_options.omnivoice_root,
-            omnivoice_python_bin=runtime_options.omnivoice_python_bin,
-            omnivoice_model=runtime_options.omnivoice_model,
-            omnivoice_device=runtime_options.omnivoice_device,
-            omnivoice_via_api=runtime_options.omnivoice_via_api,
-            omnivoice_api_url=runtime_options.omnivoice_api_url,
-            pipeline_version=runtime_options.pipeline_version,
             rewrite_translation=runtime_options.rewrite_translation,
             grouped_synthesis=runtime_options.grouped_synthesis,
             force_fit_timing=runtime_options.force_fit_timing,
             redub_local_indices=redub_local_indices,
             tts_backend=runtime_options.tts_backend,
+            speaker_metadata_path=speaker_metadata_path if speaker_metadata_path.exists() else None,
         )
     )
 

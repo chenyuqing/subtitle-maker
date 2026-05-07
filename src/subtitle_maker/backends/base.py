@@ -27,6 +27,13 @@ class TtsSynthesisRequest:
     max_text_tokens: int = 120
     # 目标时长（秒）：供支持时长控制的后端（如 OmniVoice）直接按时长生成。
     target_duration_sec: Optional[float] = None
+    # OmniVoice 专用开关：是否启用模型内部 output 后处理（去静音等）。
+    # 仅在 OmniVoice backend 读取；其他 backend 会忽略。
+    omnivoice_postprocess_output: Optional[bool] = None
+    # OmniVoice 可选随机种子：传入后同参可复现。
+    omnivoice_seed: Optional[int] = None
+    # 允许后端在必要时跳过部分前置硬校验（例如组合后端短句兜底场景）。
+    allow_relaxed_validation: bool = False
 
 
 class TtsBackend(ABC):

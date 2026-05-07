@@ -6,8 +6,13 @@ from typing import Optional
 from fastapi import APIRouter, Form, HTTPException
 from starlette.concurrency import run_in_threadpool
 
+from subtitle_maker.domains.subtitles import normalize_subtitles_with_speakers
 from subtitle_maker.transcriber import format_srt
-from subtitle_maker.translator import Translator
+from subtitle_maker.translator import (
+    DEFAULT_TRANSLATE_BASE_URL,
+    DEFAULT_TRANSLATE_MODEL,
+    Translator,
+)
 
 from .. import legacy_runtime
 
@@ -18,7 +23,9 @@ router = APIRouter(tags=["translation"])
 @router.post("/translate")
 async def translate(
     target_lang: str = Form(...),
-    api_key: str = Form(...),
+    api_key: str = Form(""),
+    translate_base_url: str = Form(DEFAULT_TRANSLATE_BASE_URL),
+    translate_model: str = Form(DEFAULT_TRANSLATE_MODEL),
     task_id: Optional[str] = Form(None),
     subtitles_json: Optional[str] = Form(None),
     system_prompt: Optional[str] = Form(None),
@@ -44,7 +51,12 @@ async def translate(
         return {"translated_subtitles": []}
 
     try:
-        translator = Translator(api_key=api_key)
+        subtitles, _ = normalize_subtitles_with_speakers(subtitles)
+        translator = Translator(
+            api_key=api_key,
+            base_url=str(translate_base_url or "").strip() or DEFAULT_TRANSLATE_BASE_URL,
+            model=str(translate_model or "").strip() or DEFAULT_TRANSLATE_MODEL,
+        )
         original_texts = [sub["text"] for sub in subtitles]
         translated_texts = await run_in_threadpool(
             translator.translate_batch,
@@ -67,12 +79,13 @@ async def translate(
     except Exception as exc:
         legacy_runtime.logger.error("Translation failed: %s", exc, exc_info=True)
         error_msg = str(exc)
-        if "Authentication" in error_msg or "api_key" in error_msg.lower():
+        lowered = error_msg.lower()
+        if "authentication" in lowered or "api_key" in lowered or "api key" in lowered:
             raise HTTPException(status_code=401, detail=f"API Key 验证失败: {error_msg}")
-        if "rate_limit" in error_msg.lower() or "429" in error_msg:
+        if "rate_limit" in lowered or "429" in error_msg:
             raise HTTPException(status_code=429, detail=f"请求过于频繁，请稍后再试: {error_msg}")
-        if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+        if "timeout" in lowered or "timed out" in lowered:
             raise HTTPException(status_code=504, detail=f"请求超时，请检查网络: {error_msg}")
-        if "connection" in error_msg.lower():
+        if "connection" in lowered:
             raise HTTPException(status_code=502, detail=f"连接失败，请检查网络: {error_msg}")
         raise HTTPException(status_code=500, detail=f"翻译失败: {error_msg}")

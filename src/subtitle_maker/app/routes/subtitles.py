@@ -11,8 +11,9 @@ from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Uploa
 from fastapi.responses import PlainTextResponse
 from starlette.concurrency import run_in_threadpool
 
+from subtitle_maker.domains.subtitles import normalize_subtitles_with_speakers
 from subtitle_maker.transcriber import format_srt, merge_subtitles, parse_srt
-from subtitle_maker.translator import Translator
+from subtitle_maker.translator import DEFAULT_TRANSLATE_BASE_URL, DEFAULT_TRANSLATE_MODEL, Translator
 
 from .. import legacy_runtime
 
@@ -24,6 +25,7 @@ router = APIRouter(tags=["subtitles"])
 async def upload_srt(
     file: UploadFile = File(...),
     video_filename: Optional[str] = Form(None),
+    subtitle_kind: str = Form("source"),
 ):
     """上传现成 SRT，并直接生成可供前端消费的任务记录。"""
 
@@ -37,8 +39,14 @@ async def upload_srt(
         content_str = content_bytes.decode("latin-1")
 
     subtitles = parse_srt(content_str)
+    subtitles, _ = normalize_subtitles_with_speakers(subtitles)
     if not subtitles:
         raise HTTPException(status_code=400, detail="Could not parse subtitles or file is empty")
+
+    # 明确区分“原字幕上传”和“译文字幕上传”，供 Current Project 直接配音策略选择。
+    normalized_subtitle_kind = str(subtitle_kind or "source").strip().lower()
+    if normalized_subtitle_kind not in {"source", "translated"}:
+        raise HTTPException(status_code=400, detail="Invalid subtitle_kind")
 
     task_id = str(uuid.uuid4())
     legacy_runtime.tasks[task_id] = {
@@ -46,9 +54,15 @@ async def upload_srt(
         "filename": file.filename,
         "video_filename": video_filename,
         "subtitles": subtitles,
-        "translated_subtitles": None,
+        "translated_subtitles": subtitles if normalized_subtitle_kind == "translated" else None,
     }
-    return {"task_id": task_id, "filename": file.filename, "subtitles": subtitles}
+    return {
+        "task_id": task_id,
+        "filename": file.filename,
+        "subtitle_kind": normalized_subtitle_kind,
+        "subtitles": subtitles,
+        "translated_subtitles": subtitles if normalized_subtitle_kind == "translated" else [],
+    }
 
 
 @router.post("/transcribe/sync")
@@ -58,6 +72,8 @@ async def transcribe_sync(
     max_width: int = Form(40),
     target_lang: Optional[str] = Form(None),
     api_key: Optional[str] = Form(None),
+    translate_base_url: str = Form(DEFAULT_TRANSLATE_BASE_URL),
+    translate_model: str = Form(DEFAULT_TRANSLATE_MODEL),
     system_prompt: Optional[str] = Form(None),
 ):
     """同步转写入口：上传媒体后直接返回 SRT 文本。"""
@@ -92,7 +108,11 @@ async def transcribe_sync(
 
         subtitles = task.get("subtitles", [])
         if do_translate and subtitles:
-            translator = Translator(api_key=api_key)
+            translator = Translator(
+                api_key=api_key,
+                base_url=str(translate_base_url or "").strip() or DEFAULT_TRANSLATE_BASE_URL,
+                model=str(translate_model or "").strip() or DEFAULT_TRANSLATE_MODEL,
+            )
             original_texts = [sub["text"] for sub in subtitles]
             translated_texts = await run_in_threadpool(
                 translator.translate_batch,
@@ -175,4 +195,3 @@ async def transcribe(
         existing_subs,
     )
     return {"task_id": task_id}
-

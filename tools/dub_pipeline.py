@@ -37,6 +37,7 @@ from subtitle_maker.backends import (
 )
 from subtitle_maker.core.ffmpeg import run_cmd as run_cmd_impl
 from subtitle_maker.domains.dubbing import (
+    VoiceReference,
     allocate_balanced_durations as allocate_balanced_durations_impl,
     apply_atempo as apply_atempo_impl,
     apply_short_fade_edges as apply_short_fade_edges_impl,
@@ -46,6 +47,7 @@ from subtitle_maker.domains.dubbing import (
     compute_effective_target_duration as compute_effective_target_duration_impl,
     estimate_line_speech_weight as estimate_line_speech_weight_impl,
     extract_reference_audio as extract_reference_audio_impl,
+    extract_reference_audio_from_first_subtitle as extract_reference_audio_from_first_subtitle_impl,
     extract_reference_audio_from_offset as extract_reference_audio_from_offset_impl,
     extract_reference_audio_from_window as extract_reference_audio_from_window_impl,
     fit_audio_to_duration as fit_audio_to_duration_impl,
@@ -69,6 +71,9 @@ from subtitle_maker.domains.subtitles import (
     expand_block_with_punctuation_splits as expand_block_with_punctuation_splits_impl,
     has_internal_explicit_break_boundary as has_internal_explicit_break_boundary_impl,
     merge_short_source_subtitles as merge_short_source_subtitles_impl,
+    normalize_subtitles_with_speakers as normalize_subtitles_with_speakers_impl,
+    parse_speaker_ref_map_json as parse_speaker_ref_map_json_impl,
+    parse_speaker_reference_specs_json as parse_speaker_reference_specs_json_impl,
     source_short_merge_tolerance_seconds as source_short_merge_tolerance_seconds_impl,
     split_cluster_into_punctuation_blocks as split_cluster_into_punctuation_blocks_impl,
     split_cluster_into_sentence_blocks as split_cluster_into_sentence_blocks_impl,
@@ -83,8 +88,15 @@ from subtitle_maker.manifests import (
     load_segment_manifest,
     write_manifest_json,
 )
-from subtitle_maker.translator import Translator
-from subtitle_maker.qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel
+from subtitle_maker.translator import (
+    DEFAULT_TRANSLATE_BASE_URL,
+    DEFAULT_TRANSLATE_MODEL,
+    LEGACY_TRANSLATE_API_KEY_ENV,
+    TRANSLATE_API_KEY_ENV,
+    Translator,
+    build_translation_system_prompt,
+    resolve_translation_api_key,
+)
 
 # Exit-code contract for callers (e.g. dub_long_video.py)
 EXIT_OK = 0
@@ -96,26 +108,37 @@ DEFAULT_SOURCE_SHORT_MERGE_TARGET_SEC = 15
 MIN_SOURCE_SHORT_MERGE_TARGET_SEC = 6
 MAX_SOURCE_SHORT_MERGE_TARGET_SEC = 20
 DEFAULT_SOURCE_SHORT_MERGE_GAP_SEC = 1.5
+DEFAULT_OMNIVOICE_SINGLE_REBUILD_TARGET_SEC = 10
 DEFAULT_OMNIVOICE_MIN_SUBTITLE_REF_SEC = 1.2
 DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS = 0.12
 DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB = -35.0
 DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB = 8.0
 DEFAULT_DUB_AUDIO_LEVELING_PEAK_CEILING = 0.95
-
-
 def iso_now() -> str:
     return datetime.utcnow().isoformat()
 
 
 def resolve_source_short_merge_policy(*, requested_enabled: bool, tts_backend: str) -> Tuple[bool, str]:
-    """解析 source short merge 的最终生效态，OmniVoice 链路强制开启。"""
+    """解析 source short merge 的最终生效态。"""
 
-    normalized_backend = (tts_backend or "").strip().lower()
     if requested_enabled:
         return True, "user"
-    if normalized_backend == "omnivoice":
-        return True, "omnivoice_policy"
     return False, "disabled"
+
+
+def resolve_grouped_synthesis_policy(
+    *,
+    requested_enabled: bool,
+    input_srt_is_translated: bool,
+    translated_input_preserve_synthesis_mode: bool,
+    source_short_merge_enabled: bool,
+) -> Tuple[bool, str]:
+    """解析 grouped synthesis 的最终生效态。"""
+
+    del source_short_merge_enabled
+    if input_srt_is_translated and (not translated_input_preserve_synthesis_mode):
+        return False, "input_translated_strict_alignment"
+    return bool(requested_enabled), "user" if requested_enabled else "disabled"
 
 
 def build_readable_run_id(*, root_dir: Path, time_tag: str) -> str:
@@ -463,6 +486,7 @@ def enforce_subtitle_timestamps(
     min_duration_sec: float = 0.12,
 ) -> List[Dict[str, Any]]:
     # 时间戳守卫：确保每条字幕满足 end > start、整体单调、并限制在媒体时长内。
+    # 注意：除 start/end/text 外，保留原始元数据（如 speaker_id），避免多人链路丢失说话人信息。
     if not subtitles:
         return subtitles
     safe_media_duration = max(float(media_duration_sec), float(min_duration_sec))
@@ -482,13 +506,11 @@ def enforce_subtitle_timestamps(
             end_sec = min(safe_media_duration, start_sec + float(min_duration_sec))
         if end_sec <= start_sec:
             continue
-        output.append(
-            {
-                "start": start_sec,
-                "end": end_sec,
-                "text": text,
-            }
-        )
+        normalized_item = dict(item)
+        normalized_item["start"] = start_sec
+        normalized_item["end"] = end_sec
+        normalized_item["text"] = text
+        output.append(normalized_item)
         cursor = end_sec
         if cursor >= safe_media_duration - 1e-6:
             break
@@ -728,22 +750,15 @@ def load_or_transcribe_subtitles(
             subtitles=subtitles,
             media_duration_sec=media_duration_sec,
         )
-        # 上传 source.srt 也复用与 ASR 相同的分句规则，保证最终落盘的
-        # source.srt 与后续翻译/TTS 使用的是同一份句级结果。
+        # 直接上传的字幕不再走 ASR/source-layout 重排。
+        # 这里只保留纯字幕级预处理：时间戳校正 + 可选短句合并。
         if persist_input_srt_to_source and asr_balance_lines:
-            subtitles = rebalance_source_subtitles(
+            subtitles = preprocess_uploaded_source_subtitles(
                 subtitles=subtitles,
-                max_gap_sec=asr_balance_gap_sec,
-                max_line_width=max_width,
-                source_layout_mode=source_layout_mode,
-                source_layout_llm_min_duration_sec=source_layout_llm_min_duration_sec,
-                source_layout_llm_min_text_units=source_layout_llm_min_text_units,
-                source_layout_llm_max_cues=source_layout_llm_max_cues,
                 source_short_merge_enabled=source_short_merge_enabled,
                 source_short_merge_threshold=source_short_merge_threshold,
                 source_short_merge_requested=source_short_merge_requested,
                 source_short_merge_effective_reason=source_short_merge_effective_reason,
-                translator_factory=translator_factory,
                 logger=logger,
             )
             subtitles = enforce_subtitle_timestamps(
@@ -849,6 +864,74 @@ def load_or_transcribe_subtitles(
             logger.log("INFO", "asr_align", "asr_released", "asr model released")
         except Exception:
             logger.log("WARN", "asr_align", "asr_release_failed", "asr model release failed")
+
+
+def preprocess_uploaded_source_subtitles(
+    *,
+    subtitles: List[Dict[str, Any]],
+    source_short_merge_enabled: bool,
+    source_short_merge_threshold: int,
+    source_short_merge_requested: Optional[bool],
+    source_short_merge_effective_reason: str,
+    logger: JsonlLogger,
+) -> List[Dict[str, Any]]:
+    """上传 source.srt 只做纯字幕级预处理，不再进入 ASR/source-layout 重排。"""
+
+    if len(subtitles) <= 1:
+        return [dict(item) for item in subtitles]
+
+    normalized_input_subtitles, detected_speaker_ids = normalize_subtitles_with_speakers(subtitles)
+    output = [dict(item) for item in normalized_input_subtitles]
+    short_sentence_merges = 0
+    short_merge_speaker_runs = 0
+    if source_short_merge_enabled:
+        if detected_speaker_ids:
+            output, short_sentence_merges, short_merge_speaker_runs = merge_short_source_subtitles_speaker_aware(
+                subtitles=output,
+                short_merge_target_seconds=source_short_merge_threshold,
+                gap_threshold_sec=DEFAULT_SOURCE_SHORT_MERGE_GAP_SEC,
+            )
+        else:
+            output, short_sentence_merges = merge_short_source_subtitles(
+                subtitles=output,
+                short_merge_target_seconds=source_short_merge_threshold,
+                gap_threshold_sec=DEFAULT_SOURCE_SHORT_MERGE_GAP_SEC,
+            )
+    requested_short_merge = bool(source_short_merge_enabled) if source_short_merge_requested is None else bool(
+        source_short_merge_requested
+    )
+    before_signature = [
+        (round(float(item["start"]), 3), round(float(item["end"]), 3), (item.get("text") or "").strip())
+        for item in normalized_input_subtitles
+    ]
+    after_signature = [
+        (round(float(item["start"]), 3), round(float(item["end"]), 3), (item.get("text") or "").strip())
+        for item in output
+    ]
+    if after_signature != before_signature:
+        logger.log(
+            "INFO",
+            "asr_align",
+            "uploaded_source_subtitle_preprocessed",
+            "uploaded source subtitles were preprocessed without ASR/source-layout reflow",
+            data={
+                "before_count": len(subtitles),
+                "after_count": len(output),
+                "short_merge_requested": requested_short_merge,
+                "short_merge_enabled": bool(source_short_merge_enabled),
+                "short_merge_effective": bool(source_short_merge_enabled),
+                "short_merge_effective_reason": str(source_short_merge_effective_reason or "user"),
+                "short_sentence_merges": short_sentence_merges,
+                "short_merge_speaker_aware": bool(detected_speaker_ids),
+                "short_merge_speaker_runs": int(short_merge_speaker_runs),
+                "short_merge_target_seconds": int(source_short_merge_threshold),
+                "short_merge_tolerance_seconds": source_short_merge_tolerance_seconds(
+                    int(source_short_merge_threshold)
+                ),
+                "short_merge_gap_seconds": DEFAULT_SOURCE_SHORT_MERGE_GAP_SEC,
+            },
+        )
+    return output
 
 
 def is_cjk_target_lang(target_lang: str) -> bool:
@@ -1232,6 +1315,177 @@ def merge_short_source_subtitles(
     )
 
 
+def normalize_subtitles_with_speakers(
+    subtitles: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """兼容旧入口：规范化字幕里的 speaker 前缀并抽取 speaker_id。"""
+
+    return normalize_subtitles_with_speakers_impl(subtitles)
+
+
+def parse_speaker_ref_map_json(raw: str) -> Dict[str, Path]:
+    """兼容旧入口：解析多人模式的 `speaker_id -> ref_audio_path` 映射。"""
+
+    return parse_speaker_ref_map_json_impl(raw)
+
+
+def parse_speaker_reference_specs_json(raw: str) -> Dict[str, Dict[str, Any]]:
+    """兼容旧入口：解析多人模式的 `speaker_id -> {ref_audio_path, ref_text}` 结构。"""
+
+    return parse_speaker_reference_specs_json_impl(raw)
+
+
+def _subtitle_gap_ms(left: Dict[str, Any], right: Dict[str, Any]) -> int:
+    """计算两条字幕之间的静默间隔（毫秒）。"""
+
+    left_end_sec = float(left.get("end", 0.0) or 0.0)
+    right_start_sec = float(right.get("start", 0.0) or 0.0)
+    return int(round((right_start_sec - left_end_sec) * 1000.0))
+
+
+def _split_sentence_block_by_target_duration(
+    *,
+    block: List[Dict[str, Any]],
+    max_gap_sec: float,
+    target_duration_sec: float,
+) -> List[List[Dict[str, Any]]]:
+    """按目标时长拆分单句块，优先自然边界，避免生成过长句。"""
+
+    if not block:
+        return []
+    if len(block) <= 1:
+        return [list(block)]
+
+    safe_target = max(1.0, float(target_duration_sec))
+    remaining = [dict(item) for item in block]
+    parts: List[List[Dict[str, Any]]] = []
+    split_applied = False
+
+    while len(remaining) > 1:
+        remaining_duration = subtitle_group_duration(remaining)
+        if remaining_duration <= safe_target:
+            break
+
+        cjk_mode = infer_cjk_mode_from_lines([(item.get("text") or "") for item in remaining])
+        remaining_text = subtitle_group_text(remaining, cjk_mode=cjk_mode)
+        remaining_units = subtitle_text_units(remaining_text, cjk_mode=cjk_mode)
+        desired_parts = max(2, int(math.ceil(remaining_duration / safe_target)))
+        target_duration = remaining_duration / float(desired_parts)
+        target_units = max(1.0, remaining_units / float(desired_parts))
+        split_index = choose_asr_sentence_split_index(
+            remaining,
+            cjk_mode=cjk_mode,
+            max_gap_sec=max_gap_sec,
+            target_duration_sec=target_duration,
+            target_text_units=target_units,
+            require_explicit_break=True,
+        )
+        if split_index is None:
+            break
+        left = remaining[: split_index + 1]
+        right = remaining[split_index + 1 :]
+        if not left or not right:
+            break
+        parts.append(left)
+        remaining = right
+        split_applied = True
+
+    parts.append(remaining)
+    if not split_applied:
+        return [list(block)]
+    return [part for part in parts if part]
+
+
+def merge_short_source_subtitles_sentence_aware(
+    *,
+    subtitles: List[Dict[str, Any]],
+    short_merge_target_seconds: int,
+    gap_threshold_sec: float = DEFAULT_SOURCE_SHORT_MERGE_GAP_SEC,
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    """句子完整优先的真实重构：先句级收敛，再按目标时长合并完整句。"""
+
+    if not subtitles:
+        return [], 0, 0
+    if len(subtitles) == 1:
+        return [dict(subtitles[0])], 0, 1
+
+    target_sec = max(1, int(short_merge_target_seconds or 0))
+    sentence_blocks: List[List[Dict[str, Any]]] = []
+    clusters = build_asr_gap_clusters(subtitles, max_gap_sec=gap_threshold_sec)
+    for cluster in clusters:
+        expanded = expand_block_with_punctuation_splits(cluster, include_soft_breaks=False)
+        sentence_blocks.extend(split_cluster_into_sentence_blocks(expanded))
+
+    sentence_level_subtitles = [build_rebalanced_subtitle(block) for block in sentence_blocks if block]
+    packed_subtitles, _ = merge_short_source_subtitles(
+        subtitles=sentence_level_subtitles,
+        short_merge_target_seconds=target_sec,
+        gap_threshold_sec=gap_threshold_sec,
+    )
+    merged_pairs = max(0, len(subtitles) - len(packed_subtitles))
+    return packed_subtitles, merged_pairs, len(sentence_blocks)
+
+
+def merge_short_source_subtitles_speaker_aware(
+    *,
+    subtitles: List[Dict[str, Any]],
+    short_merge_target_seconds: int,
+    gap_threshold_sec: float = DEFAULT_SOURCE_SHORT_MERGE_GAP_SEC,
+) -> Tuple[List[Dict[str, Any]], int, int]:
+    """按 speaker 连续 run 做真实并句重构，避免跨 speaker 合并。"""
+
+    if not subtitles:
+        return [], 0, 0
+
+    normalized_rows: List[Dict[str, Any]] = []
+    for item in subtitles:
+        row = dict(item)
+        speaker_id = str(row.get("speaker_id") or "").strip()
+        if speaker_id:
+            row["speaker_id"] = speaker_id
+        normalized_rows.append(row)
+
+    gap_threshold_ms = max(0, int(round(float(gap_threshold_sec) * 1000.0)))
+    speaker_runs: List[List[Dict[str, Any]]] = []
+    current_run: List[Dict[str, Any]] = []
+    for row in normalized_rows:
+        if not current_run:
+            current_run = [row]
+            continue
+        prev = current_run[-1]
+        prev_speaker = str(prev.get("speaker_id") or "").strip()
+        current_speaker = str(row.get("speaker_id") or "").strip()
+        same_speaker = prev_speaker == current_speaker
+        small_gap = _subtitle_gap_ms(prev, row) <= gap_threshold_ms
+        if same_speaker and small_gap:
+            current_run.append(row)
+            continue
+        speaker_runs.append(current_run)
+        current_run = [row]
+    if current_run:
+        speaker_runs.append(current_run)
+
+    merged: List[Dict[str, Any]] = []
+    merged_pairs = 0
+    for run in speaker_runs:
+        run_merged, run_pairs = merge_short_source_subtitles(
+            subtitles=run,
+            short_merge_target_seconds=short_merge_target_seconds,
+            gap_threshold_sec=gap_threshold_sec,
+        )
+        run_speaker_id = str(run[0].get("speaker_id") or "").strip()
+        for item in run_merged:
+            rebuilt = dict(item)
+            if run_speaker_id:
+                rebuilt["speaker_id"] = run_speaker_id
+            else:
+                rebuilt.pop("speaker_id", None)
+            merged.append(rebuilt)
+        merged_pairs += run_pairs
+
+    return merged, merged_pairs, len(speaker_runs)
+
+
 def soft_source_layout_text_limit(*, max_line_width: int, cjk_mode: bool) -> int:
     """给句级分句评分使用更严格的软上限，避免行长失控。"""
     width = max(8, int(max_line_width or 0))
@@ -1432,7 +1686,8 @@ def plan_source_layout_with_llm(
 ) -> List[Tuple[int, int]]:
     """调用 LLM 生成 source layout 分组计划。"""
     prompt = build_source_layout_plan_prompt(block=block, rule_groups=rule_groups)
-    response = translator.client.chat.completions.create(
+    client = translator._ensure_client()
+    response = client.chat.completions.create(
         model=translator.model,
         messages=[
             {
@@ -1873,6 +2128,7 @@ def reflow_cluster_with_llm(
     translated_lines: List[str],
     indices: List[int],
     target_lang: str,
+    system_prompt: Optional[str] = None,
 ) -> List[str]:
     rows = []
     for row_no, idx in enumerate(indices, start=1):
@@ -1898,10 +2154,17 @@ def reflow_cluster_with_llm(
     if is_cantonese_target_lang(target_lang):
         prompt += "\n\n" + _build_cantonese_prompt_constraints()
 
-    response = translator.client.chat.completions.create(
+    client = translator._ensure_client()
+    # 复用用户在配音页输入的翻译系统提示词，避免重排阶段覆盖术语/人名策略。
+    effective_system_prompt = (
+        system_prompt.strip()
+        if isinstance(system_prompt, str) and system_prompt.strip()
+        else "You are a subtitle layout editor for dubbing."
+    )
+    response = client.chat.completions.create(
         model=translator.model,
         messages=[
-            {"role": "system", "content": "You are a subtitle layout editor for dubbing."},
+            {"role": "system", "content": effective_system_prompt},
             {"role": "user", "content": prompt},
         ],
         stream=False,
@@ -1920,6 +2183,7 @@ def smart_layout_translated_lines(
     max_gap_sec: float,
     use_llm: bool,
     logger: JsonlLogger,
+    system_prompt: Optional[str] = None,
 ) -> List[str]:
     if not enabled or len(subtitles) <= 1:
         return translated_lines
@@ -1963,6 +2227,7 @@ def smart_layout_translated_lines(
                     translated_lines=output,
                     indices=cluster,
                     target_lang=target_lang,
+                    system_prompt=system_prompt,
                 )
                 candidate_merged = merge_text_lines(candidate, cjk_mode=cjk_mode)
                 if (
@@ -1996,6 +2261,7 @@ def repair_punctuation_only_translations(
     translator: Translator,
     target_lang: str,
     logger: JsonlLogger,
+    system_prompt: Optional[str],
 ) -> List[str]:
     bad_indices: List[int] = []
     for index, (subtitle, translated) in enumerate(zip(subtitles, translated_lines)):
@@ -2008,16 +2274,19 @@ def repair_punctuation_only_translations(
         return translated_lines
 
     retry_inputs = [subtitles[index]["text"] for index in bad_indices]
+    base_system_prompt = build_translation_system_prompt(system_prompt)
     retry_system_prompt = (
-        "You are a professional subtitle translator. "
-        "Translate each input line faithfully and naturally. "
-        "Never output only punctuation or ellipsis."
+        f"{base_system_prompt}\n"
+        "Additional hard rules:\n"
+        "- Never output only punctuation or ellipsis.\n"
+        "- Keep line count exactly the same as input."
     )
     retried = translator.translate_batch(
         retry_inputs,
         target_lang=target_lang,
         system_prompt=retry_system_prompt,
         chunk_size=50,
+        system_prompt_is_final=True,
     )
 
     output = list(translated_lines)
@@ -2072,7 +2341,9 @@ def rebalance_source_subtitles(
     if len(subtitles) <= 1:
         return [dict(item) for item in subtitles]
 
-    clusters = build_asr_gap_clusters(subtitles, max_gap_sec=max_gap_sec)
+    normalized_input_subtitles, detected_speaker_ids = normalize_subtitles_with_speakers(subtitles)
+
+    clusters = build_asr_gap_clusters(normalized_input_subtitles, max_gap_sec=max_gap_sec)
     output: List[Dict[str, Any]] = []
     sentence_blocks = 0
     oversized_splits = 0
@@ -2104,19 +2375,27 @@ def rebalance_source_subtitles(
 
     # 第二阶段短句合并改为显式开关控制，默认关闭，避免误把对话中的短句并在一起。
     short_sentence_merges = 0
+    short_merge_speaker_runs = 0
     if source_short_merge_enabled:
-        output, short_sentence_merges = merge_short_source_subtitles(
-            subtitles=output,
-            short_merge_target_seconds=source_short_merge_threshold,
-            gap_threshold_sec=DEFAULT_SOURCE_SHORT_MERGE_GAP_SEC,
-        )
+        if detected_speaker_ids:
+            output, short_sentence_merges, short_merge_speaker_runs = merge_short_source_subtitles_speaker_aware(
+                subtitles=output,
+                short_merge_target_seconds=source_short_merge_threshold,
+                gap_threshold_sec=DEFAULT_SOURCE_SHORT_MERGE_GAP_SEC,
+            )
+        else:
+            output, short_sentence_merges = merge_short_source_subtitles(
+                subtitles=output,
+                short_merge_target_seconds=source_short_merge_threshold,
+                gap_threshold_sec=DEFAULT_SOURCE_SHORT_MERGE_GAP_SEC,
+            )
     requested_short_merge = bool(source_short_merge_enabled) if source_short_merge_requested is None else bool(
         source_short_merge_requested
     )
 
     before_signature = [
         (round(float(item["start"]), 3), round(float(item["end"]), 3), (item.get("text") or "").strip())
-        for item in subtitles
+        for item in normalized_input_subtitles
     ]
     after_signature = [
         (round(float(item["start"]), 3), round(float(item["end"]), 3), (item.get("text") or "").strip())
@@ -2139,6 +2418,8 @@ def rebalance_source_subtitles(
                 "short_merge_effective": bool(source_short_merge_enabled),
                 "short_merge_effective_reason": str(source_short_merge_effective_reason or "user"),
                 "short_sentence_merges": short_sentence_merges,
+                "short_merge_speaker_aware": bool(detected_speaker_ids),
+                "short_merge_speaker_runs": int(short_merge_speaker_runs),
                 "short_merge_target_seconds": int(source_short_merge_threshold),
                 "short_merge_tolerance_seconds": source_short_merge_tolerance_seconds(
                     int(source_short_merge_threshold)
@@ -2146,20 +2427,22 @@ def rebalance_source_subtitles(
                 "short_merge_gap_seconds": DEFAULT_SOURCE_SHORT_MERGE_GAP_SEC,
             },
         )
-    elif bool(source_short_merge_enabled) and str(source_short_merge_effective_reason or "") == "omnivoice_policy":
+    elif bool(source_short_merge_enabled) and str(source_short_merge_effective_reason or "") == "policy_forced":
         logger.log(
             "INFO",
             "asr_align",
             "source_short_merge_policy_applied",
-            "omnivoice source short merge policy evaluated with no boundary change",
+            "source short merge policy evaluated with no boundary change",
             data={
                 "before_count": len(subtitles),
                 "after_count": len(output),
                 "short_merge_requested": requested_short_merge,
                 "short_merge_enabled": bool(source_short_merge_enabled),
                 "short_merge_effective": bool(source_short_merge_enabled),
-                "short_merge_effective_reason": "omnivoice_policy",
+                "short_merge_effective_reason": "policy_forced",
                 "short_sentence_merges": short_sentence_merges,
+                "short_merge_speaker_aware": bool(detected_speaker_ids),
+                "short_merge_speaker_runs": int(short_merge_speaker_runs),
                 "short_merge_target_seconds": int(source_short_merge_threshold),
                 "short_merge_tolerance_seconds": source_short_merge_tolerance_seconds(
                     int(source_short_merge_threshold)
@@ -2261,18 +2544,18 @@ def translate_batch_with_budget(
 ) -> List[str]:
     translated: List[str] = []
     total = len(lines)
+    final_system_prompt = build_translation_system_prompt(system_prompt)
     for start in range(0, total, chunk_size):
         chunk_lines = lines[start : start + chunk_size]
         chunk_durations = durations[start : start + chunk_size]
         content = build_translation_prompt(chunk_lines, chunk_durations, target_lang)
-        response = translator.client.chat.completions.create(
+        client = translator._ensure_client()
+        response = client.chat.completions.create(
             model=translator.model,
             messages=[
                 {
                     "role": "system",
-                    "content": system_prompt
-                    if system_prompt and system_prompt.strip()
-                    else "You are a professional subtitle dubbing translator.",
+                    "content": final_system_prompt,
                 },
                 {"role": "user", "content": content},
             ],
@@ -2293,6 +2576,7 @@ def retranslate_single_line(
     target_duration_sec: float,
     need_shorter: bool,
     aggressiveness: int,
+    system_prompt: Optional[str] = None,
 ) -> str:
     direction = "shorter" if need_shorter else "slightly longer"
     prompt = (
@@ -2311,10 +2595,18 @@ def retranslate_single_line(
             + _build_cantonese_prompt_constraints()
             + "Do not switch to Mandarin written style."
         )
-    response = translator.client.chat.completions.create(
+    client = translator._ensure_client()
+    final_system_prompt = (
+        f"{build_translation_system_prompt(system_prompt)}\n"
+        "你还负责配音时长改写，输出必须适合配音。"
+    )
+    response = client.chat.completions.create(
         model=translator.model,
         messages=[
-            {"role": "system", "content": "You rewrite subtitle lines for dubbing duration fit."},
+            {
+                "role": "system",
+                "content": final_system_prompt,
+            },
             {"role": "user", "content": prompt},
         ],
         stream=False,
@@ -2373,6 +2665,22 @@ def extract_reference_audio_from_window(
     )
 
 
+def extract_reference_audio_from_first_subtitle(
+    *,
+    vocals_audio: Path,
+    subtitles: List[Dict[str, Any]],
+    out_ref: Path,
+    seconds: float = 10.0,
+) -> Path:
+    """兼容旧入口：从首条字幕起点抽取单人默认参考音。"""
+    return extract_reference_audio_from_first_subtitle_impl(
+        vocals_audio=vocals_audio,
+        subtitles=subtitles,
+        out_ref=out_ref,
+        seconds=seconds,
+    )
+
+
 def build_subtitle_reference_map(
     *,
     subtitles: List[Dict[str, Any]],
@@ -2399,6 +2707,49 @@ def read_reference_duration_sec(path: Path) -> float:
         return 0.0
 
 
+def load_speaker_metadata_map(path: Optional[Path]) -> Dict[int, Dict[str, Any]]:
+    """读取 segment 级 speaker sidecar，并按 1-based subtitle_index 建索引。"""
+
+    if path is None or not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise RuntimeError("speaker metadata sidecar must be a list")
+    output: Dict[int, Dict[str, Any]] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        try:
+            subtitle_index = int(item.get("subtitle_index") or 0)
+        except (TypeError, ValueError):
+            continue
+        if subtitle_index <= 0:
+            continue
+        output[subtitle_index] = dict(item)
+    return output
+
+
+def merge_speaker_metadata_into_subtitles(
+    *,
+    subtitles: List[Dict[str, Any]],
+    speaker_metadata_map: Dict[int, Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """把 speaker sidecar 合并回字幕对象，保留原有时间与文本。"""
+
+    if not speaker_metadata_map:
+        return subtitles
+    merged: List[Dict[str, Any]] = []
+    for index, subtitle in enumerate(subtitles, start=1):
+        merged_item = dict(subtitle)
+        metadata = speaker_metadata_map.get(index)
+        if metadata:
+            for key in ("speaker_id", "speaker_track_id", "coverage_ratio", "needs_review"):
+                if key in metadata and metadata.get(key) is not None:
+                    merged_item[key] = metadata.get(key)
+        merged.append(merged_item)
+    return merged
+
+
 def build_backend_reference_selector(
     *,
     tts_backend: str,
@@ -2406,52 +2757,66 @@ def build_backend_reference_selector(
     subtitle_ref_map: Dict[int, Path],
     default_ref: Path,
     omnivoice_min_subtitle_ref_sec: float = DEFAULT_OMNIVOICE_MIN_SUBTITLE_REF_SEC,
-) -> Tuple[Callable[[int], Path], Dict[str, Any]]:
-    """按底座选择参考音策略，避免 OmniVoice 默认吃到过短逐句参考音。"""
+) -> Tuple[Callable[[int], VoiceReference], Dict[str, Any]]:
+    """按底座选择参考音策略。
 
-    normalized_backend = (tts_backend or "").strip().lower()
-    if normalized_backend != "omnivoice":
-        def _selector(index: int) -> Path:
-            return subtitle_ref_map.get(index, default_ref)
+    当前 Auto Dubbing 只保留 index-tts，因此这里统一返回逐句参考音策略。
+    """
 
-        return _selector, {
-            "reference_strategy": "sentence_original_audio_per_subtitle",
-            "reference_count": len(subtitle_ref_map),
-            "shared_reference_count": 0,
-            "subtitle_reference_count": len(subtitle_ref_map),
-            "subtitle_reference_min_sec": None,
-        }
-
-    selected_map: Dict[int, Path] = {}
-    shared_reference_count = 0
-    subtitle_reference_count = 0
-    safe_min_sec = max(0.2, float(omnivoice_min_subtitle_ref_sec))
-    for index, _subtitle in enumerate(subtitles):
-        candidate = subtitle_ref_map.get(index, default_ref)
-        use_subtitle_reference = False
-        if candidate != default_ref and candidate.exists():
-            candidate_duration_sec = read_reference_duration_sec(candidate)
-            use_subtitle_reference = candidate_duration_sec >= safe_min_sec
-        selected_path = candidate if use_subtitle_reference else default_ref
-        selected_map[index] = selected_path
-        if selected_path == default_ref:
-            shared_reference_count += 1
-        else:
-            subtitle_reference_count += 1
-
-    if not selected_map:
-        selected_map[0] = default_ref
-        shared_reference_count = 1
-
-    def _selector(index: int) -> Path:
-        return selected_map.get(index, default_ref)
+    def _selector(index: int) -> VoiceReference:
+        subtitle = subtitles[index] if 0 <= index < len(subtitles) else {}
+        return VoiceReference(
+            audio_path=subtitle_ref_map.get(index, default_ref),
+            reference_text=str(subtitle.get("text") or "").strip() or None,
+        )
 
     return _selector, {
-        "reference_strategy": "shared_reference_preferred_for_omnivoice",
-        "reference_count": len(selected_map),
-        "shared_reference_count": int(shared_reference_count),
-        "subtitle_reference_count": int(subtitle_reference_count),
-        "subtitle_reference_min_sec": round(float(safe_min_sec), 3),
+        "reference_strategy": "sentence_original_audio_per_subtitle",
+        "reference_count": len(subtitle_ref_map),
+        "shared_reference_count": 0,
+        "subtitle_reference_count": len(subtitle_ref_map),
+        "subtitle_reference_min_sec": None,
+    }
+
+
+def build_strict_speaker_reference_selector(
+    *,
+    subtitles: List[Dict[str, Any]],
+    speaker_ref_map: Dict[str, Path],
+    detected_speaker_ids: List[str],
+) -> Tuple[Callable[[int], VoiceReference], Dict[str, Any]]:
+    """为 index-tts 严格多人模式构建 speaker_id -> 上传参考音 的直通选择器。"""
+
+    def _selector(index: int) -> VoiceReference:
+        if not (0 <= index < len(subtitles)):
+            raise RuntimeError(
+                "index-tts strict speaker mapping subtitle index out of range: "
+                f"{index + 1}"
+            )
+        subtitle = subtitles[index]
+        speaker_id = str(subtitle.get("speaker_id") or "").strip()
+        if not speaker_id:
+            raise RuntimeError(
+                "index-tts strict speaker mapping missing speaker_id at row "
+                f"{index + 1}"
+            )
+        if speaker_id not in speaker_ref_map:
+            raise RuntimeError(
+                "index-tts strict speaker mapping missing reference for "
+                f"speaker_id='{speaker_id}' at row {index + 1}"
+            )
+        return VoiceReference(
+            audio_path=speaker_ref_map[speaker_id],
+            reference_text=str(subtitle.get("text") or "").strip() or None,
+        )
+
+    return _selector, {
+        "reference_strategy": "index_tts_strict_speaker_refs",
+        "dubbing_mode": "multi",
+        "reference_count": len(speaker_ref_map),
+        "speaker_override_count": len(speaker_ref_map),
+        "speaker_ids": sorted(detected_speaker_ids),
+        "subtitle_reference_count": 0,
     }
 
 
@@ -2551,21 +2916,6 @@ def mix_with_bgm(
     )
 
 
-def load_tts_model(model_path: str, device: str, dtype_name: str) -> Qwen3TTSModel:
-    dtype_map = {
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float32": torch.float32,
-    }
-    if dtype_name not in dtype_map:
-        raise ValueError(f"unsupported --tts-dtype: {dtype_name}")
-    return Qwen3TTSModel.from_pretrained(
-        model_path,
-        device_map=device,
-        dtype=dtype_map[dtype_name],
-    )
-
-
 def load_index_tts_model(
     *,
     root_dir: Optional[str],
@@ -2660,16 +3010,11 @@ def release_index_tts_api_model(*, api_url: str, timeout_sec: float) -> Dict[str
 
 def release_local_tts_models(
     *,
-    tts_qwen: Optional[Qwen3TTSModel],
     tts_index: Optional[Any],
     logger: JsonlLogger,
 ) -> None:
-    if tts_qwen is None and tts_index is None:
+    if tts_index is None:
         return
-    try:
-        del tts_qwen
-    except Exception:
-        pass
     try:
         del tts_index
     except Exception:
@@ -2732,8 +3077,6 @@ def synthesize_text_once(
     index_tts_via_api: bool,
     index_tts_api_url: str,
     index_tts_api_timeout_sec: float,
-    tts_qwen: Optional[Qwen3TTSModel],
-    qwen_prompt_items: Optional[List[Any]],
     tts_index: Optional[Any],
     ref_audio_path: Path,
     index_emo_audio_prompt: Optional[Path],
@@ -2748,23 +3091,15 @@ def synthesize_text_once(
     output_path: Path,
     target_duration_sec: Optional[float] = None,
     fallback_tts_backend: str = "none",
-    omnivoice_root: str = "",
-    omnivoice_python_bin: str = "",
-    omnivoice_model: str = "",
-    omnivoice_device: str = "auto",
-    omnivoice_via_api: bool = True,
-    omnivoice_api_url: str = "",
     ref_text: Optional[str] = None,
     target_lang: str = "",
-) -> None:
+) -> Dict[str, Any]:
     """兼容旧入口：执行一次单句 TTS 合成。"""
     return synthesize_text_once_impl(
         tts_backend=tts_backend,
         index_tts_via_api=index_tts_via_api,
         index_tts_api_url=index_tts_api_url,
         index_tts_api_timeout_sec=index_tts_api_timeout_sec,
-        tts_qwen=tts_qwen,
-        qwen_prompt_items=qwen_prompt_items,
         tts_index=tts_index,
         ref_audio_path=ref_audio_path,
         index_emo_audio_prompt=index_emo_audio_prompt,
@@ -2779,12 +3114,6 @@ def synthesize_text_once(
         output_path=output_path,
         target_duration_sec=target_duration_sec,
         fallback_tts_backend=fallback_tts_backend,
-        omnivoice_root=omnivoice_root,
-        omnivoice_python_bin=omnivoice_python_bin,
-        omnivoice_model=omnivoice_model,
-        omnivoice_device=omnivoice_device,
-        omnivoice_via_api=omnivoice_via_api,
-        omnivoice_api_url=omnivoice_api_url,
         ref_text=ref_text,
         target_lang=target_lang,
     )
@@ -2872,11 +3201,10 @@ def apply_short_fade_edges(*, wav: np.ndarray, sample_rate: int, fade_ms: float 
 def synthesize_segments_grouped(
     *,
     tts_backend: str,
+    dubbing_mode: str,
     index_tts_via_api: bool,
     index_tts_api_url: str,
     index_tts_api_timeout_sec: float,
-    tts_qwen: Optional[Qwen3TTSModel],
-    qwen_prompt_items: Optional[List[Any]],
     tts_index: Optional[Any],
     ref_audio_path: Path,
     ref_audio_selector: Optional[Callable[[int], Path]],
@@ -2904,12 +3232,6 @@ def synthesize_segments_grouped(
     logger: JsonlLogger,
     target_lang: str,
     fallback_tts_backend: str = "none",
-    omnivoice_root: str = "",
-    omnivoice_python_bin: str = "",
-    omnivoice_model: str = "",
-    omnivoice_device: str = "auto",
-    omnivoice_via_api: bool = True,
-    omnivoice_api_url: str = "",
     dub_audio_leveling_enabled: bool = True,
     dub_audio_leveling_target_rms: float = DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS,
     dub_audio_leveling_activity_threshold_db: float = DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB,
@@ -2919,11 +3241,10 @@ def synthesize_segments_grouped(
     """兼容旧入口：grouped / legacy 主循环转调到新的 dubbing pipeline。"""
     return synthesize_segments_grouped_impl(
         tts_backend=tts_backend,
+        dubbing_mode=dubbing_mode,
         index_tts_via_api=index_tts_via_api,
         index_tts_api_url=index_tts_api_url,
         index_tts_api_timeout_sec=index_tts_api_timeout_sec,
-        tts_qwen=tts_qwen,
-        qwen_prompt_items=qwen_prompt_items,
         tts_index=tts_index,
         ref_audio_path=ref_audio_path,
         ref_audio_selector=ref_audio_selector,
@@ -2951,12 +3272,6 @@ def synthesize_segments_grouped(
         logger=logger,
         target_lang=target_lang,
         fallback_tts_backend=fallback_tts_backend,
-        omnivoice_root=omnivoice_root,
-        omnivoice_python_bin=omnivoice_python_bin,
-        omnivoice_model=omnivoice_model,
-        omnivoice_device=omnivoice_device,
-        omnivoice_via_api=omnivoice_via_api,
-        omnivoice_api_url=omnivoice_api_url,
         dub_audio_leveling_enabled=dub_audio_leveling_enabled,
         dub_audio_leveling_target_rms=dub_audio_leveling_target_rms,
         dub_audio_leveling_activity_threshold_db=dub_audio_leveling_activity_threshold_db,
@@ -2968,11 +3283,10 @@ def synthesize_segments_grouped(
 def synthesize_segments(
     *,
     tts_backend: str,
+    dubbing_mode: str = "single",
     index_tts_via_api: bool,
     index_tts_api_url: str,
     index_tts_api_timeout_sec: float,
-    tts_qwen: Optional[Qwen3TTSModel],
-    qwen_prompt_items: Optional[List[Any]],
     tts_index: Optional[Any],
     ref_audio_path: Path,
     ref_audio_selector: Optional[Callable[[int], Path]],
@@ -3001,15 +3315,9 @@ def synthesize_segments(
     prefer_translated_text: bool,
     existing_records_by_id: Optional[Dict[str, Dict[str, Any]]],
     redub_line_indices: Optional[set[int]],
-    v2_mode: bool,
     logger: JsonlLogger,
+    translate_system_prompt: Optional[str] = None,
     fallback_tts_backend: str = "none",
-    omnivoice_root: str = "",
-    omnivoice_python_bin: str = "",
-    omnivoice_model: str = "",
-    omnivoice_device: str = "auto",
-    omnivoice_via_api: bool = True,
-    omnivoice_api_url: str = "",
     dub_audio_leveling_enabled: bool = True,
     dub_audio_leveling_target_rms: float = DEFAULT_DUB_AUDIO_LEVELING_TARGET_RMS,
     dub_audio_leveling_activity_threshold_db: float = DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB,
@@ -3019,11 +3327,10 @@ def synthesize_segments(
     """兼容旧入口：逐句主循环转调到新的 dubbing pipeline。"""
     return synthesize_segments_impl(
         tts_backend=tts_backend,
+        dubbing_mode=dubbing_mode,
         index_tts_via_api=index_tts_via_api,
         index_tts_api_url=index_tts_api_url,
         index_tts_api_timeout_sec=index_tts_api_timeout_sec,
-        tts_qwen=tts_qwen,
-        qwen_prompt_items=qwen_prompt_items,
         tts_index=tts_index,
         ref_audio_path=ref_audio_path,
         ref_audio_selector=ref_audio_selector,
@@ -3052,15 +3359,10 @@ def synthesize_segments(
         prefer_translated_text=prefer_translated_text,
         existing_records_by_id=existing_records_by_id,
         redub_line_indices=redub_line_indices,
-        v2_mode=v2_mode,
+        v2_mode=False,
         logger=logger,
+        translate_system_prompt=translate_system_prompt,
         fallback_tts_backend=fallback_tts_backend,
-        omnivoice_root=omnivoice_root,
-        omnivoice_python_bin=omnivoice_python_bin,
-        omnivoice_model=omnivoice_model,
-        omnivoice_device=omnivoice_device,
-        omnivoice_via_api=omnivoice_via_api,
-        omnivoice_api_url=omnivoice_api_url,
         dub_audio_leveling_enabled=dub_audio_leveling_enabled,
         dub_audio_leveling_target_rms=dub_audio_leveling_target_rms,
         dub_audio_leveling_activity_threshold_db=dub_audio_leveling_activity_threshold_db,
@@ -3189,13 +3491,13 @@ def _build_manifest_replay_options(args: argparse.Namespace) -> BatchReplayOptio
 
     return BatchReplayOptions(
         target_lang=args.target_lang,
-        pipeline_version="v2" if read_bool(str(getattr(args, "v2_mode", "false"))) else "v1",
-        rewrite_translation=read_bool(str(getattr(args, "v2_rewrite_translation", "true"))),
+        pipeline_version="auto-dubbing",
+        dubbing_mode=getattr(args, "dubbing_mode", "single"),
+        rewrite_translation=True,
         timing_mode=getattr(args, "timing_mode", "strict"),
         grouping_strategy=getattr(args, "grouping_strategy", "sentence"),
         input_srt_kind=getattr(args, "input_srt_kind", "source"),
         index_tts_api_url=getattr(args, "index_tts_api_url", None),
-        auto_pick_ranges=read_bool(str(getattr(args, "auto_pick_ranges", "false"))),
         time_ranges=list(getattr(args, "requested_time_ranges", [])),
         source_short_merge_enabled=read_bool(str(getattr(args, "source_short_merge_enabled", "false"))),
         source_short_merge_threshold=int(
@@ -3232,14 +3534,20 @@ def _build_manifest_replay_options(args: argparse.Namespace) -> BatchReplayOptio
         force_fit_timing=bool(
             getattr(args, "force_fit_timing_effective", read_bool(str(getattr(args, "force_fit_timing", "true"))))
         ),
-        tts_backend=args.tts_backend,
-        fallback_tts_backend=getattr(args, "fallback_tts_backend", "none"),
-        omnivoice_root=str(getattr(args, "omnivoice_root", "") or ""),
-        omnivoice_python_bin=str(getattr(args, "omnivoice_python_bin", "") or ""),
-        omnivoice_model=str(getattr(args, "omnivoice_model", "") or ""),
-        omnivoice_device=str(getattr(args, "omnivoice_device", "auto") or "auto"),
-        omnivoice_via_api=read_bool(str(getattr(args, "omnivoice_via_api", "true"))),
-        omnivoice_api_url=str(getattr(args, "omnivoice_api_url", "http://127.0.0.1:8020") or "http://127.0.0.1:8020"),
+        tts_backend="index-tts",
+        single_ref_audio=str(getattr(args, "single_speaker_ref", "") or ""),
+        single_ref_text=str(getattr(args, "single_ref_text", "") or ""),
+        # manifest 必须原样保留用户上传的 speaker 映射，供恢复/重放与审计使用。
+        speaker_ref_map=[
+            {
+                "speaker_id": str(spec.get("speaker_id") or ""),
+                "ref_audio_path": str(spec.get("ref_audio_path") or ""),
+                "ref_text": str(spec.get("ref_text") or ""),
+            }
+            for spec in parse_speaker_reference_specs_json(str(getattr(args, "speaker_ref_map_json", "") or "")).values()
+            if str(spec.get("speaker_id") or "").strip()
+        ],
+        tts_model_path=str(getattr(args, "tts_model_path", "") or ""),
     )
 
 
@@ -3309,9 +3617,21 @@ def parse_args() -> argparse.Namespace:
         choices=["source", "translated"],
         help="Type of --input-srt: source(need translation) or translated(skip translation)",
     )
+    parser.add_argument(
+        "--dubbing-mode",
+        default="single",
+        choices=["single", "multi"],
+        help="single: one shared ref audio for all lines; multi: route by subtitle speaker_id",
+    )
 
     parser.add_argument("--single-speaker-ref", help="Optional reference wav for single-speaker mode")
+    parser.add_argument("--single-ref-text", default="", help="Optional explicit reference transcript for uploaded single-speaker reference audio")
     parser.add_argument("--single-speaker-ref-seconds", type=float, default=10.0)
+    parser.add_argument(
+        "--speaker-ref-map-json",
+        default="",
+        help="JSON list of {speaker_id, ref_audio_path, ref_text?} used by multi-speaker mode",
+    )
 
     parser.add_argument("--separate-vocals", default="true")
     parser.add_argument("--separator-model", default="htdemucs")
@@ -3339,8 +3659,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--export-vocals", default="true")
     parser.add_argument("--export-mix", default="true")
 
-    parser.add_argument("--asr-model-path", default=str(REPO_ROOT / "models/Qwen3-ASR-0.6B"))
-    parser.add_argument("--aligner-path", default=str(REPO_ROOT / "models/Qwen3-ForcedAligner-0.6B"))
+    parser.add_argument("--asr-model-path", default="")
+    parser.add_argument("--aligner-path", default="")
     parser.add_argument("--asr-device", default="mps")
     parser.add_argument("--asr-language", default=None)
     parser.add_argument("--max-width", type=int, default=40)
@@ -3369,15 +3689,11 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional JSON list of 1-based subtitle line indices to re-dub; others reuse existing audio",
     )
-    parser.add_argument("--auto-pick-ranges", default="false")
-    parser.add_argument("--auto-pick-min-silence-sec", type=float, default=0.8)
-    parser.add_argument("--auto-pick-min-speech-sec", type=float, default=1.0)
-    parser.add_argument("--v2-mode", default="false")
-    parser.add_argument("--v2-rewrite-translation", default="true")
+    parser.add_argument("--speaker-metadata-path", default=None)
 
-    parser.add_argument("--translate-base-url", default="https://api.deepseek.com")
-    parser.add_argument("--translate-model", default="deepseek-v4-flash")
-    parser.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
+    parser.add_argument("--translate-base-url", default=DEFAULT_TRANSLATE_BASE_URL)
+    parser.add_argument("--translate-model", default=DEFAULT_TRANSLATE_MODEL)
+    parser.add_argument("--api-key-env", default=TRANSLATE_API_KEY_ENV)
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--translate-system-prompt", default=None)
     parser.add_argument("--smart-layout", default="true")
@@ -3387,9 +3703,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--display-merge-fragments", default="false")
     parser.add_argument("--display-merge-gap-sec", type=float, default=0.35)
 
-    parser.add_argument("--tts-backend", default="qwen", choices=["qwen", "index-tts", "omnivoice"])
-    parser.add_argument("--fallback-tts-backend", default="none", choices=["none", "omnivoice"])
-    parser.add_argument("--tts-model-path", default=str(REPO_ROOT / "models/Qwen3-TTS-12Hz-0.6B-Base"))
+    parser.add_argument("--tts-backend", default="index-tts", choices=["index-tts"])
+    parser.add_argument("--tts-model-path", default="")
     parser.add_argument("--tts-device", default="mps")
     parser.add_argument("--tts-dtype", default="float16", choices=["float16", "bfloat16", "float32"])
 
@@ -3410,24 +3725,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--index-top-p", type=float, default=0.8)
     parser.add_argument("--index-top-k", type=int, default=30)
     parser.add_argument("--index-temperature", type=float, default=0.8)
-    parser.add_argument("--index-max-text-tokens", type=int, default=120)
-    parser.add_argument("--omnivoice-root", default=os.environ.get("OMNIVOICE_ROOT", ""))
-    parser.add_argument("--omnivoice-python-bin", default=os.environ.get("OMNIVOICE_PYTHON_BIN", ""))
-    parser.add_argument("--omnivoice-model", default=os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice"))
-    parser.add_argument("--omnivoice-device", default=os.environ.get("OMNIVOICE_DEVICE", "auto"))
-    parser.add_argument("--omnivoice-via-api", default=os.environ.get("OMNIVOICE_VIA_API", "true"))
-    parser.add_argument("--omnivoice-api-url", default=os.environ.get("OMNIVOICE_API_URL", "http://127.0.0.1:8020"))
+    parser.add_argument("--index-max-text-tokens", type=int, default=40)
     parser.add_argument("--resume-job-dir", default=None, help="Reuse an existing job directory and continue processing")
     return parser.parse_args()
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    # source short merge 的持久化字段保留“用户请求态”，但 OmniVoice 运行时会强制开启。
     requested_source_short_merge_enabled = read_bool(str(args.source_short_merge_enabled))
     effective_source_short_merge_enabled, _ = resolve_source_short_merge_policy(
         requested_enabled=requested_source_short_merge_enabled,
         tts_backend=str(args.tts_backend or ""),
     )
+    if args.dubbing_mode not in {"single", "multi"}:
+        raise ValueError("--dubbing-mode must be one of: single, multi")
 
     if not (0 < args.single_speaker_ref_seconds <= 20):
         raise ValueError("--single-speaker-ref-seconds must be in (0, 20]")
@@ -3455,36 +3765,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--balanced-max-tempo-shift must be in [0.0, 0.3]")
     if not (0.05 <= args.balanced_min_line_sec <= 2.0):
         raise ValueError("--balanced-min-line-sec must be in [0.05, 2.0]")
-    if args.tts_backend not in {"qwen", "index-tts", "omnivoice"}:
-        raise ValueError("--tts-backend must be one of: qwen, index-tts, omnivoice")
-    if args.fallback_tts_backend not in {"none", "omnivoice"}:
-        raise ValueError("--fallback-tts-backend must be one of: none, omnivoice")
-    if args.fallback_tts_backend == "omnivoice" or args.tts_backend == "omnivoice":
-        omnivoice_via_api = read_bool(str(args.omnivoice_via_api))
-        if omnivoice_via_api:
-            if not str(args.omnivoice_api_url or "").strip():
-                raise ValueError(
-                    "--omnivoice-api-url must not be empty when --omnivoice-via-api true "
-                    "and OmniVoice is selected"
-                )
-        else:
-            omnivoice_root = Path(str(args.omnivoice_root or "")).expanduser()
-            if not args.omnivoice_root or not omnivoice_root.exists():
-                raise ValueError(
-                    "--omnivoice-root is required and must exist when --tts-backend omnivoice "
-                    "or --fallback-tts-backend omnivoice"
-                )
-            omnivoice_python_bin = Path(str(args.omnivoice_python_bin or "")).expanduser()
-            if not args.omnivoice_python_bin or not omnivoice_python_bin.exists():
-                raise ValueError(
-                    "--omnivoice-python-bin is required and must exist when --tts-backend omnivoice "
-                    "or --fallback-tts-backend omnivoice"
-                )
-            if not (args.omnivoice_model or "").strip():
-                raise ValueError(
-                    "--omnivoice-model must not be empty when --tts-backend omnivoice "
-                    "or --fallback-tts-backend omnivoice"
-                )
+    if args.tts_backend != "index-tts":
+        raise ValueError("--tts-backend must be index-tts")
     if not (0.0 <= args.index_emo_alpha <= 1.0):
         raise ValueError("--index-emo-alpha must be in [0.0, 1.0]")
     if not (0.1 <= args.index_top_p <= 1.0):
@@ -3537,11 +3819,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--dub-audio-leveling-peak-ceiling must be in (0.0, 0.99]")
     if not (10 <= args.cjk_wrap_chars <= 40):
         raise ValueError("--cjk-wrap-chars must be in [10, 40]")
-    if args.auto_pick_min_silence_sec < 0.1 or args.auto_pick_min_silence_sec > 10.0:
-        raise ValueError("--auto-pick-min-silence-sec must be in [0.1, 10.0]")
-    if args.auto_pick_min_speech_sec < 0.1 or args.auto_pick_min_speech_sec > 30.0:
-        raise ValueError("--auto-pick-min-speech-sec must be in [0.1, 30.0]")
-
 
 def main() -> int:
     args = parse_args()
@@ -3597,36 +3874,33 @@ def main() -> int:
     separate_vocals = read_bool(args.separate_vocals)
     input_srt_kind = (args.input_srt_kind or "source").strip().lower()
     input_srt_is_translated = bool(args.input_srt) and input_srt_kind == "translated"
+    speaker_metadata_path = Path(args.speaker_metadata_path).expanduser() if args.speaker_metadata_path else None
+    speaker_metadata_map = load_speaker_metadata_map(speaker_metadata_path)
     bilingual_enabled = read_bool(args.bilingual_srt)
     export_vocals = read_bool(args.export_vocals)
     export_mix = read_bool(args.export_mix)
     asr_balance_lines = read_bool(args.asr_balance_lines)
-    auto_pick_ranges = read_bool(args.auto_pick_ranges)
     smart_layout_enabled = read_bool(args.smart_layout)
     smart_layout_use_llm = read_bool(args.smart_layout_use_llm)
     display_merge_fragments = read_bool(args.display_merge_fragments)
-    v2_mode = read_bool(args.v2_mode)
-    v2_rewrite_translation = read_bool(args.v2_rewrite_translation)
+    dubbing_mode = (args.dubbing_mode or "single").strip().lower() or "single"
     source_layout_mode = (args.source_layout_mode or "hybrid").strip().lower() or "hybrid"
     force_fit_timing = read_bool(args.force_fit_timing)
-    grouped_synthesis = read_bool(args.grouped_synthesis)
+    requested_grouped_synthesis = read_bool(args.grouped_synthesis)
     requested_source_short_merge_enabled = read_bool(str(args.source_short_merge_enabled))
     effective_source_short_merge_enabled, source_short_merge_effective_reason = resolve_source_short_merge_policy(
         requested_enabled=requested_source_short_merge_enabled,
         tts_backend=str(args.tts_backend or ""),
     )
     translated_input_preserve_synthesis_mode = read_bool(args.translated_input_preserve_synthesis_mode)
-    if v2_mode:
-        # V2 主链路：默认逐句合成，避免分组合成导致的节奏撕裂。
-        grouped_synthesis = False
-        # V2 以“start 严格对齐 + 自然收尾”为主，不走硬性 end 拟合。
-        force_fit_timing = False
-    # 上传“已翻译字幕”时，优先遵循用户提供的句级时间轴：
-    # 1) 关闭 grouped 合成，改为逐句合成与逐句贴轨（严格对齐）；
-    # 2) 逐句流程仍保留“借后续静音”窗口，避免尾音被硬截断导致漏音。
-    if input_srt_is_translated and (not translated_input_preserve_synthesis_mode):
-        if grouped_synthesis:
-            grouped_synthesis = False
+    grouped_synthesis, grouped_synthesis_reason = resolve_grouped_synthesis_policy(
+        requested_enabled=requested_grouped_synthesis,
+        input_srt_is_translated=input_srt_is_translated,
+        translated_input_preserve_synthesis_mode=translated_input_preserve_synthesis_mode,
+        source_short_merge_enabled=effective_source_short_merge_enabled,
+    )
+    if requested_grouped_synthesis and (not grouped_synthesis):
+        if grouped_synthesis_reason == "input_translated_strict_alignment":
             logger.log(
                 "INFO",
                 "tts",
@@ -3634,6 +3908,10 @@ def main() -> int:
                 "uploaded translated subtitles force per-line synthesis for strict start-time alignment",
                 data={"input_srt_kind": "translated"},
             )
+    # 上传“已翻译字幕”时，优先遵循用户提供的句级时间轴：
+    # 1) 关闭 grouped 合成，改为逐句合成与逐句贴轨（严格对齐）；
+    # 2) 逐句流程仍保留“借后续静音”窗口，避免尾音被硬截断导致漏音。
+    if input_srt_is_translated and (not translated_input_preserve_synthesis_mode):
         # 上传翻译字幕时：只要求 start 严格对齐，end 允许自然收尾（可借后续静音，不强制 fit 到 end）。
         if force_fit_timing:
             force_fit_timing = False
@@ -3668,8 +3946,6 @@ def main() -> int:
     should_release_index_tts_api = (
         args.tts_backend == "index-tts" and index_tts_via_api and index_tts_api_release_after_job
     )
-    tts_qwen: Optional[Qwen3TTSModel] = None
-    qwen_prompt_items: Optional[List[Any]] = None
     tts_index: Optional[Any] = None
     translator_cache: Dict[str, Translator] = {}
 
@@ -3678,13 +3954,17 @@ def main() -> int:
         cached = translator_cache.get("main")
         if cached is not None:
             return cached
-        api_key = args.api_key or os.environ.get(args.api_key_env)
+        api_key = resolve_translation_api_key(api_key=args.api_key, api_key_env=args.api_key_env)
         if not api_key:
-            raise RuntimeError(f"E-TRN-001 missing api key (set --api-key or {args.api_key_env})")
+            raise RuntimeError(
+                "E-TRN-001 missing translation api key "
+                f"(set --api-key or {TRANSLATE_API_KEY_ENV}; legacy: {LEGACY_TRANSLATE_API_KEY_ENV})"
+            )
         translator = Translator(
             api_key=api_key,
             base_url=args.translate_base_url,
             model=args.translate_model,
+            api_key_env=args.api_key_env,
         )
         translator_cache["main"] = translator
         return translator
@@ -3731,13 +4011,6 @@ def main() -> int:
                 ]
             )
             range_strategy = "manual"
-        elif auto_pick_ranges:
-            effective_time_ranges = detect_speech_time_ranges(
-                input_audio=source_audio,
-                min_silence_sec=float(args.auto_pick_min_silence_sec),
-                min_speech_sec=float(args.auto_pick_min_speech_sec),
-            )
-            range_strategy = "auto"
         if effective_time_ranges:
             logger.log(
                 "INFO",
@@ -3855,7 +4128,7 @@ def main() -> int:
                         data={"count": len(subtitles), "timestamp_health": source_health},
                     )
                     translated_lines = []
-        else:
+        elif input_srt_is_translated:
             # 对于 translated 输入（尤其 save-and-redub 的 resume 场景），
             # 这里会直接读取 args.input_srt（即段内最新 translated.srt），
             # 从源头保证后续 TTS 输入就是用户编辑后的文本。
@@ -3885,6 +4158,105 @@ def main() -> int:
             if not subtitles:
                 raise RuntimeError("E-ASR-001 no subtitles produced")
             translated_lines = []
+        else:
+            # 首轮 source 输入且本地尚无 source.srt 时，必须把上传字幕当成“真实源字幕”
+            # 落盘并重构；否则 short merge / sentence rebalance 只会停留在表单输入，不会影响翻译结果。
+            subtitles = load_or_transcribe_subtitles(
+                input_srt=Path(args.input_srt).expanduser() if args.input_srt else None,
+                asr_audio=source_audio,
+                source_srt_path=source_srt,
+                persist_input_srt_to_source=True,
+                asr_model_path=args.asr_model_path,
+                aligner_path=args.aligner_path,
+                device=args.asr_device,
+                language=args.asr_language,
+                max_width=args.max_width,
+                asr_balance_lines=asr_balance_lines,
+                asr_balance_gap_sec=args.asr_balance_gap_sec,
+                source_layout_mode=source_layout_mode,
+                source_layout_llm_min_duration_sec=args.source_layout_llm_min_duration_sec,
+                source_layout_llm_min_text_units=args.source_layout_llm_min_text_units,
+                source_layout_llm_max_cues=args.source_layout_llm_max_cues,
+                source_short_merge_enabled=effective_source_short_merge_enabled,
+                source_short_merge_threshold=args.source_short_merge_threshold,
+                source_short_merge_requested=requested_source_short_merge_enabled,
+                source_short_merge_effective_reason=source_short_merge_effective_reason,
+                translator_factory=get_or_create_translator,
+                logger=logger,
+            )
+            if not subtitles:
+                raise RuntimeError("E-ASR-001 no subtitles produced")
+            translated_lines = []
+
+        # 先把 sidecar 里的 speaker_id 合回字幕，再做前缀归一化。
+        # 这样 segment 级 speaker_metadata_path 不会被误判成“没有 Speaker 前缀”。
+        subtitles = merge_speaker_metadata_into_subtitles(
+            subtitles=subtitles,
+            speaker_metadata_map=speaker_metadata_map,
+        )
+
+        # 统一在字幕进入后续编排前解析 speaker 前缀或已有 speaker_id。
+        # 这样 single / multi 两种模式、翻译与 TTS 都能共享同一份 speaker_id 语义。
+        subtitles, detected_speaker_ids = normalize_subtitles_with_speakers(subtitles)
+        logger.log(
+            "INFO",
+            "asr_align",
+            "speaker_prefix_normalized",
+            "normalized subtitle speaker prefixes",
+            data={
+                "dubbing_mode": dubbing_mode,
+                "speaker_count": len(detected_speaker_ids),
+                "speaker_ids": detected_speaker_ids,
+            },
+        )
+        if dubbing_mode == "multi":
+            speaker_ref_specs = parse_speaker_reference_specs_json(str(args.speaker_ref_map_json or ""))
+            speaker_ref_map = {
+                speaker_id: Path(str(spec.get("ref_audio_path") or "")).expanduser().resolve()
+                for speaker_id, spec in speaker_ref_specs.items()
+                if str(spec.get("ref_audio_path") or "").strip()
+            }
+            strict_index_tts_speaker_refs = (
+                str(args.tts_backend or "").strip().lower() == "index-tts"
+                and bool(str(args.speaker_ref_map_json or "").strip())
+            )
+            if not detected_speaker_ids:
+                raise RuntimeError("multi-speaker mode requires subtitles with stable speaker prefixes like 'Speaker 1:'")
+            if strict_index_tts_speaker_refs:
+                missing_speakers = [speaker_id for speaker_id in detected_speaker_ids if speaker_id not in speaker_ref_map]
+                if missing_speakers:
+                    raise RuntimeError(
+                        "index-tts strict speaker mapping missing reference audio for: "
+                        + ", ".join(missing_speakers)
+                    )
+                subtitle_rows_missing_speaker = [
+                    index + 1
+                    for index, subtitle in enumerate(subtitles)
+                    if not str(subtitle.get("speaker_id") or "").strip()
+                ]
+                if subtitle_rows_missing_speaker:
+                    preview = ", ".join(str(item) for item in subtitle_rows_missing_speaker[:10])
+                    if len(subtitle_rows_missing_speaker) > 10:
+                        preview += ", ..."
+                    raise RuntimeError(
+                        "index-tts strict speaker mapping missing speaker_id at row(s): "
+                        f"{preview}"
+                    )
+                for index, subtitle in enumerate(subtitles):
+                    speaker_id = str(subtitle.get("speaker_id") or "").strip()
+                    if speaker_id not in speaker_ref_map:
+                        raise RuntimeError(
+                            "index-tts strict speaker mapping missing reference for "
+                            f"speaker_id='{speaker_id}' at row {index + 1}"
+                        )
+            for speaker_id, ref_path in speaker_ref_map.items():
+                if not ref_path.exists():
+                    raise RuntimeError(f"speaker reference audio not found for {speaker_id}: {ref_path}")
+        else:
+            speaker_ref_map = {}
+            speaker_ref_specs = {}
+
+        single_ref_text = str(args.single_ref_text or "").strip()
 
         # 在识别完成后按时间区间过滤字幕，确保后续翻译/TTS 仅处理指定区间。
         if range_strategy != "all":
@@ -3919,27 +4291,6 @@ def main() -> int:
                 )
             else:
                 translated_lines = []
-
-        if v2_mode and subtitles:
-            # V2 在翻译/TTS 前统一标准化句单元时间轴，降低后续对齐抖动。
-            before_count = len(subtitles)
-            subtitles = normalize_subtitle_sentence_units(
-                subtitles=subtitles,
-                media_duration_sec=source_duration_sec,
-            )
-            subtitles = enforce_subtitle_timestamps(
-                subtitles=subtitles,
-                media_duration_sec=source_duration_sec,
-            )
-            if source_subtitles_writable:
-                save_srt(subtitles, source_srt)
-            logger.log(
-                "INFO",
-                "asr_align",
-                "v2_sentence_units_normalized",
-                "normalized sentence units for v2 pipeline",
-                data={"before": before_count, "after": len(subtitles)},
-            )
 
         # 识别字幕完成后再做人声分离，避免“分离音频退化”影响字幕时间戳。
         if source_vocals.exists():
@@ -4056,6 +4407,7 @@ def main() -> int:
                 max_gap_sec=args.smart_layout_gap_sec,
                 use_llm=smart_layout_use_llm,
                 logger=logger,
+                system_prompt=args.translate_system_prompt,
             )
             translated_lines = repair_punctuation_only_translations(
                 subtitles=subtitles,
@@ -4063,6 +4415,7 @@ def main() -> int:
                 translator=translator,
                 target_lang=args.target_lang,
                 logger=logger,
+                system_prompt=args.translate_system_prompt,
             )
             logger.log("INFO", "translate", "translation_completed", "translation completed", progress=60)
 
@@ -4080,34 +4433,89 @@ def main() -> int:
         else:
             logger.log("INFO", "translate", "translation_reused", "reused existing translated subtitles", progress=60)
 
-        if args.single_speaker_ref:
-            src_ref = Path(args.single_speaker_ref).expanduser()
-            if not src_ref.exists():
-                raise RuntimeError("E-REF-001 provided --single-speaker-ref does not exist")
-            ensure_parent(ref_audio_path)
-            shutil.copy2(src_ref, ref_audio_path)
-        else:
-            # 保留一个兜底参考音（当分段切片失败时回退使用）
-            extract_reference_audio(
-                vocals_audio=separation.vocals_audio,
-                out_ref=ref_audio_path,
-                seconds=float(args.single_speaker_ref_seconds),
-            )
+        if dubbing_mode == "single":
+            if args.single_speaker_ref:
+                src_ref = Path(args.single_speaker_ref).expanduser()
+                if not src_ref.exists():
+                    raise RuntimeError("E-REF-001 provided --single-speaker-ref does not exist")
+                ensure_parent(ref_audio_path)
+                shutil.copy2(src_ref, ref_audio_path)
+            else:
+                # 单人模式默认从首条字幕的起点开始自动截一个共享参考音。
+                extract_reference_audio_from_first_subtitle(
+                    vocals_audio=separation.vocals_audio,
+                    subtitles=subtitles,
+                    out_ref=ref_audio_path,
+                    seconds=float(args.single_speaker_ref_seconds),
+                )
 
-        # 当前固定策略：逐句使用“原音频窗口”做克隆+情绪参考。
-        subtitle_ref_map = build_subtitle_reference_map(
-            subtitles=subtitles,
-            source_audio=source_audio,
-            out_dir=job_dir / "refs" / "subtitles",
-            default_ref=ref_audio_path,
-        )
-        selector, reference_strategy_stats = build_backend_reference_selector(
-            tts_backend=args.tts_backend,
-            subtitles=subtitles,
-            subtitle_ref_map=subtitle_ref_map,
-            default_ref=ref_audio_path,
-        )
-        ref_audio_selector: Optional[Callable[[int], Path]] = selector
+            subtitle_ref_map = build_subtitle_reference_map(
+                subtitles=subtitles,
+                # 逐句参考音必须从人声 stem 抽取，避免把原始混音里的英文原声/背景音带进克隆 prompt。
+                source_audio=separation.vocals_audio,
+                out_dir=job_dir / "refs" / "subtitles",
+                default_ref=ref_audio_path,
+            )
+            selector, reference_strategy_stats = build_backend_reference_selector(
+                tts_backend=args.tts_backend,
+                subtitles=subtitles,
+                subtitle_ref_map=subtitle_ref_map,
+                default_ref=ref_audio_path,
+            )
+            ref_audio_selector = selector
+        else:
+            ensure_parent(ref_audio_path)
+            if speaker_ref_map:
+                first_speaker_ref = next(iter(speaker_ref_map.values()))
+                shutil.copy2(first_speaker_ref, ref_audio_path)
+            else:
+                extract_reference_audio_from_first_subtitle(
+                    vocals_audio=separation.vocals_audio,
+                    subtitles=subtitles,
+                    out_ref=ref_audio_path,
+                    seconds=float(args.single_speaker_ref_seconds),
+                )
+
+            strict_index_tts_speaker_refs = (
+                str(args.tts_backend or "").strip().lower() == "index-tts"
+                and bool(str(args.speaker_ref_map_json or "").strip())
+            )
+            if strict_index_tts_speaker_refs:
+                ref_audio_selector, reference_strategy_stats = build_strict_speaker_reference_selector(
+                    subtitles=subtitles,
+                    speaker_ref_map=speaker_ref_map,
+                    detected_speaker_ids=detected_speaker_ids,
+                )
+            else:
+                subtitle_ref_map = build_subtitle_reference_map(
+                    subtitles=subtitles,
+                    source_audio=separation.vocals_audio,
+                    out_dir=job_dir / "refs" / "subtitles",
+                    default_ref=ref_audio_path,
+                )
+
+                def select_multi_speaker_reference(index: int) -> VoiceReference:
+                    subtitle = subtitles[index] if 0 <= index < len(subtitles) else {}
+                    speaker_id = str(subtitle.get("speaker_id") or "").strip()
+                    if speaker_id and speaker_id in speaker_ref_map:
+                        ref_path = speaker_ref_map[speaker_id]
+                        ref_text = str((speaker_ref_specs.get(speaker_id) or {}).get("ref_text") or "").strip() or None
+                    else:
+                        ref_path = subtitle_ref_map.get(index, ref_audio_path)
+                        ref_text = None
+                    return VoiceReference(
+                        audio_path=ref_path,
+                        reference_text=ref_text or str(subtitle.get("text") or "").strip() or None,
+                    )
+
+                ref_audio_selector = select_multi_speaker_reference
+                reference_strategy_stats = {
+                    "reference_strategy": "auto_subtitle_ref_with_optional_speaker_override",
+                    "dubbing_mode": "multi",
+                    "reference_count": len(subtitle_ref_map),
+                    "speaker_override_count": len(speaker_ref_map),
+                    "speaker_ids": sorted(detected_speaker_ids),
+                }
         logger.log(
             "INFO",
             "ref_extract",
@@ -4127,44 +4535,27 @@ def main() -> int:
 
         logger.log("INFO", "tts", "tts_model_loading", "loading tts model")
 
-        if args.tts_backend == "qwen":
-            tts_qwen = load_tts_model(args.tts_model_path, args.tts_device, args.tts_dtype)
-            qwen_prompt_items = tts_qwen.create_voice_clone_prompt(
-                ref_audio=str(ref_audio_path),
-                ref_text=None,
-                x_vector_only_mode=True,
+        if index_tts_via_api:
+            check_index_tts_service(
+                api_url=args.index_tts_api_url,
+                timeout_sec=args.index_tts_api_timeout_sec,
             )
-        elif args.tts_backend == "index-tts":
-            if index_tts_via_api:
-                check_index_tts_service(
-                    api_url=args.index_tts_api_url,
-                    timeout_sec=args.index_tts_api_timeout_sec,
-                )
-                logger.log(
-                    "INFO",
-                    "tts",
-                    "index_tts_api_ready",
-                    "index-tts api service is ready",
-                    data={"api_url": args.index_tts_api_url},
-                )
-            else:
-                tts_index = load_index_tts_model(
-                    root_dir=args.index_tts_root,
-                    cfg_path=args.index_tts_cfg_path,
-                    model_dir=args.index_tts_model_dir,
-                    device=args.tts_device,
-                    use_fp16=index_use_fp16,
-                    use_accel=index_use_accel,
-                    use_torch_compile=index_use_torch_compile,
-                )
-        else:
-            # OmniVoice 由独立服务或 CLI 路径处理，这里不需要 index-tts 预热。
             logger.log(
                 "INFO",
                 "tts",
-                "omnivoice_backend_selected",
-                "using OmniVoice backend without index-tts preflight",
-                data={"tts_backend": args.tts_backend},
+                "index_tts_api_ready",
+                "index-tts api service is ready",
+                data={"api_url": args.index_tts_api_url},
+            )
+        else:
+            tts_index = load_index_tts_model(
+                root_dir=args.index_tts_root,
+                cfg_path=args.index_tts_cfg_path,
+                model_dir=args.index_tts_model_dir,
+                device=args.tts_device,
+                use_fp16=index_use_fp16,
+                use_accel=index_use_accel,
+                use_torch_compile=index_use_torch_compile,
             )
 
         index_emo_audio_prompt_path: Optional[Path] = None
@@ -4176,12 +4567,11 @@ def main() -> int:
         if grouped_synthesis:
             records, segment_manual = synthesize_segments_grouped(
                 tts_backend=args.tts_backend,
-                fallback_tts_backend=args.fallback_tts_backend,
+                dubbing_mode=args.dubbing_mode,
+                fallback_tts_backend="none",
                 index_tts_via_api=index_tts_via_api,
                 index_tts_api_url=args.index_tts_api_url,
                 index_tts_api_timeout_sec=args.index_tts_api_timeout_sec,
-                tts_qwen=tts_qwen,
-                qwen_prompt_items=qwen_prompt_items,
                 tts_index=tts_index,
                 ref_audio_path=ref_audio_path,
                 ref_audio_selector=ref_audio_selector,
@@ -4208,12 +4598,6 @@ def main() -> int:
                 delta_pass_ms=args.delta_pass_ms,
                 logger=logger,
                 target_lang=args.target_lang,
-                omnivoice_root=args.omnivoice_root,
-                omnivoice_python_bin=args.omnivoice_python_bin,
-                omnivoice_model=args.omnivoice_model,
-                omnivoice_device=args.omnivoice_device,
-                omnivoice_via_api=read_bool(str(args.omnivoice_via_api)),
-                omnivoice_api_url=args.omnivoice_api_url,
                 dub_audio_leveling_enabled=read_bool(str(args.dub_audio_leveling_enabled)),
                 dub_audio_leveling_target_rms=args.dub_audio_leveling_target_rms,
                 dub_audio_leveling_activity_threshold_db=args.dub_audio_leveling_activity_threshold_db,
@@ -4223,22 +4607,22 @@ def main() -> int:
         else:
             # 关键逻辑：翻译字幕直通链路（input_srt_kind=translated）默认禁用改写。
             # 此处按 allow_rewrite_translation 惰性初始化 Translator，避免无 Key 的误报失败。
-            allow_rewrite_translation = (not input_srt_is_translated) and ((not v2_mode) or v2_rewrite_translation)
+            allow_rewrite_translation = not input_srt_is_translated
             rewrite_translator: Optional[Translator] = translator
             if allow_rewrite_translation and rewrite_translator is None:
                 rewrite_translator = Translator(
-                    api_key=args.api_key or os.environ.get(args.api_key_env) or "",
+                    api_key=resolve_translation_api_key(api_key=args.api_key, api_key_env=args.api_key_env) or "",
                     base_url=args.translate_base_url,
                     model=args.translate_model,
+                    api_key_env=args.api_key_env,
                 )
             records, segment_manual = synthesize_segments(
                 tts_backend=args.tts_backend,
-                fallback_tts_backend=args.fallback_tts_backend,
+                dubbing_mode=dubbing_mode,
+                fallback_tts_backend="none",
                 index_tts_via_api=index_tts_via_api,
                 index_tts_api_url=args.index_tts_api_url,
                 index_tts_api_timeout_sec=args.index_tts_api_timeout_sec,
-                tts_qwen=tts_qwen,
-                qwen_prompt_items=qwen_prompt_items,
                 tts_index=tts_index,
                 ref_audio_path=ref_audio_path,
                 ref_audio_selector=ref_audio_selector,
@@ -4258,23 +4642,17 @@ def main() -> int:
                 segment_dir=segment_dir,
                 delta_pass_ms=args.delta_pass_ms,
                 delta_rewrite_ms=args.delta_rewrite_ms,
-                atempo_min=max(float(args.atempo_min), 0.92) if v2_mode else args.atempo_min,
-                atempo_max=min(float(args.atempo_max), 1.08) if v2_mode else args.atempo_max,
-                max_retry=max(int(args.max_retry), 2) if v2_mode else args.max_retry,
+                atempo_min=args.atempo_min,
+                atempo_max=args.atempo_max,
+                max_retry=args.max_retry,
                 translator=rewrite_translator,
                 target_lang=args.target_lang,
                 allow_rewrite_translation=allow_rewrite_translation,
                 prefer_translated_text=input_srt_is_translated,
                 existing_records_by_id=existing_records_by_id,
                 redub_line_indices=redub_line_indices,
-                v2_mode=v2_mode,
                 logger=logger,
-                omnivoice_root=args.omnivoice_root,
-                omnivoice_python_bin=args.omnivoice_python_bin,
-                omnivoice_model=args.omnivoice_model,
-                omnivoice_device=args.omnivoice_device,
-                omnivoice_via_api=read_bool(str(args.omnivoice_via_api)),
-                omnivoice_api_url=args.omnivoice_api_url,
+                translate_system_prompt=args.translate_system_prompt,
                 dub_audio_leveling_enabled=read_bool(str(args.dub_audio_leveling_enabled)),
                 dub_audio_leveling_target_rms=args.dub_audio_leveling_target_rms,
                 dub_audio_leveling_activity_threshold_db=args.dub_audio_leveling_activity_threshold_db,
@@ -4283,12 +4661,11 @@ def main() -> int:
             )
         manual_review.extend(segment_manual)
         for record in records:
-            if not record.get("voice_ref_path"):
+            if (not record.get("voice_ref_path")) and ref_audio_path.exists():
                 record["voice_ref_path"] = str(ref_audio_path)
 
         if not index_tts_via_api:
-            release_local_tts_models(tts_qwen=tts_qwen, tts_index=tts_index, logger=logger)
-            tts_qwen = None
+            release_local_tts_models(tts_index=tts_index, logger=logger)
             tts_index = None
 
         # 关键同步：确保 translated/bilingual 使用“最终实际配音文本”（含必要改写）。
@@ -4396,9 +4773,9 @@ def main() -> int:
             raise
         return EXIT_FAILED
     finally:
-        if tts_qwen is not None or tts_index is not None:
+        if tts_index is not None:
             try:
-                release_local_tts_models(tts_qwen=tts_qwen, tts_index=tts_index, logger=logger)
+                release_local_tts_models(tts_index=tts_index, logger=logger)
             except Exception:
                 pass
         if should_release_index_tts_api:

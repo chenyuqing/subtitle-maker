@@ -43,7 +43,7 @@ class JobRecord(TypedDict, total=False):
     total_segments: int | None
     manual_review_segments: int
     target_lang: str
-    pipeline_version: str
+    dubbing_mode: str
     rewrite_translation: bool
     timing_mode: str
     grouping_strategy: str
@@ -60,17 +60,13 @@ class JobRecord(TypedDict, total=False):
     min_segment_minutes: float
     subtitle_mode: str
     index_tts_api_url: str
-    auto_pick_ranges: bool
     grouped_synthesis: bool
     force_fit_timing: bool
     tts_backend: str
-    fallback_tts_backend: str
-    omnivoice_root: str
-    omnivoice_python_bin: str
-    omnivoice_model: str
-    omnivoice_device: str
-    omnivoice_via_api: bool
-    omnivoice_api_url: str
+    single_ref_audio: str
+    speaker_ref_map: list[dict[str, str]]
+    translate_system_prompt: str
+    tts_model_path: str
     input_media_url: str | None
     result_audio: str | None
     result_srt: str | None
@@ -95,7 +91,7 @@ class PublicJobRecord(TypedDict, total=False):
     total_segments: int | None
     manual_review_segments: int
     target_lang: str
-    pipeline_version: str
+    dubbing_mode: str
     rewrite_translation: bool
     timing_mode: str
     grouping_strategy: str
@@ -112,17 +108,13 @@ class PublicJobRecord(TypedDict, total=False):
     min_segment_minutes: float
     subtitle_mode: str
     index_tts_api_url: str
-    auto_pick_ranges: bool
     grouped_synthesis: bool
     force_fit_timing: bool
     tts_backend: str
-    fallback_tts_backend: str
-    omnivoice_root: str
-    omnivoice_python_bin: str
-    omnivoice_model: str
-    omnivoice_device: str
-    omnivoice_via_api: bool
-    omnivoice_api_url: str
+    single_ref_audio: str
+    speaker_ref_map: list[dict[str, str]]
+    translate_system_prompt: str
+    tts_model_path: str
     input_media_url: str | None
     result_audio: str | None
     result_srt: str | None

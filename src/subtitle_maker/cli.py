@@ -14,7 +14,7 @@ def main():
     parser.add_argument("--model_path", default="./models/Qwen3-ASR-0.6B", help="Path to ASR model (local or HF hub)")
     parser.add_argument("--aligner_path", default="./models/Qwen3-ForcedAligner-0.6B", help="Path to Aligner model (local or HF hub)")
     parser.add_argument("--translate_to", help="Target language for translation (e.g. 'English')")
-    parser.add_argument("--api_key", help="DeepSeek API Key")
+    parser.add_argument("--api_key", help="Translation API Key")
     parser.add_argument("--chunk_size", type=int, default=30, help="Chunk size in seconds for long audio/video transcription")
 
     args = parser.parse_args()
@@ -57,7 +57,7 @@ def main():
         
         # Translation Logic
         if args.translate_to:
-            print(f"Translating to {args.translate_to} using DeepSeek...")
+            print(f"Translating to {args.translate_to} using OpenAI-compatible translation provider...")
             translator = Translator(api_key=args.api_key)
             
             # Extract texts

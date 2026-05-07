@@ -22,6 +22,14 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from subtitle_maker.transcriber import format_srt, parse_srt
+from subtitle_maker.translator import (
+    DEFAULT_TRANSLATE_BASE_URL,
+    DEFAULT_TRANSLATE_MODEL,
+    LEGACY_TRANSLATE_API_KEY_ENV,
+    TRANSLATE_API_KEY_ENV,
+    build_translation_system_prompt,
+    resolve_translation_api_key,
+)
 from subtitle_maker.backends import (
     check_index_tts_service as check_index_tts_service_impl,
     synthesize_via_index_tts_api as synthesize_via_index_tts_api_impl,
@@ -287,6 +295,25 @@ def resolve_output_path(path_text: Optional[str]) -> Optional[Path]:
     return (REPO_ROOT / raw).resolve()
 
 
+def _resolve_segment_reference_audio(manifest: Dict[str, Any], segment_job_dir: Path) -> Optional[Path]:
+    """优先从 manifest 里的 speaker_ref_map 还原参考音，避免依赖 refs/ 旧路径。"""
+
+    speaker_refs = list(manifest.get("speaker_ref_map") or [])
+    for item in speaker_refs:
+        if not isinstance(item, dict):
+            continue
+        ref_text = str(item.get("ref_audio_path") or "").strip()
+        if not ref_text:
+            continue
+        ref_path = resolve_output_path(ref_text)
+        if ref_path and ref_path.exists():
+            return ref_path
+    legacy_ref = segment_job_dir / "refs" / "single_speaker_ref.wav"
+    if legacy_ref.exists():
+        return legacy_ref
+    return None
+
+
 def repair_segment_job(
     *,
     segment_job_dir: Path,
@@ -303,17 +330,16 @@ def repair_segment_job(
     source_srt_path = segment_job_dir / "subtitles" / "source.srt"
     translated_srt_path = segment_job_dir / "subtitles" / "translated.srt"
     dubbed_final_srt_path = segment_job_dir / "subtitles" / "dubbed_final.srt"
-    ref_audio_path = segment_job_dir / "refs" / "single_speaker_ref.wav"
     segment_audio_dir = segment_job_dir / "dubbed_segments"
 
     if not manifest_path.exists():
         raise RuntimeError(f"manifest not found: {manifest_path}")
     if not source_srt_path.exists() or not translated_srt_path.exists():
         raise RuntimeError(f"srt not found in {segment_job_dir}")
-    if not ref_audio_path.exists():
-        raise RuntimeError(f"ref audio not found: {ref_audio_path}")
-
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    ref_audio_path = _resolve_segment_reference_audio(manifest, segment_job_dir)
+    if ref_audio_path is None:
+        raise RuntimeError(f"ref audio not found for segment job: {segment_job_dir}")
     segment_records = manifest.get("segments", [])
     source_subs = parse_srt(source_srt_path.read_text(encoding="utf-8"))
     translated_subs = parse_srt(translated_srt_path.read_text(encoding="utf-8"))
@@ -339,15 +365,17 @@ def repair_segment_job(
 
     retry_inputs = [source_subs[idx]["text"] for idx in bad_indices]
     retry_system_prompt = (
-        "You are a professional subtitle translator. "
-        "Translate each input line faithfully and naturally. "
-        "Never output only punctuation or ellipsis."
+        f"{build_translation_system_prompt()}\n"
+        "Additional hard rules:\n"
+        "- Translate each input line faithfully and naturally.\n"
+        "- Never output only punctuation or ellipsis."
     )
     retried = translator.translate_batch(
         retry_inputs,
         target_lang=target_lang,
         system_prompt=retry_system_prompt,
         chunk_size=50,
+        system_prompt_is_final=True,
     )
 
     translated_lines = [item["text"] for item in translated_subs]
@@ -709,7 +737,8 @@ def rebuild_batch_outputs(batch_dir: Path) -> Dict[str, Any]:
     elif not final_paths.get("dubbed_final_full_srt"):
         final_paths["dubbed_final_full_srt"] = None
 
-    # 同步 preferred_audio，优先 mix，保证前端默认播放可保留原声的成品轨。
+    # 同步 preferred_audio。
+    # 当前自动配音只保留 index-tts，默认优先 mixed，缺失时回退 vocals。
     effective_mix = resolve_output_path(final_paths.get("dubbed_mix_full"))
     effective_vocals = resolve_output_path(final_paths.get("dubbed_vocals_full"))
     if effective_mix and effective_mix.exists():
@@ -751,10 +780,10 @@ def main() -> int:
     parser.add_argument("--batch-dir", required=True, help="Path to longdub batch directory")
     parser.add_argument("--segment-indexes", required=True, help="Comma-separated segment indexes, e.g. 1,2")
     parser.add_argument("--target-lang", default="Chinese")
-    parser.add_argument("--translate-base-url", default="https://api.deepseek.com")
-    parser.add_argument("--translate-model", default="deepseek-v4-flash")
+    parser.add_argument("--translate-base-url", default=DEFAULT_TRANSLATE_BASE_URL)
+    parser.add_argument("--translate-model", default=DEFAULT_TRANSLATE_MODEL)
     parser.add_argument("--api-key", default=None)
-    parser.add_argument("--api-key-env", default="DEEPSEEK_API_KEY")
+    parser.add_argument("--api-key-env", default=TRANSLATE_API_KEY_ENV)
     parser.add_argument("--index-tts-api-url", default="http://127.0.0.1:8010")
     parser.add_argument("--index-tts-api-timeout-sec", type=float, default=900.0)
     parser.add_argument("--index-top-p", type=float, default=0.8)
@@ -780,15 +809,19 @@ def main() -> int:
     if missing:
         raise RuntimeError(f"segment index not found in batch_manifest: {missing}")
 
-    api_key = args.api_key or __import__("os").environ.get(args.api_key_env)
+    api_key = resolve_translation_api_key(api_key=args.api_key, api_key_env=args.api_key_env)
     if not api_key:
-        raise RuntimeError(f"missing api key (--api-key or {args.api_key_env})")
+        raise RuntimeError(
+            "missing translation api key "
+            f"(--api-key or {TRANSLATE_API_KEY_ENV}; legacy: {LEGACY_TRANSLATE_API_KEY_ENV})"
+        )
 
     check_index_tts_service(api_url=args.index_tts_api_url, timeout_sec=args.index_tts_api_timeout_sec)
     translator = Translator(
         api_key=api_key,
         base_url=args.translate_base_url,
         model=args.translate_model,
+        api_key_env=args.api_key_env,
     )
 
     reports: List[Dict[str, Any]] = []

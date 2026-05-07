@@ -13,6 +13,13 @@ from .sentence_split import (
     split_text_on_punctuation_boundaries,
 )
 from .short_merge import merge_short_source_subtitles, source_short_merge_tolerance_seconds
+from .speakers import (
+    build_segment_speaker_metadata_from_subtitles,
+    normalize_subtitles_with_speakers,
+    parse_speaker_ref_map_json,
+    parse_speaker_reference_specs_json,
+    strip_speaker_prefix,
+)
 
 __all__ = [
     "allocate_text_segment_times",
@@ -21,11 +28,15 @@ __all__ = [
     "expand_block_with_punctuation_splits",
     "has_internal_explicit_break_boundary",
     "merge_short_source_subtitles",
+    "build_segment_speaker_metadata_from_subtitles",
+    "normalize_subtitles_with_speakers",
+    "parse_speaker_ref_map_json",
+    "parse_speaker_reference_specs_json",
     "source_short_merge_tolerance_seconds",
+    "strip_speaker_prefix",
     "split_cluster_into_punctuation_blocks",
     "split_cluster_into_sentence_blocks",
     "split_oversized_asr_sentence_block",
     "split_subtitle_item_by_punctuation",
     "split_text_on_punctuation_boundaries",
 ]
-

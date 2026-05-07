@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from subtitle_maker.manifests import load_batch_manifest
+from subtitle_maker.manifests.readwrite import load_segment_manifest
 
 from .models import JobArtifact, TaskPayload
 
@@ -130,15 +131,39 @@ def build_batch_task_updates(
         except Exception:
             input_media_exists = False
 
-    # 统计 batch 级成功/人工复核数量，用于区分“真完成”和“全量静音兜底失败”。
+    # 统计 batch 级成功/人工复核数量，并探测是否存在真实可用音频（非 missing 占位）。
     total_done = 0
     total_segments = 0
     total_manual_review = 0
+    has_non_missing_segment_audio = False
     for segment in manifest.segments:
         summary = segment.get("summary") or {}
         total_done += int(summary.get("done", 0) or 0)
         total_segments += int(summary.get("total", 0) or 0)
         total_manual_review += int(summary.get("manual_review", 0) or 0)
+        if has_non_missing_segment_audio:
+            continue
+        job_dir = str(segment.get("job_dir") or "").strip()
+        if not job_dir:
+            continue
+        segment_manifest_path = Path(job_dir).expanduser() / "manifest.json"
+        if not segment_manifest_path.exists():
+            continue
+        try:
+            segment_manifest = load_segment_manifest(segment_manifest_path)
+        except Exception:
+            continue
+        for row in segment_manifest.segment_rows:
+            audio_path_text = str(row.get("tts_audio_path") or "").strip()
+            if not audio_path_text:
+                continue
+            audio_path = Path(audio_path_text).expanduser()
+            if not audio_path.exists():
+                continue
+            if audio_path.name.endswith("_missing.wav"):
+                continue
+            has_non_missing_segment_audio = True
+            break
 
     updates: TaskPayload = {
         "batch_id": manifest.batch_id,
@@ -150,7 +175,7 @@ def build_batch_task_updates(
         "input_path": str(input_media_path) if input_media_path else "",
         "input_media_url": artifact_url_builder(task_id, "input_media") if input_media_exists else None,
         "target_lang": options.target_lang,
-        "pipeline_version": options.pipeline_version,
+        "dubbing_mode": options.dubbing_mode,
         "rewrite_translation": options.rewrite_translation,
         "timing_mode": options.timing_mode,
         "grouping_strategy": options.grouping_strategy,
@@ -167,22 +192,24 @@ def build_batch_task_updates(
         "min_segment_minutes": float(manifest.raw.get("min_segment_minutes", 4.0) or 4.0),
         "subtitle_mode": options.input_srt_kind,
         "index_tts_api_url": options.index_tts_api_url,
-        "auto_pick_ranges": options.auto_pick_ranges,
         "time_ranges": options.time_ranges,
         "grouped_synthesis": options.grouped_synthesis,
         "force_fit_timing": options.force_fit_timing,
         "tts_backend": options.tts_backend,
-        "fallback_tts_backend": options.fallback_tts_backend,
-        "omnivoice_root": options.omnivoice_root,
-        "omnivoice_python_bin": options.omnivoice_python_bin,
-        "omnivoice_model": options.omnivoice_model,
-        "omnivoice_device": options.omnivoice_device,
-        "omnivoice_via_api": options.omnivoice_via_api,
-        "omnivoice_api_url": options.omnivoice_api_url,
+        "single_ref_audio": options.single_ref_audio,
+        "single_ref_text": options.single_ref_text,
+        "speaker_ref_map": options.speaker_ref_map,
+        "translate_system_prompt": options.translate_system_prompt,
+        "tts_model_path": options.tts_model_path,
     }
 
-    # 当所有片段都掉进 manual_review 且没有任何成功 TTS 时，应标记为失败而不是完成。
-    if total_done <= 0 and total_segments > 0 and total_manual_review >= total_segments:
+    # 只有“全量 manual_review 且没有任何真实音频产物”时，才判定为失败。
+    if (
+        total_done <= 0
+        and total_segments > 0
+        and total_manual_review >= total_segments
+        and not has_non_missing_segment_audio
+    ):
         updates.update(
             status="failed",
             stage="failed",
@@ -247,18 +274,15 @@ def build_loaded_batch_task(
         "dub_audio_leveling_max_gain_db": 8.0,
         "dub_audio_leveling_peak_ceiling": 0.95,
         "subtitle_mode": "source",
-        "pipeline_version": "v1",
+        "dubbing_mode": "single",
         "rewrite_translation": True,
         "index_tts_api_url": default_index_tts_api_url,
-        "auto_pick_ranges": False,
         "tts_backend": "index-tts",
-        "fallback_tts_backend": "none",
-        "omnivoice_root": "",
-        "omnivoice_python_bin": "",
-        "omnivoice_model": "",
-        "omnivoice_device": "auto",
-        "omnivoice_via_api": True,
-        "omnivoice_api_url": "http://127.0.0.1:8020",
+        "single_ref_audio": "",
+        "single_ref_text": "",
+        "speaker_ref_map": [],
+        "translate_system_prompt": "",
+        "tts_model_path": "",
         "processed_segments": 0,
         "total_segments": None,
         "manual_review_segments": 0,

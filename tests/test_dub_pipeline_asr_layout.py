@@ -77,6 +77,23 @@ class FakeTranslator:
         self.client = type("FakeClient", (), {})()
         self.client.chat = type("FakeChat", (), {})()
         self.client.chat.completions = self.completions
+        self._ensure_client = lambda: self.client
+
+    def _parse_translated_lines(self, content: str, expected_len: int) -> List[str]:
+        lines: List[str] = []
+        for raw in str(content or "").splitlines():
+            line = raw.strip()
+            if not line:
+                continue
+            if "." in line:
+                prefix, rest = line.split(".", 1)
+                if prefix.strip().isdigit():
+                    lines.append(rest.strip())
+                    continue
+            lines.append(line)
+        if len(lines) < expected_len:
+            lines.extend([""] * (expected_len - len(lines)))
+        return lines[:expected_len]
 
 
 class DubPipelineAsrLayoutTests(unittest.TestCase):
@@ -105,6 +122,32 @@ class DubPipelineAsrLayoutTests(unittest.TestCase):
             {"start": 27.839, "end": 29.839, "text": "no, that we we are the"},
             {"start": 29.839, "end": 29.960, "text": "underdog."},
         ]
+
+    def test_resolve_grouped_synthesis_policy_keeps_grouping_for_source_short_merge(self) -> None:
+        """source short merge 只做字幕重构，不应强制关闭 grouped synthesis。"""
+
+        effective, reason = dub_pipeline.resolve_grouped_synthesis_policy(
+            requested_enabled=True,
+            input_srt_is_translated=False,
+            translated_input_preserve_synthesis_mode=False,
+            source_short_merge_enabled=True,
+        )
+
+        self.assertTrue(effective)
+        self.assertEqual(reason, "user")
+
+    def test_resolve_grouped_synthesis_policy_keeps_translated_strict_alignment_priority(self) -> None:
+        """translated 直通模式仍应优先禁用 grouped synthesis。"""
+
+        effective, reason = dub_pipeline.resolve_grouped_synthesis_policy(
+            requested_enabled=True,
+            input_srt_is_translated=True,
+            translated_input_preserve_synthesis_mode=False,
+            source_short_merge_enabled=False,
+        )
+
+        self.assertFalse(effective)
+        self.assertEqual(reason, "input_translated_strict_alignment")
 
     def test_rebalance_source_subtitles_merges_fragmented_sentence_sample(self) -> None:
         """坏样例应被压回更接近一句一行的布局，同时保留原始时间边界。"""
@@ -375,38 +418,6 @@ class DubPipelineAsrLayoutTests(unittest.TestCase):
             "Tail piece. Tail close.",
         ])
 
-    def test_build_backend_reference_selector_prefers_shared_ref_for_short_omnivoice_refs(self) -> None:
-        """OmniVoice 应优先使用共享参考音，仅在逐句参考音足够长时才启用。"""
-
-        subtitles = [
-            {"start": 0.000, "end": 0.600, "text": "短句一"},
-            {"start": 0.600, "end": 2.600, "text": "短句二"},
-        ]
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            default_ref = tmp_path / "shared.wav"
-            short_ref = tmp_path / "subtitle_0001_ref.wav"
-            long_ref = tmp_path / "subtitle_0002_ref.wav"
-            sf.write(str(default_ref), np.zeros(32000, dtype=np.float32), 16000)
-            sf.write(str(short_ref), np.zeros(9600, dtype=np.float32), 16000)
-            sf.write(str(long_ref), np.zeros(24000, dtype=np.float32), 16000)
-
-            selector, stats = dub_pipeline.build_backend_reference_selector(
-                tts_backend="omnivoice",
-                subtitles=subtitles,
-                subtitle_ref_map={0: short_ref, 1: long_ref},
-                default_ref=default_ref,
-                omnivoice_min_subtitle_ref_sec=1.2,
-            )
-
-        self.assertEqual(selector(0), default_ref)
-        self.assertEqual(selector(1), long_ref)
-        self.assertEqual(stats["reference_strategy"], "shared_reference_preferred_for_omnivoice")
-        self.assertEqual(stats["shared_reference_count"], 1)
-        self.assertEqual(stats["subtitle_reference_count"], 1)
-        self.assertEqual(stats["subtitle_reference_min_sec"], 1.2)
-
     def test_build_backend_reference_selector_keeps_per_subtitle_refs_for_index_tts(self) -> None:
         """非 OmniVoice 底座应保持现有逐句 reference 行为，不受新策略影响。"""
 
@@ -427,7 +438,8 @@ class DubPipelineAsrLayoutTests(unittest.TestCase):
                 omnivoice_min_subtitle_ref_sec=1.2,
             )
 
-        self.assertEqual(selector(0), short_ref)
+        self.assertEqual(selector(0).audio_path, short_ref)
+        self.assertEqual(selector(0).reference_text, "短句一")
         self.assertEqual(stats["reference_strategy"], "sentence_original_audio_per_subtitle")
         self.assertEqual(stats["shared_reference_count"], 0)
         self.assertEqual(stats["subtitle_reference_count"], 1)
@@ -451,68 +463,8 @@ class DubPipelineAsrLayoutTests(unittest.TestCase):
 
         self.assertEqual([item["text"] for item in result], [item["text"] for item in subtitles])
 
-    def test_resolve_source_short_merge_policy_forces_omnivoice_when_user_disabled(self) -> None:
-        """OmniVoice 链路即使未请求 source merge，也应在运行时强制开启。"""
-
-        effective, reason = dub_pipeline.resolve_source_short_merge_policy(
-            requested_enabled=False,
-            tts_backend="omnivoice",
-        )
-
-        self.assertTrue(effective)
-        self.assertEqual(reason, "omnivoice_policy")
-
-    def test_load_or_transcribe_subtitles_applies_omnivoice_source_short_merge_policy_for_uploaded_source_srt(self) -> None:
-        """上传 source.srt 时，OmniVoice 策略态也应触发短句合并并写出日志原因。"""
-
-        subtitles = [
-            {"start": 0.000, "end": 2.000, "text": "First short sentence."},
-            {"start": 2.000, "end": 5.000, "text": "Second short sentence."},
-            {"start": 5.000, "end": 9.000, "text": "Third line closes cleanly."},
-        ]
-        logger = DummyLogger()
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
-            input_srt = tmp_path / "input.srt"
-            source_srt = tmp_path / "source.srt"
-            fake_audio = tmp_path / "audio.wav"
-            input_srt.write_text(dub_pipeline.format_srt(subtitles), encoding="utf-8")
-
-            with patch.object(dub_pipeline, "audio_duration", return_value=30.0):
-                result = dub_pipeline.load_or_transcribe_subtitles(
-                    input_srt=input_srt,
-                    asr_audio=fake_audio,
-                    source_srt_path=source_srt,
-                    persist_input_srt_to_source=True,
-                    asr_model_path="unused",
-                    aligner_path="unused",
-                    device="cpu",
-                    language=None,
-                    max_width=40,
-                    asr_balance_lines=True,
-                    asr_balance_gap_sec=0.5,
-                    source_layout_mode="rule",
-                    source_layout_llm_min_duration_sec=6.0,
-                    source_layout_llm_min_text_units=85,
-                    source_layout_llm_max_cues=12,
-                    source_short_merge_enabled=True,
-                    source_short_merge_threshold=10,
-                    source_short_merge_requested=False,
-                    source_short_merge_effective_reason="omnivoice_policy",
-                    translator_factory=None,
-                    logger=logger,
-                )
-
-        self.assertEqual(len(result), 1)
-        self.assertEqual(result[0]["text"], "First short sentence. Second short sentence. Third line closes cleanly.")
-        rebalanced_record = next(record for record in logger.records if record["event"] == "source_layout_rebalanced")
-        self.assertFalse(rebalanced_record["data"]["short_merge_requested"])
-        self.assertTrue(rebalanced_record["data"]["short_merge_effective"])
-        self.assertEqual(rebalanced_record["data"]["short_merge_effective_reason"], "omnivoice_policy")
-
-    def test_load_or_transcribe_subtitles_merges_uploaded_source_srt_by_time_window(self) -> None:
-        """上传 source.srt 时，也应复用第 2 步时间窗合并逻辑。"""
+    def test_load_or_transcribe_subtitles_merges_uploaded_source_srt_without_asr_layout(self) -> None:
+        """上传 source.srt 时，只做纯字幕级并句，不再触发 ASR/source-layout。"""
         subtitles = [
             {"start": 0.000, "end": 2.000, "text": "First short sentence."},
             {"start": 2.000, "end": 5.000, "text": "Second short sentence."},
@@ -559,8 +511,198 @@ class DubPipelineAsrLayoutTests(unittest.TestCase):
             self.assertAlmostEqual(saved[0]["start"], 0.000, places=3)
             self.assertAlmostEqual(saved[0]["end"], 9.000, places=3)
             self.assertTrue(all(dub_pipeline.ends_with_explicit_break(item["text"]) for item in saved))
-            self.assertTrue(any(record["event"] == "source_layout_rebalanced" for record in logger.records))
+            self.assertTrue(any(record["event"] == "uploaded_source_subtitle_preprocessed" for record in logger.records))
             self.assertTrue(any(record["event"] == "srt_loaded" for record in logger.records))
+            self.assertFalse(any(record["event"] == "source_layout_rebalanced" for record in logger.records))
+            self.assertFalse(any(str(record["event"]).startswith("source_layout_llm_") for record in logger.records))
+
+    def test_main_first_run_source_input_persists_uploaded_srt_for_rebalance(self) -> None:
+        """首轮 source 输入且尚无 source.srt 时，主流程也必须走重构落盘分支。"""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            input_media = tmp_path / "demo.wav"
+            input_media.write_bytes(b"fake-media")
+            input_srt = tmp_path / "input.srt"
+            input_srt.write_text(
+                "1\n00:00:00,000 --> 00:00:02,000\nFirst short sentence.\n",
+                encoding="utf-8",
+            )
+            out_dir = tmp_path / "out"
+            seen: Dict[str, Any] = {}
+
+            def fake_extract_audio(src: Path, dst: Path) -> None:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                dst.write_bytes(b"fake-source-audio")
+
+            def fake_load_or_transcribe_subtitles(**kwargs: Any) -> List[Dict[str, Any]]:
+                seen.update(kwargs)
+                raise RuntimeError("stop_after_load")
+
+            with patch.object(dub_pipeline, "extract_audio", side_effect=fake_extract_audio), patch.object(
+                dub_pipeline, "audio_duration", return_value=6.0
+            ), patch.object(
+                dub_pipeline, "load_or_transcribe_subtitles", side_effect=fake_load_or_transcribe_subtitles
+            ), patch.object(
+                sys,
+                "argv",
+                [
+                    "dub_pipeline.py",
+                    "--input-media",
+                    str(input_media),
+                    "--input-srt",
+                    str(input_srt),
+                    "--input-srt-kind",
+                    "source",
+                    "--target-lang",
+                    "Chinese",
+                    "--out-dir",
+                    str(out_dir),
+                    "--source-short-merge-enabled",
+                    "true",
+                    "--source-short-merge-threshold",
+                    "15",
+                    "--index-tts-api-release-after-job",
+                    "false",
+                ],
+            ):
+                exit_code = dub_pipeline.main()
+
+            self.assertEqual(exit_code, 1)
+            self.assertTrue(bool(seen))
+            self.assertTrue(seen["persist_input_srt_to_source"])
+            self.assertEqual(Path(seen["input_srt"]).resolve(), input_srt.resolve())
+
+    def test_merge_short_source_subtitles_sentence_aware_prefers_complete_sentences(self) -> None:
+        """句级重构应避免把一句话拆成多行。"""
+
+        subtitles = [
+            {"start": 0.0, "end": 2.0, "text": "First clause,"},
+            {"start": 2.0, "end": 4.0, "text": "still same sentence."},
+            {"start": 4.0, "end": 6.0, "text": "Second sentence starts,"},
+            {"start": 6.0, "end": 8.0, "text": "and ends here."},
+        ]
+
+        merged, merged_pairs, sentence_blocks = dub_pipeline.merge_short_source_subtitles_sentence_aware(
+            subtitles=subtitles,
+            short_merge_target_seconds=10,
+            gap_threshold_sec=1.5,
+        )
+
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged_pairs, 3)
+        self.assertEqual(sentence_blocks, 2)
+        self.assertEqual(
+            merged[0]["text"],
+            "First clause, still same sentence. Second sentence starts, and ends here.",
+        )
+        self.assertAlmostEqual(merged[0]["start"], 0.0, places=3)
+        self.assertAlmostEqual(merged[0]["end"], 8.0, places=3)
+
+    def test_merge_short_source_subtitles_sentence_aware_splits_oversized_sentence(self) -> None:
+        """单句超过目标时长时应拆分，避免产生超长字幕块。"""
+
+        subtitles = [
+            {"start": 0.0, "end": 4.0, "text": "One long thought,"},
+            {"start": 4.0, "end": 8.0, "text": "with another clause,"},
+            {"start": 8.0, "end": 12.0, "text": "and it keeps extending."},
+        ]
+
+        merged, merged_pairs, sentence_blocks = dub_pipeline.merge_short_source_subtitles_sentence_aware(
+            subtitles=subtitles,
+            short_merge_target_seconds=10,
+            gap_threshold_sec=1.5,
+        )
+
+        self.assertEqual(sentence_blocks, 1)
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged_pairs, 2)
+        self.assertEqual(
+            [item["text"] for item in merged],
+            ["One long thought, with another clause, and it keeps extending."],
+        )
+        self.assertAlmostEqual(merged[0]["start"], 0.0, places=3)
+        self.assertAlmostEqual(merged[0]["end"], 12.0, places=3)
+        self.assertGreater(merged[0]["end"] - merged[0]["start"], 10.0)
+
+    def test_merge_short_source_subtitles_speaker_aware_does_not_cross_different_speakers(self) -> None:
+        """source short merge 遇到不同 speaker 时，绝不能跨 speaker 合并。"""
+
+        subtitles = [
+            {"start": 0.0, "end": 2.0, "text": "第一句。", "speaker_id": "Speaker 1"},
+            {"start": 2.0, "end": 4.0, "text": "第二句。", "speaker_id": "Speaker 1"},
+            {"start": 4.0, "end": 6.0, "text": "第三句。", "speaker_id": "Speaker 2"},
+            {"start": 6.0, "end": 8.0, "text": "第四句。", "speaker_id": "Speaker 2"},
+        ]
+
+        merged, merged_pairs, speaker_runs = dub_pipeline.merge_short_source_subtitles_speaker_aware(
+            subtitles=subtitles,
+            short_merge_target_seconds=10,
+            gap_threshold_sec=1.5,
+        )
+
+        self.assertEqual(merged_pairs, 2)
+        self.assertEqual(speaker_runs, 2)
+        self.assertEqual(len(merged), 2)
+        self.assertEqual([item["speaker_id"] for item in merged], ["Speaker 1", "Speaker 2"])
+        self.assertEqual(
+            [item["text"] for item in merged],
+            ["第一句。第二句。", "第三句。第四句。"],
+        )
+
+    def test_rebalance_source_subtitles_short_merge_respects_speaker_prefix_boundaries(self) -> None:
+        """上传 source.srt 含 Speaker 前缀时，短句合并也应先识别 speaker 边界。"""
+
+        subtitles = [
+            {"start": 0.0, "end": 2.0, "text": "Speaker 1: First short sentence."},
+            {"start": 2.0, "end": 4.0, "text": "Speaker 1: Second short sentence."},
+            {"start": 4.0, "end": 6.0, "text": "Speaker 2: Third short sentence."},
+            {"start": 6.0, "end": 8.0, "text": "Speaker 2: Fourth short sentence."},
+        ]
+
+        result = dub_pipeline.rebalance_source_subtitles(
+            subtitles=subtitles,
+            max_gap_sec=0.5,
+            max_line_width=40,
+            source_short_merge_enabled=True,
+            source_short_merge_threshold=10,
+            logger=DummyLogger(),
+        )
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual([item.get("speaker_id") for item in result], ["Speaker 1", "Speaker 2"])
+        self.assertEqual(
+            [item["text"] for item in result],
+            [
+                "First short sentence. Second short sentence.",
+                "Third short sentence. Fourth short sentence.",
+            ],
+        )
+
+    def test_reflow_cluster_with_llm_uses_custom_translate_system_prompt(self) -> None:
+        """翻译后重排调用 LLM 时应沿用用户自定义系统提示词。"""
+
+        subtitles = [
+            {"start": 0.0, "end": 1.0, "text": "Speaker 1: Andrew Main"},
+            {"start": 1.0, "end": 2.0, "text": "Speaker 1: OpenAI Podcast"},
+        ]
+        translated_lines = ["安德鲁", "播客。"]
+        fake_translator = FakeTranslator(["1. Andrew\n2. OpenAI Podcast"])
+        custom_prompt = "这是 openai 的视频播客，翻译时名字保留英文。"
+
+        output = dub_pipeline.reflow_cluster_with_llm(
+            translator=fake_translator,
+            subtitles=subtitles,
+            translated_lines=translated_lines,
+            indices=[0, 1],
+            target_lang="Chinese",
+            system_prompt=custom_prompt,
+        )
+
+        self.assertEqual(output, ["Andrew", "OpenAI Podcast"])
+        self.assertEqual(len(fake_translator.completions.calls), 1)
+        system_message = fake_translator.completions.calls[0]["messages"][0]["content"]
+        self.assertEqual(system_message, custom_prompt)
 
 
 if __name__ == "__main__":

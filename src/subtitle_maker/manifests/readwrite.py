@@ -140,18 +140,18 @@ def _build_batch_options(raw: Dict[str, Any]) -> BatchReplayOptions:
     target_lang = str(raw.get("target_lang") or "")
     if not target_lang:
         legacy_inferred["target_lang"] = True
-    pipeline_version = str(raw.get("pipeline_version") or "v1")
+    pipeline_version = str(raw.get("pipeline_version") or "auto-dubbing")
     if "pipeline_version" not in raw:
         legacy_inferred["pipeline_version"] = True
     return BatchReplayOptions(
         target_lang=target_lang,
         pipeline_version=pipeline_version,
+        dubbing_mode=str(raw.get("dubbing_mode") or "single"),
         rewrite_translation=_coerce_bool(raw.get("rewrite_translation"), default=True),
         timing_mode=str(raw.get("timing_mode") or "strict"),
         grouping_strategy=str(raw.get("grouping_strategy") or "sentence"),
         input_srt_kind=str(raw.get("input_srt_kind") or raw.get("subtitle_mode") or "source"),
         index_tts_api_url=str(raw.get("index_tts_api_url") or DEFAULT_INDEX_TTS_API_URL),
-        auto_pick_ranges=_coerce_bool(raw.get("auto_pick_ranges"), default=False),
         time_ranges=_normalize_time_ranges(raw.get("requested_time_ranges") or raw.get("requested_ranges") or []),
         source_short_merge_enabled=_coerce_bool(raw.get("source_short_merge_enabled"), default=False),
         source_short_merge_threshold=_normalize_short_merge_target_seconds(
@@ -172,14 +172,13 @@ def _build_batch_options(raw: Dict[str, Any]) -> BatchReplayOptions:
         dub_audio_leveling_peak_ceiling=float(raw.get("dub_audio_leveling_peak_ceiling") or 0.95),
         grouped_synthesis=_coerce_bool(raw.get("grouped_synthesis"), default=False),
         force_fit_timing=_coerce_bool(raw.get("force_fit_timing"), default=False),
-        tts_backend=str(raw.get("tts_backend") or "index-tts"),
-        fallback_tts_backend=str(raw.get("fallback_tts_backend") or "none"),
-        omnivoice_root=str(raw.get("omnivoice_root") or ""),
-        omnivoice_python_bin=str(raw.get("omnivoice_python_bin") or ""),
-        omnivoice_model=str(raw.get("omnivoice_model") or ""),
-        omnivoice_device=str(raw.get("omnivoice_device") or "auto"),
-        omnivoice_via_api=_coerce_bool(raw.get("omnivoice_via_api"), default=True),
-        omnivoice_api_url=str(raw.get("omnivoice_api_url") or "http://127.0.0.1:8020"),
+        # Auto Dubbing 已固定只走 index-tts；读取历史 manifest 时也统一收口。
+        tts_backend="index-tts",
+        single_ref_audio=str(raw.get("single_ref_audio") or ""),
+        single_ref_text=str(raw.get("single_ref_text") or ""),
+        speaker_ref_map=list(raw.get("speaker_ref_map") or []),
+        translate_system_prompt=str(raw.get("translate_system_prompt") or ""),
+        tts_model_path=str(raw.get("tts_model_path") or ""),
         legacy_inferred=legacy_inferred,
     )
 
@@ -191,22 +190,22 @@ def _build_segment_options(raw: Dict[str, Any]) -> BatchReplayOptions:
     inferred_grouped_synthesis = any(str(row.get("group_id") or "").strip() for row in rows) or any(
         bool(row.get("skip_compose")) for row in rows
     )
-    pipeline_version = str(raw.get("pipeline_version") or "v1").strip().lower() or "v1"
+    pipeline_version = str(raw.get("pipeline_version") or "auto-dubbing").strip().lower() or "auto-dubbing"
     input_srt_kind = str(raw.get("input_srt_kind") or "source").strip().lower() or "source"
     if "force_fit_timing" in raw:
         force_fit_timing = _coerce_bool(raw.get("force_fit_timing"), default=False)
     else:
         # 老 manifest 缺字段时沿用当前 review redub 的保守推断。
-        force_fit_timing = False if pipeline_version == "v2" or input_srt_kind == "translated" else True
+        force_fit_timing = False if input_srt_kind == "translated" else True
     return BatchReplayOptions(
         target_lang=str(raw.get("target_lang") or ""),
         pipeline_version=pipeline_version,
+        dubbing_mode=str(raw.get("dubbing_mode") or "single"),
         rewrite_translation=_coerce_bool(raw.get("rewrite_translation"), default=True),
         timing_mode=str(raw.get("timing_mode") or "strict"),
         grouping_strategy=str(raw.get("grouping_strategy") or "sentence"),
         input_srt_kind=input_srt_kind,
         index_tts_api_url=str(raw.get("index_tts_api_url") or DEFAULT_INDEX_TTS_API_URL),
-        auto_pick_ranges=_coerce_bool(raw.get("auto_pick_ranges"), default=False),
         time_ranges=_normalize_time_ranges(raw.get("requested_time_ranges") or raw.get("requested_ranges") or []),
         source_short_merge_enabled=_coerce_bool(raw.get("source_short_merge_enabled"), default=False),
         source_short_merge_threshold=_normalize_short_merge_target_seconds(
@@ -227,14 +226,12 @@ def _build_segment_options(raw: Dict[str, Any]) -> BatchReplayOptions:
         dub_audio_leveling_peak_ceiling=float(raw.get("dub_audio_leveling_peak_ceiling") or 0.95),
         grouped_synthesis=_coerce_bool(raw.get("grouped_synthesis"), default=inferred_grouped_synthesis),
         force_fit_timing=force_fit_timing,
-        tts_backend=str(raw.get("tts_backend") or "index-tts"),
-        fallback_tts_backend=str(raw.get("fallback_tts_backend") or "none"),
-        omnivoice_root=str(raw.get("omnivoice_root") or ""),
-        omnivoice_python_bin=str(raw.get("omnivoice_python_bin") or ""),
-        omnivoice_model=str(raw.get("omnivoice_model") or ""),
-        omnivoice_device=str(raw.get("omnivoice_device") or "auto"),
-        omnivoice_via_api=_coerce_bool(raw.get("omnivoice_via_api"), default=True),
-        omnivoice_api_url=str(raw.get("omnivoice_api_url") or "http://127.0.0.1:8020"),
+        tts_backend="index-tts",
+        single_ref_audio=str(raw.get("single_ref_audio") or ""),
+        single_ref_text=str(raw.get("single_ref_text") or ""),
+        speaker_ref_map=list(raw.get("speaker_ref_map") or []),
+        translate_system_prompt=str(raw.get("translate_system_prompt") or ""),
+        tts_model_path=str(raw.get("tts_model_path") or ""),
         legacy_inferred={},
     )
 
@@ -346,6 +343,7 @@ def build_batch_manifest(
         "input_media_path": str(input_media_path),
         "target_lang": options.target_lang,
         "pipeline_version": options.pipeline_version,
+        "dubbing_mode": options.dubbing_mode,
         "rewrite_translation": bool(options.rewrite_translation),
         "timing_mode": options.timing_mode,
         "grouping_strategy": options.grouping_strategy,
@@ -364,15 +362,12 @@ def build_batch_manifest(
         "force_fit_timing": bool(options.force_fit_timing),
         "input_srt_kind": options.input_srt_kind,
         "index_tts_api_url": options.index_tts_api_url,
-        "tts_backend": options.tts_backend,
-        "fallback_tts_backend": options.fallback_tts_backend,
-        "omnivoice_root": options.omnivoice_root,
-        "omnivoice_python_bin": options.omnivoice_python_bin,
-        "omnivoice_model": options.omnivoice_model,
-        "omnivoice_device": options.omnivoice_device,
-        "omnivoice_via_api": bool(options.omnivoice_via_api),
-        "omnivoice_api_url": options.omnivoice_api_url,
-        "auto_pick_ranges": bool(options.auto_pick_ranges),
+        "tts_backend": "index-tts",
+        "single_ref_audio": options.single_ref_audio,
+        "single_ref_text": options.single_ref_text,
+        "speaker_ref_map": list(options.speaker_ref_map),
+        "translate_system_prompt": options.translate_system_prompt,
+        "tts_model_path": options.tts_model_path,
         "input_srt": str(input_srt_path) if input_srt_path else None,
         "segment_minutes": segment_minutes,
         "range_strategy": range_strategy,
@@ -430,17 +425,16 @@ def build_segment_manifest(
         "input_media_path": str(input_media_path),
         "target_lang": target_lang,
         "pipeline_version": options.pipeline_version,
+        "dubbing_mode": options.dubbing_mode,
         "rewrite_translation": bool(options.rewrite_translation),
         "input_srt_kind": options.input_srt_kind,
-        "tts_backend": options.tts_backend,
-        "fallback_tts_backend": options.fallback_tts_backend,
+        "tts_backend": "index-tts",
+        "single_ref_audio": options.single_ref_audio,
+        "single_ref_text": options.single_ref_text,
+        "speaker_ref_map": list(options.speaker_ref_map),
+        "translate_system_prompt": options.translate_system_prompt,
+        "tts_model_path": options.tts_model_path,
         "index_tts_api_url": options.index_tts_api_url,
-        "omnivoice_root": options.omnivoice_root,
-        "omnivoice_python_bin": options.omnivoice_python_bin,
-        "omnivoice_model": options.omnivoice_model,
-        "omnivoice_device": options.omnivoice_device,
-        "omnivoice_via_api": bool(options.omnivoice_via_api),
-        "omnivoice_api_url": options.omnivoice_api_url,
         "timing_mode": options.timing_mode,
         "grouping_strategy": options.grouping_strategy,
         "source_short_merge_enabled": bool(options.source_short_merge_enabled),
@@ -456,7 +450,6 @@ def build_segment_manifest(
         "dub_audio_leveling_peak_ceiling": float(options.dub_audio_leveling_peak_ceiling),
         "grouped_synthesis": bool(options.grouped_synthesis),
         "force_fit_timing": bool(options.force_fit_timing),
-        "auto_pick_ranges": bool(options.auto_pick_ranges),
         "range_strategy": range_strategy,
         "requested_time_ranges": list(requested_time_ranges or options.time_ranges),
         "effective_time_ranges": list(effective_time_ranges or []),
@@ -502,17 +495,15 @@ def build_failed_segment_manifest(
         "input_media_path": str(input_media_path),
         "target_lang": target_lang,
         "pipeline_version": options.pipeline_version,
+        "dubbing_mode": options.dubbing_mode,
         "rewrite_translation": bool(options.rewrite_translation),
         "input_srt_kind": options.input_srt_kind,
-        "tts_backend": options.tts_backend,
-        "fallback_tts_backend": options.fallback_tts_backend,
+        "tts_backend": "index-tts",
+        "single_ref_audio": options.single_ref_audio,
+        "single_ref_text": options.single_ref_text,
+        "speaker_ref_map": list(options.speaker_ref_map),
+        "translate_system_prompt": options.translate_system_prompt,
         "index_tts_api_url": options.index_tts_api_url,
-        "omnivoice_root": options.omnivoice_root,
-        "omnivoice_python_bin": options.omnivoice_python_bin,
-        "omnivoice_model": options.omnivoice_model,
-        "omnivoice_device": options.omnivoice_device,
-        "omnivoice_via_api": bool(options.omnivoice_via_api),
-        "omnivoice_api_url": options.omnivoice_api_url,
         "timing_mode": options.timing_mode,
         "grouping_strategy": options.grouping_strategy,
         "source_short_merge_enabled": bool(options.source_short_merge_enabled),
@@ -528,7 +519,6 @@ def build_failed_segment_manifest(
         "dub_audio_leveling_peak_ceiling": float(options.dub_audio_leveling_peak_ceiling),
         "grouped_synthesis": bool(options.grouped_synthesis),
         "force_fit_timing": bool(options.force_fit_timing),
-        "auto_pick_ranges": bool(options.auto_pick_ranges),
         "range_strategy": range_strategy,
         "requested_time_ranges": list(requested_time_ranges or options.time_ranges),
         "effective_time_ranges": list(effective_time_ranges or []),

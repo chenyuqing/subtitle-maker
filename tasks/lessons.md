@@ -1,5 +1,35 @@
 # Lessons
 
+- 2026-05-07：做双配音链路时，面板、localStorage、请求参数和任务状态都必须物理隔离；`Auto Dubbing` 和 `Auto Dub Omnivoice` 不能再共用任何底座模型选择器。
+- 2026-05-07：OmniVoice 这种独立链路优先走“当前项目上下文 + 独立后端桥接”，不要把它硬塞回 index-tts 的共享 runtime，否则后面只会继续串状态。
+
+- 2026-05-06：`Merge short source lines` 这类 source short merge 不能只看时长窗口；只要 source 字幕里存在 `speaker_id` 或 `Speaker N:` 前缀，就必须先做 speaker 归一化，再按 speaker run 并句，禁止跨 speaker 合并。
+
+- 2026-05-04：`start-from-project` 这类长视频入口如果依赖 `speaker_id`，必须在 long-video 主入口的多人模式校验前就合并 sidecar；只在 segment job 里补 metadata 还不够，因为校验会先把任务拦死。
+
+- 2026-05-04：前端新增全局 backend 选项时，不能只改下拉 DOM 和请求透传；`app.js` 的状态归一化白名单、变更事件，以及消费侧面板的动态必填逻辑也要一起补，否则 UI 看得到新选项，但状态源会把它吞回默认值，或切换后表单仍停留在旧规则。
+- 2026-05-04：`start.sh/stop.sh` 的服务管理语义必须和后端运行时一致；如果后端已经是懒汉式按需拉起，脚本层就不要再偷偷预热某个 TTS，否则用户会被两套“什么时候自动启动”规则搞混。
+- 2026-05-04：参考音策略不要把“手动上传”当成默认主路径；如果系统已经能从视频自动截取稳定参考音，前端应把手动上传明确降级为覆盖选项，否则用户会误以为必须先准备参考音文件。
+- 2026-05-04：做“产品收口”时，不能只删 manifest 字段和入口表单；像 `dub_long_video.py` 这种 orchestration 文件里未引用的 V3/V4 helper、以及 API 层的自动启停壳，也要物理删除，否则 grep 结果、后续改动和团队心智都会继续被历史版本污染。
+- 2026-05-04：重构测试时不要“修补旧版本断言”；像 `tests/test_dub_long_video.py` 这种已经被历史版本塞满的文件，直接重写成当前主合同的小测试集，比继续兼容 `v3/v4/asd/diarization` 壳稳定得多。
+- 2026-05-04：`unittest` 批量执行时，如果测试模块在导入阶段直接抛 `SkipTest`，整次命令可能会被提前打断；缺 `soundfile/torch` 这类重依赖时，要改成“模块可导入 + 类级别 `@skipIf`”，这样剩余纯 Python 主链路测试还能继续汇总。
+- 2026-05-04：收缩历史多版本产品时，测试也必须一起“删版本心智”，不要继续维护 `v2/v3/v4/asd/diarization` 断言壳；这次直接把 `test_job_recovery/test_manifest_contracts/test_dubbing_cli_api` 改写成 `single/multi + index-tts/voxcpm-omnivoice + speaker_ref_map` 主合同后，主链路验证才重新清晰。
+- 2026-05-04：清 manifest/review 链路时，不能只删 schema 字段；还要同时检查“谁在构造 replay options”“谁在 redub 时恢复运行参数”“谁在测试里继续断言旧字段”，否则旧 `pipeline_version` 会从工具脚本或测试假数据里再次渗回主链路。
+- 2026-05-04：做“收敛重构”时，先收紧输入/输出主合同，再清历史实现壳；这次先统一成 `dubbing_mode + tts_backend + single_ref_audio/speaker_ref_map`，后面删 V3/V4/diarization 遗留时才不会继续从旧表单或旧 manifest 把废参数带回来。
+- 2026-05-04：多人模式如果要求“用户显式上传每个 speaker 的参考音”，前后端都不能只传路径字符串；前端必须真的上传文件，后端必须先落盘再生成 `speaker_ref_map_json`，否则 UI 看起来支持多人，启动时还是没有实际参考音。
+- 2026-05-04：菜单数量缩减后，前端 tab 切换不能再依赖按钮索引；像 `switchTab(2)` 这种旧逻辑在收缩导航后会直接错位，应该改成按 `panelId` 选择，避免布局调整把流程跳转一起搞坏。
+- 2026-05-04：清理历史多版本前端时，不要只停掉 JS 初始化；模板里的旧 `panel-auto-dub-v2/v3` 大块 DOM 也要物理删掉，否则后续 grep、样式命中和维护心智都会继续被旧版本污染。
+
+- 2026-05-03：接第三方 CLI 时，不能只看文档摘要就假设 JSON 字段名；这次 `FluidAudio process --output` 真实输出是 `ProcessingResult.segments[].speakerId/startTimeSeconds/endTimeSeconds`，不是内部拍脑袋假设的 `turns[].speaker_id/start_sec/end_sec`。接线前必须先读源码里的命令实现和 Codable 模型。
+- 2026-05-03：第三方模型“能编译、能出 JSON”不等于“业务质量达标”；`FluidAudio` 在 `test-0003-multi-person-17s.wav` 上虽然 1.26s 就跑完了 offline diarization，但只分出了 `1` 个 speaker。后续必须把“运行链路验证”和“分人质量验证”拆开看，不能混为一谈。
+- 2026-05-03：给 orchestration 层新增可选参数时，旧测试里的 fake 函数签名会被直接打爆；像 `speaker_metadata_path` 这类新参数，生产代码必须只在真实存在 sidecar 时再传，测试侧也要同步 stub 新增的 merge/postprocess helper。
+- 2026-05-03：`dub_long_video` 这类批处理测试只要覆盖到 merge 阶段，就必须把 `build_full_timeline_vocals/build_full_timeline_bgm/build_full_timeline_mix` 成套 stub 掉；漏一个都会掉进真实媒体读取，报出来的错会偏离真正要测的编排逻辑。
+
+- 2026-05-03：对接 `asd-pipeline /run-tracked` 这类独立服务时，不能把落盘 JSON 契约写死成“顶层必须是 list”；像 `focus_predictions.json` 这种产物一旦升级成 `{"predictions":[...], ...}` 包装对象，调用侧必须先做兼容归一化，再进入业务映射层。
+- 2026-05-03：处理带 `time_ranges_json` 的 V3 long-video 编排时，任何 batch 级前置步骤都必须先尊重窗口，不能先扫整条视频做 source subtitles / tracked ASD；否则用户明明只选 `120-180s`，系统仍会先处理整片。
+- 2026-05-03：这类 orchestration 回归测试要把 `build_full_timeline_vocals/build_full_timeline_bgm/two-step postprocess` 一起 stub 掉；否则会被 merge 阶段的媒体读取噪音干扰，误判成 V3 主逻辑失败。
+
+- 2026-05-03：排查 `V3/ASD` 是否真的执行时，不能只看到 segment 内 `dub_pipeline.py` 能生成 `source.srt` 就以为 batch 层前置条件已满足；像 `tools/dub_long_video.py` 这类 orchestration 层如果先拿不到字幕，tracked ASD 会在更上游直接被短路，必须先修编排触发条件，再谈 segment 内能力。
 - 2026-04-30：侧边栏品牌头在深色 UI 下优先用“导航式左对齐”而不是居中方块；按钮要独立定位，避免挤偏 logo 主体视觉重心。
 - 2026-04-30：Logo 资产接入深色背景前必须先做底色抠除（透明 PNG）并同步重生 favicon；仅靠 CSS 调间距无法消除“白贴纸/发灰”观感。
 - 2026-04-30：折叠侧栏宽度要与导航数字列同量级，并与展开态 logo 尺寸解耦；否则会出现“折叠后仍过宽、视觉笨重”的回归。
@@ -55,3 +85,19 @@
 - 2026-04-28：讨论“配音 TTS 底座”时，先和用户对齐实际在用的底座范围；本项目当前用户语境下只分析 `index-tts` 与 `omnivoice`，不要把 `qwen` 混进配音链路判断。
 - 2026-04-28：核对“某开关是否真的执行”时，不能只 grep `tools/dub_pipeline.py` 或 API 透传层；长视频任务还要检查 `tools/dub_long_video.py` 这类编排层的一次性预处理逻辑，否则会把“执行在 orchestration 层”的能力误判成未接线。
 - 2026-04-28：用户不接受同一任务中途切换 TTS 底座；短句与失败句问题必须优先在前置编排层解决（短句合并、参考音策略、时长门槛、人工复审），不要用运行时切到另一套 TTS 来兜底，否则会引入速度差和音色不一致。
+- OmniVoice 组合链路必须按“当前喂给模型的参考音频”决定 `ref_text`：如果参考音频已经换成 VoxCPM 生成的 anchor，`ref_text` 就必须同步换成 anchor 实际内容，不能继续沿用原参考音 transcript。
+- 2026-05-04：`ref_text` 只能表示“当前 `ref_audio` 里真实说了什么”，绝不能把“默认提示句”“占位文案”或“待配音正文”混成同一个字段；一旦 `ref_audio` 变了，`ref_text` 也必须同步切换语义。
+- 2026-05-04：给 OmniVoice 填默认参考文本时，必须分清“表单默认值”和“实际配音文本参数”；任何默认句都不能进入 `text` 主字段，否则整条任务会被错误朗读成默认句本身。
+- 2026-05-04：当 `omnivoice` 和 `voxcpm-omnivoice` 共用同一个 OmniVoice API 服务时，语义边界必须在服务层锁死：`ref_text` 只能参与 `create_voice_clone_prompt()`，正式 `generate()` 只能吃当前字幕正文 `text`；不能指望上游两条链路“自己别传错”。
+- 2026-05-04：OmniVoice 本体的 `voice_clone_prompt` 里仍带 `ref_text`，而生成阶段会把 `voice_clone_prompt.ref_text + text` 拼进文本条件；所以 API 包装层不能只避免传 `ref_text` 参数，还必须在创建 prompt 后清空 `voice_clone_prompt.ref_text`，否则参考文本仍会被朗读。
+- 2026-05-04：OmniVoice 短字幕不能因为低于历史安全时长直接写 `_missing.wav`；有实际文本时宁可生成结果时长不完美，也要保留内容，时长偏差只能作为 review 信号，不能导致整批被判“all segments failed”。
+
+- 2026-05-04：OmniVoice 已改为强制手动参考音策略，single/multi 都不得再构造 `refs/subtitles/subtitle_000*_ref.wav`；逐句自动参考音仅保留给 index-tts 等非 OmniVoice backend。
+- 2026-05-05：做“单底座收口”时，先把共享运行时改成只接受当前主合同（这里是 `index-tts`），旧底座参数先保留兼容形参但禁止实际执行；等 focused 回归全绿后，再物理删除旧 backend 文件和导出。
+- 2026-05-06：当用户明确要求删除低价值功能时，不能只隐藏 UI；必须同时清掉 API 入参、任务快照、manifest/recovery、命令构建、编排分支和测试断言，做到真正的端到端收口。
+- 2026-05-06：Auto Dubbing 的 single/multi 模式不能再让用户手选；应按当前待配音字幕是否带 `speaker_id / Speaker N:` 自动推断。无 speaker 时直接走旧自动参考音方法；有 speaker 时只允许“0 上传”或“全上传”，部分上传必须前后端都拒绝。
+- 2026-05-06：`index-tts` 的 `source short merge` 不能想当然等同于“重构后逐句直配更好”；是否保留 `grouped_synthesis`、`index_max_text_tokens` 取值必须以真实听感 A/B 为准。本次用户实测结论是 `grouped_synthesis` 最稳，`token=40` 明显优于 `120`。
+- 2026-05-06：用户直接上传 `source.srt` 时，不能再复用 ASR/source-layout 重排链路；上传字幕与语音转写是两种不同语义。上传字幕只允许做“纯字幕级预处理”（清洗、时间戳校正、可选 short merge），`build_asr_gap_clusters / source_layout_llm` 只保留给真正 ASR 结果。
+- 2026-05-06：凡是会产生外部计费的翻译调用（这里是 DeepSeek），`start` 级运行日志必须直接展示“是否走翻译、翻译 provider、累计调用次数”；不能把成本信息只藏在段内 stdout 里。
+- 2026-05-06：同一个翻译 provider 的默认 system prompt 必须在后端集中构造，前端自定义 prompt 只能作为追加要求合并进去；不能让正常翻译、重试修复、时长改写、坏段修复各自维护一份默认提示词，否则术语规则和计费行为都会漂移。
+- 2026-05-06：当用户要求把某个专用 provider（这里是 DeepSeek）改造成通用 OpenAI-compatible 能力时，不能只在 SDK 层说“已经支持”；必须把前端配置、环境变量回退、CLI 启动注入、错误文案、运行日志标签一起去品牌化，否则表面能配 `base_url`，实际仍被旧语义卡住。

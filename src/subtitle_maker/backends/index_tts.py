@@ -20,6 +20,8 @@ DEFAULT_INDEX_TTS_QUALITY_MIN_RATIO = 0.72
 DEFAULT_INDEX_TTS_QUALITY_MAX_RATIO = 1.18
 DEFAULT_INDEX_TTS_QUALITY_MIN_SHORTFALL_SEC = 0.25
 DEFAULT_INDEX_TTS_QUALITY_MIN_OVERRUN_SEC = 0.18
+DEFAULT_INDEX_TTS_QUALITY_RETRY_MIN_TARGET_SEC = 1.60
+DEFAULT_INDEX_TTS_QUALITY_RETRY_MIN_TEXT_CHARS = 20
 
 
 def _http_json_request(
@@ -69,6 +71,30 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _should_probe_output_duration(chunk_results: List[Dict[str, Any]]) -> bool:
+    """若 API 已为每个分片返回稳定时长，则跳过额外整句 probe。"""
+
+    if not chunk_results:
+        return True
+    for item in chunk_results:
+        duration = _safe_float(item.get("duration_sec"))
+        if duration is None or duration <= 0.0:
+            return True
+    return False
+
+
+def _should_allow_quality_retry(*, request: TtsSynthesisRequest, chunks: List[str], via_api: bool) -> bool:
+    """只为长句保留第二轮整句质量重试，短句直接交给后处理。"""
+
+    if not via_api:
+        return False
+    target_duration_sec = _safe_float(request.target_duration_sec)
+    if target_duration_sec is None or target_duration_sec < DEFAULT_INDEX_TTS_QUALITY_RETRY_MIN_TARGET_SEC:
+        return False
+    compact_text_len = len(re.sub(r"\s+", "", request.text or ""))
+    return compact_text_len >= DEFAULT_INDEX_TTS_QUALITY_RETRY_MIN_TEXT_CHARS or len(chunks) > 1
 
 
 def check_index_tts_service(*, api_url: str, timeout_sec: float) -> Dict[str, Any]:
@@ -389,8 +415,8 @@ class IndexTtsBackend(TtsBackend):
         """按分片规则执行整句 Index-TTS 合成。"""
 
         self.last_synthesis_meta = None
-        max_quality_attempts = 2 if self.via_api and request.target_duration_sec is not None else 1
         chunks = split_text_for_index_tts(request.text, max_text_tokens=request.max_text_tokens)
+        max_quality_attempts = 2 if _should_allow_quality_retry(request=request, chunks=chunks, via_api=self.via_api) else 1
         for quality_attempt_no in range(1, max_quality_attempts + 1):
             part_paths: List[Path] = []
             chunk_results: List[Dict[str, Any]] = []
@@ -426,7 +452,9 @@ class IndexTtsBackend(TtsBackend):
                     except Exception:
                         pass
 
-            output_duration_sec = audio_duration(request.output_path) if request.output_path.exists() else None
+            output_duration_sec = None
+            if request.output_path.exists() and _should_probe_output_duration(chunk_results):
+                output_duration_sec = audio_duration(request.output_path)
             summary = self._build_duration_summary(
                 request,
                 chunk_results=chunk_results,

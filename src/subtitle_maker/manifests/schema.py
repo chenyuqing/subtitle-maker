@@ -9,14 +9,14 @@ from typing import Any, Dict, List, Optional
 class BatchReplayOptions:
     """批处理 replay 关键配置。"""
 
-    target_lang: str
-    pipeline_version: str
-    rewrite_translation: bool
-    timing_mode: str
-    grouping_strategy: str
-    input_srt_kind: str
-    index_tts_api_url: str
-    auto_pick_ranges: bool
+    target_lang: str = ""
+    pipeline_version: str = "auto-dubbing"
+    dubbing_mode: str = "single"
+    rewrite_translation: bool = True
+    timing_mode: str = "strict"
+    grouping_strategy: str = "sentence"
+    input_srt_kind: str = "source"
+    index_tts_api_url: str = "http://127.0.0.1:8010"
     time_ranges: List[Dict[str, float]] = field(default_factory=list)
     source_short_merge_enabled: bool = False
     source_short_merge_threshold: int = 15
@@ -32,13 +32,11 @@ class BatchReplayOptions:
     grouped_synthesis: bool = False
     force_fit_timing: bool = False
     tts_backend: str = "index-tts"
-    fallback_tts_backend: str = "none"
-    omnivoice_root: str = ""
-    omnivoice_python_bin: str = ""
-    omnivoice_model: str = ""
-    omnivoice_device: str = "auto"
-    omnivoice_via_api: bool = True
-    omnivoice_api_url: str = "http://127.0.0.1:8020"
+    single_ref_audio: str = ""
+    single_ref_text: str = ""
+    speaker_ref_map: List[Dict[str, str]] = field(default_factory=list)
+    translate_system_prompt: str = ""
+    tts_model_path: str = ""
     legacy_inferred: Dict[str, bool] = field(default_factory=dict)
 
 

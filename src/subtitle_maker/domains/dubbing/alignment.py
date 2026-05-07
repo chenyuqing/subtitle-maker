@@ -108,6 +108,60 @@ def trim_silence_edges(
     return full_duration, trimmed_duration
 
 
+def trim_leading_silence_conservative(
+    *,
+    input_path: Path,
+    output_path: Path,
+    threshold_db: float = -35.0,
+    pad_sec: float = 0.08,
+    max_trim_sec: float = 0.35,
+    min_keep_sec: float = 0.10,
+) -> Tuple[float, float]:
+    """仅保守清理句首异常前导静音/脏音，不裁句尾。"""
+
+    wav, sample_rate = sf.read(str(input_path))
+    if sample_rate <= 0:
+        raise RuntimeError("E-ALN-001 invalid sample rate")
+    if isinstance(wav, np.ndarray) and wav.ndim > 1:
+        mono = wav.mean(axis=1)
+    else:
+        mono = np.asarray(wav)
+    mono = np.asarray(mono, dtype=np.float32)
+
+    full_duration = float(len(mono) / sample_rate) if len(mono) > 0 else 0.0
+    if mono.size == 0:
+        shutil.copy2(input_path, output_path)
+        return full_duration, full_duration
+
+    threshold_amp = float(10 ** (threshold_db / 20.0))
+    active = np.where(np.abs(mono) >= threshold_amp)[0]
+    if active.size == 0:
+        shutil.copy2(input_path, output_path)
+        return full_duration, full_duration
+
+    pad_samples = max(0, int(pad_sec * sample_rate))
+    max_trim_samples = max(0, int(max_trim_sec * sample_rate))
+    min_keep_samples = max(1, int(min_keep_sec * sample_rate))
+
+    raw_start = int(active[0])
+    start = max(0, raw_start - pad_samples)
+    start = min(start, max_trim_samples)
+    end = len(mono)
+
+    if end - start < min_keep_samples:
+        start = max(0, end - min_keep_samples)
+
+    if isinstance(wav, np.ndarray) and wav.ndim > 1:
+        trimmed = wav[start:end, :]
+    else:
+        trimmed = wav[start:end]
+
+    _ensure_parent(output_path)
+    sf.write(str(output_path), trimmed, sample_rate)
+    trimmed_duration = float(max(0, end - start) / sample_rate)
+    return full_duration, trimmed_duration
+
+
 def fit_audio_to_duration(
     *,
     input_path: Path,

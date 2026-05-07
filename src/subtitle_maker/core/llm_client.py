@@ -1,10 +1,17 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from openai import OpenAI
+
+from subtitle_maker.translator import (
+    DEFAULT_TRANSLATE_BASE_URL,
+    DEFAULT_TRANSLATE_MODEL,
+    LEGACY_TRANSLATE_API_KEY_ENV,
+    TRANSLATE_API_KEY_ENV,
+    resolve_translation_api_key,
+)
 
 
 @dataclass
@@ -30,16 +37,17 @@ class OpenAICompatibleChatClient:
         self,
         *,
         api_key: Optional[str],
-        api_key_env: str = "DEEPSEEK_API_KEY",
-        base_url: str = "https://api.deepseek.com",
-        model: str = "deepseek-v4-flash",
+        api_key_env: str = TRANSLATE_API_KEY_ENV,
+        base_url: str = DEFAULT_TRANSLATE_BASE_URL,
+        model: str = DEFAULT_TRANSLATE_MODEL,
         timeout: float = 30.0,
     ) -> None:
         # API key 只在内存中使用；调用方不得把它写入日志或 manifest。
-        final_api_key = api_key or os.environ.get(api_key_env)
+        final_api_key = resolve_translation_api_key(api_key=api_key, api_key_env=api_key_env)
         if not final_api_key:
             raise LlmClientError(
-                f"Missing API key. Provide api_key or set {api_key_env}.",
+                "Missing translation API key. Provide api_key or set "
+                f"{TRANSLATE_API_KEY_ENV} (legacy: {LEGACY_TRANSLATE_API_KEY_ENV}).",
                 status_code=400,
                 code="E-AGENT-001",
             )
@@ -65,5 +73,5 @@ class OpenAICompatibleChatClient:
             if "401" in error_text or "authentication" in lowered or "unauthorized" in lowered:
                 raise LlmClientError("API Key 无效或无权限。", status_code=401, code="E-AGENT-002") from exc
             if "timeout" in lowered or "timed out" in lowered:
-                raise LlmClientError("DeepSeek 请求超时。", status_code=504, code="E-AGENT-003") from exc
-            raise LlmClientError("DeepSeek 返回错误。", status_code=502, code="E-AGENT-004") from exc
+                raise LlmClientError("翻译 provider 请求超时。", status_code=504, code="E-AGENT-003") from exc
+            raise LlmClientError("翻译 provider 返回错误。", status_code=502, code="E-AGENT-004") from exc
