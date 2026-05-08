@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -116,6 +117,16 @@ def build_translation_system_prompt(user_prompt: str | None = None) -> str:
     )
 
 
+def _normalize_prompt_text(text: str | None) -> str:
+    """把单条字幕里的内部换行折叠掉，避免翻译 prompt 把一个 cue 拆成多行。"""
+
+    cleaned = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not cleaned:
+        return ""
+    cleaned = cleaned.replace("\n", " ")
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
 class Translator:
     def __init__(
         self,
@@ -151,7 +162,10 @@ class Translator:
         return self.client
 
     def _build_prompt(self, subtitles, target_lang):
-        input_text = "\n".join([f"{i+1}. {text}" for i, text in enumerate(subtitles)])
+        # 单条字幕可能包含 cue 内部换行，先折叠成单行，避免模型把它误读成新条目。
+        input_text = "\n".join(
+            [f"{i+1}. {_normalize_prompt_text(text)}" for i, text in enumerate(subtitles)]
+        )
         prompt = f"""Translate the following lines into {target_lang}.
 Maintain the tone and meaning. Output format must correspond line by line.
 Return ONLY the translated lines, numbered as in the input.

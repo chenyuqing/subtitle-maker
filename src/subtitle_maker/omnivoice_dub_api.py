@@ -60,7 +60,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 OUTPUT_ROOT = REPO_ROOT / "outputs" / "dub_jobs"
 LEGACY_OUTPUT_ROOT = REPO_ROOT / "outputs" / "omnivoice_dub_jobs"
 OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-LEGACY_OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+# 旧目录只用于兼容读取历史任务，不再主动创建，避免污染新的输出结构。
 
 _task_store = TaskStore()
 logger = logging.getLogger(__name__)

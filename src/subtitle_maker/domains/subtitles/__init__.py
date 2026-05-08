@@ -13,6 +13,7 @@ from .sentence_split import (
     split_text_on_punctuation_boundaries,
 )
 from .short_merge import merge_short_source_subtitles, source_short_merge_tolerance_seconds
+from .deepgram import deepgram_json_to_subtitles
 from .speakers import (
     build_segment_speaker_metadata_from_subtitles,
     normalize_subtitles_with_speakers,
@@ -29,6 +30,7 @@ __all__ = [
     "has_internal_explicit_break_boundary",
     "merge_short_source_subtitles",
     "build_segment_speaker_metadata_from_subtitles",
+    "deepgram_json_to_subtitles",
     "normalize_subtitles_with_speakers",
     "parse_speaker_ref_map_json",
     "parse_speaker_reference_specs_json",

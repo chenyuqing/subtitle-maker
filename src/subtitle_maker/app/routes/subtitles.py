@@ -5,12 +5,14 @@ import json
 import os
 import shutil
 import uuid
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 from fastapi.responses import PlainTextResponse
 from starlette.concurrency import run_in_threadpool
 
+from subtitle_maker.domains.subtitles import deepgram_json_to_subtitles
 from subtitle_maker.domains.subtitles import normalize_subtitles_with_speakers
 from subtitle_maker.transcriber import format_srt, merge_subtitles, parse_srt
 from subtitle_maker.translator import DEFAULT_TRANSLATE_BASE_URL, DEFAULT_TRANSLATE_MODEL, Translator
@@ -62,6 +64,51 @@ async def upload_srt(
         "subtitle_kind": normalized_subtitle_kind,
         "subtitles": subtitles,
         "translated_subtitles": subtitles if normalized_subtitle_kind == "translated" else [],
+    }
+
+
+@router.post("/upload_deepgram_json")
+async def upload_deepgram_json(
+    file: UploadFile = File(...),
+    video_filename: Optional[str] = Form(None),
+):
+    """上传 Deepgram diarization JSON，并规范化成可供前端直接消费的字幕任务。"""
+
+    if not file.filename.lower().endswith(".json"):
+        raise HTTPException(status_code=400, detail="Only .json files are supported")
+
+    content_bytes = await file.read()
+    try:
+        content_str = content_bytes.decode("utf-8")
+    except UnicodeDecodeError:
+        content_str = content_bytes.decode("latin-1")
+
+    try:
+        deepgram_payload = json.loads(content_str)
+        subtitles = deepgram_json_to_subtitles(deepgram_payload)
+        subtitles, _ = normalize_subtitles_with_speakers(subtitles)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"Could not parse Deepgram JSON: {exc}") from exc
+
+    if not subtitles:
+        raise HTTPException(status_code=400, detail="Could not parse subtitles or file is empty")
+
+    task_id = str(uuid.uuid4())
+    normalized_filename = f"deepgram_{Path(file.filename).stem}.srt"
+    legacy_runtime.tasks[task_id] = {
+        "status": "completed",
+        "filename": normalized_filename,
+        "video_filename": video_filename,
+        "deepgram_json_filename": file.filename,
+        "subtitles": subtitles,
+        "translated_subtitles": None,
+    }
+    return {
+        "task_id": task_id,
+        "filename": normalized_filename,
+        "subtitle_kind": "source",
+        "subtitles": subtitles,
+        "translated_subtitles": [],
     }
 
 

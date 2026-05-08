@@ -511,6 +511,35 @@ class DubbingPipelineTests(unittest.TestCase):
         self.assertIn("AI 的发展", system_message)
         self.assertIn("名字保留英文。", system_message)
 
+    def test_translator_translate_batch_flattens_internal_newlines_in_one_cue(self):
+        from subtitle_maker.translator import Translator
+
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=Mock(
+                        return_value=SimpleNamespace(
+                            choices=[SimpleNamespace(message=SimpleNamespace(content="1. 不"))]
+                        )
+                    )
+                )
+            )
+        )
+        translator = Translator(api_key="test-key", base_url="http://example.com", model="demo-model")
+        translator.client = fake_client
+
+        translated = translator.translate_batch(
+            ["No.\nBut most guys are doing things in order not to ejaculate quite so quickly."],
+            target_lang="Chinese",
+            system_prompt=None,
+            chunk_size=1,
+        )
+
+        self.assertEqual(translated, ["不"])
+        user_message = fake_client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("1. No. But most guys are doing things in order not to ejaculate quite so quickly.", user_message)
+        self.assertNotIn("No.\nBut most guys", user_message)
+
     def test_resolve_translation_api_key_prefers_generic_env_then_legacy_env(self):
         from subtitle_maker.translator import resolve_translation_api_key
 

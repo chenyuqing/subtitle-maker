@@ -1,5 +1,45 @@
 # TODO
 
+## 68. 2026-05-08 Deepgram JSON 导入到 4/5 配音链路
+- [x] 目标
+  - 在 1 号面板新增 Deepgram JSON 上传入口
+  - 把 Deepgram diarization 的原始 JSON 规范化成 speaker-aware SRT，再写回当前项目状态
+  - 4 号和 5 号面板继续直接消费当前项目字幕，不改配音主链路
+- [x] 后端
+  - 新增 `POST /upload_deepgram_json`
+  - Deepgram JSON 先优先按 `results.channels[0].alternatives[0].paragraphs.paragraphs` 转换，再在必要时 fallback 到 `words[]`
+  - Deepgram speaker 按首次出现顺序映射成 `Speaker 1 / Speaker 2 / ...`
+  - 导入结果只保留转换后的 SRT，不保留原始 JSON 产物
+- [x] 前端
+  - 1 号面板新增 `.json` 上传控件
+  - `.srt` 和 `.json` 两条导入路径共用同一个“写回当前项目状态”函数
+  - 导入后保持当前项目状态、localStorage 和 results 面板同步
+- [x] 验证
+  - 新增转换单测，覆盖 paragraphs 和 words 两条路径
+  - 新增接口测试，覆盖 `/upload_deepgram_json` 与 `/status/{task_id}` 的任务合同
+  - `node --check src/subtitle_maker/static/app.js`
+  - `uv run python -m py_compile src/subtitle_maker/domains/subtitles/deepgram.py src/subtitle_maker/domains/subtitles/__init__.py src/subtitle_maker/app/routes/subtitles.py tests/test_subtitle_speakers.py tests/test_web_routes_legacy.py`
+  - `uv run python -m unittest tests.test_subtitle_speakers tests.test_web_routes_legacy`
+- [x] Review
+  - 这次 Deepgram 导入沿用了现有字幕写回合同，没有把原始 JSON 留进项目态
+  - 为避免 `loadState()` 把导入文件误判成媒体，后端返回了派生的 `.srt` 文件名
+  - 4 号和 5 号面板没有改配音逻辑，只是多了一条更适合 speaker-aware 输入的上游入口
+
+## 67. 2026-05-08 OmniVoice 5 号长视频分段/并发优化
+- [ ] 现状
+  - 5 号 `Auto Dub Omnivoice` 当前是逐句串行调用 OmniVoice，长视频会因为字幕行数多而明显变慢
+  - 目前没有复用 4 号 `Auto Dubbing` 的 grouped synthesis 分段编排
+- [ ] 目标
+  - 为 5 号面板补上真正的分段/分组处理能力，减少长视频的总 TTS 调用成本
+  - 保持 speaker 映射、手工上传参考音和最终结果目录结构不变
+- [ ] 计划
+  - 对齐 4 号 grouped synthesis 的分组策略，优先复用现有 grouping / segment 机制
+  - 评估是否需要有限并发，避免单线程逐句阻塞
+  - 保持每句结果可追踪，避免破坏 manifest / artifact 恢复
+- [ ] 验证
+  - 长视频任务的总体耗时显著下降
+  - 5 号结果仍可正常恢复、下载和回放
+
 ## 66. 2026-05-07 OmniVoice 输出目录并入 dub_jobs
 - [x] 目标
   - 5 号 `Auto Dub Omnivoice` 的结果目录从 `outputs/omnivoice_dub_jobs/` 迁移到 `outputs/dub_jobs/`
@@ -5237,3 +5277,8 @@
 
     - 第九阶段已完成 index-tts 单底座收口：删除 `src/subtitle_maker/backends/omni_voice.py` 与导出，`domains/dubbing/pipeline.py` 的真实运行时已强制只走 `IndexTtsBackend`，工具层/前端中的 OmniVoice 偏好逻辑与文案残留已同步清掉；保留少量兼容形参仅用于旧调用不炸。
     - 第九阶段验证：`node --check src/subtitle_maker/static/js/dubbingPanel.js`、`uv run python -m py_compile src/subtitle_maker/backends/__init__.py src/subtitle_maker/domains/dubbing/pipeline.py tools/dub_pipeline.py tools/dub_long_video.py tools/repair_bad_segments.py`、`uv run python -m unittest -v tests.test_dub_pipeline_asr_layout tests.test_dub_long_video tests.test_dubbing_runtime tests.test_dubbing_cli_api` 全部通过。
+
+## Review（2026-05-08 OmniVoice 旧目录收口）
+- 本次修复把 `src/subtitle_maker/omnivoice_dub_api.py` 里旧输出根目录的主动创建去掉了，兼容逻辑只保留读取，不再落空目录。
+- 旧的 `outputs/omnivoice_dub_jobs/` 已清理，新的 5 号链路继续只写 `outputs/dub_jobs/`。
+- 验证结果：`uv run python -m py_compile src/subtitle_maker/omnivoice_dub_api.py` 通过。

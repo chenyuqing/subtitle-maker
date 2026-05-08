@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 import tempfile
@@ -103,6 +104,67 @@ class WebLegacyRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("subtitle_kind", response.json()["detail"])
 
+    def test_upload_deepgram_json_and_status_keep_legacy_task_contract(self):
+        deepgram_payload = {
+            "results": {
+                "channels": [
+                    {
+                        "alternatives": [
+                            {
+                                "paragraphs": {
+                                    "paragraphs": [
+                                        {
+                                            "speaker": 0,
+                                            "start": 0.0,
+                                            "end": 1.0,
+                                            "sentences": [
+                                                {"text": "Hello there.", "start": 0.0, "end": 1.0},
+                                            ],
+                                        },
+                                        {
+                                            "speaker": 1,
+                                            "start": 1.2,
+                                            "end": 2.0,
+                                            "sentences": [
+                                                {"text": "General Kenobi.", "start": 1.2, "end": 2.0},
+                                            ],
+                                        },
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+
+        response = self.client.post(
+            "/upload_deepgram_json",
+            files={
+                "file": (
+                    "demo.json",
+                    json.dumps(deepgram_payload, ensure_ascii=False).encode("utf-8"),
+                    "application/json",
+                )
+            },
+            data={"video_filename": "demo.mp4"},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertIn("task_id", payload)
+        self.assertTrue(payload["filename"].endswith(".srt"))
+        self.assertEqual(payload["subtitle_kind"], "source")
+        self.assertEqual(len(payload["subtitles"]), 2)
+        self.assertEqual(payload["subtitles"][0]["speaker_id"], "Speaker 1")
+
+        status = self.client.get(f"/status/{payload['task_id']}")
+        self.assertEqual(status.status_code, 200)
+        status_payload = status.json()
+        self.assertEqual(status_payload["status"], "completed")
+        self.assertEqual(status_payload["video_filename"], "demo.mp4")
+        self.assertEqual(len(status_payload["subtitles"]), 2)
+        self.assertEqual(status_payload["subtitles"][1]["speaker_id"], "Speaker 2")
+
     def test_async_transcribe_status_translate_and_export_still_work(self):
         media_path = self.upload_dir / "demo.mp4"
         media_path.write_bytes(b"video-bytes")
@@ -170,7 +232,7 @@ class WebLegacyRouteTests(unittest.TestCase):
                 "cancelled_auto_tasks": 2,
                 "uploads_removed": 3,
                 "dubbing_pruned": {"video_candidates": 5, "kept_task_dirs": 3, "removed_entries": 2},
-                "outputs_removed": 4,
+                "outputs_removed": 0,
             },
         )
 

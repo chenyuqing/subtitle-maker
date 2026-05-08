@@ -2,6 +2,8 @@ const mediaUploadArea = document.getElementById('upload-area');
 const mediaFileInput = document.getElementById('file-input');
 const srtUploadArea = document.getElementById('srt-upload-area');
 const srtFileInput = document.getElementById('srt-file-input');
+const deepgramJsonUploadArea = document.getElementById('deepgram-json-upload-area');
+const deepgramJsonFileInput = document.getElementById('deepgram-json-file-input');
 const srtSubtitleKindSelect = document.getElementById('srt-subtitle-kind');
 
 const uploadStatus = document.getElementById('upload-status');
@@ -953,9 +955,21 @@ function switchTab(target) {
 
 // --- Persistence Logic ---
 function saveState() {
-    if (currentTaskId) localStorage.setItem('sm_taskId', currentTaskId);
-    if (currentFilename) localStorage.setItem('sm_filename', currentFilename);
-    if (currentOriginalFilename) localStorage.setItem('sm_originalFilename', currentOriginalFilename);
+    if (currentTaskId) {
+        localStorage.setItem('sm_taskId', currentTaskId);
+    } else {
+        localStorage.removeItem('sm_taskId');
+    }
+    if (currentFilename) {
+        localStorage.setItem('sm_filename', currentFilename);
+    } else {
+        localStorage.removeItem('sm_filename');
+    }
+    if (currentOriginalFilename) {
+        localStorage.setItem('sm_originalFilename', currentOriginalFilename);
+    } else {
+        localStorage.removeItem('sm_originalFilename');
+    }
     if (currentProjectMediaFilename) {
         localStorage.setItem(PROJECT_MEDIA_FILENAME_KEY, currentProjectMediaFilename);
     } else {
@@ -966,14 +980,22 @@ function saveState() {
     } else {
         localStorage.removeItem(PROJECT_MEDIA_ORIGINAL_FILENAME_KEY);
     }
-    if (transcriptionStartTime) localStorage.setItem('sm_startTime', transcriptionStartTime);
+    if (transcriptionStartTime) {
+        localStorage.setItem('sm_startTime', transcriptionStartTime);
+    } else {
+        localStorage.removeItem('sm_startTime');
+    }
 
     // Save subtitles content
     if (originalSubtitlesData && originalSubtitlesData.length > 0) {
         localStorage.setItem('sm_originalSubtitles', JSON.stringify(originalSubtitlesData));
+    } else {
+        localStorage.removeItem('sm_originalSubtitles');
     }
     if (translatedSubtitlesData && translatedSubtitlesData.length > 0) {
         localStorage.setItem('sm_translatedSubtitles', JSON.stringify(translatedSubtitlesData));
+    } else {
+        localStorage.removeItem('sm_translatedSubtitles');
     }
     notifyProjectContextChanged();
 }
@@ -1233,6 +1255,9 @@ setupUploadLogic(mediaUploadArea, mediaFileInput, handleMediaUpload);
 // 1. Optional SRT Upload Logic (Panel 1)
 setupUploadLogic(srtUploadArea, srtFileInput, handleSrtUploadWrapper);
 
+// 1. Optional Deepgram JSON Upload Logic (Panel 1)
+setupUploadLogic(deepgramJsonUploadArea, deepgramJsonFileInput, handleDeepgramJsonUploadWrapper);
+
 function setupUploadLogic(area, input, handler) {
     if (area && input) {
         // Click
@@ -1362,6 +1387,27 @@ async function handleSrtUploadWrapper(file) {
     } catch (e) {
         console.error("SRT Upload Error:", e);
         alert("SRT Upload Failed: " + e.message);
+    }
+}
+
+async function handleDeepgramJsonUploadWrapper(file) {
+    if (!file.name.toLowerCase().endsWith('.json')) {
+        alert("Please select a valid .json file");
+        return;
+    }
+
+    // Deepgram JSON 同样依赖“当前项目媒体”上下文；未上传视频/音频时直接阻断，避免创建孤立字幕状态。
+    const mediaName = String(currentProjectMediaFilename || currentFilename || '').trim();
+    if (!mediaName || mediaName.toLowerCase().endsWith('.srt') || mediaName.toLowerCase().endsWith('.json')) {
+        alert("请先上传视频/音频，再导入 Deepgram JSON 字幕。");
+        return;
+    }
+
+    try {
+        await handleDeepgramJsonUpload(file);
+    } catch (e) {
+        console.error("Deepgram JSON Upload Error:", e);
+        alert("Deepgram JSON Import Failed: " + e.message);
     }
 }
 
@@ -1808,6 +1854,39 @@ function bindExportButtons() {
 }
 
 // --- Handler for SRT Upload ---
+/**
+ * 将导入后的字幕任务结果统一写回当前项目状态。
+ * 这里同时复用 SRT 和 Deepgram JSON 两条导入路径，避免状态散落。
+ */
+function applyImportedSubtitleResponse(data, { successText = 'SRT Upload Complete' } = {}) {
+    currentTaskId = data?.task_id || null;
+    currentFilename = data?.filename || currentFilename;
+
+    if (data?.subtitle_kind === 'translated') {
+        translatedSubtitlesData = Array.isArray(data.translated_subtitles) ? data.translated_subtitles : [];
+        // 保留 source 面板为同一时间轴文本，方便双栏与导出对齐。
+        originalSubtitlesData = Array.isArray(data.subtitles) ? data.subtitles : [];
+    } else {
+        originalSubtitlesData = Array.isArray(data.subtitles) ? data.subtitles : [];
+        translatedSubtitlesData = [];
+    }
+
+    renderSubtitles(originalSubtitlesData, originalDisplay);
+    renderSubtitles(translatedSubtitlesData, translatedDisplay);
+    saveState();
+
+    if (uploadStatus) uploadStatus.textContent = successText;
+
+    // 只要当前项目已经有可用字幕，就允许翻译/导出/配音继续走。
+    if (translateBtn) translateBtn.disabled = false;
+    const expBtn = document.getElementById('export-btn');
+    if (expBtn) expBtn.disabled = false;
+    const segBtn = document.getElementById('export-segments-btn');
+    if (segBtn) segBtn.disabled = false;
+
+    switchTab('panel-results');
+}
+
 async function handleSrtUpload(file) {
     if (!file) return;
 
@@ -1831,42 +1910,43 @@ async function handleSrtUpload(file) {
         }
 
         const data = await res.json();
-
-        // Update state
-        currentTaskId = data.task_id;
-        currentFilename = data.filename;
-        if (data.subtitle_kind === 'translated') {
-            translatedSubtitlesData = Array.isArray(data.translated_subtitles) ? data.translated_subtitles : [];
-            // 保留 source 面板为同一时间轴文本，方便双栏与导出对齐。
-            originalSubtitlesData = Array.isArray(data.subtitles) ? data.subtitles : [];
-        } else {
-            originalSubtitlesData = Array.isArray(data.subtitles) ? data.subtitles : [];
-            translatedSubtitlesData = []; // source 字幕上传时清空旧译文，避免误用
-        }
-
-        // Render
-        renderSubtitles(originalSubtitlesData, originalDisplay);
-        renderSubtitles(translatedSubtitlesData, translatedDisplay);
-
-        saveState();
-
-        if (uploadStatus) uploadStatus.textContent = "SRT Upload Complete";
-
-        // Enable buttons since we possess subtitles now
-        if (translateBtn) translateBtn.disabled = false;
-
-        const expBtn = document.getElementById('export-btn');
-        if (expBtn) expBtn.disabled = false;
-
-        const segBtn = document.getElementById('export-segments-btn');
-        if (segBtn) segBtn.disabled = false;
-
-        // Switch to Translate tab (since transcription is skipped)
-        switchTab('panel-results');
+        applyImportedSubtitleResponse(data, { successText: 'SRT Upload Complete' });
 
     } catch (e) {
         console.error("SRT Upload Error:", e);
         alert("SRT Upload Failed: " + e.message);
+        if (uploadStatus) uploadStatus.textContent = "Upload Failed";
+    }
+}
+
+/**
+ * 上传 Deepgram diarization JSON，并把它转换成可复用的 source SRT 状态。
+ */
+async function handleDeepgramJsonUpload(file) {
+    if (!file) return;
+
+    if (uploadStatus) uploadStatus.textContent = "Uploading Deepgram JSON...";
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    // 与 SRT 导入保持一致：如果当前项目已有媒体，则显式把媒体文件名传给后端，避免导入后丢失项目上下文。
+    if (currentProjectMediaFilename && !currentProjectMediaFilename.toLowerCase().endsWith('.srt')) {
+        formData.append('video_filename', currentProjectMediaFilename);
+    }
+
+    try {
+        const res = await fetch('/upload_deepgram_json', { method: 'POST', body: formData });
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({ detail: 'Upload failed' }));
+            throw new Error(err.detail || 'Upload failed');
+        }
+
+        const data = await res.json();
+        applyImportedSubtitleResponse(data, { successText: 'Deepgram JSON Import Complete' });
+    } catch (e) {
+        console.error("Deepgram JSON Upload Error:", e);
+        alert("Deepgram JSON Import Failed: " + e.message);
         if (uploadStatus) uploadStatus.textContent = "Upload Failed";
     }
 }
