@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import sys
@@ -42,8 +43,17 @@ from subtitle_maker.domains.media import (
     replace_video_audio_two_step,
 )
 from subtitle_maker.domains.subtitles import normalize_subtitles_with_speakers
+from subtitle_maker.domains.subtitles import optimize_srt_import_subtitles
+from subtitle_maker.domains.subtitles.srt import (
+    ends_with_connector,
+    infer_cjk_mode_from_lines,
+    is_sentence_end,
+    starts_with_connector,
+    subtitle_group_text,
+    subtitle_text_units,
+)
 from subtitle_maker.jobs import TaskStore
-from subtitle_maker.transcriber import format_srt
+from subtitle_maker.transcriber import format_srt, parse_srt
 from subtitle_maker.translator import (
     DEFAULT_TRANSLATE_BASE_URL,
     DEFAULT_TRANSLATE_MODEL,
@@ -77,7 +87,24 @@ OMNIVOICE_BACKEND_PYTHON = OMNIVOICE_STUDIO_DIR / ".venv" / "bin" / "python"
 OMNIVOICE_BACKEND_PID_FILE = REPO_ROOT / "outputs" / "omnivoice_backend.pid"
 OMNIVOICE_BACKEND_LOG_PATH = REPO_ROOT / "outputs" / "omnivoice_backend.log"
 OMNIVOICE_LOCAL_CHECKPOINT_DIR = Path("/Users/tim/Documents/vibe-coding/MVP/OmniVoice/omnivoice/checkpoints")
+REF_VOICES_ROOT = REPO_ROOT / "ref-voices"
+LOCAL_VOICE_GENDER_MODEL_DIR = REPO_ROOT / "norwood-maleVSfemale"
 _omnivoice_backend_start_lock = threading.Lock()
+_voice_gender_classifier_lock = threading.Lock()
+_voice_gender_classifier = None
+OMNIVOICE_FINAL_SRT_MAX_CHARS = 25
+_OMNIVOICE_STRONG_BREAK_RE = re.compile(r'([。！？!?]+["\')\]]*)')
+_OMNIVOICE_SOFT_BREAK_RE = re.compile(r"([，,；;：:、…]+)")
+OMNIVOICE_SYNTH_MIN_CPS = 0.8
+OMNIVOICE_SYNTH_MAX_CPS = 20.0
+OMNIVOICE_SYNTH_PAIR_MAX_GAP_SEC = 0.8
+OMNIVOICE_SYNTH_MIN_SEG_SEC = 0.25
+OMNIVOICE_SELECTED_MAX_SEG_SEC = 12.0
+OMNIVOICE_SELECTED_SPLIT_MAX_CHARS = 60
+OMNIVOICE_SELECTED_MAX_CPS = 10.0
+OMNIVOICE_SELECTED_MIN_SEG_SEC = 0.25
+VOICE_GENDER_MALE_MARKERS = ("male", "man", "boy", "男", "nan")
+VOICE_GENDER_FEMALE_MARKERS = ("female", "woman", "girl", "女", "nv")
 
 
 def _iso_now() -> str:
@@ -168,15 +195,101 @@ def _normalize_subtitles_payload(raw: str, *, field_name: str) -> List[Dict[str,
     return rows
 
 
-def _ensure_speaker_ids(rows: List[Dict[str, Any]], fallback_rows: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
-    """补齐缺失 speaker_id，避免 OmniVoice 路由时出现空 speaker。"""
+def _ensure_speaker_ids(
+    rows: List[Dict[str, Any]],
+    fallback_rows: Optional[List[Dict[str, Any]]] = None,
+    *,
+    force_align_by_time: bool = False,
+) -> List[Dict[str, Any]]:
+    """补齐或按时间校正 speaker_id，避免 OmniVoice 路由时 speaker 错位。"""
+
+    def _build_fallback_candidates(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把 fallback rows 规整成可按时间匹配 speaker 的候选集。"""
+
+        candidates: List[Dict[str, Any]] = []
+        for item in items:
+            speaker_id = str(item.get("speaker_id") or "").strip()
+            if not speaker_id:
+                continue
+            start_sec = float(item.get("start", 0.0) or 0.0)
+            end_sec = float(item.get("end", 0.0) or 0.0)
+            if end_sec <= start_sec:
+                continue
+            candidates.append(
+                {
+                    "start": start_sec,
+                    "end": end_sec,
+                    "speaker_id": speaker_id,
+                    "center": (start_sec + end_sec) / 2.0,
+                }
+            )
+        candidates.sort(key=lambda item: (item["start"], item["end"]))
+        return candidates
+
+    def _pick_speaker_id_by_time(
+        row: Dict[str, Any],
+        *,
+        candidates: List[Dict[str, Any]],
+        index: int,
+        index_fallback: List[Dict[str, Any]],
+    ) -> str:
+        """优先按时间重叠挑 speaker，兜底才按索引。"""
+
+        if not candidates:
+            return ""
+
+        start_sec = float(row.get("start", 0.0) or 0.0)
+        end_sec = float(row.get("end", 0.0) or 0.0)
+        center_sec = (start_sec + end_sec) / 2.0 if end_sec > start_sec else start_sec
+        best_overlap = 0.0
+        best_distance = float("inf")
+        best_speaker = ""
+
+        for candidate in candidates:
+            overlap = max(0.0, min(end_sec, candidate["end"]) - max(start_sec, candidate["start"]))
+            if overlap <= 0.0:
+                continue
+            distance = abs(center_sec - float(candidate["center"]))
+            if overlap > best_overlap + 1e-9:
+                best_overlap = overlap
+                best_distance = distance
+                best_speaker = str(candidate["speaker_id"])
+                continue
+            if abs(overlap - best_overlap) <= 1e-9 and distance < best_distance:
+                best_distance = distance
+                best_speaker = str(candidate["speaker_id"])
+
+        if best_speaker:
+            return best_speaker
+
+        nearest: Optional[Dict[str, Any]] = None
+        nearest_distance = float("inf")
+        for candidate in candidates:
+            distance = abs(center_sec - float(candidate["center"]))
+            if distance < nearest_distance:
+                nearest_distance = distance
+                nearest = candidate
+        if nearest is not None:
+            return str(nearest.get("speaker_id") or "")
+
+        if index < len(index_fallback):
+            return str(index_fallback[index].get("speaker_id") or "").strip()
+        return ""
 
     normalized: List[Dict[str, Any]] = []
     fallback_rows = fallback_rows or []
+    fallback_candidates = _build_fallback_candidates(fallback_rows)
     for index, row in enumerate(rows):
         speaker_id = str(row.get("speaker_id") or "").strip()
-        if not speaker_id and index < len(fallback_rows):
-            speaker_id = str(fallback_rows[index].get("speaker_id") or "").strip()
+        if force_align_by_time or not speaker_id:
+            speaker_id = _pick_speaker_id_by_time(
+                row,
+                candidates=fallback_candidates,
+                index=index,
+                index_fallback=fallback_rows,
+            )
+        if not speaker_id and normalized:
+            speaker_id = str(normalized[-1].get("speaker_id") or "").strip()
         if not speaker_id:
             speaker_id = "Speaker 1"
         normalized.append(
@@ -209,6 +322,524 @@ def _normalize_translation_result(
     return normalized
 
 
+def _resolve_ref_voices_dir(target_lang: str) -> Optional[Path]:
+    """按目标语种解析预存参考音目录（ref-voices/<target_lang>/）。"""
+
+    lang = str(target_lang or "").strip()
+    if not lang:
+        return None
+    direct = (REF_VOICES_ROOT / lang).resolve()
+    if direct.exists() and direct.is_dir():
+        return direct
+    if not REF_VOICES_ROOT.exists():
+        return None
+    lowered = lang.lower()
+    for child in REF_VOICES_ROOT.iterdir():
+        if child.is_dir() and child.name.lower() == lowered:
+            return child.resolve()
+    return None
+
+
+def _pick_preset_ref_voices_for_missing_speakers(
+    *,
+    missing_speaker_ids: List[str],
+    target_lang: str,
+    out_root: Path,
+    speaker_gender_hints: Optional[Dict[str, str]] = None,
+    excluded_source_filenames: Optional[List[str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """为缺失 speaker 从 ref-voices/<target_lang>/ 挑选参考音并落盘到任务目录。"""
+
+    if not missing_speaker_ids:
+        return {}
+
+    ref_dir = _resolve_ref_voices_dir(target_lang)
+    if ref_dir is None:
+        raise RuntimeError(
+            f"Missing preset reference voices dir: {REF_VOICES_ROOT}/{target_lang}. "
+            "Please create it or upload all speaker references."
+        )
+
+    audio_exts = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aac"}
+    excluded_name_set = {
+        Path(str(name or "").strip()).name.lower()
+        for name in (excluded_source_filenames or [])
+        if str(name or "").strip()
+    }
+
+    def _list_audio_files(base_dir: Path) -> List[Path]:
+        """列出目录下可用的参考音，排除已上传同名文件。"""
+
+        return [
+            path
+            for path in sorted(base_dir.rglob("*"), key=lambda p: str(p).lower())
+            if path.is_file()
+            and path.suffix.lower() in audio_exts
+            and path.name.lower() not in excluded_name_set
+        ]
+
+    speaker_gender_hints = dict(speaker_gender_hints or {})
+    gender_pools: Dict[str, List[Path]] = {"male": [], "female": []}
+    for gender in ("male", "female"):
+        gender_dir = ref_dir / gender
+        if gender_dir.exists() and gender_dir.is_dir():
+            gender_pools[gender] = _list_audio_files(gender_dir)
+            random.shuffle(gender_pools[gender])
+    gender_pool_cursor = {"male": 0, "female": 0}
+
+    generic_candidates = _list_audio_files(ref_dir)
+    if not generic_candidates:
+        raise RuntimeError(
+            f"No usable preset reference voices under {ref_dir}. "
+            "Please add audio files or upload missing speaker references."
+        )
+    random.shuffle(generic_candidates)
+
+    target_dir = out_root / "uploaded_speaker_refs"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    preset_map: Dict[str, Dict[str, Any]] = {}
+    for index, speaker_id in enumerate(missing_speaker_ids):
+        preferred_gender = str(speaker_gender_hints.get(speaker_id) or "").strip().lower()
+        source_path: Path
+        if preferred_gender in {"male", "female"} and gender_pools[preferred_gender]:
+            pool = gender_pools[preferred_gender]
+            cursor = gender_pool_cursor[preferred_gender]
+            source_path = pool[cursor % len(pool)]
+            gender_pool_cursor[preferred_gender] = cursor + 1
+        elif preferred_gender in {"male", "female"}:
+            raise RuntimeError(
+                f"No usable preset reference voices under {ref_dir / preferred_gender} "
+                f"for speaker {speaker_id}. Please add matching preset voices or upload a reference."
+            )
+        else:
+            source_path = generic_candidates[index % len(generic_candidates)]
+        safe_name = _sanitize_filename(speaker_id) or f"speaker_{index+1}"
+        copied_path = (target_dir / f"preset_{safe_name}{source_path.suffix.lower()}").resolve()
+        shutil.copy2(source_path, copied_path)
+        duration_sec = 0.0
+        try:
+            duration_sec = round(float(sf.info(copied_path).duration), 3)
+        except Exception:
+            duration_sec = 0.0
+        preset_map[speaker_id] = {
+            "ref_audio": str(copied_path),
+            "ref_text": UPLOADED_SPEAKER_REF_TEXT,
+            "duration": duration_sec,
+            "source_count": 1,
+            "reference_mode": "preset_pool",
+            "source_path": str(source_path.resolve()),
+            "gender_hint": preferred_gender if preferred_gender in {"male", "female"} else "",
+        }
+    return preset_map
+
+
+def _infer_gender_from_text_hint(raw: str) -> Optional[str]:
+    """从目录名/文件名里的标记词推断男声或女声。"""
+
+    text = str(raw or "").strip().lower()
+    if not text:
+        return None
+    normalized = re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", " ", text)
+    tokens = [token for token in normalized.split(" ") if token]
+    # 先判 female，避免 "female" 被 "male" 子串误命中。
+    for marker in VOICE_GENDER_FEMALE_MARKERS:
+        marker_text = str(marker).strip().lower()
+        if marker_text and marker_text in tokens:
+            return "female"
+    for marker in VOICE_GENDER_MALE_MARKERS:
+        marker_text = str(marker).strip().lower()
+        if marker_text and marker_text in tokens:
+            return "male"
+    return None
+
+
+def _get_local_voice_gender_classifier():
+    """懒加载本地男/女声分类器，避免启动阶段额外加载大模型。"""
+
+    global _voice_gender_classifier
+    if _voice_gender_classifier is not None:
+        return _voice_gender_classifier
+    with _voice_gender_classifier_lock:
+        if _voice_gender_classifier is not None:
+            return _voice_gender_classifier
+        if not LOCAL_VOICE_GENDER_MODEL_DIR.exists():
+            return None
+        from transformers import pipeline
+
+        _voice_gender_classifier = pipeline(
+            "audio-classification",
+            model=str(LOCAL_VOICE_GENDER_MODEL_DIR.resolve()),
+        )
+        return _voice_gender_classifier
+
+
+def _classify_voice_gender_with_local_model(audio_path: Path) -> Optional[str]:
+    """使用本地男/女声分类模型对单个参考音做判别。"""
+
+    classifier = _get_local_voice_gender_classifier()
+    if classifier is None:
+        return None
+    try:
+        result = classifier(str(Path(audio_path).expanduser()))
+    except Exception as exc:
+        logger.warning("Local voice gender classification failed for %s: %s", audio_path, exc)
+        return None
+    if not isinstance(result, list) or not result:
+        return None
+    top = result[0]
+    if isinstance(top, dict):
+        raw_label = top.get("label")
+    else:
+        raw_label = top
+    label = _infer_gender_from_text_hint(str(raw_label or ""))
+    if label in {"male", "female"}:
+        return label
+    raw = str(raw_label or "").strip().lower()
+    if raw.startswith("male"):
+        return "male"
+    if raw.startswith("female"):
+        return "female"
+    return None
+
+
+def _estimate_voice_pitch_hz(audio: np.ndarray, sample_rate: int) -> Optional[float]:
+    """用自相关法估算主频，作为男女声粗分依据。"""
+
+    if sample_rate <= 0:
+        return None
+    wav = np.asarray(audio, dtype=np.float32).flatten()
+    if wav.size < int(sample_rate * 0.3):
+        return None
+    max_samples = int(sample_rate * 8.0)
+    wav = wav[:max_samples]
+    wav = wav - float(np.mean(wav))
+    peak = float(np.max(np.abs(wav))) if wav.size else 0.0
+    if peak <= 1e-6:
+        return None
+    wav = wav / peak
+
+    frame_len = max(256, int(0.04 * sample_rate))
+    hop_len = max(128, int(0.01 * sample_rate))
+    min_lag = max(1, int(sample_rate / 300.0))
+    max_lag = max(min_lag + 1, int(sample_rate / 80.0))
+    if frame_len <= max_lag + 2:
+        return None
+
+    starts = range(0, max(1, wav.size - frame_len + 1), hop_len)
+    energies: List[float] = []
+    frames: List[np.ndarray] = []
+    for start in starts:
+        frame = wav[start : start + frame_len]
+        if frame.size < frame_len:
+            continue
+        frames.append(frame)
+        energies.append(float(np.mean(frame * frame)))
+    if not energies:
+        return None
+
+    energy_threshold = max(1e-6, float(np.percentile(np.asarray(energies, dtype=np.float32), 45)))
+    f0_values: List[float] = []
+    for frame, energy in zip(frames, energies):
+        if energy < energy_threshold:
+            continue
+        centered = frame - float(np.mean(frame))
+        corr = np.correlate(centered, centered, mode="full")[frame_len - 1 :]
+        if corr.size <= max_lag or corr[0] <= 0:
+            continue
+        search = corr[min_lag : max_lag + 1]
+        if search.size == 0:
+            continue
+        peak_idx = int(np.argmax(search))
+        peak_lag = min_lag + peak_idx
+        peak_score = float(search[peak_idx]) / float(corr[0])
+        if peak_score < 0.18:
+            continue
+        f0 = float(sample_rate) / float(peak_lag)
+        if 80.0 <= f0 <= 300.0:
+            f0_values.append(f0)
+
+    if len(f0_values) < 4:
+        return None
+    return float(np.median(np.asarray(f0_values, dtype=np.float32)))
+
+
+def _infer_voice_gender_label(audio_path: Path, *, use_path_hint: bool = True) -> Optional[str]:
+    """识别音频男/女声；可选是否信任目录/文件名提示。"""
+
+    path = Path(audio_path).expanduser()
+    if use_path_hint:
+        hint_text = " ".join(part.lower() for part in path.parts[-4:]) + " " + path.name.lower()
+        hint_label = _infer_gender_from_text_hint(hint_text)
+        if hint_label in {"male", "female"}:
+            return hint_label
+    local_model_label = _classify_voice_gender_with_local_model(path)
+    if local_model_label in {"male", "female"}:
+        return local_model_label
+
+    try:
+        wav, sample_rate = load_mono_audio(path)
+    except Exception:
+        return None
+    pitch_hz = _estimate_voice_pitch_hz(wav, int(sample_rate))
+    if pitch_hz is None:
+        return None
+    if pitch_hz <= 155.0:
+        return "male"
+    if pitch_hz >= 185.0:
+        return "female"
+    return None
+
+
+def _target_prefers_cjk_text(target_lang: str) -> bool:
+    """判断目标语言是否应优先输出中文文本。"""
+
+    lowered = str(target_lang or "").strip().lower()
+    if not lowered:
+        return False
+    markers = ("chinese", "mandarin", "cantonese", "中文", "汉语", "普通话", "粤语", "廣東話", "广东话")
+    return any(marker in lowered for marker in markers)
+
+
+def _is_latin_dominant_text(text: str) -> bool:
+    """判定文本是否英文主导（用于发现漏译行）。"""
+
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    latin_count = len(re.findall(r"[A-Za-z]", raw))
+    cjk_count = len(re.findall(r"[\u4e00-\u9fff]", raw))
+    if latin_count < 8:
+        return False
+    return cjk_count == 0 or latin_count > cjk_count * 2
+
+
+def _normalize_omnivoice_selected_text(text: str) -> str:
+    """清洗 5 号链路字幕文本，修正中英粘连与大小写连写。"""
+
+    normalized = _normalize_final_srt_text(text)
+    if not normalized:
+        return ""
+
+    if re.search(r"[A-Za-z]", normalized):
+        # 先拆 PascalCase / camelCase：ClaudeCode -> Claude Code
+        normalized = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", normalized)
+        normalized = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", normalized)
+
+    has_cjk = bool(re.search(r"[\u4e00-\u9fff]", normalized))
+    has_latin_or_digit = bool(re.search(r"[A-Za-z0-9]", normalized))
+    if has_cjk and has_latin_or_digit:
+        # 中英文或数字直接贴在一起时补空格：AI时代 -> AI 时代
+        normalized = re.sub(r"([A-Za-z0-9])([\u4e00-\u9fff])", r"\1 \2", normalized)
+        normalized = re.sub(r"([\u4e00-\u9fff])([A-Za-z0-9])", r"\1 \2", normalized)
+
+    normalized = re.sub(r"\s+([，。！？、；：,.!?;:])", r"\1", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _merge_two_subtitle_rows(left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, Any]:
+    """合并两条相邻字幕。"""
+
+    cjk_mode = infer_cjk_mode_from_lines([str(left.get("text") or ""), str(right.get("text") or "")])
+    merged_text = _normalize_final_srt_text(
+        subtitle_group_text(
+            [
+                {"text": str(left.get("text") or "").strip()},
+                {"text": str(right.get("text") or "").strip()},
+            ],
+            cjk_mode=cjk_mode,
+        )
+    )
+    speaker_id = str(left.get("speaker_id") or "").strip() or str(right.get("speaker_id") or "").strip()
+    return {
+        "start": float(left.get("start", 0.0) or 0.0),
+        "end": float(right.get("end", 0.0) or 0.0),
+        "text": merged_text,
+        "speaker_id": speaker_id,
+    }
+
+
+def _smooth_selected_rows_for_cps(
+    rows: List[Dict[str, Any]],
+    *,
+    max_cps: float = OMNIVOICE_SELECTED_MAX_CPS,
+    min_seg_sec: float = OMNIVOICE_SELECTED_MIN_SEG_SEC,
+) -> List[Dict[str, Any]]:
+    """仅在 5 号 selected 链路压制高 CPS：先并短碎行，再按 CPS 分段。"""
+
+    if not rows:
+        return []
+
+    merged_rows: List[Dict[str, Any]] = []
+    index = 0
+    while index < len(rows):
+        current = dict(rows[index])
+        if index + 1 >= len(rows):
+            merged_rows.append(current)
+            break
+        nxt = dict(rows[index + 1])
+        gap_sec = float(nxt["start"]) - float(current["end"])
+        same_speaker = str(current.get("speaker_id") or "").strip() == str(nxt.get("speaker_id") or "").strip()
+        current_duration = max(0.0, float(current["end"]) - float(current["start"]))
+        current_text = str(current.get("text") or "").strip()
+        cjk_mode = infer_cjk_mode_from_lines([current_text, str(nxt.get("text") or "")])
+        current_units = max(1, subtitle_text_units(current_text, cjk_mode=cjk_mode))
+        current_cps = current_units / max(0.05, current_duration)
+        should_merge = (
+            same_speaker
+            and gap_sec <= 0.25
+            and current_duration < 0.7
+            and current_cps > max_cps
+        )
+        if should_merge:
+            merged_rows.append(_merge_two_subtitle_rows(current, nxt))
+            index += 2
+            continue
+        merged_rows.append(current)
+        index += 1
+
+    output: List[Dict[str, Any]] = []
+    for row in merged_rows:
+        start_sec = float(row.get("start", 0.0) or 0.0)
+        end_sec = float(row.get("end", 0.0) or 0.0)
+        duration_sec = max(0.0, end_sec - start_sec)
+        text = _normalize_final_srt_text(str(row.get("text") or ""))
+        speaker_id = str(row.get("speaker_id") or "").strip()
+        if not text or duration_sec <= 0.0:
+            continue
+        cjk_mode = infer_cjk_mode_from_lines([text])
+        units = max(1, subtitle_text_units(text, cjk_mode=cjk_mode))
+        cps = units / max(0.05, duration_sec)
+        if cps <= max_cps:
+            output.append(
+                {
+                    "start": start_sec,
+                    "end": end_sec,
+                    "text": text,
+                    "speaker_id": speaker_id,
+                }
+            )
+            continue
+
+        desired_parts = max(2, int(np.ceil(cps / max_cps)))
+        max_parts_by_duration = max(1, int(np.floor(duration_sec / max(min_seg_sec, 0.01))))
+        part_count = min(desired_parts, max_parts_by_duration)
+        if part_count <= 1:
+            output.append(
+                {
+                    "start": start_sec,
+                    "end": end_sec,
+                    "text": text,
+                    "speaker_id": speaker_id,
+                }
+            )
+            continue
+
+        segments = _split_long_final_segment(
+            text,
+            max_chars=max(6, int(np.ceil(len(text) / part_count))),
+        )
+        if len(segments) <= 1:
+            output.append(
+                {
+                    "start": start_sec,
+                    "end": end_sec,
+                    "text": text,
+                    "speaker_id": speaker_id,
+                }
+            )
+            continue
+        spans = _estimate_final_srt_time_spans(start_sec, end_sec, segments)
+        if len(spans) != len(segments):
+            output.append(
+                {
+                    "start": start_sec,
+                    "end": end_sec,
+                    "text": text,
+                    "speaker_id": speaker_id,
+                }
+            )
+            continue
+        for (seg_start, seg_end), seg_text in zip(spans, segments):
+            cleaned = str(seg_text or "").strip()
+            if not cleaned or seg_end <= seg_start:
+                continue
+            output.append(
+                {
+                    "start": float(seg_start),
+                    "end": float(seg_end),
+                    "text": cleaned,
+                    "speaker_id": speaker_id,
+                }
+            )
+    return _merge_selected_fragment_rows(output)
+
+
+def _is_selected_fragment_row(row: Dict[str, Any]) -> bool:
+    """判断一条字幕是否像残句碎片，便于最后做轻量回并。"""
+
+    text = _normalize_omnivoice_selected_text(str(row.get("text") or ""))
+    if not text:
+        return True
+    duration_sec = max(0.0, float(row.get("end", 0.0) or 0.0) - float(row.get("start", 0.0) or 0.0))
+    compact_len = len(re.sub(r"\s+", "", text))
+    if duration_sec <= 0.4:
+        return True
+    if compact_len <= 8 and not is_sentence_end(text):
+        return True
+    if not is_sentence_end(text) and (ends_with_connector(text) or starts_with_connector(text)):
+        return True
+    return False
+
+
+def _merge_selected_fragment_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    max_gap_sec: float = 0.35,
+) -> List[Dict[str, Any]]:
+    """把同 speaker 的短残句回并，减少“半句断裂”字幕。"""
+
+    if len(rows) <= 1:
+        return [dict(item) for item in rows]
+
+    merged: List[Dict[str, Any]] = []
+    for raw_row in rows:
+        current = {
+            "start": float(raw_row.get("start", 0.0) or 0.0),
+            "end": float(raw_row.get("end", 0.0) or 0.0),
+            "text": _normalize_omnivoice_selected_text(str(raw_row.get("text") or "")),
+            "speaker_id": str(raw_row.get("speaker_id") or "").strip(),
+        }
+        if not current["text"] or current["end"] <= current["start"]:
+            continue
+
+        if not merged:
+            merged.append(current)
+            continue
+
+        prev = merged[-1]
+        same_speaker = str(prev.get("speaker_id") or "").strip() == str(current.get("speaker_id") or "").strip()
+        gap_sec = float(current["start"]) - float(prev["end"])
+        if not same_speaker or gap_sec > max_gap_sec:
+            merged.append(current)
+            continue
+
+        merged_duration = float(current["end"]) - float(prev["start"])
+        should_merge = (
+            _is_selected_fragment_row(prev)
+            or _is_selected_fragment_row(current)
+            or ends_with_connector(str(prev.get("text") or ""))
+            or starts_with_connector(str(current.get("text") or ""))
+        )
+        if should_merge and merged_duration <= (OMNIVOICE_SELECTED_MAX_SEG_SEC + 0.5):
+            merged[-1] = _merge_two_subtitle_rows(prev, current)
+            merged[-1]["text"] = _normalize_omnivoice_selected_text(str(merged[-1].get("text") or ""))
+            continue
+        merged.append(current)
+    return merged
+
+
 def _drop_empty_subtitle_rows(
     rows: List[Dict[str, Any]],
     *,
@@ -234,6 +865,490 @@ def _drop_empty_subtitle_rows(
     if dropped > 0:
         logger.warning("OmniVoice dropped %d empty %s rows before synthesis", dropped, label)
     return filtered
+
+
+def _optimize_omnivoice_source_rows(source_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """仅在 5 号 OmniVoice source 字幕链路做导入优化，避免影响其他入口。"""
+
+    if not source_rows:
+        return []
+    optimized = optimize_srt_import_subtitles(
+        source_rows,
+        speaker_mode="auto",
+        enforce_merge_duration_guard=True,
+    )
+    return _ensure_speaker_ids(optimized, fallback_rows=source_rows)
+
+
+def _optimize_omnivoice_selected_rows(selected_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """仅在 5 号 OmniVoice 最终选中字链路做防长时窗优化，不影响其他面板。
+
+    约束：
+    - 这里强制按 multi-speaker 规则执行句块优化，避免 auto 在 speaker 缺失/错填时退化成 single，
+      进而吞掉 speaker 边界，导致后续配音映射错位。
+    """
+
+    if not selected_rows:
+        return []
+    normalized_input_rows: List[Dict[str, Any]] = []
+    for row in selected_rows:
+        normalized_input_rows.append(
+            {
+                "start": float(row.get("start", 0.0) or 0.0),
+                "end": float(row.get("end", 0.0) or 0.0),
+                "text": _normalize_omnivoice_selected_text(str(row.get("text") or "")),
+                "speaker_id": str(row.get("speaker_id") or "").strip(),
+            }
+        )
+    expanded_rows: List[Dict[str, Any]] = []
+    for row in normalized_input_rows:
+        start_sec = float(row.get("start", 0.0) or 0.0)
+        end_sec = float(row.get("end", 0.0) or 0.0)
+        duration_sec = max(0.0, end_sec - start_sec)
+        if duration_sec <= OMNIVOICE_SELECTED_MAX_SEG_SEC:
+            expanded_rows.append(dict(row))
+            continue
+        normalized_text = _normalize_final_srt_text(str(row.get("text") or ""))
+        if not normalized_text:
+            expanded_rows.append(dict(row))
+            continue
+        segments = _wrap_final_srt_text_segments(
+            normalized_text,
+            max_chars=OMNIVOICE_SELECTED_SPLIT_MAX_CHARS,
+        )
+        if len(segments) <= 1:
+            expanded_rows.append(dict(row))
+            continue
+        spans = _estimate_final_srt_time_spans(start_sec, end_sec, segments)
+        if len(spans) != len(segments):
+            expanded_rows.append(dict(row))
+            continue
+        for (split_start, split_end), split_text in zip(spans, segments):
+            if not split_text or split_end <= split_start:
+                continue
+            expanded_rows.append(
+                {
+                    "start": split_start,
+                    "end": split_end,
+                    "text": split_text,
+                    "speaker_id": str(row.get("speaker_id") or "").strip(),
+                }
+            )
+    optimized = optimize_srt_import_subtitles(
+        expanded_rows,
+        speaker_mode="multi",
+        enforce_merge_duration_guard=True,
+    )
+    optimized = _ensure_speaker_ids(
+        optimized,
+        fallback_rows=expanded_rows,
+        force_align_by_time=True,
+    )
+
+    final_rows: List[Dict[str, Any]] = []
+    for row in optimized:
+        start_sec = float(row.get("start", 0.0) or 0.0)
+        end_sec = float(row.get("end", 0.0) or 0.0)
+        duration_sec = max(0.0, end_sec - start_sec)
+        text = str(row.get("text") or "").strip()
+        speaker_id = str(row.get("speaker_id") or "").strip()
+        if not text or duration_sec <= OMNIVOICE_SELECTED_MAX_SEG_SEC:
+            if text and end_sec > start_sec:
+                final_rows.append(
+                    {
+                        "start": start_sec,
+                        "end": end_sec,
+                        "text": text,
+                        "speaker_id": speaker_id,
+                    }
+                )
+            continue
+        piece_count = max(2, int(np.ceil(duration_sec / OMNIVOICE_SELECTED_MAX_SEG_SEC)))
+        segments = _split_long_final_segment(text, max_chars=max(6, int(np.ceil(len(text) / piece_count))))
+        spans = _estimate_final_srt_time_spans(start_sec, end_sec, segments)
+        if len(segments) != len(spans):
+            final_rows.append(
+                {
+                    "start": start_sec,
+                    "end": end_sec,
+                    "text": text,
+                    "speaker_id": speaker_id,
+                }
+            )
+            continue
+        for (seg_start, seg_end), seg_text in zip(spans, segments):
+            cleaned = str(seg_text or "").strip()
+            if not cleaned or seg_end <= seg_start:
+                continue
+            final_rows.append(
+                {
+                    "start": float(seg_start),
+                    "end": float(seg_end),
+                    "text": cleaned,
+                    "speaker_id": speaker_id,
+                }
+            )
+
+    repaired_rows = [dict(item) for item in final_rows]
+    for index in range(len(repaired_rows) - 1):
+        current = repaired_rows[index]
+        nxt = repaired_rows[index + 1]
+        if str(current.get("speaker_id") or "").strip() != str(nxt.get("speaker_id") or "").strip():
+            continue
+        gap_sec = float(nxt["start"]) - float(current["end"])
+        if gap_sec > 0.3:
+            continue
+        current_duration = max(0.05, float(current["end"]) - float(current["start"]))
+        if current_duration <= OMNIVOICE_SELECTED_MAX_SEG_SEC:
+            continue
+        current_text = str(current.get("text") or "").strip()
+        next_text = str(nxt.get("text") or "").strip()
+        if not current_text or not next_text:
+            continue
+        cjk_mode = infer_cjk_mode_from_lines([current_text, next_text])
+        current_units = max(1, subtitle_text_units(current_text, cjk_mode=cjk_mode))
+        next_units = max(1, subtitle_text_units(next_text, cjk_mode=cjk_mode))
+        if current_units > 2:
+            continue
+        window_start = float(current["start"])
+        window_end = float(nxt["end"])
+        total_duration = max(0.1, window_end - window_start)
+        target_current = total_duration * (current_units / float(current_units + next_units))
+        target_current = max(0.25, min(2.0, target_current))
+        target_current = min(target_current, total_duration - 0.25)
+        current["end"] = round(window_start + target_current, 3)
+        nxt["start"] = current["end"]
+        nxt["end"] = round(window_end, 3)
+
+    capped_rows: List[Dict[str, Any]] = []
+    for row in repaired_rows:
+        start_sec = float(row.get("start", 0.0) or 0.0)
+        end_sec = float(row.get("end", 0.0) or 0.0)
+        duration_sec = max(0.0, end_sec - start_sec)
+        text = str(row.get("text") or "").strip()
+        speaker_id = str(row.get("speaker_id") or "").strip()
+        if not text or end_sec <= start_sec:
+            continue
+        if duration_sec <= OMNIVOICE_SELECTED_MAX_SEG_SEC:
+            capped_rows.append(
+                {
+                    "start": start_sec,
+                    "end": end_sec,
+                    "text": text,
+                    "speaker_id": speaker_id,
+                }
+            )
+            continue
+        piece_count = max(2, int(np.ceil(duration_sec / OMNIVOICE_SELECTED_MAX_SEG_SEC)))
+        segments = _split_long_final_segment(
+            text,
+            max_chars=max(6, int(np.ceil(len(text) / piece_count))),
+        )
+        if len(segments) <= 1:
+            midpoint = max(1, len(text) // 2)
+            segments = [text[:midpoint].strip(), text[midpoint:].strip()]
+            segments = [segment for segment in segments if segment]
+        spans = _estimate_final_srt_time_spans(start_sec, end_sec, segments)
+        if len(spans) != len(segments):
+            capped_rows.append(
+                {
+                    "start": start_sec,
+                    "end": end_sec,
+                    "text": text,
+                    "speaker_id": speaker_id,
+                }
+            )
+            continue
+        for (seg_start, seg_end), seg_text in zip(spans, segments):
+            cleaned = str(seg_text or "").strip()
+            if not cleaned or seg_end <= seg_start:
+                continue
+            capped_rows.append(
+                {
+                    "start": float(seg_start),
+                    "end": float(seg_end),
+                    "text": cleaned,
+                    "speaker_id": speaker_id,
+                }
+            )
+
+    return _smooth_selected_rows_for_cps(capped_rows)
+
+
+def _rebalance_omnivoice_synthesis_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    min_cps: float = OMNIVOICE_SYNTH_MIN_CPS,
+    max_cps: float = OMNIVOICE_SYNTH_MAX_CPS,
+    max_pair_gap_sec: float = OMNIVOICE_SYNTH_PAIR_MAX_GAP_SEC,
+    min_seg_sec: float = OMNIVOICE_SYNTH_MIN_SEG_SEC,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """在合成前修正极端“文本-时长失配”的相邻字幕对，减少无效长音/截断。"""
+
+    if len(rows) <= 1:
+        return [dict(item) for item in rows], 0
+
+    normalized: List[Dict[str, Any]] = []
+    for row in rows:
+        normalized.append(
+            {
+                "start": float(row.get("start", 0.0) or 0.0),
+                "end": float(row.get("end", 0.0) or 0.0),
+                "text": str(row.get("text") or "").strip(),
+                "speaker_id": str(row.get("speaker_id") or "").strip(),
+            }
+        )
+
+    adjusted_pairs = 0
+    for index in range(len(normalized) - 1):
+        current = normalized[index]
+        nxt = normalized[index + 1]
+        if not current["text"] or not nxt["text"]:
+            continue
+        if current["speaker_id"] != nxt["speaker_id"]:
+            continue
+
+        gap = float(nxt["start"]) - float(current["end"])
+        if gap > max_pair_gap_sec:
+            continue
+
+        current_duration = max(0.05, float(current["end"]) - float(current["start"]))
+        next_duration = max(0.05, float(nxt["end"]) - float(nxt["start"]))
+        cjk_mode = infer_cjk_mode_from_lines([current["text"], nxt["text"]])
+        current_units = max(1, subtitle_text_units(current["text"], cjk_mode=cjk_mode))
+        next_units = max(1, subtitle_text_units(nxt["text"], cjk_mode=cjk_mode))
+        current_cps = current_units / current_duration
+        next_cps = next_units / next_duration
+
+        is_extreme_pair = (
+            (current_cps < min_cps and next_cps > max_cps)
+            or (current_cps > max_cps and next_cps < min_cps)
+        )
+        if not is_extreme_pair:
+            continue
+
+        window_start = float(current["start"])
+        window_end = max(float(current["end"]), float(nxt["end"]))
+        total_duration = window_end - window_start
+        if total_duration < min_seg_sec * 2:
+            continue
+
+        total_units = current_units + next_units
+        target_current = total_duration * (current_units / float(total_units))
+        target_current = max(min_seg_sec, min(total_duration - min_seg_sec, target_current))
+        target_next = total_duration - target_current
+        if target_next < min_seg_sec:
+            continue
+
+        current["start"] = window_start
+        current["end"] = round(window_start + target_current, 3)
+        nxt["start"] = current["end"]
+        nxt["end"] = round(window_end, 3)
+        adjusted_pairs += 1
+
+    return normalized, adjusted_pairs
+
+
+def _normalize_final_srt_text(text: str) -> str:
+    """把结果字幕正文清洗成单行，避免内部换行干扰后续切分。"""
+
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    return re.sub(r"\s+", " ", normalized)
+
+
+def _build_selected_subtitles_with_speaker_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """构建带 speaker 前缀的字幕副本行，用于人工 review。"""
+
+    output: List[Dict[str, Any]] = []
+    for row in rows:
+        text = str(row.get("text") or "").strip()
+        if not text:
+            continue
+        speaker_id = str(row.get("speaker_id") or "").strip() or "Speaker 1"
+        output.append(
+            {
+                "start": float(row.get("start", 0.0) or 0.0),
+                "end": float(row.get("end", 0.0) or 0.0),
+                "text": f"[{speaker_id}] {text}",
+                "speaker_id": speaker_id,
+            }
+        )
+    return output
+
+
+def _split_by_regex_with_left_punct(text: str, pattern: re.Pattern[str]) -> List[str]:
+    """按给定标点边界切分文本，并把标点保留在左侧片段。"""
+
+    tokens = pattern.split(text)
+    parts: List[str] = []
+    current = ""
+    for token in tokens:
+        if not token:
+            continue
+        if pattern.fullmatch(token):
+            current += token
+            if current.strip():
+                parts.append(current.strip())
+            current = ""
+        else:
+            current += token
+    if current.strip():
+        parts.append(current.strip())
+    return parts
+
+
+def _is_ascii_word_char(ch: str) -> bool:
+    """判断字符是否属于英文/数字单词，避免把单词从中间硬切开。"""
+
+    return ch.isascii() and ch.isalnum()
+
+
+def _split_long_final_segment(text: str, *, max_chars: int, min_piece_chars: int = 6) -> List[str]:
+    """把仍然超长的片段切到上限以内，优先自然边界，再回退字符边界。"""
+
+    remaining = text.strip()
+    pieces: List[str] = []
+    break_chars = set("，。！？；：、,.;:!?…")
+    while len(remaining) > max_chars:
+        total_chars = len(remaining)
+        target_cut = min(max_chars, max(min_piece_chars, round(total_chars / 2)))
+        lower_bound = max(min_piece_chars, total_chars - max_chars)
+        upper_bound = min(max_chars, total_chars - min_piece_chars) if total_chars - min_piece_chars >= lower_bound else max_chars
+        best_cut: Optional[int] = None
+        best_score: Optional[int] = None
+        for cut in range(lower_bound, upper_bound + 1):
+            if cut < len(remaining) and _is_ascii_word_char(remaining[cut - 1]) and _is_ascii_word_char(remaining[cut]):
+                continue
+            last_char = remaining[cut - 1]
+            if last_char in break_chars:
+                boundary_kind = 0
+            elif last_char.isspace():
+                boundary_kind = 1
+            else:
+                boundary_kind = 2
+            remainder_chars = total_chars - cut
+            score = (boundary_kind * 1000) + abs(cut - target_cut) * 10 + max(0, min_piece_chars - remainder_chars) * 200
+            if best_score is None or score < best_score:
+                best_score = score
+                best_cut = cut
+        if best_cut is None:
+            best_cut = target_cut
+            while (
+                best_cut < len(remaining)
+                and _is_ascii_word_char(remaining[best_cut - 1])
+                and _is_ascii_word_char(remaining[best_cut])
+            ):
+                best_cut += 1
+            if best_cut > max_chars:
+                best_cut = max_chars
+                while (
+                    best_cut > min_piece_chars
+                    and _is_ascii_word_char(remaining[best_cut - 1])
+                    and _is_ascii_word_char(remaining[best_cut])
+                ):
+                    best_cut -= 1
+        next_piece = remaining[:best_cut].strip()
+        if next_piece:
+            pieces.append(next_piece)
+        remaining = remaining[best_cut:].lstrip()
+    if remaining:
+        pieces.append(remaining)
+    return pieces
+
+
+def _wrap_final_srt_text_segments(text: str, *, max_chars: int) -> List[str]:
+    """按“强句末 -> 软标点 -> 超长补切”的顺序把结果字幕拆成显示片段。"""
+
+    segments: List[str] = []
+    for sentence in _split_by_regex_with_left_punct(text, _OMNIVOICE_STRONG_BREAK_RE):
+        if len(sentence) <= max_chars:
+            segments.append(sentence)
+            continue
+        for clause in _split_by_regex_with_left_punct(sentence, _OMNIVOICE_SOFT_BREAK_RE):
+            if len(clause) <= max_chars:
+                segments.append(clause)
+            else:
+                segments.extend(_split_long_final_segment(clause, max_chars=max_chars))
+    merged: List[str] = []
+    for segment in segments:
+        if merged and len(segment) <= 2 and len(merged[-1]) + len(segment) <= max_chars:
+            merged[-1] += segment
+        else:
+            merged.append(segment)
+    return merged
+
+
+def _estimate_final_srt_time_spans(start_sec: float, end_sec: float, segments: List[str]) -> List[Tuple[float, float]]:
+    """按文本负载把原 cue 时长分配给拆分后的多个片段。"""
+
+    if not segments:
+        return []
+    if len(segments) == 1:
+        return [(float(start_sec), float(end_sec))]
+
+    total_duration_sec = max(0.05, float(end_sec) - float(start_sec))
+    weights = [max(1, len(re.sub(r"\s+", "", segment))) for segment in segments]
+    total_weight = max(1, sum(weights))
+    min_piece_duration = 0.25
+    if total_duration_sec < min_piece_duration * len(segments):
+        step = total_duration_sec / len(segments)
+        return [
+            (float(start_sec) + index * step, float(start_sec) + (index + 1) * step)
+            for index in range(len(segments))
+        ]
+
+    spans: List[Tuple[float, float]] = []
+    cursor = float(start_sec)
+    consumed_weight = 0
+    for index, weight in enumerate(weights):
+        consumed_weight += weight
+        if index == len(weights) - 1:
+            segment_end = float(end_sec)
+        else:
+            target_end = float(start_sec) + total_duration_sec * (consumed_weight / float(total_weight))
+            remaining_slots = len(weights) - index - 1
+            max_end = float(end_sec) - min_piece_duration * remaining_slots
+            segment_end = max(cursor + min_piece_duration, min(max_end, target_end))
+        spans.append((cursor, segment_end))
+        cursor = segment_end
+    return spans
+
+
+def _rebalance_omnivoice_final_srt_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    max_chars: int = OMNIVOICE_FINAL_SRT_MAX_CHARS,
+) -> List[Dict[str, Any]]:
+    """重构 OmniVoice 结果字幕：每行限长并重估时间戳，仅用于最终结果落盘。"""
+
+    rebalanced: List[Dict[str, Any]] = []
+    for row in rows:
+        text = _normalize_final_srt_text(str(row.get("text") or ""))
+        if not text:
+            continue
+        start_sec = float(row.get("start", 0.0) or 0.0)
+        end_sec = float(row.get("end", 0.0) or 0.0)
+        if end_sec <= start_sec:
+            continue
+        segments = _wrap_final_srt_text_segments(text, max_chars=max_chars)
+        spans = _estimate_final_srt_time_spans(start_sec, end_sec, segments)
+        if len(spans) != len(segments):
+            total_duration_sec = max(0.05, end_sec - start_sec)
+            step = total_duration_sec / max(1, len(segments))
+            spans = [
+                (start_sec + index * step, start_sec + (index + 1) * step)
+                for index in range(len(segments))
+            ]
+        for (segment_start, segment_end), segment_text in zip(spans, segments):
+            rebalanced.append(
+                {
+                    "start": round(float(segment_start), 3),
+                    "end": round(float(segment_end), 3),
+                    "text": segment_text,
+                    "speaker_id": str(row.get("speaker_id") or "").strip(),
+                }
+            )
+    return rebalanced
 
 
 def _pick_reference_slices(items: List[Tuple[int, Dict[str, Any]]]) -> List[Tuple[int, Dict[str, Any]]]:
@@ -393,6 +1508,49 @@ def _build_speaker_reference_map(
         }
 
     return references
+
+
+def _infer_missing_speaker_gender_hints(
+    *,
+    vocals_path: Path,
+    subtitles: List[Dict[str, Any]],
+    missing_speaker_ids: List[str],
+    out_root: Path,
+) -> Dict[str, str]:
+    """从原音频中抽取缺失 speaker 的片段，粗判男/女用于挑选预存参考音。"""
+
+    if not missing_speaker_ids:
+        return {}
+    grouped: Dict[str, List[Tuple[int, Dict[str, Any]]]] = {}
+    for index, subtitle in enumerate(subtitles):
+        speaker_id = str(subtitle.get("speaker_id") or "").strip() or "Speaker 1"
+        if speaker_id in missing_speaker_ids:
+            grouped.setdefault(speaker_id, []).append((index, subtitle))
+    if not grouped:
+        return {}
+
+    probe_root = out_root / "speaker_gender_probe"
+    hints: Dict[str, str] = {}
+    for speaker_id in missing_speaker_ids:
+        items = grouped.get(speaker_id) or []
+        if not items:
+            continue
+        picked = _pick_reference_slices(items)
+        speaker_probe_dir = probe_root / _safe_speaker_name(speaker_id)
+        try:
+            probe_path, _ = _concat_reference_slices(
+                vocals_path=vocals_path,
+                picked=picked,
+                out_dir=speaker_probe_dir,
+                speaker_id=speaker_id,
+            )
+            label = _infer_voice_gender_label(probe_path, use_path_hint=False)
+            if label in {"male", "female"}:
+                hints[speaker_id] = label
+        except Exception as exc:
+            logger.warning("OmniVoice gender hint probe failed for %s: %s", speaker_id, exc)
+            continue
+    return hints
 
 
 def _build_generation_ref_text(ref_meta: Dict[str, Any]) -> str:
@@ -686,9 +1844,105 @@ def _translate_subtitles_if_needed(
         target_lang=target_lang,
         system_prompt=build_translation_system_prompt(translate_system_prompt),
     )
+    if _target_prefers_cjk_text(target_lang):
+        retry_indices = [
+            index
+            for index, text in enumerate(translated_texts)
+            if _is_latin_dominant_text(str(text or ""))
+        ]
+        if retry_indices:
+            retry_inputs = [texts[index] for index in retry_indices]
+            try:
+                retry_outputs = translator.translate_batch(
+                    retry_inputs,
+                    target_lang=target_lang,
+                    system_prompt=build_translation_system_prompt(translate_system_prompt),
+                )
+                if len(retry_outputs) != len(retry_inputs):
+                    logger.warning(
+                        "OmniVoice translation retry count mismatch: requested=%d returned=%d",
+                        len(retry_inputs),
+                        len(retry_outputs),
+                    )
+                    retry_outputs = []
+                replaced = 0
+                for idx, retry_text in zip(retry_indices, retry_outputs):
+                    if not _is_latin_dominant_text(str(retry_text or "")):
+                        translated_texts[idx] = str(retry_text or "").strip()
+                        replaced += 1
+                if replaced > 0:
+                    logger.warning(
+                        "OmniVoice translation retry replaced %d latin-dominant rows",
+                        replaced,
+                    )
+            except Exception as exc:
+                logger.warning("OmniVoice translation retry failed: %s", exc)
     translated_rows = _normalize_translation_result(selected_rows, translated_texts)
     translated_rows = _ensure_speaker_ids(translated_rows, fallback_rows=source_rows)
-    translated_rows = _drop_empty_subtitle_rows(translated_rows, label="translated")
+    # 5 号链路最小兜底：翻译空行不再删除，直接回退对应 source 文本，保证 1:1 行数不缩水。
+    repaired_rows: List[Dict[str, Any]] = []
+    fallback_count = 0
+    for index, row in enumerate(translated_rows):
+        text = str(row.get("text") or "").strip()
+        if not text and index < len(selected_rows):
+            text = str(selected_rows[index].get("text") or "").strip()
+            if text:
+                fallback_count += 1
+        repaired_rows.append(
+            {
+                "start": float(row.get("start", 0.0) or 0.0),
+                "end": float(row.get("end", 0.0) or 0.0),
+                "text": text,
+                "speaker_id": str(row.get("speaker_id") or "").strip(),
+            }
+        )
+    if fallback_count > 0:
+        logger.warning(
+            "OmniVoice translation fallback restored %d empty rows using source text",
+            fallback_count,
+        )
+    # 5 号链路最小修复：空译文回退 source 后，仍可能残留英文主导文本。
+    # 这里仅对回退结果再做一次定向重译，避免英文原文直接写入 selected_subtitles.srt。
+    if _target_prefers_cjk_text(target_lang):
+        repaired_retry_indices = [
+            index
+            for index, row in enumerate(repaired_rows)
+            if _is_latin_dominant_text(str(row.get("text") or ""))
+        ]
+        if repaired_retry_indices:
+            repaired_retry_inputs = [texts[index] for index in repaired_retry_indices]
+            strict_prompt = (
+                f"{build_translation_system_prompt(translate_system_prompt)}\n"
+                "硬性要求：输出必须是中文，不要保留整句英文；专有名词请用中文或中文括注。"
+            )
+            try:
+                repaired_retry_outputs = translator.translate_batch(
+                    repaired_retry_inputs,
+                    target_lang=target_lang,
+                    system_prompt=strict_prompt,
+                    system_prompt_is_final=True,
+                )
+                if len(repaired_retry_outputs) != len(repaired_retry_inputs):
+                    logger.warning(
+                        "OmniVoice repaired-row retry count mismatch: requested=%d returned=%d",
+                        len(repaired_retry_inputs),
+                        len(repaired_retry_outputs),
+                    )
+                    repaired_retry_outputs = []
+                repaired_replaced = 0
+                for idx, retry_text in zip(repaired_retry_indices, repaired_retry_outputs):
+                    normalized_retry_text = str(retry_text or "").strip()
+                    if normalized_retry_text and not _is_latin_dominant_text(normalized_retry_text):
+                        repaired_rows[idx]["text"] = normalized_retry_text
+                        repaired_replaced += 1
+                if repaired_replaced > 0:
+                    logger.warning(
+                        "OmniVoice repaired-row retry replaced %d latin-dominant rows",
+                        repaired_replaced,
+                    )
+            except Exception as exc:
+                logger.warning("OmniVoice repaired-row retry failed: %s", exc)
+    translated_rows = _drop_empty_subtitle_rows(repaired_rows, label="translated")
     if not translated_rows:
         raise HTTPException(status_code=400, detail="OmniVoice translation produced no usable subtitle rows")
     logger.info("OmniVoice task %s translated %d subtitles from source mode", task_id, len(translated_rows))
@@ -807,6 +2061,7 @@ def _build_manifest(
     separation_report_path: Path,
     speaker_reference_dir: Path,
     subtitles_path: Path,
+    subtitles_with_speaker_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """写入独立 OmniVoice manifest，供恢复与 artifact 下载使用。"""
 
@@ -817,6 +2072,11 @@ def _build_manifest(
         "speaker_ref_map": str(speaker_ref_map_path.resolve()) if speaker_ref_map_path.exists() else None,
         "speaker_reference_dir": str(speaker_reference_dir.resolve()) if speaker_reference_dir.exists() else None,
         "selected_subtitles": str(subtitles_path.resolve()) if subtitles_path.exists() else None,
+        "selected_subtitles_with_speakers": (
+            str(subtitles_with_speaker_path.resolve())
+            if subtitles_with_speaker_path and subtitles_with_speaker_path.exists()
+            else None
+        ),
         "dubbed_final_srt": str(final_srt_path.resolve()) if final_srt_path.exists() else None,
         "dubbed_vocals": str(final_vocals_path.resolve()) if final_vocals_path.exists() else None,
         "dubbed_mix": str(final_mix_path.resolve()) if final_mix_path.exists() else None,
@@ -892,6 +2152,8 @@ def _artifact_path_from_task(task: Dict[str, Any], artifact: str) -> Optional[Pa
     out_root = manifest_path.parent if manifest_path.exists() else _resolve_output_dir(str(task.get("batch_id") or task.get("id") or ""))
     paths = {
         "srt": out_root / "final" / "dubbed_final_full.srt",
+        "selected_srt": out_root / "selected_subtitles.srt",
+        "selected_srt_with_speaker": out_root / "selected_subtitles_with_speakers.srt",
         "vocals": out_root / "final" / "dubbed_vocals_full.wav",
         "mix": out_root / "final" / "dubbed_mix_full.wav",
         "video": out_root / "final" / "dubbed_video_full.mp4",
@@ -1062,7 +2324,7 @@ def _run_omnivoice_job(
 
     selected_subtitles, selected_mode = _translate_subtitles_if_needed(
         subtitles_mode=subtitle_mode,
-        source_rows=source_subtitles,
+        source_rows=_optimize_omnivoice_source_rows(source_subtitles),
         translated_rows=translated_subtitles,
         target_lang=target_lang,
         api_key=api_key,
@@ -1071,11 +2333,29 @@ def _run_omnivoice_job(
         translate_system_prompt=translate_system_prompt,
         task_id=task_id,
     )
-    selected_subtitles = _ensure_speaker_ids(selected_subtitles, fallback_rows=source_subtitles)
+    selected_subtitles = _optimize_omnivoice_selected_rows(selected_subtitles)
+    selected_subtitles = _ensure_speaker_ids(
+        selected_subtitles,
+        fallback_rows=source_subtitles,
+        force_align_by_time=True,
+    )
     selected_subtitles = _drop_empty_subtitle_rows(selected_subtitles, label="selected")
+    selected_subtitles, adjusted_pairs = _rebalance_omnivoice_synthesis_rows(selected_subtitles)
+    if adjusted_pairs > 0:
+        logger.warning(
+            "OmniVoice task %s rebalanced %d extreme subtitle timing pairs before synthesis",
+            task_id,
+            adjusted_pairs,
+        )
     source_reference_subtitles = _ensure_speaker_ids(source_subtitles, fallback_rows=selected_subtitles)
     selected_subtitles_path = out_root / "selected_subtitles.srt"
     selected_subtitles_path.write_text(format_srt(selected_subtitles), encoding="utf-8")
+    selected_subtitles_with_speaker_path = out_root / "selected_subtitles_with_speakers.srt"
+    selected_subtitles_with_speaker_rows = _build_selected_subtitles_with_speaker_rows(selected_subtitles)
+    selected_subtitles_with_speaker_path.write_text(
+        format_srt(selected_subtitles_with_speaker_rows),
+        encoding="utf-8",
+    )
 
     if not selected_subtitles:
         raise RuntimeError("No usable subtitles for OmniVoice dubbing")
@@ -1087,7 +2367,7 @@ def _run_omnivoice_job(
         }
     )
 
-    # speaker 参考音优先使用用户上传的 strict 映射；未提供时才回退自动聚合。
+    # speaker 参考音优先使用用户上传映射；缺失 speaker 自动从预存目录补齐。
     _set_task(task_id, stage="dubbing:preparing_refs", progress=12.0)
     reference_mode = "auto_aggregate"
     if uploaded_speaker_ref_map:
@@ -1096,16 +2376,34 @@ def _run_omnivoice_job(
             for speaker_id in detected_speaker_ids
             if speaker_id not in uploaded_speaker_ref_map
         ]
-        if missing_speakers:
-            raise RuntimeError(
-                "OmniVoice strict speaker mapping missing uploaded references for: "
-                + ", ".join(missing_speakers)
-            )
         speaker_ref_map = {
             speaker_id: dict(uploaded_speaker_ref_map[speaker_id])
             for speaker_id in detected_speaker_ids
+            if speaker_id in uploaded_speaker_ref_map
         }
-        reference_mode = "uploaded_strict"
+        if missing_speakers:
+            uploaded_source_filenames = [
+                Path(str(meta.get("upload_filename") or meta.get("source_path") or meta.get("ref_audio") or "")).name
+                for meta in uploaded_speaker_ref_map.values()
+                if str(meta.get("upload_filename") or meta.get("source_path") or meta.get("ref_audio") or "").strip()
+            ]
+            speaker_gender_hints = _infer_missing_speaker_gender_hints(
+                vocals_path=source_vocals_path,
+                subtitles=selected_subtitles,
+                missing_speaker_ids=missing_speakers,
+                out_root=out_root,
+            )
+            preset_map = _pick_preset_ref_voices_for_missing_speakers(
+                missing_speaker_ids=missing_speakers,
+                target_lang=target_lang,
+                out_root=out_root,
+                speaker_gender_hints=speaker_gender_hints,
+                excluded_source_filenames=uploaded_source_filenames,
+            )
+            speaker_ref_map.update(preset_map)
+            reference_mode = "uploaded_mixed"
+        else:
+            reference_mode = "uploaded_strict"
     else:
         speaker_ref_map = _build_speaker_reference_map(
             vocals_path=source_vocals_path,
@@ -1224,7 +2522,8 @@ def _run_omnivoice_job(
         shutil.copy2(final_vocals_path, final_mix_path)
 
     final_srt_path = final_dir / "dubbed_final_full.srt"
-    final_srt_path.write_text(format_srt(selected_subtitles), encoding="utf-8")
+    final_srt_rows = _rebalance_omnivoice_final_srt_rows(selected_subtitles)
+    final_srt_path.write_text(format_srt(final_srt_rows), encoding="utf-8")
 
     final_video_path: Optional[Path] = None
     prepared_audio_path: Optional[Path] = None
@@ -1275,6 +2574,7 @@ def _run_omnivoice_job(
         separation_report_path=separation_report_path,
         speaker_reference_dir=speaker_root,
         subtitles_path=selected_subtitles_path,
+        subtitles_with_speaker_path=selected_subtitles_with_speaker_path,
     )
     task["artifacts"] = list(manifest.get("artifacts") or [])
     task["batch_manifest_path"] = str((out_root / "manifest.json").resolve())
@@ -1325,6 +2625,7 @@ async def start_omnivoice_from_project(
     translate_model: str = Form(DEFAULT_TRANSLATE_MODEL),
     translate_system_prompt: str = Form(""),
     omnivoice_api_url: str = Form(DEFAULT_OMNIVOICE_API_URL),
+    prepared_batch_id: str = Form(""),
 ) -> Dict[str, Any]:
     """基于当前项目上下文启动独立 OmniVoice dubbing 任务。"""
 
@@ -1344,13 +2645,34 @@ async def start_omnivoice_from_project(
     if not source_rows and not translated_rows:
         raise HTTPException(status_code=400, detail="OmniVoice requires project subtitles")
 
-    resolved_task_id = _build_readable_task_id()
+    prepared_batch_id = str(prepared_batch_id or "").strip()
+    reuse_prepared_batch = False
+    if prepared_batch_id:
+        prepared_manifest = _load_manifest(prepared_batch_id)
+        if prepared_manifest is None:
+            raise HTTPException(status_code=400, detail=f"Prepared batch not found: {prepared_batch_id}")
+        selected_path = Path(str((prepared_manifest.get("paths") or {}).get("selected_subtitles") or "")).expanduser()
+        if not selected_path.exists():
+            raise HTTPException(status_code=400, detail=f"Prepared selected_subtitles.srt missing: {selected_path}")
+        selected_items = parse_srt(selected_path.read_text(encoding="utf-8"))
+        if not selected_items:
+            raise HTTPException(status_code=400, detail=f"Prepared selected_subtitles.srt is empty: {selected_path}")
+        translated_rows = _ensure_speaker_ids(
+            selected_items,
+            fallback_rows=source_rows,
+            force_align_by_time=True,
+        )
+        subtitle_mode = "translated"
+        reuse_prepared_batch = True
+
+    resolved_task_id = prepared_batch_id if reuse_prepared_batch else _build_readable_task_id()
     out_root = _resolve_output_dir(resolved_task_id)
     out_root.mkdir(parents=True, exist_ok=True)
 
     selected_rows_for_preview = _ensure_speaker_ids(
         translated_rows if translated_rows else source_rows,
         fallback_rows=source_rows,
+        force_align_by_time=True,
     )
     speaker_ids = sorted(
         {
@@ -1368,12 +2690,6 @@ async def start_omnivoice_from_project(
             raise HTTPException(status_code=400, detail="speaker_ref_speaker_ids_json must be a list")
         if len(speaker_ids_payload) != len(speaker_ref_files):
             raise HTTPException(status_code=400, detail="speaker_ref_speaker_ids_json count must match speaker_ref_files")
-        missing_uploads = [speaker_id for speaker_id in speaker_ids if speaker_id not in {str(item or '').strip() for item in speaker_ids_payload}]
-        if missing_uploads:
-            raise HTTPException(
-                status_code=400,
-                detail="OmniVoice strict speaker mapping missing uploaded references for: " + ", ".join(missing_uploads),
-            )
         uploaded_ref_dir = out_root / "uploaded_speaker_refs"
         uploaded_ref_dir.mkdir(parents=True, exist_ok=True)
         for speaker_id, ref_file in zip(speaker_ids_payload, speaker_ref_files):
@@ -1394,14 +2710,9 @@ async def start_omnivoice_from_project(
                 "ref_text": UPLOADED_SPEAKER_REF_TEXT,
                 "duration": round(float(sf.info(stored_path).duration), 3),
                 "source_count": 1,
-                "reference_mode": "uploaded_strict",
+                "reference_mode": "uploaded_partial",
+                "upload_filename": Path(str(ref_file.filename or "")).name,
             }
-        unresolved = [speaker_id for speaker_id in speaker_ids if speaker_id not in uploaded_speaker_ref_map]
-        if unresolved:
-            raise HTTPException(
-                status_code=400,
-                detail="OmniVoice strict speaker mapping missing valid audio files for: " + ", ".join(unresolved),
-            )
 
     task = _create_task_payload(
         task_id=resolved_task_id,
@@ -1449,6 +2760,134 @@ async def start_omnivoice_from_project(
         "stage": "queued",
         "project_filename": display_name,
         "message": "OmniVoice task started",
+    }
+
+
+@router.post("/prepare-subtitles-from-project")
+async def prepare_omnivoice_subtitles_from_project(
+    filename: str = Form(""),
+    original_filename: str = Form(""),
+    task_id: str = Form(""),
+    source_subtitles_json: str = Form(""),
+    translated_subtitles_json: str = Form(""),
+    subtitle_mode: str = Form("auto"),
+    source_lang: str = Form("auto"),
+    target_lang: str = Form("Chinese"),
+    api_key: str = Form(""),
+    translate_base_url: str = Form(DEFAULT_TRANSLATE_BASE_URL),
+    translate_model: str = Form(DEFAULT_TRANSLATE_MODEL),
+    translate_system_prompt: str = Form(""),
+) -> Dict[str, Any]:
+    """仅生成并落盘 selected_subtitles.srt，供人工 review 后再启动配音。"""
+
+    source_media_path = _resolve_project_media_path(filename, task_id)
+    display_name = _sanitize_filename(original_filename or source_media_path.name)
+    source_rows = _normalize_subtitles_payload(source_subtitles_json, field_name="source_subtitles_json")
+    translated_rows = _normalize_subtitles_payload(translated_subtitles_json, field_name="translated_subtitles_json")
+    if not source_rows and not translated_rows:
+        raise HTTPException(status_code=400, detail="OmniVoice requires project subtitles")
+
+    resolved_task_id = _build_readable_task_id()
+    out_root = _resolve_output_dir(resolved_task_id)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    selected_subtitles, selected_mode = _translate_subtitles_if_needed(
+        subtitles_mode=subtitle_mode,
+        source_rows=_optimize_omnivoice_source_rows(source_rows),
+        translated_rows=translated_rows,
+        target_lang=target_lang,
+        api_key=api_key,
+        translate_base_url=translate_base_url,
+        translate_model=translate_model,
+        translate_system_prompt=translate_system_prompt,
+        task_id=resolved_task_id,
+    )
+    selected_subtitles = _optimize_omnivoice_selected_rows(selected_subtitles)
+    selected_subtitles = _ensure_speaker_ids(
+        selected_subtitles,
+        fallback_rows=source_rows,
+        force_align_by_time=True,
+    )
+    selected_subtitles = _drop_empty_subtitle_rows(selected_subtitles, label="selected")
+    if not selected_subtitles:
+        raise HTTPException(status_code=400, detail="OmniVoice selected subtitles are empty")
+
+    selected_subtitles_path = out_root / "selected_subtitles.srt"
+    selected_subtitles_path.write_text(format_srt(selected_subtitles), encoding="utf-8")
+    selected_subtitles_with_speaker_path = out_root / "selected_subtitles_with_speakers.srt"
+    selected_subtitles_with_speaker_rows = _build_selected_subtitles_with_speaker_rows(selected_subtitles)
+    selected_subtitles_with_speaker_path.write_text(
+        format_srt(selected_subtitles_with_speaker_rows),
+        encoding="utf-8",
+    )
+
+    task = _create_task_payload(
+        task_id=resolved_task_id,
+        project_filename=display_name,
+        input_media_path=source_media_path,
+        subtitle_mode=subtitle_mode,
+        source_lang=source_lang,
+        target_lang=target_lang,
+        source_count=len(source_rows),
+        translated_count=len(translated_rows),
+        speaker_ids=sorted({str(row.get("speaker_id") or "").strip() or "Speaker 1" for row in selected_subtitles}),
+        out_root=out_root,
+    )
+    task.update(
+        {
+            "status": "completed",
+            "stage": "prepared:selected_subtitles",
+            "progress": 100.0,
+            "selected_subtitle_mode": selected_mode,
+            "result_srt": str(selected_subtitles_path.resolve()),
+            "artifacts": [
+                {"key": "selected_srt", "label": "Selected Subtitles SRT", "url": _build_artifact_url(task["id"], "selected_srt")},
+                {"key": "selected_srt_with_speaker", "label": "Selected Subtitles SRT (With Speaker)", "url": _build_artifact_url(task["id"], "selected_srt_with_speaker")},
+                {"key": "manifest", "label": "Manifest JSON", "url": _build_artifact_url(task["id"], "manifest")},
+            ],
+            "batch_manifest_path": str((out_root / "manifest.json").resolve()),
+            "result_audio": None,
+            "speaker_reference_mode": "not_started",
+        }
+    )
+    manifest = {
+        "task_id": task["id"],
+        "batch_id": task["batch_id"],
+        "created_at": task["created_at"],
+        "updated_at": _iso_now(),
+        "status": task["status"],
+        "stage": task["stage"],
+        "progress": task["progress"],
+        "project_filename": task["project_filename"],
+        "input_media_path": task["input_media_path"],
+        "subtitle_mode": task["subtitle_mode"],
+        "source_lang": task["source_lang"],
+        "target_lang": task["target_lang"],
+        "selected_subtitle_mode": task.get("selected_subtitle_mode"),
+        "source_subtitles_count": task["source_subtitles_count"],
+        "translated_subtitles_count": task["translated_subtitles_count"],
+        "speaker_ids": task["speaker_ids"],
+        "speaker_reference_mode": task.get("speaker_reference_mode") or "not_started",
+        "paths": {
+            "selected_subtitles": str(selected_subtitles_path.resolve()),
+            "selected_subtitles_with_speakers": str(selected_subtitles_with_speaker_path.resolve()),
+            "manifest": str((out_root / "manifest.json").resolve()),
+        },
+        "artifacts": task["artifacts"],
+        "segment_count": len(selected_subtitles),
+    }
+    (out_root / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    _task_store.create(resolved_task_id, task)
+    return {
+        "task_id": resolved_task_id,
+        "short_id": resolved_task_id.split("_")[0],
+        "status": "completed",
+        "stage": "prepared:selected_subtitles",
+        "project_filename": display_name,
+        "selected_subtitle_mode": selected_mode,
+        "result_srt": str(selected_subtitles_path.resolve()),
+        "artifacts": task["artifacts"],
+        "message": "OmniVoice selected subtitles prepared",
     }
 
 
@@ -1568,7 +3007,7 @@ async def download_omnivoice_artifact(task_id: str, artifact: str):
     if path is None or not path.exists():
         raise HTTPException(status_code=404, detail="Artifact not found")
     media_type = "application/octet-stream"
-    if artifact in {"srt"}:
+    if artifact in {"srt", "selected_srt", "selected_srt_with_speaker"}:
         media_type = "application/x-subrip"
     elif artifact in {"vocals", "mix", "video_audio"}:
         media_type = "audio/wav" if artifact != "video_audio" else "audio/mp4"

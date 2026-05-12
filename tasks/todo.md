@@ -1,5 +1,107 @@
 # TODO
 
+## 73. 2026-05-10 OmniVoice SRT 极端时长错配修复（无效声音）
+- [x] 目标
+  - 修复 source SRT 导致的“短字长时窗 / 长字短时窗”异常，减少 OmniVoice 无效声音
+  - 仅改 5 号 OmniVoice 结果链路，不影响 4 号 Auto Dubbing
+- [x] 实现
+  - 在 `src/subtitle_maker/omnivoice_dub_api.py` 增加 `_rebalance_omnivoice_synthesis_rows(...)`
+  - 合成前按相邻字幕文本负载与时长密度（cps）检测极端对并重分配时间窗
+  - 仅对同 speaker、相邻时间窗口、极端失配对生效，最小化影响
+- [x] 测试
+  - 新增 `test_omnivoice_synthesis_rebalance_fixes_extreme_adjacent_timing_pairs`
+  - 保留 `test_omnivoice_final_srt_rebalance_limits_line_width_and_keeps_monotonic_timing` 回归
+- [x] 验证
+  - `uv run python -m py_compile src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py`
+  - `uv run python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_omnivoice_synthesis_rebalance_fixes_extreme_adjacent_timing_pairs tests.test_dubbing_cli_api.DubbingCliApiTests.test_omnivoice_final_srt_rebalance_limits_line_width_and_keeps_monotonic_timing`
+- [x] Review
+  - 最新 batch `omnivoice_20260510_050427` 可复现 231/232、233/234 这类极端失配；新规则可命中并修正。
+
+## 72. 2026-05-10 OmniVoice source 翻译纯标点行修复
+- [x] 目标
+  - 修复 OmniVoice source->translate 路径里偶发的“译文仅 `。`”问题
+  - 仅改翻译回填后处理，不改 speaker-first 逻辑和配音主链路
+- [x] 实现
+  - 在 `src/subtitle_maker/omnivoice_dub_api.py` 增加纯标点检测与二次翻译修复
+  - 对“源文本可读 + 译文纯标点”的行执行定向重试
+  - 若重试仍异常，回退该行 source 文本，避免 `。` 直接落盘
+- [x] 测试
+  - 新增 `test_omnivoice_translate_subtitles_repairs_punctuation_only_lines`
+  - 保留 `test_omnivoice_final_srt_rebalance_limits_line_width_and_keeps_monotonic_timing` 回归通过
+- [x] 验证
+  - `uv run python -m py_compile src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py`
+  - `uv run python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_omnivoice_translate_subtitles_repairs_punctuation_only_lines tests.test_dubbing_cli_api.DubbingCliApiTests.test_omnivoice_final_srt_rebalance_limits_line_width_and_keeps_monotonic_timing`
+  - `uv run python -m unittest tests.test_dubbing_runtime.DubbingPipelineTests.test_repair_punctuation_only_translations_inherits_merged_system_prompt tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_parse_translated_lines_merges_multiline_numbered_blocks tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_parse_translated_lines_ignores_noise_lines_without_index_shift`
+- [x] Review
+  - 根因是 OmniVoice 路由未接入 `punct-only` 翻译修复，导致 `。` 这类异常行未被兜底。
+  - 修复后 OmniVoice source 翻译会先重试，再回退 source，保证不会再把纯标点行直接写入结果字幕。
+
+## 71. 2026-05-09 OmniVoice Source 翻译回填错位修复（Speaker 优先保持不变）
+- [x] 目标
+  - 仅修复翻译输出解析/回填错位，不改 speaker-first 分层逻辑
+  - 保持 `translate_batch()` 输入输出合同不变（输入 N 条，返回 N 条）
+  - 不改 `optimize_srt_import_subtitles(...)`、`deepgram_json_to_subtitles(...)` 和 OmniVoice 配音链路
+- [x] 实现
+  - `translator._parse_translated_lines()` 改为“编号块优先解析”
+  - 同一编号下多行译文自动聚合，避免逐行追加导致后续错位
+  - 过滤编号块内常见噪声行（说明行、注释行、空行）
+  - 当未识别到编号块时，回退到旧的逐行解析策略
+- [x] 测试
+  - 新增 `test_translator_parse_translated_lines_merges_multiline_numbered_blocks`
+  - 新增 `test_translator_parse_translated_lines_ignores_noise_lines_without_index_shift`
+  - 保留并回归 `test_translator_translate_batch_flattens_internal_newlines_in_one_cue`
+- [x] 验证
+  - `uv run python -m py_compile src/subtitle_maker/translator.py tests/test_dubbing_runtime.py`
+  - `uv run python -m unittest tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_parse_translated_lines_merges_multiline_numbered_blocks`
+  - `uv run python -m unittest tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_parse_translated_lines_ignores_noise_lines_without_index_shift`
+  - `uv run python -m unittest tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_translate_batch_flattens_internal_newlines_in_one_cue`
+  - `uv run python -m unittest tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_translate_batch_merges_default_and_custom_system_prompt tests.test_dubbing_runtime.DubbingPipelineTests.test_translate_batch_with_budget_lazy_initializes_translator_client`
+- [x] Review
+  - 修复只落在 translator 解析层，speaker-first 导入与 OmniVoice 配音主链路未改动。
+  - 新解析优先按编号块回填，能防止模型输出换行/说明行导致的整批错位。
+  - 当回复没有编号结构时自动回退旧逻辑，兼容现有翻译返回格式。
+
+## 70. 2026-05-08 Translation API 连通性测试
+- [x] 目标
+  - 在侧栏底部的 `Translation API / OpenAI-compatible 配置` 卡片中增加“测试连通性”功能
+  - 复用现有 `OpenAI-compatible` 配置，不改翻译主流程
+  - 明确返回 API key / base URL / model 这组配置是否可实际完成一次最小请求
+- [x] 后端
+  - 新增一个独立的翻译连通性测试接口，优先复用现有 OpenAI-compatible client
+  - 测试请求应尽量轻量，避免影响正式翻译任务
+  - 只返回是否可用与失败原因，不回显 key 或其它敏感配置
+- [x] 前端
+  - 在侧栏翻译配置卡片中增加一个测试按钮
+  - 点击后展示成功或失败状态，不影响当前保存态
+  - 保持卡片折叠/展开与现有保存逻辑不变
+- [x] 验证
+  - `node --check src/subtitle_maker/static/app.js`
+  - `uv run python -m py_compile src/subtitle_maker/app/routes/translation.py src/subtitle_maker/core/llm_client.py src/subtitle_maker/translator.py`
+  - 浏览器里实际点一次测试按钮，确认成功/失败提示可见
+- [x] Review
+  - 新增的 `/translation/test` 复用了现有 OpenAI-compatible 配置解析，不会污染正式 `/translate` 路径
+  - 侧栏测试入口放在卡片头部，避免正文区因为高度不足把按钮挤出首屏
+  - 浏览器实测可见按钮状态切换，成功时会显示 provider host 和 model，失败时会直接回显后端错误摘要
+
+## 69. 2026-05-08 OmniVoice 5 号结果态直接播放成片
+- [x] 目标
+  - 5 号面板加载结果时优先直接播放 `final/dubbed_video_full.mp4`
+  - 同时读取 `final/dubbed_final_full.srt` 作为结果字幕预览
+  - 保持 2 号面板原字幕 / 译文显示链路不变
+- [x] 前端
+  - 结果态加载逻辑优先挂载成片视频，必要时再回退源视频
+  - 继续支持原字幕 / 翻译字幕 overlay 切换
+- [x] 验证
+  - 5 号面板加载结果后播放器直接播成片
+  - 5 号面板字幕叠加正常显示翻译结果
+  - 2 号面板字幕显示不受影响
+- [x] Review
+  - 结果态现在优先直接加载 `final/dubbed_video_full.mp4`，不再靠单独音轨切换去拼成片
+  - overlay 仍然沿用全局原字幕 + 5 号本地译文预览，所以原字幕和翻译字幕都能切
+  - 2 号面板没有写入 5 号本地预览状态，显示链路没有被污染
+  - 当当前项目没有原字幕时，`Original Only` 在 5 号结果预览下会自动回退显示结果字幕，避免用户看到空字幕误以为没加载成功
+  - 结果文件夹切换时会保留当前选中的 batch，并显式刷新结果区附件，避免“视频已切换但下载链接仍停留在旧 batch”的假失败
+
 ## 68. 2026-05-08 Deepgram JSON 导入到 4/5 配音链路
 - [x] 目标
   - 在 1 号面板新增 Deepgram JSON 上传入口
@@ -5282,3 +5384,133 @@
 - 本次修复把 `src/subtitle_maker/omnivoice_dub_api.py` 里旧输出根目录的主动创建去掉了，兼容逻辑只保留读取，不再落空目录。
 - 旧的 `outputs/omnivoice_dub_jobs/` 已清理，新的 5 号链路继续只写 `outputs/dub_jobs/`。
 - 验证结果：`uv run python -m py_compile src/subtitle_maker/omnivoice_dub_api.py` 通过。
+
+## TODO（2026-05-08 SRT 导入优化）
+- [x] 为 `upload_srt` 单独增加导入时优化规则，只合并同 speaker 的相邻短句，不改 Deepgram JSON 导入逻辑。
+- [x] 补充 SRT 导入回归测试，验证短句合并和不同 speaker 保持分离。
+- [x] 验证命令：`uv run python -m unittest tests.test_subtitle_speakers tests.test_web_routes_legacy`
+
+## Review（2026-05-08 SRT 导入优化）
+- SRT 上传现在会先做 `parse_srt()` + `normalize_subtitles_with_speakers()`，再走独立的 `optimize_srt_import_subtitles()`。
+- Deepgram JSON 的导入和合并逻辑未改动，仍保持原来的 `deepgram_json_to_subtitles()` 路径。
+- 验证结果：
+  - `uv run python -m unittest tests.test_subtitle_speakers tests.test_web_routes_legacy` 通过
+  - `uv run python -m py_compile src/subtitle_maker/domains/subtitles/srt_import.py src/subtitle_maker/app/routes/subtitles.py src/subtitle_maker/domains/subtitles/__init__.py` 通过
+  - 规则已从保守的局部合并改成按连续 speaker block 的 short-merge 重分句，合并力度明显更大。
+  - 最新修正：导入顺序调整为“先按 speaker 合并，再按标点切句”，保证整句尽量落在同一行。
+  - 最新修正 2：主规则已切换成“speaker + 停顿分块 + 句末标点收敛”，碎片只做补救，不再把 `No.` 之类完整短句误判成碎片。
+
+## TODO（2026-05-08 单参考音自动收敛）
+- [x] 让 Auto Dubbing 在检测到仅 1 份 speaker 参考音时自动走 single speaker。
+- [x] 让 SRT 导入的 single speaker 分支只做句子优先的简化处理，不再强依赖 speaker 边界。
+- [x] 调整测试合同：1 份参考音应通过并返回 `dubbing_mode=single`，2 份参考音保持 `multi`。
+
+## Review（2026-05-08 单参考音自动收敛）
+- 现在 Auto Dubbing 会把单个 speaker 参考音自动收敛成 single speaker，不再把这种场景当成“部分上传错误”。
+- SRT 导入的 single speaker 分支只保留更简单的句子级收敛，避免把多人规则硬套到单人字幕上。
+- 验证结果：
+  - `uv run python -m py_compile src/subtitle_maker/domains/subtitles/srt_import.py src/subtitle_maker/dubbing_cli_api.py tests/test_subtitle_speakers.py tests/test_dubbing_cli_api.py` 通过
+  - `uv run python -m unittest tests.test_subtitle_speakers tests.test_dubbing_cli_api` 通过
+
+## TODO（2026-05-12 OmniVoice 缺失参考音按性别目录选取）
+- [x] 收紧 5 号面板缺失 speaker 的预存参考音选择逻辑
+  - 先按源音频推断缺失 speaker 性别
+  - 再只从 `ref-voices/<lang>/male/` 或 `ref-voices/<lang>/female/` 目录中随机选择
+  - 保留已上传参考音同名排除，不影响 4 号链路
+- [x] 补充/调整 OmniVoice 单测
+  - 验证男声只命中 `male/`
+  - 验证女声只命中 `female/`
+  - 验证对应性别目录为空时不会误选另一性别目录
+
+## Review（2026-05-12 OmniVoice 缺失参考音按性别目录选取）
+- `src/subtitle_maker/omnivoice_dub_api.py` 已改为：
+  - 先读取缺失 speaker 的 `speaker_gender_hints`
+  - 有性别提示时只从 `ref-voices/<lang>/male/` 或 `ref-voices/<lang>/female/` 中选
+  - 对应性别目录为空时直接报错，不再串到另一性别目录
+  - 仅在没有性别提示时，才回退到 `ref-voices/<lang>/` 通用候选池
+- `tests/test_dubbing_cli_api.py` 新增了“对应性别目录为空时报错”的回归测试，并保留原有男/女目录命中测试。
+- 验证结果：
+  - `uv run python -m py_compile src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py`：通过
+  - `uv run python -m unittest tests.test_dubbing_cli_api -k preset_ref_voices`：`Ran 5 tests ... OK`
+  - `uv run python -m unittest tests.test_dubbing_cli_api -k omnivoice`：`Ran 17 tests ... OK`
+
+## TODO（2026-05-12 OmniVoice 译文 speaker 回填按时间对齐）
+- [x] 修复 5 号面板中 `speaker_id` 缺失时的回填策略
+  - 从“按索引回填 fallback_rows”改为“按时间重叠优先回填”
+  - 无重叠时回退到最近时间片的 speaker，再兜底索引/默认值
+  - 避免 `selected_subtitles_with_speakers.srt` 在 speaker 切换后大量错贴 `Speaker 1`
+- [x] 新增回归测试
+  - 行数变化场景下应按时间窗命中正确 speaker
+  - 无时间重叠场景下应命中最近 speaker，而非默认 `Speaker 1`
+
+## Review（2026-05-12 OmniVoice 译文 speaker 回填按时间对齐）
+- 已修改：
+  - [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py)
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py)
+- 验证结果：
+  - `uv run python -m py_compile src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py`：通过
+  - `uv run python -m unittest tests.test_dubbing_cli_api -k ensure_speaker_ids`：`Ran 2 tests ... OK`
+  - `uv run python -m unittest tests.test_dubbing_cli_api -k omnivoice`：`Ran 18 tests ... OK`
+
+## TODO（2026-05-12 OmniVoice 译文文本清洗与碎片回并）
+- [x] 在 5 号面板 selected 字幕后处理里增加中英混排清洗
+  - 修正粘连英文 token（如 `ClaudeCode` -> `Claude Code`）
+  - 修正中英数字贴连（如 `AI时代` -> `AI 时代`）
+- [x] 在 5 号面板 selected 后处理末端增加同 speaker 短残句回并
+  - 仅对短时长/连接词断裂/半句碎片触发
+  - 限制 gap 与时长上限，避免过度合并
+- [x] 补充单测并回归
+  - 文本规范化单测
+  - 短残句回并单测
+
+## Review（2026-05-12 OmniVoice 译文文本清洗与碎片回并）
+- 已修改：
+  - [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py)
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py)
+- 验证结果：
+  - `uv run python -m py_compile src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py`：通过
+  - `uv run python -m unittest tests.test_dubbing_cli_api -k selected_text_normalizer`：`Ran 1 test ... OK`
+  - `uv run python -m unittest tests.test_dubbing_cli_api -k merge_selected_fragment_rows`：`Ran 1 test ... OK`
+  - `uv run python -m unittest tests.test_dubbing_cli_api -k omnivoice`：`Ran 20 tests ... OK`
+- 对任务 `omnivoice_20260512_012742` 的离线复算对比（同一输入）：
+  - 行数：`425 -> 398`
+  - 驼峰/连写英文问题：`46 -> 37`
+  - 疑似半句碎片：`48 -> 21`
+  - speaker 时间重叠错配：`70 -> 59`（明显下降，但仍未归零）
+
+## TODO（2026-05-12 OmniVoice speaker-first 强制时间对齐）
+- [x] 在 5 号面板 selected 字幕关键入口开启 `force_align_by_time`
+  - `_optimize_omnivoice_selected_rows` 内部补齐阶段
+  - `prepare-subtitles-from-project` 的 `selected_subtitles` 与 preview 路径
+  - `start-from-project` 复用 prepared selected 路径
+  - `_run_omnivoice_job` 合成前 `selected_subtitles` 路径
+- [x] 保持 4 号链路不变，仅收紧 5 号 OmniVoice
+- [x] 回归测试通过
+  - `uv run python -m unittest tests.test_dubbing_cli_api -k omnivoice`
+
+## Review（2026-05-12 OmniVoice speaker-first 强制时间对齐）
+- 已修改：
+  - [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py)
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py)
+- 验证结果：
+  - `uv run python -m py_compile src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py`：通过
+  - `uv run python -m unittest tests.test_dubbing_cli_api -k omnivoice`：`Ran 21 tests ... OK`
+- 针对 `omnivoice_20260512_012742` 的离线复算（同输入、按新逻辑重算）：
+  - speaker 时间重叠错配：`70 -> 0`
+
+## Review（2026-05-12 最新产物对照验证）
+- 对照文件：
+  - source：[This is AGI： Sequoia AI Ascent 2026 Keynote.srt](/Users/tim/Downloads/This%20is%20AGI%EF%BC%9A%20Sequoia%20AI%20Ascent%202026%20Keynote.srt)
+  - 最新带 speaker 译文：[selected_subtitles_with_speakers.srt](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/omnivoice_20260512_034002/selected_subtitles_with_speakers.srt)
+  - 对照基线：`outputs/dub_jobs/omnivoice_20260512_012742/selected_subtitles_with_speakers.srt`
+- 关键指标（基线 -> 最新）：
+  - speaker 错配：`70 -> 0`
+  - 疑似半句碎片：`48 -> 9`
+  - 超短碎片（<=0.4s）：`24 -> 0`
+  - 驼峰/粘连英文：`46 -> 36`
+  - 含英文行：`67 -> 62`
+  - 总行数：`425 -> 369`
+- 结论：
+  - speaker-first 对齐已恢复正确（时间窗比对为 0 错配）
+  - 译文碎片化明显改善
+  - 仍有少量专有名词英文保留，属于可接受的后续文本优化项
