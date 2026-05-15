@@ -14,10 +14,12 @@ try:
     from subtitle_maker import dubbing_cli_api
     from subtitle_maker import omnivoice_dub_api
     from subtitle_maker import web
+    from subtitle_maker.domains.media import compose as media_compose
 except ModuleNotFoundError as exc:  # pragma: no cover - 仅在缺三方依赖的本地环境触发
     dubbing_cli_api = None
     omnivoice_dub_api = None
     web = None
+    media_compose = None
     API_TEST_SKIP_REASON = f"missing dependency {exc.name}"
 
 
@@ -251,6 +253,29 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(output_rows[0]["text"], "[Speaker 1] 你好")
         self.assertEqual(output_rows[1]["text"], "[Speaker 2] 世界")
 
+    def test_build_styled_ass_from_rows_uses_fixed_template_and_dialogue_format(self):
+        """5号面板 styled ASS 应使用固定样式模板，并输出标准 Dialogue 行。"""
+
+        input_rows = [
+            {"start": 1.36, "end": 3.57, "text": "你可能见过一些机器学习模型，", "speaker_id": "Speaker 1"},
+        ]
+
+        ass_text = omnivoice_dub_api._build_styled_ass_from_rows(
+            input_rows,
+            source_name="What-Are-Word-Embeddings.srt",
+        )
+        self.assertIn("; Converted from What-Are-Word-Embeddings.srt", ass_text)
+        self.assertIn("PlayResX: 1920", ass_text)
+        self.assertIn("PlayResY: 1080", ass_text)
+        self.assertIn(
+            "Style: Default,PingFang SC,80,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,4,0,0,2,80,80,80,1",
+            ass_text,
+        )
+        self.assertIn(
+            "Dialogue: 0,0:00:01.36,0:00:03.57,Default,,0,0,0,,你可能见过一些机器学习模型，",
+            ass_text,
+        )
+
     def test_omnivoice_selected_text_normalizer_splits_stuck_english_tokens(self):
         """中英混排字幕应拆开粘连英文词，避免 ClaudeCode 这类连写。"""
 
@@ -327,6 +352,28 @@ class DubbingCliApiTests(unittest.TestCase):
         output = omnivoice_dub_api._ensure_speaker_ids(rows, fallback_rows=fallback_rows)
         self.assertEqual(output[0]["speaker_id"], "Speaker 3")
 
+    def test_ensure_speaker_ids_defaults_first_blank_row_to_speaker_1(self):
+        """首行缺失 speaker 且没有可对齐来源时，应最终回退到 Speaker 1。"""
+
+        rows = [
+            {"start": 0.0, "end": 1.0, "text": "hello", "speaker_id": ""},
+        ]
+
+        output = omnivoice_dub_api._ensure_speaker_ids(rows, fallback_rows=[])
+        self.assertEqual(output[0]["speaker_id"], "Speaker 1")
+
+    def test_ensure_speaker_ids_prefers_previous_row_before_speaker_1(self):
+        """中间缺失 speaker 且没有可对齐来源时，应优先继承上一行 speaker。"""
+
+        rows = [
+            {"start": 0.0, "end": 1.0, "text": "a", "speaker_id": "Speaker 2"},
+            {"start": 1.0, "end": 2.0, "text": "b", "speaker_id": ""},
+            {"start": 2.0, "end": 3.0, "text": "c", "speaker_id": ""},
+        ]
+
+        output = omnivoice_dub_api._ensure_speaker_ids(rows, fallback_rows=[])
+        self.assertEqual([item["speaker_id"] for item in output], ["Speaker 2", "Speaker 2", "Speaker 2"])
+
     def test_ensure_speaker_ids_force_align_by_time_overrides_wrong_tag(self):
         """强制按时间对齐时，应覆盖已有但错误的 speaker 标签。"""
 
@@ -394,6 +441,126 @@ class DubbingCliApiTests(unittest.TestCase):
         speaker_copy_text = speaker_copy_path.read_text(encoding="utf-8")
         self.assertIn("[Speaker 1]", speaker_copy_text)
         self.assertIn("[Speaker 2]", speaker_copy_text)
+
+    def test_build_manifest_includes_styled_ass_artifact_and_path(self):
+        """5号面板最终 manifest 应暴露 styled ASS 路径与 artifact。"""
+
+        out_root = self.omnivoice_output_root / "omnivoice_demo"
+        final_dir = out_root / "final"
+        final_dir.mkdir(parents=True, exist_ok=True)
+        source_audio = out_root / "source.wav"
+        source_vocals = out_root / "source_vocals.wav"
+        source_bgm = out_root / "source_bgm.wav"
+        speaker_ref_map = out_root / "speaker_ref_map.json"
+        selected_srt = out_root / "selected_subtitles.srt"
+        selected_with_speaker = out_root / "selected_subtitles_with_speakers.srt"
+        final_srt = final_dir / "dubbed_final_full.srt"
+        final_ass = final_dir / "dubbed_final_full-styled.ass"
+        final_vocals = final_dir / "dubbed_vocals_full.wav"
+        final_mix = final_dir / "dubbed_mix_full.wav"
+        final_video = final_dir / "dubbed_video_full.mp4"
+        final_video_burned = final_dir / "dubbed_video_full_burned.mp4"
+        separation_report = out_root / "separation_report.json"
+        speaker_reference_dir = out_root / "speaker_refs"
+        speaker_reference_dir.mkdir(parents=True, exist_ok=True)
+
+        for path in [
+            source_audio,
+            source_vocals,
+            source_bgm,
+            speaker_ref_map,
+            selected_srt,
+            selected_with_speaker,
+            final_srt,
+            final_ass,
+            final_vocals,
+            final_mix,
+            final_video,
+            final_video_burned,
+            separation_report,
+        ]:
+            path.write_text("x", encoding="utf-8")
+
+        task = omnivoice_dub_api._create_task_payload(
+            task_id="20260515_123456",
+            project_filename="demo.mp4",
+            input_media_path=source_audio,
+            subtitle_mode="translated",
+            source_lang="English",
+            target_lang="Chinese",
+            source_count=1,
+            translated_count=1,
+            speaker_ids=["Speaker 1"],
+            out_root=out_root,
+        )
+        task["status"] = "completed"
+        task["stage"] = "completed"
+        task["progress"] = 100.0
+
+        manifest = omnivoice_dub_api._build_manifest(
+            task=task,
+            out_root=out_root,
+            source_audio_path=source_audio,
+            source_vocals_path=source_vocals,
+            source_bgm_path=source_bgm,
+            speaker_ref_map_path=speaker_ref_map,
+            final_srt_path=final_srt,
+            final_vocals_path=final_vocals,
+            final_mix_path=final_mix,
+            final_video_path=final_video,
+            separated_video_audio_path=None,
+            separation_report_path=separation_report,
+            speaker_reference_dir=speaker_reference_dir,
+            subtitles_path=selected_srt,
+            subtitles_with_speaker_path=selected_with_speaker,
+            final_ass_path=final_ass,
+            burned_video_path=final_video_burned,
+        )
+
+        artifact_keys = {item["key"] for item in manifest.get("artifacts") or []}
+        self.assertIn("ass", artifact_keys)
+        self.assertIn("video_burned", artifact_keys)
+        self.assertEqual(manifest["paths"]["dubbed_final_ass"], str(final_ass.resolve()))
+        self.assertEqual(manifest["paths"]["dubbed_video_burned"], str(final_video_burned.resolve()))
+        artifact_order = [item["key"] for item in manifest.get("artifacts") or []]
+        self.assertLess(artifact_order.index("video_burned"), artifact_order.index("video"))
+
+    def test_burn_ass_subtitles_into_video_uses_expected_ffmpeg_args(self):
+        """ASS 烧录视频应使用 `ass=` filter、libx264 和固定画质参数。"""
+
+        input_video = self.tmpdir / "input.mp4"
+        subtitle_ass = self.tmpdir / "subtitles.ass"
+        output_video = self.tmpdir / "output.mp4"
+        input_video.write_text("video", encoding="utf-8")
+        subtitle_ass.write_text("ass", encoding="utf-8")
+
+        seen = {}
+
+        def _fake_run_cmd(cmd, cwd=None):
+            seen["cmd"] = list(cmd)
+            output_video.write_text("burned", encoding="utf-8")
+            return 0, "", ""
+
+        with patch.object(media_compose, "run_cmd", side_effect=_fake_run_cmd):
+            result = media_compose.burn_ass_subtitles_into_video(
+                input_video_path=input_video,
+                ass_subtitle_path=subtitle_ass,
+                output_video_path=output_video,
+                video_codec="libx264",
+                crf=16,
+                preset="slow",
+            )
+
+        self.assertEqual(result, output_video)
+        cmd = seen["cmd"]
+        self.assertIn("-vf", cmd)
+        vf_value = cmd[cmd.index("-vf") + 1]
+        self.assertIn("ass='", vf_value)
+        self.assertIn(str(subtitle_ass.resolve()).replace(":", r"\:"), vf_value)
+        self.assertEqual(cmd[cmd.index("-c:v") + 1], "libx264")
+        self.assertEqual(cmd[cmd.index("-crf") + 1], "16")
+        self.assertEqual(cmd[cmd.index("-preset") + 1], "slow")
+        self.assertEqual(cmd[cmd.index("-c:a") + 1], "copy")
 
     def test_translate_subtitles_if_needed_restores_empty_rows_from_source_for_omnivoice(self):
         """5 号链路翻译空行应回退 source 文本，避免行数缩水导致后续失配。"""
@@ -1499,6 +1666,18 @@ class DubbingCliApiFailureParsingTests(unittest.TestCase):
         message = dubbing_cli_api._build_cli_exit_error(1, stdout_tail)
         self.assertIn("Pipeline failed: Connection error.", message)
         self.assertNotIn("RuntimeError: command failed", message)
+
+    def test_extract_cli_failure_detail_maps_translation_401_to_auth_message(self):
+        stdout_tail = [
+            '[INFO] translate:translation_started - translating subtitles',
+            'HTTP Request: POST https://api.freemodel.dev/v1/chat/completions "HTTP/1.1 401 Unauthorized"',
+            "Pipeline failed: Error code: 401 - {'error': 'Internal server error'}",
+        ]
+
+        detail = dubbing_cli_api._extract_cli_failure_detail(stdout_tail)
+        self.assertIsNotNone(detail)
+        self.assertIn("authentication failed", str(detail).lower())
+        self.assertIn("http 401", str(detail).lower())
 
 
 if __name__ == "__main__":

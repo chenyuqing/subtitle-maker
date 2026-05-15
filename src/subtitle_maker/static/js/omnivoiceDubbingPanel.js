@@ -12,10 +12,14 @@ export function setupOmnivoiceDubbingPanel(deps) {
         describeAutoStage,
         formatLineProgress,
         formatEtaAsSegmentProgress,
+        audioTrackController,
         getProjectDubbingContext,
         getTranslateApiKey,
         getTranslateBaseUrl,
         getTranslateModel,
+        refreshSubtitleOverlay,
+        setOmnivoiceSubtitlePreview,
+        clearOmnivoiceSubtitlePreview,
     } = deps;
 
     const projectMediaEl = byId('omnivoice-project-media');
@@ -32,6 +36,7 @@ export function setupOmnivoiceDubbingPanel(deps) {
     const backendNoteEl = byId('omnivoice-backend-note');
     const speakerRefListEl = byId('omnivoice-speaker-ref-list');
     const speakerRefHintEl = byId('omnivoice-speaker-ref-hint');
+    const prepareBtn = byId('prepare-omnivoice-subtitles-btn');
     const startBtn = byId('start-omnivoice-dub-btn');
     const batchSelect = byId('omnivoice-load-batch-select');
     const refreshBatchesBtn = byId('omnivoice-refresh-batches-btn');
@@ -53,6 +58,8 @@ export function setupOmnivoiceDubbingPanel(deps) {
     let autoDubStartedAtMs = null;
     let omnivoiceBackendReady = false;
     let speakerRefFiles = new Map();
+    let omnivoiceResultLoadSeq = 0;
+    let preparedBatchId = '';
 
     /**
      * 读取当前项目上下文。
@@ -95,14 +102,29 @@ export function setupOmnivoiceDubbingPanel(deps) {
     }
 
     /**
+     * 5 号面板的缺失 speaker 采用“上一行优先、最后 Speaker 1”的补齐顺序。
+     * 这里只服务于前端上传槽位/提示统计，确保和后端实际路由策略一致。
+     */
+    function normalizeSpeakerIdsForPanelRows(rows) {
+        const normalized = [];
+        let previousSpeakerId = '';
+        (Array.isArray(rows) ? rows : []).forEach((row) => {
+            const explicitSpeakerId = String(row?.speaker_id || '').trim();
+            const speakerId = explicitSpeakerId || previousSpeakerId || 'Speaker 1';
+            normalized.push(speakerId);
+            previousSpeakerId = speakerId;
+        });
+        return normalized;
+    }
+
+    /**
      * 提取稳定 speaker 列表，和 4 号面板一样完全以字幕 speaker_id 为准。
      */
     function getDetectedSpeakerIds(projectContext = readProjectContext()) {
         const rows = getEffectiveSubtitleRows(projectContext);
         const ordered = [];
         const seen = new Set();
-        (Array.isArray(rows) ? rows : []).forEach((row) => {
-            const speakerId = String(row?.speaker_id || '').trim() || 'Speaker 1';
+        normalizeSpeakerIdsForPanelRows(rows).forEach((speakerId) => {
             if (!seen.has(speakerId)) {
                 seen.add(speakerId);
                 ordered.push(speakerId);
@@ -197,18 +219,16 @@ export function setupOmnivoiceDubbingPanel(deps) {
     }
 
     /**
-     * strict 模式校验：检测到的每个 speaker 都必须上传参考音。
+     * 部分上传模式：允许只上传部分 speaker 参考音。
+     * 返回“已上传文件”的 speaker_id 列表，和后端 files 数量保持一致。
      */
     function validateSpeakerReferenceUploads() {
         const speakerIds = getDetectedSpeakerIds();
         if (speakerIds.length === 0) {
             throw new Error('当前项目字幕里没有稳定 speaker 信息，OmniVoice strict 模式无法建立参考音映射。');
         }
-        const missing = speakerIds.filter((speakerId) => !speakerRefFiles.get(speakerId));
-        if (missing.length > 0) {
-            throw new Error(`OmniVoice 需要为每个 speaker 上传参考音，当前缺少：${missing.join('、')}`);
-        }
-        return speakerIds;
+        const uploadedSpeakerIds = speakerIds.filter((speakerId) => !!speakerRefFiles.get(speakerId));
+        return uploadedSpeakerIds;
     }
 
     /**
@@ -217,6 +237,9 @@ export function setupOmnivoiceDubbingPanel(deps) {
     function syncStartButtonState() {
         if (!startBtn) return;
         startBtn.disabled = !omnivoiceBackendReady;
+        if (prepareBtn) {
+            prepareBtn.disabled = !omnivoiceBackendReady;
+        }
     }
 
     /**
@@ -314,7 +337,7 @@ export function setupOmnivoiceDubbingPanel(deps) {
             if (!mediaName) {
                 projectNoteEl.textContent = '请先在 1.Upload Video + Optional SRT 中上传视频。OmniVoice 会直接复用当前项目上下文，不再单独上传。';
             } else if (sourceCount === 0 && translatedCount === 0) {
-                projectNoteEl.textContent = '当前项目还没有可用字幕。OmniVoice 只能复用当前项目字幕上下文，不能像 4.Auto Dubbing 一样重新起一条 index-tts 链路。';
+                projectNoteEl.textContent = '当前项目还没有可用字幕。OmniVoice 只能复用当前项目字幕上下文，请先在当前项目生成或导入字幕。';
             } else {
                 projectNoteEl.textContent = 'OmniVoice 会优先复用 translated 字幕，否则翻译 source 字幕；speaker 会从字幕自动识别，参考音需要你逐个上传并严格映射。';
             }
@@ -407,6 +430,9 @@ export function setupOmnivoiceDubbingPanel(deps) {
         if (translateSystemPrompt) {
             formData.append('translate_system_prompt', translateSystemPrompt);
         }
+        if (preparedBatchId) {
+            formData.append('prepared_batch_id', preparedBatchId);
+        }
         const speakerIds = validateSpeakerReferenceUploads();
         formData.append('speaker_ref_speaker_ids_json', JSON.stringify(speakerIds));
         speakerIds.forEach((speakerId) => {
@@ -423,9 +449,162 @@ export function setupOmnivoiceDubbingPanel(deps) {
     }
 
     /**
-     * 统一渲染下载链接。
+     * 判断结果文件地址是否能直接被浏览器播放或抓取。
      */
-    function renderResults(data) {
+    function isPlayableUrl(rawUrl) {
+        const value = String(rawUrl || '').trim();
+        if (!value) return false;
+        return /^(https?:\/\/|file:\/\/|blob:|\/omnivoice\/auto\/artifact\/|\/dubbing\/artifact\/|\/artifact\/)/i.test(value);
+    }
+
+    /**
+     * 给地址追加 cache bust，避免浏览器复用旧的结果字幕缓存。
+     */
+    function withCacheBust(url) {
+        const base = audioTrackController?.withCacheBust?.(url) || String(url || '').trim();
+        return base;
+    }
+
+    /**
+     * 标记一次新的 OmniVoice 结果加载。
+     * 任何更早开始的异步请求都会被视为过期，防止旧结果串回当前页面。
+     */
+    function beginOmnivoiceResultLoad() {
+        omnivoiceResultLoadSeq += 1;
+        return omnivoiceResultLoadSeq;
+    }
+
+    /**
+     * 判断某个异步请求是否仍然属于当前这次结果加载。
+     */
+    function isLatestOmnivoiceResultLoad(loadSeq) {
+        if (loadSeq === null || loadSeq === undefined) {
+            return true;
+        }
+        return Number(loadSeq || 0) === omnivoiceResultLoadSeq;
+    }
+
+    /**
+     * 从 OmniVoice 结果中优先挑出可播放的 SRT 产物地址。
+     */
+    function pickOmnivoiceSrtUrl(data) {
+        const artifacts = Array.isArray(data?.artifacts) ? data.artifacts : [];
+        const preferred = artifacts.find((item) => item?.key === 'srt' && item?.url)
+            || artifacts.find((item) => item?.key === 'translated_srt' && item?.url)
+            || artifacts.find((item) => item?.key === 'source_srt' && item?.url);
+        if (preferred?.url) {
+            return preferred.url;
+        }
+        const resultSrt = String(data?.result_srt || '').trim();
+        return isPlayableUrl(resultSrt) ? resultSrt : null;
+    }
+
+    /**
+     * 从 OmniVoice 结果中优先挑出可播放的成片视频。
+     * 5 号面板加载结果时，优先直接播烧录 ASS 的成片视频，其次再回退未烧录版本。
+     */
+    function pickOmnivoiceVideoUrl(data) {
+        const artifacts = Array.isArray(data?.artifacts) ? data.artifacts : [];
+        const preferred = artifacts.find((item) => item?.key === 'video_burned' && item?.url)
+            || artifacts.find((item) => item?.key === 'video' && item?.url)
+            || artifacts.find((item) => item?.key === 'result_video' && item?.url);
+        if (preferred?.url) {
+            return preferred.url;
+        }
+        const resultVideo = String(data?.dubbed_video_burned || data?.result_video || data?.dubbed_video_full || '').trim();
+        return isPlayableUrl(resultVideo) ? resultVideo : null;
+    }
+
+    /**
+     * 将 SRT 文本解析成字幕条目，供顶部播放器 overlay 预览。
+     */
+    function parseSrtTimeToSeconds(timeText) {
+        const match = String(timeText || '').trim().match(/^(\d{2}):(\d{2}):(\d{2}),(\d{3})$/);
+        if (!match) return null;
+        const h = Number(match[1]);
+        const m = Number(match[2]);
+        const s = Number(match[3]);
+        const ms = Number(match[4]);
+        return h * 3600 + m * 60 + s + ms / 1000;
+    }
+
+    /**
+     * 解析 SRT 为统一字幕项结构，保持和 4 号面板一致。
+     */
+    function parseSrtToSubtitleItems(srtText) {
+        const normalized = String(srtText || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+        if (!normalized) return [];
+        const blocks = normalized.split(/\n{2,}/);
+        const items = [];
+        for (const block of blocks) {
+            const lines = block.split('\n').map((line) => line.trimEnd()).filter(Boolean);
+            if (lines.length < 2) continue;
+            const timeLineIndex = lines.findIndex((line) => line.includes('-->'));
+            if (timeLineIndex < 0) continue;
+            const [startText, endText] = lines[timeLineIndex].split('-->').map((part) => part.trim());
+            const start = parseSrtTimeToSeconds(startText);
+            const end = parseSrtTimeToSeconds(endText);
+            if (start === null || end === null) continue;
+            const text = lines.slice(timeLineIndex + 1).join('\n').trim();
+            if (!text) continue;
+            items.push({ start, end, text });
+        }
+        return items;
+    }
+
+    /**
+     * 拉取并加载 OmniVoice 结果字幕，只作为 5 号面板本地预览，不写回 2 号面板状态。
+     */
+    async function loadOmnivoiceSubtitlePreview(data, loadSeq) {
+        if (!isLatestOmnivoiceResultLoad(loadSeq)) {
+            return [];
+        }
+        const srtUrl = pickOmnivoiceSrtUrl(data);
+        if (!srtUrl) {
+            if (isLatestOmnivoiceResultLoad(loadSeq)) {
+                clearOmnivoiceSubtitlePreview?.();
+            }
+            return [];
+        }
+        try {
+            const response = await fetch(withCacheBust(srtUrl));
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            const srtText = await response.text();
+            if (!isLatestOmnivoiceResultLoad(loadSeq)) {
+                return [];
+            }
+            const parsed = parseSrtToSubtitleItems(srtText);
+            if (!parsed.length) {
+                throw new Error('empty or invalid srt');
+            }
+            if (!isLatestOmnivoiceResultLoad(loadSeq)) {
+                return [];
+            }
+            setOmnivoiceSubtitlePreview?.(parsed);
+            // 兜底：本地 app.js 若未提供独立预览注入器，则回退写入全局 translated 字幕并切到翻译显示。
+            if (typeof window.applyOmnivoicePreviewSubtitles === 'function') {
+                window.applyOmnivoicePreviewSubtitles(parsed);
+            }
+            refreshSubtitleOverlay?.();
+            return parsed;
+        } catch (error) {
+            if (!isLatestOmnivoiceResultLoad(loadSeq)) {
+                return [];
+            }
+            console.warn('Load OmniVoice subtitle preview failed:', error);
+            clearOmnivoiceSubtitlePreview?.();
+            return [];
+        }
+    }
+
+    /**
+     * 只刷新结果区的下载链接和字幕预览，不重复切主播放器媒体。
+     * 这个 helper 专门给恢复既有结果时使用，避免结果区依赖别的状态分支。
+     */
+    function renderOmnivoiceResultAssets(data, loadSeq) {
+        if (!isLatestOmnivoiceResultLoad(loadSeq)) return;
         if (!resultsContainer || !downloadLinks) return;
         const artifacts = Array.isArray(data?.artifacts) ? data.artifacts : [];
         downloadLinks.innerHTML = '';
@@ -440,12 +619,52 @@ export function setupOmnivoiceDubbingPanel(deps) {
             downloadLinks.appendChild(link);
         });
         resultsContainer.style.display = 'block';
+        loadOmnivoiceSubtitlePreview(data, loadSeq).catch(() => {});
+    }
+
+    /**
+     * 统一渲染下载链接。
+     */
+    function renderResults(data, loadSeq) {
+        if (!isLatestOmnivoiceResultLoad(loadSeq)) return;
+        if (!resultsContainer || !downloadLinks) return;
+        loadResultMediaToPlayer(data);
+        renderOmnivoiceResultAssets(data, loadSeq);
+    }
+
+    /**
+     * 恢复历史 batch 的播放媒体。
+     * 结果文件存在时优先直接播放成片视频；如果缺失，则回退到源视频。
+     */
+    function loadResultMediaToPlayer(data) {
+        audioTrackController?.resetAudioTrackState?.();
+        const resultVideoUrl = pickOmnivoiceVideoUrl(data);
+        const mediaUrl = resultVideoUrl || data?.input_media_url;
+        if (!videoPlayer) return;
+        if (!mediaUrl) {
+            if (statusText) {
+                statusText.textContent = 'Loaded · Completed（成片与源视频都已不存在，请重新上传视频进行预览）';
+                statusText.className = 'status-text';
+            }
+            return;
+        }
+        const shouldResume = !videoPlayer.paused;
+        videoPlayer.src = withCacheBust(mediaUrl);
+        videoPlayer.style.display = 'block';
+        videoPlayer.load();
+        if (shouldResume) {
+            videoPlayer.play().catch(() => {});
+        }
+        videoPlayer.controls = true;
+        if (videoPlaceholder) {
+            videoPlaceholder.style.display = 'none';
+        }
     }
 
     /**
      * 更新状态区，兼容轮询和恢复任务。
      */
-    function renderTaskState(data) {
+    function renderTaskState(data, loadSeq) {
         if (!statusContainer) return;
         statusContainer.style.display = 'block';
         if (progressFill && typeof data?.progress === 'number') {
@@ -482,7 +701,7 @@ export function setupOmnivoiceDubbingPanel(deps) {
             }
         }
         if (data?.status === 'completed') {
-            renderResults(data);
+            renderResults(data, loadSeq);
         }
     }
 
@@ -561,11 +780,15 @@ export function setupOmnivoiceDubbingPanel(deps) {
             }
             return;
         }
+        const batchId = batchSelect.value;
+        const loadSeq = beginOmnivoiceResultLoad();
         if (loadBatchBtn) loadBatchBtn.disabled = true;
         if (refreshBatchesBtn) refreshBatchesBtn.disabled = true;
+        audioTrackController?.resetAudioTrackState?.();
+        clearOmnivoiceSubtitlePreview?.();
         try {
             const formData = new FormData();
-            formData.append('batch_id', batchSelect.value);
+            formData.append('batch_id', batchId);
             const res = await fetch('/omnivoice/auto/load-batch', {
                 method: 'POST',
                 body: formData,
@@ -574,18 +797,30 @@ export function setupOmnivoiceDubbingPanel(deps) {
             if (!res.ok) {
                 throw new Error(data.detail || 'Failed to load OmniVoice batch');
             }
-            renderTaskState(data);
-            renderResults(data);
+            if (!isLatestOmnivoiceResultLoad(loadSeq)) {
+                return;
+            }
+            if (batchSelect) {
+                batchSelect.value = batchId;
+            }
+            loadResultMediaToPlayer(data);
+            renderTaskState(data, loadSeq);
+            renderOmnivoiceResultAssets(data, loadSeq);
             if (batchHintEl) {
-                batchHintEl.textContent = `已加载 ${data.project_filename || batchSelect.value}`;
+                batchHintEl.textContent = `已加载 ${data.project_filename || batchId}`;
             }
         } catch (error) {
+            if (!isLatestOmnivoiceResultLoad(loadSeq)) {
+                return;
+            }
             if (batchHintEl) {
                 batchHintEl.textContent = `加载失败：${error.message}`;
             }
         } finally {
-            if (loadBatchBtn) loadBatchBtn.disabled = false;
-            if (refreshBatchesBtn) refreshBatchesBtn.disabled = false;
+            if (isLatestOmnivoiceResultLoad(loadSeq)) {
+                if (loadBatchBtn) loadBatchBtn.disabled = false;
+                if (refreshBatchesBtn) refreshBatchesBtn.disabled = false;
+            }
         }
     }
 
@@ -594,6 +829,7 @@ export function setupOmnivoiceDubbingPanel(deps) {
      */
     async function startTask() {
         try {
+            beginOmnivoiceResultLoad();
             const backendStatus = await refreshBackendStatus({ scheduleRetry: false });
             if (!backendStatus?.ready) {
                 throw new Error(backendStatus?.detail || 'OmniVoice backend is still loading');
@@ -611,6 +847,8 @@ export function setupOmnivoiceDubbingPanel(deps) {
             if (progressFill) {
                 progressFill.style.width = '8%';
             }
+            audioTrackController?.resetAudioTrackState?.();
+            clearOmnivoiceSubtitlePreview?.();
             autoDubStartedAtMs = Date.now();
             const res = await fetch(request.endpoint, {
                 method: 'POST',
@@ -634,6 +872,60 @@ export function setupOmnivoiceDubbingPanel(deps) {
     }
 
     /**
+     * 仅生成 selected_subtitles.srt，供人工 review 后再手动开始配音。
+     */
+    async function prepareSelectedSubtitles() {
+        try {
+            beginOmnivoiceResultLoad();
+            const backendStatus = await refreshBackendStatus({ scheduleRetry: false });
+            if (!backendStatus?.ready) {
+                throw new Error(backendStatus?.detail || 'OmniVoice backend is still loading');
+            }
+            const request = buildCurrentProjectRequest();
+            request.formData.delete('prepared_batch_id');
+            if (prepareBtn) prepareBtn.disabled = true;
+            if (startBtn) startBtn.disabled = true;
+            if (loadBatchBtn) loadBatchBtn.disabled = true;
+            if (refreshBatchesBtn) refreshBatchesBtn.disabled = true;
+            if (resultsContainer) resultsContainer.style.display = 'none';
+            if (statusContainer) statusContainer.style.display = 'block';
+            if (statusText) {
+                statusText.textContent = 'Preparing selected_subtitles.srt ...';
+                statusText.className = 'status-text';
+            }
+            if (progressFill) {
+                progressFill.style.width = '20%';
+            }
+            autoDubStartedAtMs = Date.now();
+            const res = await fetch('/omnivoice/auto/prepare-subtitles-from-project', {
+                method: 'POST',
+                body: request.formData,
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                throw new Error(data.detail || 'Failed to prepare selected subtitles');
+            }
+            preparedBatchId = String(data?.batch_id || data?.task_id || '').trim();
+            const loadSeq = beginOmnivoiceResultLoad();
+            renderTaskState(data, loadSeq);
+            renderOmnivoiceResultAssets(data, loadSeq);
+            if (statusText) {
+                statusText.textContent = 'selected_subtitles.srt 已生成，可先 review 后再点击开始配音';
+                statusText.className = 'status-text success';
+            }
+        } catch (error) {
+            if (statusText) {
+                statusText.textContent = `Prepare failed: ${error.message}`;
+                statusText.className = 'status-text error';
+            }
+        } finally {
+            syncStartButtonState();
+            if (loadBatchBtn) loadBatchBtn.disabled = false;
+            if (refreshBatchesBtn) refreshBatchesBtn.disabled = false;
+        }
+    }
+
+    /**
      * 监听项目变化，保持摘要和提示始终同步。
      */
     function syncProjectUi() {
@@ -648,6 +940,9 @@ export function setupOmnivoiceDubbingPanel(deps) {
     }
     if (startBtn) {
         startBtn.addEventListener('click', startTask);
+    }
+    if (prepareBtn) {
+        prepareBtn.addEventListener('click', prepareSelectedSubtitles);
     }
     if (refreshBatchesBtn) {
         refreshBatchesBtn.addEventListener('click', refreshBatches);

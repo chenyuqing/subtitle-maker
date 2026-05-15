@@ -10,6 +10,7 @@
 *   **AI 翻译**: 集成 DeepSeek API，支持将字幕翻译为多种语言。
 *   **Auto Dubbing 可选字幕输入**: 在 Step 5 可上传自定义 `.srt`，自动跳过 ASR，直接进入翻译与配音。
 *   **按时间区间配音**: Step 5 支持手动时间区间与自动语音区间，仅处理选中片段。
+*   **OmniVoice Final 成片输出**: 5 号面板最终结果会同时产出 `styled ASS` 字幕与烧录字幕的 `MP4` 成片，便于直接下载和回放。
 *   **灵活导出**: 支持导出 SRT 字幕文件，可选原文、译文或双语对照格式。
 *   **实时预览**:
     *   转写过程中实时显示生成字幕。
@@ -131,6 +132,7 @@ subtitle-maker/
     *   可选上传字幕文件（`.srt`）：上传后会跳过 ASR，直接翻译与配音。
     *   可选设置配音时间区间：仅对指定区间执行翻译与配音，区间外保留原声。
     *   时长对齐策略：当配音超出当前字幕窗口时，会先尝试借用“下一句前的静音间隔”（保留约 100ms 安全边界），只有仍超出可用窗口时才进行变速压缩。
+    *   OmniVoice final 结果目录会同时包含 `dubbed_final_full.srt`、`dubbed_final_full-styled.ass`、`dubbed_video_full.mp4` 和 `dubbed_video_full_burned.mp4`。
 
 ## ⚠️ 注意事项
 
@@ -140,3 +142,4 @@ subtitle-maker/
 ## 📘 进阶文档
 
 *   长视频分段批处理与定向修复：`docs/long_video_batch.md`
+*   FFmpeg 烧录 ASS 字幕与 5 号面板 final 输出说明：`docs/output-video-with-subtitle.md`

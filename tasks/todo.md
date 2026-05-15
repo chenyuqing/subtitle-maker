@@ -1,5 +1,84 @@
 # TODO
 
+## 77. 2026-05-15 文档同步并推送 GitHub
+- [x] 现状
+  - 5 号面板的 styled ASS 导出与 burned MP4 已经实现并完成端到端验证
+  - 现有 README / CHANGELOG / FFmpeg 说明文档还没有同步这些结果
+- [x] 目标
+  - 更新用户可见文档，说明 5 号面板 final 现在会产出 `styled ASS` 和烧录字幕视频
+  - 记录这次交付的 ffmpeg 参数与结果合同
+  - 提交并推送当前分支到 GitHub
+- [x] 计划
+  - 更新 `README.md`、`CHANGELOG.md` 和 `docs/output-video-with-subtitle.md`
+  - 只提交与这次功能和文档同步相关的文件，避免把本地未追踪的大目录一起推送
+  - 做最小校验后提交并推送
+- [ ] 验证
+  - 文档内容与当前实现一致
+  - Git 提交与推送成功
+- [ ] Review
+
+## 76. 2026-05-15 5 号面板 final 视频新增 ASS 烧录输出
+- [x] 现状
+  - 5 号面板 final 当前会输出 `dubbed_video_full.mp4`，但只是替换配音音轨，不会烧录 ASS 字幕
+  - 现有 styled ASS 已能生成，但还没有接入 final 视频导出链路
+- [x] 目标
+  - 在 5 号面板 final 结果中新增一个烧录 styled ASS 的 MP4 输出
+  - 把烧录视频纳入 manifest / artifact 下载列表
+  - 同时整理一份可执行的 FFmpeg 命令说明，包含用户要求的检查、安装、参数解释和完整流程
+  - ASS 样式里的 `Fontsize` 统一固定为 `80`
+- [x] 计划
+  - 复用现有 final 视频生成链路，增加 ASS burn 分支
+  - 明确命名、artifact key 和下载合同
+  - 补最小回归测试与 FFmpeg 命令说明
+- [x] 验证
+  - final 目录出现带 ASS 烧录的新 MP4
+  - artifact 列表可下载烧录视频
+  - 定向测试覆盖 manifest / artifact 合同
+- [x] Review
+  - 5 号面板 final 结果现在保留原 `dubbed_video_full.mp4`，同时新增 `dubbed_video_full_burned.mp4`
+  - 烧录实现固定使用 `ass=` filter、`libx264`、`crf=16`、`preset=slow`、`-c:a copy`
+  - manifest `paths`、artifact 列表和下载路由已新增 `video_burned`
+  - 验证结果：`./.venv/bin/python -m py_compile src/subtitle_maker/domains/media/compose.py src/subtitle_maker/domains/media/__init__.py src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py` 通过；`./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_burn_ass_subtitles_into_video_uses_expected_ffmpeg_args tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_manifest_includes_styled_ass_artifact_and_path tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_styled_ass_from_rows_uses_fixed_template_and_dialogue_format` 通过（3 tests, OK）
+
+## 75. 2026-05-15 5 号面板最终字幕新增 styled ASS 导出
+- [x] 现状
+  - 5 号面板最终字幕当前只写出 `final/dubbed_final_full.srt`
+  - OmniVoice artifact 列表和下载路由目前只暴露 SRT，没有 ASS 产物
+- [x] 目标
+  - 在 5 号面板最终结果链路中，基于最终 SRT 同步生成一个 styled ASS 文件
+  - 输出命名参考 `*-styled.ass`，并把它纳入 5 号面板 artifact 下载列表
+- [x] 计划
+  - 明确 ASS 样式合同与 SRT->ASS 转换落点
+  - 在 5 号 OmniVoice 最终产物阶段新增 ASS 写盘
+  - 补 artifact 映射、下载接口和最小回归测试
+- [x] 验证
+  - 结果目录同时包含 `.srt` 与 `.ass`
+  - artifact 下载能拿到 styled ASS
+- [x] Review
+  - 5 号面板最终结果现在会在 `dubbed_final_full.srt` 旁边同步生成 `dubbed_final_full-styled.ass`
+  - ASS 模板严格复用了用户给定样例的固定样式参数：`PingFang SC`、字号 `80`、`BorderStyle=4`、`Alignment=2`、`MarginL/R/V=80`、`PlayRes=1920x1080`
+  - manifest `paths` 与 artifact 列表已新增 `ass`，下载路由也补了 `.ass` MIME
+  - 验证结果：`./.venv/bin/python -m py_compile src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py` 通过；`./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_styled_ass_from_rows_uses_fixed_template_and_dialogue_format tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_manifest_includes_styled_ass_artifact_and_path tests.test_dubbing_cli_api.DubbingCliApiTests.test_prepare_omnivoice_subtitles_from_project_writes_speaker_copy_artifact` 通过（3 tests, OK）
+
+## 74. 2026-05-14 5 号面板无 speaker 行默认补齐顺序调整
+- [x] 现状
+  - 5 号面板前端统计 speaker 上传槽位时，空 `speaker_id` 当前直接回退为 `Speaker 1`
+  - 5 号面板后端 `_ensure_speaker_ids(...)` 已经是“优先按时间对齐，其次上一条 speaker，最后 `Speaker 1`”
+- [x] 目标
+  - 把“无 speaker 行”的默认补齐顺序统一成：先补为上一行的 speaker，补不出来再归为 `Speaker 1`
+  - 保持 5 号面板前后端行为一致，避免上传槽位统计与实际配音 speaker 路由不一致
+- [x] 计划
+  - 调整 5 号面板前端 `getDetectedSpeakerIds(...)` 的空 speaker 归并逻辑
+  - 评估是否需要把同一规则下沉为共享 helper，避免前后端语义继续漂移
+  - 补最小回归验证，覆盖“首行为空”和“中间行为空”两类情况
+- [x] 验证
+  - 前端静态检查通过
+  - 后端/测试能证明补齐顺序符合“上一行优先，最后 Speaker 1”
+- [x] Review
+  - 5 号面板前端 speaker 槽位统计已改为“上一行优先，最后 `Speaker 1`”，不再把每个空 speaker 立即算成 `Speaker 1`
+  - 后端 `_ensure_speaker_ids(...)` 原有顺序保持不变，并补了两条单测锁住“首行空 / 中间空”合同
+  - 验证结果：`node --check src/subtitle_maker/static/js/omnivoiceDubbingPanel.js` 通过；`python3 -m unittest ...` 返回 `OK (skipped=4)`，当前环境下这组 API 测试因缺依赖被跳过，未做更深集成回归
+
 ## 73. 2026-05-10 OmniVoice SRT 极端时长错配修复（无效声音）
 - [x] 目标
   - 修复 source SRT 导致的“短字长时窗 / 长字短时窗”异常，减少 OmniVoice 无效声音
@@ -5514,3 +5593,24 @@
   - speaker-first 对齐已恢复正确（时间窗比对为 0 错配）
   - 译文碎片化明显改善
   - 仍有少量专有名词英文保留，属于可接受的后续文本优化项
+
+## TODO（2026-05-12 Auto Dubbing 4号面板 401 报错定位）
+- [x] 定位 4 号面板失败根因
+  - 从 `outputs/dub_jobs/web_20260512_071958/web_cli_stdout.log` 确认失败发生在 `translate:translation_started` 之后
+  - 确认外部翻译接口 `https://api.freemodel.dev/v1/chat/completions` 先返回 503，再返回 401
+  - 排除“未上传参考音频”根因（失败时机早于 TTS/ref 阶段）
+- [x] 最小修复错误文案，避免误导
+  - 当 stdout 含 `401` + `chat/completions` / `Internal server error` 时
+  - 将最终失败详情统一映射为“翻译 provider 鉴权失败（HTTP 401）”
+- [x] 增加回归测试
+  - `tests/test_dubbing_cli_api.py` 新增 401 文案映射用例
+
+## Review（2026-05-12 Auto Dubbing 4号面板 401 报错定位）
+- 已修改：
+  - [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py)
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py)
+- 验证结果：
+  - `uv run python -m py_compile src/subtitle_maker/dubbing_cli_api.py tests/test_dubbing_cli_api.py`：通过
+  - `uv run python -m unittest tests.test_dubbing_cli_api -k DubbingCliApiFailureParsingTests`：`Ran 2 tests ... OK`
+- 根因结论：
+  - 4 号面板这次失败不是参考音频问题，是翻译 provider 返回 `401 Unauthorized`。

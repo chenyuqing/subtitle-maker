@@ -1,5 +1,9 @@
 # Lessons
 
+- 2026-05-15：验证 FFmpeg 烧录耗时时，不能把源视频总时长直接当成编码耗时预期；必须区分“素材时长”和“本机实测编码时长”，优先引用用户已经给出的实测口径（这次是 `libx264` 约 1 分半）。
+- 2026-05-15：当用户要求 5 号面板 final 视频烧录 ASS 字幕时，不能覆盖现有 `dubbed_video_full.mp4`；应保留“纯换音轨成片”并新增独立 burned 版本，否则会破坏既有结果回放与恢复合同。
+- 2026-05-15：当用户要求 5 号面板导出 styled ASS，并明确给出一个现成 `.ass` 样例作为真值时，不要自定义“差不多”的默认字幕样式；必须直接复用样例里的 `Script Info`、`Style` 和关键排版参数，把需求收敛成固定模板导出。
+- 2026-05-14：用户明确要求 5 号面板“无 speaker 行默认补齐”为“上一行优先，补不出来再 `Speaker 1`”时，不能只看后端 `_ensure_speaker_ids(...)` 已经接近正确；还必须同步检查前端上传槽位/缺失提示用的 speaker 统计 helper，否则 UI 展示与实际配音路由会继续漂移。
 - 2026-05-10：OmniVoice 对 source SRT 逐句合成时，不能盲信 `end-start` 就是可读目标时长；遇到“短字长窗 + 长字短窗”的相邻极端对，会产生明显无效声。应在合成前做轻量时长重分配，至少修复相邻极端失配对。
 - 2026-05-10：OmniVoice 的 source->translate 路径不能只做“空行过滤”；还必须处理“纯标点译文”（例如单独 `。`）这种可见但不可读的异常行。否则 selected/final SRT 会出现长时窗+单标点，影响配音与审阅。
 - 2026-05-09：排查“字幕长时窗+短句”错配时，先沿上游链路逐层取证（source JSON -> 导入字幕 -> 翻译回填 -> 最终 SRT），不要先把结论压在某一层；尤其在用户已强调 speaker-first 的场景，必须先确认“按 speaker 分层，再分行”的语义边界是否被破坏。
@@ -132,3 +136,4 @@
 - 2026-05-12：5 号面板译文重构后，`speaker_id` 不能再按索引补齐；当行数/分句发生变化时必须按时间重叠（无重叠时按最近时间）回填 speaker，否则会在 speaker 切换点把后续整段错误标成 `Speaker 1`。
 - 2026-05-12：5 号面板译文质量问题不能只靠一层修复；“speaker 回填”与“文本清洗/碎片回并”是两条独立轴，必须分别修。文本后处理可以显著减少半句碎片和中英粘连，但无法单独消除所有 speaker 错配。
 - 2026-05-12：当 `selected_subtitles` 已经带了错误 speaker 标签时，仅“补齐空 speaker_id”不够；5 号面板必须支持按 source 时间窗强制校正 speaker（覆盖已有错误标签），否则 speaker 错配会残留。
+- 2026-05-12：4 号面板出现 `Pipeline failed: Error code: 401 - {'error': 'Internal server error'}` 时，不要先归因到参考音频；先看 `web_cli_stdout.log` 是否在 `translate:translation_started` 后出现 `chat/completions 401`。这是翻译 provider 鉴权/服务侧错误，需优先提示 API key/base_url/model。

@@ -357,6 +357,12 @@ def prepare_dubbed_audio_for_video(
     return output_audio_path
 
 
+def _ffmpeg_filter_escape(path: str) -> str:
+    """转义 ffmpeg filter 参数中的路径，兼容 macOS 绝对路径与引号。"""
+
+    return path.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
 def replace_video_audio_two_step(
     *,
     input_media_path: Path,
@@ -431,6 +437,47 @@ def replace_video_audio_two_step(
             f"reencode_out={reencode_out}"
         )
     return "reencode"
+
+
+def burn_ass_subtitles_into_video(
+    *,
+    input_video_path: Path,
+    ass_subtitle_path: Path,
+    output_video_path: Path,
+    video_codec: str = "libx264",
+    crf: int = 16,
+    preset: str = "slow",
+) -> Path:
+    """把 ASS 字幕硬烧录到 MP4 视频中，并保留原音轨。"""
+
+    output_video_path.parent.mkdir(parents=True, exist_ok=True)
+    escaped_subtitle_path = _ffmpeg_filter_escape(str(ass_subtitle_path.resolve()))
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_video_path),
+        "-vf",
+        f"ass='{escaped_subtitle_path}'",
+        "-c:v",
+        video_codec,
+        "-crf",
+        str(int(crf)),
+        "-preset",
+        str(preset),
+        "-c:a",
+        "copy",
+        "-movflags",
+        "+faststart",
+        str(output_video_path),
+    ]
+    code, out, err = run_cmd(cmd)
+    if code != 0:
+        raise RuntimeError(
+            "failed to burn ASS subtitles into video: "
+            f"stderr={err.strip()}\nstdout={out}\ncmd={' '.join(cmd)}"
+        )
+    return output_video_path
 
 
 def build_dubbed_video_two_step(

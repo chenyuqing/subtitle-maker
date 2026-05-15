@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased] - 2026-05-15
+
+### Added
+- **OmniVoice final styled ASS 导出**: 5 号面板最终结果现在会同步写出 `final/dubbed_final_full-styled.ass`，样式固定为 `PingFang SC`、字号 `80`、底部黑底白字。
+- **OmniVoice final 烧录视频成片**: 5 号面板最终结果现在会额外生成 `final/dubbed_video_full_burned.mp4`，使用 `ffmpeg ass=` filter、`libx264`、`crf=16`、`preset=slow`、`-c:a copy`。
+- **结果下载合同扩展**: OmniVoice manifest 与 artifact 列表新增 `ass` 和 `video_burned`，前端结果预览会优先选择烧录字幕后的成片。
+
+### Fixed
+- **5 号面板无 speaker 行默认补齐顺序**: 空 `speaker_id` 现在统一按“上一行优先，补不出来再归 `Speaker 1`”处理，避免前后端 speaker 槽位统计与实际路由不一致。
+
 ## [Unreleased] - 2026-04-27
 
 ### Fixed

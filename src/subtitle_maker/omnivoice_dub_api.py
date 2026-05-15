@@ -32,6 +32,7 @@ from subtitle_maker.domains.dubbing.alignment import (
 )
 from subtitle_maker.domains.dubbing.references import extract_reference_audio_from_offset
 from subtitle_maker.domains.media import (
+    burn_ass_subtitles_into_video,
     compose_vocals_master,
     extract_source_audio,
     ffprobe_duration,
@@ -1156,6 +1157,64 @@ def _normalize_final_srt_text(text: str) -> str:
     return re.sub(r"\s+", " ", normalized)
 
 
+def _format_ass_time(seconds_value: float) -> str:
+    """把秒数格式化成 ASS 时间戳 `H:MM:SS.cc`。"""
+
+    total_centiseconds = max(0, int(round(float(seconds_value or 0.0) * 100.0)))
+    hours, rem = divmod(total_centiseconds, 360000)
+    minutes, rem = divmod(rem, 6000)
+    seconds, centiseconds = divmod(rem, 100)
+    return f"{hours}:{minutes:02d}:{seconds:02d}.{centiseconds:02d}"
+
+
+def _escape_ass_text(text: str) -> str:
+    """转义 ASS 正文里的特殊字符，并把内部换行映射为 `\\N`。"""
+
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return ""
+    # ASS 把花括号当作 override block，需要显式转义成全角以避免样式串被误解析。
+    normalized = normalized.replace("{", "｛").replace("}", "｝")
+    lines = [line.strip() for line in normalized.split("\n")]
+    return r"\N".join(line for line in lines if line)
+
+
+def _build_styled_ass_from_rows(rows: List[Dict[str, Any]], *, source_name: str) -> str:
+    """按固定样式模板把最终字幕行导出为 styled ASS。"""
+
+    header_lines = [
+        "[Script Info]",
+        f"; Converted from {source_name}",
+        "; Style: large bold white Chinese subtitles with semi-transparent black background bar",
+        "ScriptType: v4.00+",
+        "WrapStyle: 2",
+        "ScaledBorderAndShadow: yes",
+        "YCbCr Matrix: TV.709",
+        "PlayResX: 1920",
+        "PlayResY: 1080",
+        "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+        "Style: Default,PingFang SC,80,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,4,0,0,2,80,80,80,1",
+        "",
+        "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+    dialogue_lines: List[str] = []
+    for row in rows:
+        text = _escape_ass_text(str(row.get("text") or ""))
+        if not text:
+            continue
+        start_sec = float(row.get("start", 0.0) or 0.0)
+        end_sec = float(row.get("end", 0.0) or 0.0)
+        if end_sec <= start_sec:
+            continue
+        dialogue_lines.append(
+            f"Dialogue: 0,{_format_ass_time(start_sec)},{_format_ass_time(end_sec)},Default,,0,0,0,,{text}"
+        )
+    return "\n".join(header_lines + dialogue_lines) + "\n"
+
+
 def _build_selected_subtitles_with_speaker_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """构建带 speaker 前缀的字幕副本行，用于人工 review。"""
 
@@ -2062,6 +2121,8 @@ def _build_manifest(
     speaker_reference_dir: Path,
     subtitles_path: Path,
     subtitles_with_speaker_path: Optional[Path] = None,
+    final_ass_path: Optional[Path] = None,
+    burned_video_path: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """写入独立 OmniVoice manifest，供恢复与 artifact 下载使用。"""
 
@@ -2078,19 +2139,24 @@ def _build_manifest(
             else None
         ),
         "dubbed_final_srt": str(final_srt_path.resolve()) if final_srt_path.exists() else None,
+        "dubbed_final_ass": str(final_ass_path.resolve()) if final_ass_path and final_ass_path.exists() else None,
         "dubbed_vocals": str(final_vocals_path.resolve()) if final_vocals_path.exists() else None,
         "dubbed_mix": str(final_mix_path.resolve()) if final_mix_path.exists() else None,
         "dubbed_audio_for_video": str(separated_video_audio_path.resolve()) if separated_video_audio_path and separated_video_audio_path.exists() else None,
         "dubbed_video_full": str(final_video_path.resolve()) if final_video_path and final_video_path.exists() else None,
+        "dubbed_video_burned": str(burned_video_path.resolve()) if burned_video_path and burned_video_path.exists() else None,
         "separation_report": str(separation_report_path.resolve()) if separation_report_path.exists() else None,
         "manifest": str((out_root / "manifest.json").resolve()),
     }
     artifacts: List[Dict[str, str]] = [
         {"key": "srt", "label": "Dubbed Final SRT", "url": _build_artifact_url(task["id"], "srt")},
+        {"key": "ass", "label": "Dubbed Final ASS", "url": _build_artifact_url(task["id"], "ass")},
         {"key": "vocals", "label": "Dubbed Vocals WAV", "url": _build_artifact_url(task["id"], "vocals")},
         {"key": "mix", "label": "Dubbed Mix WAV", "url": _build_artifact_url(task["id"], "mix")},
         {"key": "manifest", "label": "Manifest JSON", "url": _build_artifact_url(task["id"], "manifest")},
     ]
+    if burned_video_path and burned_video_path.exists():
+        artifacts.insert(2, {"key": "video_burned", "label": "Dubbed Video MP4 (Burned ASS)", "url": _build_artifact_url(task["id"], "video_burned")})
     if final_video_path and final_video_path.exists():
         artifacts.insert(3, {"key": "video", "label": "Dubbed Video MP4", "url": _build_artifact_url(task["id"], "video")})
     if separated_video_audio_path and separated_video_audio_path.exists():
@@ -2152,11 +2218,13 @@ def _artifact_path_from_task(task: Dict[str, Any], artifact: str) -> Optional[Pa
     out_root = manifest_path.parent if manifest_path.exists() else _resolve_output_dir(str(task.get("batch_id") or task.get("id") or ""))
     paths = {
         "srt": out_root / "final" / "dubbed_final_full.srt",
+        "ass": out_root / "final" / "dubbed_final_full-styled.ass",
         "selected_srt": out_root / "selected_subtitles.srt",
         "selected_srt_with_speaker": out_root / "selected_subtitles_with_speakers.srt",
         "vocals": out_root / "final" / "dubbed_vocals_full.wav",
         "mix": out_root / "final" / "dubbed_mix_full.wav",
         "video": out_root / "final" / "dubbed_video_full.mp4",
+        "video_burned": out_root / "final" / "dubbed_video_full_burned.mp4",
         "video_audio": out_root / "final" / "dubbed_audio_for_video.m4a",
         "manifest": out_root / "manifest.json",
         "separation_report": out_root / "separation_report.json",
@@ -2524,8 +2592,14 @@ def _run_omnivoice_job(
     final_srt_path = final_dir / "dubbed_final_full.srt"
     final_srt_rows = _rebalance_omnivoice_final_srt_rows(selected_subtitles)
     final_srt_path.write_text(format_srt(final_srt_rows), encoding="utf-8")
+    final_ass_path = final_dir / "dubbed_final_full-styled.ass"
+    final_ass_path.write_text(
+        _build_styled_ass_from_rows(final_srt_rows, source_name=final_srt_path.name),
+        encoding="utf-8",
+    )
 
     final_video_path: Optional[Path] = None
+    burned_video_path: Optional[Path] = None
     prepared_audio_path: Optional[Path] = None
     if has_video_stream(input_media_path):
         _set_task(task_id, stage="dubbing:muxing", progress=91.0)
@@ -2541,6 +2615,16 @@ def _run_omnivoice_job(
             prepared_audio_path=prepared_audio_path,
             output_video_path=final_video_path,
             target_duration_sec=max(0.05, float(ffprobe_duration(input_media_path))),
+        )
+        _set_task(task_id, stage="dubbing:burning_subtitles", progress=96.0)
+        burned_video_path = final_dir / "dubbed_video_full_burned.mp4"
+        burn_ass_subtitles_into_video(
+            input_video_path=final_video_path,
+            ass_subtitle_path=final_ass_path,
+            output_video_path=burned_video_path,
+            video_codec="libx264",
+            crf=16,
+            preset="slow",
         )
 
     task = _task_store.get(task_id)
@@ -2575,6 +2659,8 @@ def _run_omnivoice_job(
         speaker_reference_dir=speaker_root,
         subtitles_path=selected_subtitles_path,
         subtitles_with_speaker_path=selected_subtitles_with_speaker_path,
+        final_ass_path=final_ass_path,
+        burned_video_path=burned_video_path,
     )
     task["artifacts"] = list(manifest.get("artifacts") or [])
     task["batch_manifest_path"] = str((out_root / "manifest.json").resolve())
@@ -3009,9 +3095,11 @@ async def download_omnivoice_artifact(task_id: str, artifact: str):
     media_type = "application/octet-stream"
     if artifact in {"srt", "selected_srt", "selected_srt_with_speaker"}:
         media_type = "application/x-subrip"
+    elif artifact == "ass":
+        media_type = "text/x-ass; charset=utf-8"
     elif artifact in {"vocals", "mix", "video_audio"}:
         media_type = "audio/wav" if artifact != "video_audio" else "audio/mp4"
-    elif artifact == "video":
+    elif artifact in {"video", "video_burned"}:
         media_type = "video/mp4"
     elif artifact == "manifest":
         media_type = "application/json"
