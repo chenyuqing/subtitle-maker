@@ -12,10 +12,14 @@
   - 更新 `README.md`、`CHANGELOG.md` 和 `docs/output-video-with-subtitle.md`
   - 只提交与这次功能和文档同步相关的文件，避免把本地未追踪的大目录一起推送
   - 做最小校验后提交并推送
-- [ ] 验证
+- [x] 验证
   - 文档内容与当前实现一致
   - Git 提交与推送成功
-- [ ] Review
+- [x] Review
+  - `README.md` 已补充 5 号面板 final 的 styled ASS / burned MP4 输出说明
+  - `CHANGELOG.md` 已记录 speaker 补齐、styled ASS 导出与 burned 视频交付
+  - `docs/output-video-with-subtitle.md` 已整理成可执行的 FFmpeg 烧录说明，并补上项目 final 产物约定
+  - 相关改动已提交为 `96efe6b feat: export omnivoice burned video artifacts` 并推送到 `origin/codex/omnivoice-speaker-upload-milestone-20260507`
 
 ## 76. 2026-05-15 5 号面板 final 视频新增 ASS 烧录输出
 - [x] 现状
