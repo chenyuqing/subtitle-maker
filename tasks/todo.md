@@ -1,5 +1,231 @@
 # TODO
 
+## 86. 2026-05-16 5 号面板统一支持翻译复用与配音断点续跑
+- [x] 现状
+  - 5 号面板当前只有 `prepared_batch_id` 级别的窄复用能力，本质是复用 `selected_subtitles.srt`
+  - `load-batch` 只能恢复结果视图，不能恢复执行态
+  - `_run_omnivoice_job(...)` 每次都从第 1 条字幕整批重跑，不会复用已落盘的 `segment_jobs/segment_XXXX/seg_XXXX.wav`
+- [x] 目标
+  - 把“翻译复用”和“配音中断续跑”统一为 5 号面板同一套 `resume` 能力
+  - 恢复时优先复用已存在的 `selected_subtitles.srt`、speaker refs、stems 和已完成 segment
+  - 前端加载 batch 后明确提示是否可从断点继续，而不是只允许查看结果
+- [x] 计划
+  - 后端新增 OmniVoice `resume` 入口与 checkpoint 探测 helper
+  - 扩展 manifest / load-batch 返回合同，暴露 `resumable`、`resume_stage`、`completed_segments`
+  - 前端增加“从断点继续配音”入口并接入新接口
+  - 补 5 号面板恢复相关定向测试
+- [x] 验证
+  - 仅有 `selected_subtitles.srt` 的 prepared batch 可直接跳过翻译继续
+  - 部分 `seg_XXXX.wav + manifest.json` 已存在时，只继续未完成 segment
+  - 已完成任务不会错误显示可恢复
+- [x] Review
+  - [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 新增 OmniVoice resume 合同：`_infer_resume_state(...)`、`_build_resume_context(...)`、`/omnivoice/auto/resume/{task_id}`，并让 `_run_omnivoice_job(...)` 支持复用 `selected_subtitles`、stems、speaker refs 与已完成 segment
+  - [src/subtitle_maker/static/js/omnivoiceDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/omnivoiceDubbingPanel.js) 在 load-batch 后新增“从断点继续配音 / 跳过翻译继续配音”入口，并根据 `resumable/resume_stage/processed_segments` 动态提示
+  - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 的 5 号 Restore 区新增 resume 按钮
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 新增 5 号面板恢复相关回归测试：prepared 可恢复、resume 入队、segment 级跳过已完成条目
+  - 验证结果：`./.venv/bin/python -m py_compile src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py` 通过；`node --check src/subtitle_maker/static/js/omnivoiceDubbingPanel.js` 通过；`./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_load_omnivoice_batch_marks_prepared_batch_resumable tests.test_dubbing_cli_api.DubbingCliApiTests.test_resume_omnivoice_task_requeues_batch_with_resume_context tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_omnivoice_job_resume_skips_completed_segments tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_omnivoice_from_project_reuses_prepared_selected_subtitles` 通过（4 tests, OK）
+
+## 85. 2026-05-16 5 号面板支持重启后复用已准备好的 selected_subtitles 直接配音
+- [x] 现状
+  - `preparedBatchId` 只存在 5 号面板前端内存里，页面或后端重启后会丢失
+  - 现有 `start-from-project` 依赖前端再次把 `prepared_batch_id` 传回来，否则会重新走翻译/字幕选择流程
+  - 用户已经处理完译文后，如果后台断开，再重启时无法直接跳过这一步开始配音
+- [x] 目标
+  - 允许用户在重启后复用之前已经生成的 `selected_subtitles.srt`
+  - 启动配音时优先复用 prepared batch，直接进入 speaker 参考音和配音阶段
+  - 如果 prepared batch 已不存在或不匹配当前项目，自动降级为普通启动，避免阻塞
+- [x] 计划
+  - 前端把 prepared batch 状态持久化到本地存储，并在页面恢复时自动回填
+  - 后端继续支持 `prepared_batch_id` 复用已有 `selected_subtitles.srt`
+  - 增加“prepared batch 失效自动回退”的回归测试
+- [x] 验证
+  - 页面重启后仍可恢复之前的 prepared batch
+  - 直接点击开始配音时会沿用已准备好的 `selected_subtitles.srt`
+  - prepared batch 失效时会自动回退到普通启动，而不是报死错
+- [x] Review
+  - [src/subtitle_maker/static/js/omnivoiceDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/omnivoiceDubbingPanel.js) 新增 prepared batch 本地持久化与恢复逻辑，重启后可直接复用前一次已生成的 `selected_subtitles.srt`
+  - [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 的 `start-from-project` 继续支持 `prepared_batch_id` 复用；任务 payload 也会记录 `enable_source_separation`
+  - 当 prepared batch 失效时，前端会自动清掉缓存并回退一次普通启动，避免用户卡死在旧批次上
+  - 验证结果：`node --check src/subtitle_maker/static/js/omnivoiceDubbingPanel.js` 通过；`./.venv/bin/python -m py_compile src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py` 通过；`./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_omnivoice_from_project_reuses_prepared_selected_subtitles tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_omnivoice_from_project_can_disable_source_separation tests.test_dubbing_cli_api.DubbingCliApiTests.test_prepare_omnivoice_source_stems_passthrough_uses_source_audio_as_vocals` 通过（3 tests, OK）
+
+## 84. 2026-05-16 5 号面板支持手动关闭人声分离
+- [x] 现状
+  - 5 号面板当前默认且强制先做人声分离，前端没有显式开关
+  - `src/subtitle_maker/omnivoice_dub_api.py::_run_omnivoice_job(...)` 会无条件调用 `_prepare_omnivoice_source_stems(...)`
+  - 但后续 speaker 参考音、配音和 final 合成链路其实已经支持 `has_bgm_track=False` 的纯 vocals-only 运行方式
+- [x] 目标
+  - 默认保持开启人声分离
+  - 允许用户在 5 号面板手动关闭人声分离，适用于纯人声、无背景音乐素材
+  - 关闭后直接把 `source_audio.wav` 作为 `source_vocals.wav`，并明确禁用 BGM 回混
+- [x] 计划
+  - 前端新增开关并透传 `enable_source_separation`
+  - 后端启动接口与任务链路接住该布尔值
+  - 新增 passthrough helper 与最小回归测试
+- [x] 验证
+  - 默认不传时，仍保持现有 separation 主路径
+  - 显式 `enable_source_separation=false` 时，会走 passthrough vocals-only 语义
+  - `separation_report.json` 能明确区分“主动跳过”与“分离失败降级”
+- [x] Review
+  - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 的 5 号面板新增“开启人声分离（默认）”开关
+  - [src/subtitle_maker/static/js/omnivoiceDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/omnivoiceDubbingPanel.js) 启动请求新增 `enable_source_separation`
+  - [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 新增 `_prepare_omnivoice_source_stems_passthrough(...)`，并把 `enable_source_separation` 接到 `start-from-project`、任务 payload 和 `_run_omnivoice_job(...)`
+  - 验证结果：`./.venv/bin/python -m py_compile src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py` 通过；`./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_prepare_omnivoice_source_stems_passthrough_uses_source_audio_as_vocals tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_omnivoice_from_project_can_disable_source_separation tests.test_dubbing_cli_api.DubbingCliApiTests.test_prepare_omnivoice_source_stems_dispatches_to_chunked_for_long_video` 通过（3 tests, OK）
+
+## 83. 2026-05-16 翻译漏行重试改为“优先只补缺失编号行”以降低 API 成本
+- [x] 现状
+  - `src/subtitle_maker/translator.py::_translate_batch_with_split_retry(...)` 当前在单批漏行时直接递归二分重试
+  - 该策略能恢复行数，但会重复请求已成功的行，导致异常批次 API 调用次数明显增多
+  - 最新实测日志中，`300 -> 299` 的轻微漏行也触发了 `150/75` 级联重试，存在成本冗余
+- [x] 目标
+  - 保留当前“先保证译文完整度”的收益
+  - 对轻微漏行场景优先只重试缺失编号行，避免整半批重翻
+  - 仅在缺失过多或补齐失败时，才回退到现有二分重试路径
+- [x] 计划
+  - 明确“缺失行比例/数量”的阈值，决定走“缺失行补译”还是“二分重试”
+  - 设计缺失行补译的编号映射与结果回填逻辑
+  - 补回归测试，验证“成本下降 + 完整度不退化”
+- [x] 验证
+  - 轻微漏行时优先触发缺失编号局部补译
+  - 局部补译会把结果按原索引回填，不打乱整批顺序
+  - 局部补译不适用或补不齐时，仍会回退到现有二分重试
+- [x] Review
+  - [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 新增缺失编号补译相关 helper：`_find_missing_translation_indexes(...)`、`_should_retry_missing_only(...)`、`_build_missing_translation_retry_prompt(...)`、`_retry_missing_lines_with_context(...)`
+  - 当前策略变为：默认 `300` 行批量；轻微漏行时优先只补缺失编号行，并携带前后各 1 行上下文；局部补译失败或缺失过多时，才回退到原有二分重试
+  - 回归测试已覆盖“优先局部补译”和“必要时回退二分”两种路径，见 [tests/test_dubbing_runtime.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_runtime.py)
+  - 验证结果：`./.venv/bin/python -m py_compile src/subtitle_maker/translator.py tests/test_dubbing_runtime.py` 通过；`./.venv/bin/python -m unittest tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_translate_batch_merges_default_and_custom_system_prompt tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_translate_batch_flattens_internal_newlines_in_one_cue tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_translate_batch_uses_default_chunk_size_300 tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_translate_batch_retries_incomplete_batch_by_splitting tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_translate_batch_retries_missing_lines_only_before_split tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_parse_translated_lines_merges_multiline_numbered_blocks tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_parse_translated_lines_ignores_noise_lines_without_index_shift` 通过（7 tests, OK）
+
+## 82. 2026-05-16 字幕翻译批量改为 300 且漏行批自动拆分重试
+- [x] 现状
+  - `src/subtitle_maker/translator.py::Translator.translate_batch(...)` 当前默认按 `500` 行分批请求翻译接口
+  - `src/subtitle_maker/translator.py::_parse_translated_lines(...)` 在编号块解析少于期望行数时，只会记录 warning，并把缺失槽位保留为空字符串
+  - `src/subtitle_maker/omnivoice_dub_api.py::_translate_subtitles_if_needed(...)` 后续会把空译文回退成 source 原文，再对英文主导行做小批量补救重译
+  - 最新实测日志已出现 `500 -> 483`、`500 -> 498`、`500 -> 499`，说明 500 行批量会显著增加漏行与回退原文概率
+- [x] 目标
+  - 把默认翻译批量从 500 调整到更稳的 300
+  - 对单批 `parsed < expected` 的情况，不直接把缺失行留给后续 source fallback，而是在翻译层先自动拆小重试
+  - 保持现有 OmniVoice 后处理兜底仍然存在，作为最后保护而不是主修复路径
+- [x] 计划
+  - 先明确“漏行批”的检测信号和返回合同
+  - 再决定拆分重试策略是固定二分、递归二分还是阶梯降批
+  - 最后补翻译层回归测试，锁住“默认 300 + 漏行批自动重试”行为
+- [x] 验证
+  - `Translator.translate_batch(...)` 默认批量已改为 300
+  - 单批编号块解析漏行时，会先在翻译层递归二分重试
+  - 拆到最小阈值仍漏行时，仍保留现有后续兜底路径
+- [x] Review
+  - [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 新增 `_translate_one_batch(...)` 与 `_translate_batch_with_split_retry(...)`，把“请求、解析、漏行重试”前移到翻译器层
+  - `translate_batch(...)` 默认批量从 `500` 调整到 `300`，并在漏行批上递归二分重试，最小自动重试阈值为 `60`
+  - [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 的现有空译文回填与 latin-dominant 重试仍保留，语义变成最后兜底而不是主修复路径
+  - 验证结果：`./.venv/bin/python -m py_compile src/subtitle_maker/translator.py tests/test_dubbing_runtime.py` 通过；`./.venv/bin/python -m unittest tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_translate_batch_merges_default_and_custom_system_prompt tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_translate_batch_flattens_internal_newlines_in_one_cue tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_translate_batch_uses_default_chunk_size_300 tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_translate_batch_retries_incomplete_batch_by_splitting tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_parse_translated_lines_merges_multiline_numbered_blocks tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_parse_translated_lines_ignores_noise_lines_without_index_shift` 通过（6 tests, OK）
+
+## 81. 2026-05-16 5 号面板长视频分段改为 40 分钟附近灵活切分
+- [x] 现状
+  - `src/subtitle_maker/omnivoice_dub_api.py::_build_omnivoice_chunk_ranges(...)` 当前只支持按固定块长硬切，默认参数来自 `OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_CHUNK_SEC`
+  - `src/subtitle_maker/omnivoice_dub_api.py::_prepare_omnivoice_source_stems_chunked(...)` 会严格使用这些 range 做抽音和 Demucs 分离，不会再根据语音活动调整边界
+  - `src/subtitle_maker/domains/media/compose.py::compose_vocals_master(...)` 当前只是按时间轴把各块结果直接写回，没有 overlap/crossfade 边界融合
+  - 因此如果切点落在人声连续段中间，边界附近的分离质量和后续 speaker reference 质量都可能受影响
+- [x] 目标
+  - 保持“超过 90 分钟才走分段 separation”的阈值不变
+  - 保持“40 分钟是目标块长”这个性能方向，但切点允许在目标附近灵活调整
+  - 优先把切点避开正在说话的连续活跃区，降低边界截断对后续配音质量的影响
+- [x] 计划
+  - 先确认现有代码里哪些输入可用于切点搜索，以及搜索应放在哪个函数
+  - 再定义“40 分钟附近”的可调整窗口、静音优先级和兜底规则
+  - 最后决定是否只做智能切点，还是同时引入轻量 overlap
+- [x] 验证
+  - 长视频分段仍保持 `> 90 分钟` 才进入 chunked separation
+  - 默认目标块长改为 `40 分钟`，但实际切点允许在窗口内偏移
+  - 切点优先级为“静音/低能量 > 字幕边界 > speaker 切换点”
+- [x] Review
+  - [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 新增智能切块 helper：`_build_omnivoice_cut_hint_points(...)`、`_analyze_omnivoice_split_window(...)`、`_pick_omnivoice_adaptive_split_point(...)`、`_build_omnivoice_chunk_plan(...)`
+  - 5 号面板 chunked separation 现在会基于 `source_audio.wav` 在目标切点前后搜索静音/低能量位置，再尽量吸附到附近字幕边界；`speaker_id` 只作为字幕边界并列决胜条件，不再当主锚点
+  - `separation_report.json` 的 `ranges[]` 现已包含 `target_end_sec`、`actual_end_sec`、`split_reason`、`snapped_to_boundary`、`snapped_to_speaker_change`
+  - 验证结果：`./.venv/bin/python -m py_compile src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py` 通过；`./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_omnivoice_chunk_ranges_splits_only_when_over_threshold tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_omnivoice_chunk_plan_prefers_silence_and_snaps_to_subtitle_boundary tests.test_dubbing_cli_api.DubbingCliApiTests.test_prepare_omnivoice_source_stems_dispatches_to_chunked_for_long_video tests.test_dubbing_cli_api.DubbingCliApiTests.test_prepare_omnivoice_source_stems_keeps_single_pass_at_90_minutes tests.test_dubbing_cli_api.DubbingCliApiTests.test_prepare_omnivoice_source_stems_chunked_degrades_only_failed_chunk` 通过（5 tests, OK）
+
+## 80. 2026-05-16 5 号面板长视频分段时长从 20 分钟调到 40 分钟
+- [x] 现状
+  - `src/subtitle_maker/omnivoice_dub_api.py::_build_omnivoice_chunk_ranges(...)` 当前默认读取 `OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_CHUNK_SEC`
+  - 该常量现在是 `20 * 60` 秒，是上一轮长视频分段 separation 第一版的保守默认值
+  - 你最新实测反馈是“20 分钟素材约 2 分钟跑完、CPU 约 68%”，说明当前切块偏小，存在 Demucs 调度和切块管理开销
+- [x] 目标
+  - 保持“超过 90 分钟才分段”的阈值不变
+  - 仅把 5 号面板长视频预分离的默认切块时长从 20 分钟调整到 40 分钟
+  - 同步回归测试，确保切块合同和阈值合同仍然成立
+- [x] 计划
+  - 修改 `OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_CHUNK_SEC`
+  - 更新切块范围单测的期望值
+  - 跑 `py_compile + unittest` 定向验证
+- [ ] 验证
+  - 长视频默认切块时长已变为 40 分钟
+  - 90 分钟阈值逻辑不变
+
+## 79. 2026-05-16 5 号面板超过 90 分钟视频改为分段人声分离
+- [x] 现状
+  - 5 号面板当前整段预分离集中在 `src/subtitle_maker/omnivoice_dub_api.py::_prepare_omnivoice_source_stems(...)`
+  - 这条链路会先抽整条 `source_audio.wav`，再把整条音频一次性送进 `demucs.separate`
+  - 4 号面板 `tools/dub_pipeline.py::separate_audio(...)` 当前也仍是整段 separation，只是失败时会退化为 vocals-only
+  - 项目里已有按时间范围抽音并分离的局部实现：`src/subtitle_maker/speaker_voice_api.py::_separate_range_vocals_or_fail(...)`
+- [x] 目标
+  - 当输入视频总时长超过 90 分钟时，5 号面板改走分段人声分离
+  - 保持 90 分钟及以下视频继续走现有整段 separation，避免扩大回归面
+  - 分段 separation 完成后仍向后续 OmniVoice 参考音抽取、配音和 final 合成提供统一的 `full_source_vocals.wav` / `full_source_bgm.wav`
+- [x] 计划
+  - 先明确长视频分段 separation 的切块规则、落盘结构和 manifest / report 合同
+  - 再决定复用 `speaker_voice_api` 的 range 抽音思路，还是在 `omnivoice_dub_api.py` 内新增专用 helper
+  - 最后补长视频阈值与分段兜底的回归测试
+- [x] 功能点（Spec 第 2 段）
+  - `src/subtitle_maker/omnivoice_dub_api.py::_prepare_omnivoice_source_stems(...)` 增加总时长判断；当 `ffprobe_duration(input_media_path) > 5400s` 时切到 chunked separation
+  - chunked separation 仍先产出统一的 `stems/source_audio.wav`，但实际分离按时间块生成 `stems/range_0001/range_audio.wav`、`stems/range_0001/range_vocals.wav`、可选 `range_bgm.wav`
+  - 每个 range 的抽音方式参考 `src/subtitle_maker/speaker_voice_api.py::_separate_range_vocals_or_fail(...)`，但返回结果要服务于 5 号面板整片链路，而不是单次 speaker 提取任务
+  - range 级分离完成后，拼接生成统一的 `stems/full_source_vocals.wav` 与 `stems/full_source_bgm.wav`，供后续 `source_vocals_path`、参考音抽取和 final mix 继续复用
+  - `separation_report.json` 从“单次 attempts”扩展成“顶层 status + ranges[] + attempts[]”，保留每个分段的起止时间、状态、使用模型和是否降级
+  - 失败语义分两层：单个 range 失败时优先对该 range 退化为 vocals-only；全部 range 完成后整任务继续，而不是因为单块失败整体中止
+  - 90 分钟及以下视频保持旧的整段 separation 路径，避免改动短视频稳定链路
+  - 测试落点优先放在 `tests/test_dubbing_cli_api.py`，新增“超过阈值走 chunked”“未超过阈值走旧链路”“单个 chunk 双失败时只降级该 chunk”三类合同
+- [x] 风险与决策（Spec 第 3 段）
+  - 决策 1：阈值固定为“严格大于 90 分钟才切 chunked”，即 `duration_sec > 5400`；`5400` 秒整不切，减少边界回归
+  - 决策 2：chunk 时长优先定为 20 分钟，不直接复用 4 号面板 `segment_minutes`
+  - 原因：4 号的 `segment_minutes` 是 TTS 批处理参数，定义位置在 `src/subtitle_maker/dubbing_cli_api.py`；它不服务于 stem separation，直接复用会混淆语义
+  - 决策 3：chunk 之间先不加 overlap，也不做 crossfade；第一版按无重叠硬拼接实现
+  - 依据：当前整片回填工具 `src/subtitle_maker/domains/media/compose.py::build_full_timeline_vocals(...)` 与 `build_full_timeline_bgm(...)` 本身就是按固定时间窗直接写入，没有 crossfade 设施
+  - 决策 4：拼接方式优先做“按绝对时间轴写回整片 master”，而不是简单 `concat_wav_files(...)`
+  - 依据：`concat_wav_files(...)` 只适合顺序拼接；而 chunked separation 需要严格保持整片绝对时间轴，缺块或单块降级时也不能把后续时间轴前移
+  - 决策 5：单个 chunk 的抽音方式优先复用 `src/subtitle_maker/speaker_voice_api.py::_extract_audio_segment(...)` 的 `ffmpeg -ss/-t` 方案，避免先整片抽音再二次裁切带来的额外 IO
+  - 决策 6：单个 chunk 若 `htdemucs` 和 `mdx_extra_q` 都失败，只降级该 chunk 为 vocals-only，并在 `separation_report.json` 的 `ranges[]` 中标记 `failed_fallback_vocals_only`
+  - 风险 1：无 overlap 拼接在 chunk 边界可能出现轻微断点或底噪突变
+  - 风险应对：第一版优先解决“2 小时+ 长视频直接失败”，边界听感问题留到下一轮再评估是否引入 `0.5s-1.0s` overlap + crossfade
+  - 风险 2：如果某些 chunk 有 BGM、某些 chunk 降级为 vocals-only，最终 `full_source_bgm.wav` 会出现局部缺失
+  - 风险应对：允许 `has_bgm_track` 按整片降级为 `False`，即只要任一 chunk 缺失可用 BGM，final mix 退化为纯 dubbed vocals，避免混出局部双人声
+  - 风险 3：长视频 chunk 数增多后，`separation_report.json` 与 `stems/range_*` 目录会变大
+  - 风险应对：接受这部分调试开销，优先保留可恢复和可审计性，不在第一版做清理压缩
+- [x] 验证
+  - 超过 90 分钟视频会进入分段 separation
+  - 90 分钟及以下视频继续走旧链路
+- [x] Review
+  - 已在 `src/subtitle_maker/omnivoice_dub_api.py` 增加 long-video separation dispatcher：`> 5400s` 走 chunked，`<= 5400s` 保持 single-pass
+  - chunked separation 当前固定按 20 分钟切块，按绝对时间轴回并 `full_source_vocals.wav`；只要任一 chunk 缺失可靠 BGM，整片 `has_bgm_track` 会退化为 `False`
+  - `separation_report.json` 已扩展支持 `mode=chunked`、`ranges[]` 和 `partial_fallback_vocals_only`
+  - 验证结果：`./.venv/bin/python -m py_compile src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py` 通过；`./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_omnivoice_chunk_ranges_splits_only_when_over_threshold tests.test_dubbing_cli_api.DubbingCliApiTests.test_prepare_omnivoice_source_stems_dispatches_to_chunked_for_long_video tests.test_dubbing_cli_api.DubbingCliApiTests.test_prepare_omnivoice_source_stems_keeps_single_pass_at_90_minutes tests.test_dubbing_cli_api.DubbingCliApiTests.test_prepare_omnivoice_source_stems_chunked_degrades_only_failed_chunk` 通过（4 tests, OK）
+
+## 78. 2026-05-16 5 号面板长视频 pre-separation failed 兜底修复
+- [x] 现状
+  - 最新 5 号面板任务 `omnivoice_20260516_011511` 在预分离阶段失败，前端报错 `Failed: OmniVoice pre-separation failed`
+  - `separation_report.json` 显示 `htdemucs` 对超长音频失败，`mdx_extra_q` 又因为本机未安装 `diffq` 失败
+- [x] 目标
+  - 避免 Demucs 双失败时整条 OmniVoice 任务直接终止
+  - 对齐 4 号面板现有策略：分离失败时退化为 vocals-only，继续后续配音链路
+- [x] 计划
+  - 把 5 号面板的人声分离逻辑抽成 helper，集中处理成功、降级和报告写盘
+  - 两个分离模型都失败时，复制 `source_audio.wav` 作为 `full_source_vocals.wav`，不再抛出致命错误
+  - 补回归测试，锁住 `failed_fallback_vocals_only` 合同
+- [x] 验证
+  - Demucs 双失败时任务不会因 `pre-separation failed` 中止
+  - `separation_report.json` 会记录降级状态
+- [x] Review
+  - 根因确认：`omnivoice_20260516_011511` 的 `htdemucs` 对 7781s 长音频失败，`mdx_extra_q` 又因缺 `diffq` 失败，旧逻辑因此直接抛 `OmniVoice pre-separation failed`
+  - 修复后 5 号面板会在双失败时退化为 `failed_fallback_vocals_only`，继续后续 OmniVoice 配音链路，只是不再保留独立 BGM
+  - 验证结果：`./.venv/bin/python -m py_compile src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py` 通过；`./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_prepare_omnivoice_source_stems_falls_back_to_vocals_only_when_demucs_fails tests.test_dubbing_cli_api.DubbingCliApiTests.test_burn_ass_subtitles_into_video_uses_expected_ffmpeg_args tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_manifest_includes_styled_ass_artifact_and_path` 通过（3 tests, OK）
+
 ## 77. 2026-05-15 文档同步并推送 GitHub
 - [x] 现状
   - 5 号面板的 styled ASS 导出与 burned MP4 已经实现并完成端到端验证

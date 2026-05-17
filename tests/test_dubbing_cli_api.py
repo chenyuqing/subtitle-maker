@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
+import soundfile as sf
 from fastapi.testclient import TestClient
 
 API_TEST_SKIP_REASON = ""
@@ -562,6 +564,368 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-preset") + 1], "slow")
         self.assertEqual(cmd[cmd.index("-c:a") + 1], "copy")
 
+    def test_prepare_omnivoice_source_stems_falls_back_to_vocals_only_when_demucs_fails(self):
+        """5号面板预分离双失败时，应退化为 vocals-only，而不是整任务报错。"""
+
+        out_root = self.omnivoice_output_root / "omnivoice_fallback"
+        stems_root = out_root / "stems"
+        stems_root.mkdir(parents=True, exist_ok=True)
+        input_media = self.tmpdir / "demo.mp4"
+        input_media.write_text("video", encoding="utf-8")
+        source_audio = stems_root / "source_audio.wav"
+        source_vocals = stems_root / "full_source_vocals.wav"
+        source_bgm = stems_root / "full_source_bgm.wav"
+        separation_report = out_root / "separation_report.json"
+        demucs_out = stems_root / "demucs_tmp"
+
+        def _fake_extract_source_audio(*, input_media, output_wav):
+            del input_media
+            output_wav.write_text("fake-audio", encoding="utf-8")
+
+        with patch.object(
+            omnivoice_dub_api,
+            "_resolve_omnivoice_separator_device",
+            return_value="auto",
+        ), patch.object(
+            omnivoice_dub_api,
+            "extract_source_audio",
+            side_effect=_fake_extract_source_audio,
+        ), patch.object(
+            omnivoice_dub_api,
+            "run_cmd",
+            side_effect=[
+                (1, "", "primary demucs failed"),
+                (1, "", "fallback demucs failed"),
+            ],
+        ):
+            result = omnivoice_dub_api._prepare_omnivoice_source_stems(
+                input_media_path=input_media,
+                source_audio_path=source_audio,
+                source_vocals_path=source_vocals,
+                source_bgm_path=source_bgm,
+                separation_report_path=separation_report,
+                demucs_out=demucs_out,
+            )
+
+        self.assertTrue(source_audio.exists())
+        self.assertTrue(source_vocals.exists())
+        self.assertEqual(source_vocals.read_text(encoding="utf-8"), "fake-audio")
+        self.assertFalse(source_bgm.exists())
+        self.assertTrue(result["degraded_to_vocals_only"])
+        self.assertFalse(result["has_bgm_track"])
+
+        report = json.loads(separation_report.read_text(encoding="utf-8"))
+        self.assertEqual(report["status"], "failed_fallback_vocals_only")
+        self.assertFalse(report["has_bgm_track"])
+        self.assertEqual(len(report["attempts"]), 2)
+        self.assertEqual(report["attempts"][0]["model"], "htdemucs")
+        self.assertEqual(report["attempts"][1]["model"], "mdx_extra_q")
+
+    def test_build_omnivoice_chunk_ranges_splits_only_when_over_threshold(self):
+        """智能切块会在 40 分钟附近保持整体块长均衡。"""
+
+        ranges = omnivoice_dub_api._build_omnivoice_chunk_ranges(
+            total_duration_sec=7800.0,
+            chunk_duration_sec=2400.0,
+        )
+
+        self.assertEqual(
+            ranges,
+            [
+                (0.0, 2600.0),
+                (2600.0, 5200.0),
+                (5200.0, 7800.0),
+            ],
+        )
+
+    def test_build_omnivoice_chunk_plan_prefers_silence_and_snaps_to_subtitle_boundary(self):
+        """智能切点应优先落在静音区，并尽量吸附到附近字幕边界。"""
+
+        source_audio = self.tmpdir / "adaptive_source.wav"
+        sample_rate = 100
+        audio = np.full(sample_rate * 120, 0.3, dtype=np.float32)
+        audio[int(41.7 * sample_rate) : int(42.3 * sample_rate)] = 0.0
+        audio[int(81.7 * sample_rate) : int(82.3 * sample_rate)] = 0.0
+        sf.write(str(source_audio), audio, sample_rate)
+
+        subtitles = [
+            {"start": 40.0, "end": 42.0, "text": "A", "speaker_id": "Speaker 1"},
+            {"start": 42.0, "end": 43.0, "text": "B", "speaker_id": "Speaker 2"},
+            {"start": 80.0, "end": 82.0, "text": "C", "speaker_id": "Speaker 2"},
+            {"start": 82.0, "end": 83.0, "text": "D", "speaker_id": "Speaker 1"},
+        ]
+
+        plan = omnivoice_dub_api._build_omnivoice_chunk_plan(
+            total_duration_sec=120.0,
+            source_audio_path=source_audio,
+            subtitle_hints=subtitles,
+            chunk_duration_sec=40.0,
+            min_chunk_duration_sec=30.0,
+            max_chunk_duration_sec=50.0,
+            search_window_sec=3.0,
+        )
+
+        self.assertEqual(len(plan), 3)
+        self.assertEqual(plan[0]["end_sec"], 42.0)
+        self.assertEqual(plan[0]["split_reason"], "silence")
+        self.assertTrue(plan[0]["snapped_to_boundary"])
+        self.assertTrue(plan[0]["snapped_to_speaker_change"])
+        self.assertEqual(plan[1]["end_sec"], 82.0)
+        self.assertEqual(plan[1]["split_reason"], "silence")
+        self.assertEqual(plan[2]["split_reason"], "tail")
+
+    def test_prepare_omnivoice_source_stems_dispatches_to_chunked_for_long_video(self):
+        """超过 90 分钟时，5号面板应切到 chunked separation。"""
+
+        out_root = self.omnivoice_output_root / "omnivoice_dispatch_long"
+        stems_root = out_root / "stems"
+        stems_root.mkdir(parents=True, exist_ok=True)
+        input_media = self.tmpdir / "long.mp4"
+        input_media.write_text("video", encoding="utf-8")
+        source_audio = stems_root / "source_audio.wav"
+        source_vocals = stems_root / "full_source_vocals.wav"
+        source_bgm = stems_root / "full_source_bgm.wav"
+        separation_report = out_root / "separation_report.json"
+        demucs_out = stems_root / "demucs_tmp"
+
+        def _fake_extract_source_audio(*, input_media, output_wav):
+            del input_media
+            output_wav.write_text("fake-audio", encoding="utf-8")
+
+        with patch.object(
+            omnivoice_dub_api,
+            "extract_source_audio",
+            side_effect=_fake_extract_source_audio,
+        ), patch.object(
+            omnivoice_dub_api,
+            "_resolve_omnivoice_separator_device",
+            return_value="auto",
+        ), patch.object(
+            omnivoice_dub_api,
+            "ffprobe_duration",
+            return_value=5400.1,
+        ), patch.object(
+            omnivoice_dub_api,
+            "_prepare_omnivoice_source_stems_chunked",
+            return_value={"mode": "chunked", "has_bgm_track": False, "degraded_to_vocals_only": False},
+        ) as chunked_mock, patch.object(
+            omnivoice_dub_api,
+            "_prepare_omnivoice_source_stems_single_pass",
+        ) as single_mock:
+            result = omnivoice_dub_api._prepare_omnivoice_source_stems(
+                input_media_path=input_media,
+                source_audio_path=source_audio,
+                source_vocals_path=source_vocals,
+                source_bgm_path=source_bgm,
+                separation_report_path=separation_report,
+                demucs_out=demucs_out,
+            )
+
+        self.assertEqual(result["mode"], "chunked")
+        self.assertTrue(chunked_mock.called)
+        self.assertFalse(single_mock.called)
+
+    def test_prepare_omnivoice_source_stems_keeps_single_pass_at_90_minutes(self):
+        """90 分钟及以下视频应继续走旧的整段 separation。"""
+
+        out_root = self.omnivoice_output_root / "omnivoice_dispatch_short"
+        stems_root = out_root / "stems"
+        stems_root.mkdir(parents=True, exist_ok=True)
+        input_media = self.tmpdir / "short.mp4"
+        input_media.write_text("video", encoding="utf-8")
+        source_audio = stems_root / "source_audio.wav"
+        source_vocals = stems_root / "full_source_vocals.wav"
+        source_bgm = stems_root / "full_source_bgm.wav"
+        separation_report = out_root / "separation_report.json"
+        demucs_out = stems_root / "demucs_tmp"
+
+        def _fake_extract_source_audio(*, input_media, output_wav):
+            del input_media
+            output_wav.write_text("fake-audio", encoding="utf-8")
+
+        with patch.object(
+            omnivoice_dub_api,
+            "extract_source_audio",
+            side_effect=_fake_extract_source_audio,
+        ), patch.object(
+            omnivoice_dub_api,
+            "_resolve_omnivoice_separator_device",
+            return_value="auto",
+        ), patch.object(
+            omnivoice_dub_api,
+            "ffprobe_duration",
+            return_value=5400.0,
+        ), patch.object(
+            omnivoice_dub_api,
+            "_prepare_omnivoice_source_stems_chunked",
+        ) as chunked_mock, patch.object(
+            omnivoice_dub_api,
+            "_prepare_omnivoice_source_stems_single_pass",
+            return_value={"has_bgm_track": False, "degraded_to_vocals_only": False},
+        ) as single_mock:
+            result = omnivoice_dub_api._prepare_omnivoice_source_stems(
+                input_media_path=input_media,
+                source_audio_path=source_audio,
+                source_vocals_path=source_vocals,
+                source_bgm_path=source_bgm,
+                separation_report_path=separation_report,
+                demucs_out=demucs_out,
+            )
+
+        self.assertFalse(chunked_mock.called)
+        self.assertTrue(single_mock.called)
+        self.assertFalse(result["degraded_to_vocals_only"])
+
+    def test_prepare_omnivoice_source_stems_chunked_degrades_only_failed_chunk(self):
+        """chunked separation 中单个分块双失败时，应只降级该块而不是整条失败。"""
+
+        out_root = self.omnivoice_output_root / "omnivoice_chunked"
+        stems_root = out_root / "stems"
+        stems_root.mkdir(parents=True, exist_ok=True)
+        input_media = self.tmpdir / "long.mp4"
+        input_media.write_text("video", encoding="utf-8")
+        source_audio = stems_root / "source_audio.wav"
+        source_audio.write_text("source-audio", encoding="utf-8")
+        source_vocals = stems_root / "full_source_vocals.wav"
+        source_bgm = stems_root / "full_source_bgm.wav"
+        separation_report = out_root / "separation_report.json"
+        demucs_out = stems_root / "demucs_tmp"
+
+        def _fake_extract_chunk(*, input_media_path, output_wav, start_sec, end_sec):
+            del input_media_path
+            output_wav.write_text(f"{start_sec:.1f}-{end_sec:.1f}", encoding="utf-8")
+            return output_wav
+
+        attempt_results = [
+            {
+                "separator_device": "auto",
+                "attempts": [{"model": "htdemucs", "ok": True, "error": ""}],
+                "vocals_src": self.tmpdir / "chunk1_vocals.wav",
+                "bgm_src": self.tmpdir / "chunk1_bgm.wav",
+            },
+            {
+                "separator_device": "auto",
+                "attempts": [
+                    {"model": "htdemucs", "ok": False, "error": "primary failed"},
+                    {"model": "mdx_extra_q", "ok": False, "error": "fallback failed"},
+                ],
+                "vocals_src": None,
+                "bgm_src": None,
+            },
+        ]
+        attempt_results[0]["vocals_src"].write_text("vocals-1", encoding="utf-8")
+        attempt_results[0]["bgm_src"].write_text("bgm-1", encoding="utf-8")
+
+        composed_outputs = []
+
+        def _fake_compose_vocals_master(*, segments, output_path, source_audio_fallback=None):
+            composed_outputs.append(
+                {
+                    "segments": [dict(item) for item in segments],
+                    "output_path": output_path,
+                    "source_audio_fallback": source_audio_fallback,
+                }
+            )
+            output_path.write_text("composed", encoding="utf-8")
+            return output_path, 44100
+
+        with patch.object(
+            omnivoice_dub_api,
+            "_build_omnivoice_chunk_ranges",
+            return_value=[(0.0, 1200.0), (1200.0, 2400.0)],
+        ), patch.object(
+            omnivoice_dub_api,
+            "_build_omnivoice_chunk_plan",
+            return_value=[
+                {
+                    "start_sec": 0.0,
+                    "end_sec": 1200.0,
+                    "target_end_sec": 1200.0,
+                    "split_reason": "fallback_fixed",
+                    "snapped_to_boundary": False,
+                    "snapped_to_speaker_change": False,
+                },
+                {
+                    "start_sec": 1200.0,
+                    "end_sec": 2400.0,
+                    "target_end_sec": 2400.0,
+                    "split_reason": "tail",
+                    "snapped_to_boundary": False,
+                    "snapped_to_speaker_change": False,
+                },
+            ],
+        ), patch.object(
+            omnivoice_dub_api,
+            "_extract_omnivoice_audio_segment",
+            side_effect=_fake_extract_chunk,
+        ), patch.object(
+            omnivoice_dub_api,
+            "_attempt_omnivoice_demucs_separation",
+            side_effect=attempt_results,
+        ), patch.object(
+            omnivoice_dub_api,
+            "compose_vocals_master",
+            side_effect=_fake_compose_vocals_master,
+        ):
+            result = omnivoice_dub_api._prepare_omnivoice_source_stems_chunked(
+                input_media_path=input_media,
+                source_audio_path=source_audio,
+                source_vocals_path=source_vocals,
+                source_bgm_path=source_bgm,
+                separation_report_path=separation_report,
+                demucs_out=demucs_out,
+                separator_device="auto",
+                total_duration_sec=2400.0,
+            )
+
+        self.assertTrue(source_vocals.exists())
+        self.assertFalse(source_bgm.exists())
+        self.assertEqual(len(composed_outputs), 1)
+        self.assertEqual(len(composed_outputs[0]["segments"]), 2)
+        self.assertEqual(result["mode"], "chunked")
+        self.assertFalse(result["has_bgm_track"])
+        self.assertTrue(result["degraded_to_vocals_only"])
+
+        report = json.loads(separation_report.read_text(encoding="utf-8"))
+        self.assertEqual(report["mode"], "chunked")
+        self.assertEqual(report["status"], "partial_fallback_vocals_only")
+        self.assertEqual(len(report["ranges"]), 2)
+        self.assertEqual(report["ranges"][0]["status"], "ok")
+        self.assertEqual(report["ranges"][0]["split_reason"], "fallback_fixed")
+        self.assertEqual(report["ranges"][1]["status"], "failed_fallback_vocals_only")
+        self.assertEqual(report["ranges"][1]["split_reason"], "tail")
+        self.assertFalse(report["has_bgm_track"])
+
+    def test_prepare_omnivoice_source_stems_passthrough_uses_source_audio_as_vocals(self):
+        """手动关闭分离时，应直接复用 source_audio.wav 作为人声轨。"""
+
+        out_root = self.omnivoice_output_root / "omnivoice_passthrough"
+        stems_root = out_root / "stems"
+        stems_root.mkdir(parents=True, exist_ok=True)
+        source_audio = stems_root / "source_audio.wav"
+        source_audio.write_text("source-audio", encoding="utf-8")
+        source_vocals = stems_root / "full_source_vocals.wav"
+        source_bgm = stems_root / "full_source_bgm.wav"
+        source_bgm.write_text("stale-bgm", encoding="utf-8")
+        separation_report = out_root / "separation_report.json"
+
+        result = omnivoice_dub_api._prepare_omnivoice_source_stems_passthrough(
+            source_audio_path=source_audio,
+            source_vocals_path=source_vocals,
+            source_bgm_path=source_bgm,
+            separation_report_path=separation_report,
+        )
+
+        self.assertTrue(source_vocals.exists())
+        self.assertEqual(source_vocals.read_text(encoding="utf-8"), "source-audio")
+        self.assertFalse(source_bgm.exists())
+        self.assertEqual(result["mode"], "passthrough")
+        self.assertFalse(result["has_bgm_track"])
+        report = json.loads(separation_report.read_text(encoding="utf-8"))
+        self.assertEqual(report["mode"], "passthrough")
+        self.assertEqual(report["status"], "skipped_passthrough_vocals_only")
+        self.assertFalse(report["has_bgm_track"])
+
     def test_translate_subtitles_if_needed_restores_empty_rows_from_source_for_omnivoice(self):
         """5 号链路翻译空行应回退 source 文本，避免行数缩水导致后续失配。"""
 
@@ -847,6 +1211,413 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(label, "female")
         mock_local.assert_called_once()
         mock_load_audio.assert_not_called()
+
+    def test_start_omnivoice_from_project_can_disable_source_separation(self):
+        """5号面板显式关闭分离时，应把布尔值写入任务并传给后台线程。"""
+
+        media_path = self.upload_root / "demo.mp4"
+        media_path.write_bytes(b"video-data")
+
+        with patch.object(omnivoice_dub_api, "_ensure_omnivoice_backend_ready", return_value={"ready": True}), patch.object(
+            omnivoice_dub_api.threading,
+            "Thread",
+            FakeThread,
+        ):
+            response = self.client.post(
+                "/omnivoice/auto/start-from-project",
+                data={
+                    "filename": "demo.mp4",
+                    "original_filename": "demo.mp4",
+                    "task_id": "legacy-task",
+                    "target_lang": "Chinese",
+                    "subtitle_mode": "source",
+                    "enable_source_separation": "false",
+                    "source_subtitles_json": json.dumps(
+                        [{"start": 0.0, "end": 1.0, "text": "hello", "speaker_id": "Speaker 1"}],
+                        ensure_ascii=False,
+                    ),
+                    "translated_subtitles_json": "[]",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        task = omnivoice_dub_api._task_store.get(payload["task_id"])
+        self.assertIsNotNone(task)
+        self.assertFalse(task["enable_source_separation"])
+        self.assertTrue(FakeThread.instances)
+        self.assertFalse(FakeThread.instances[-1].kwargs["enable_source_separation"])
+
+    def test_start_omnivoice_from_project_reuses_prepared_selected_subtitles(self):
+        """传入 prepared_batch_id 时，应直接复用 selected_subtitles.srt 跳过翻译阶段。"""
+
+        media_path = self.upload_root / "demo.mp4"
+        media_path.write_bytes(b"video-data")
+        prepared_batch_id = "20260516_123456"
+        prepared_root = self.omnivoice_output_root / f"omnivoice_{prepared_batch_id}"
+        prepared_root.mkdir(parents=True, exist_ok=True)
+        selected_srt = prepared_root / "selected_subtitles.srt"
+        selected_srt.write_text(
+            "1\n00:00:00,000 --> 00:00:01,000\n[Speaker 1] 你好\n",
+            encoding="utf-8",
+        )
+        (prepared_root / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "task_id": prepared_batch_id,
+                    "batch_id": prepared_batch_id,
+                    "paths": {"selected_subtitles": str(selected_srt.resolve())},
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(omnivoice_dub_api, "_ensure_omnivoice_backend_ready", return_value={"ready": True}), patch.object(
+            omnivoice_dub_api.threading,
+            "Thread",
+            FakeThread,
+        ):
+            response = self.client.post(
+                "/omnivoice/auto/start-from-project",
+                data={
+                    "filename": "demo.mp4",
+                    "original_filename": "demo.mp4",
+                    "task_id": "legacy-task",
+                    "prepared_batch_id": prepared_batch_id,
+                    "target_lang": "Chinese",
+                    "subtitle_mode": "source",
+                    "source_subtitles_json": json.dumps(
+                        [{"start": 0.0, "end": 1.0, "text": "hello", "speaker_id": "Speaker 1"}],
+                        ensure_ascii=False,
+                    ),
+                    "translated_subtitles_json": "[]",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["task_id"], prepared_batch_id)
+        self.assertTrue(FakeThread.instances)
+        self.assertEqual(FakeThread.instances[-1].kwargs["subtitle_mode"], "translated")
+        reused_translated_rows = FakeThread.instances[-1].kwargs["translated_subtitles"]
+        self.assertEqual(len(reused_translated_rows), 1)
+        self.assertEqual(reused_translated_rows[0]["speaker_id"], "Speaker 1")
+
+    def test_load_omnivoice_batch_marks_prepared_batch_resumable(self):
+        """5号面板 load-batch 应把 prepared batch 标成可恢复。"""
+
+        batch_id = "20260516_223344"
+        out_root = self.omnivoice_output_root / f"omnivoice_{batch_id}"
+        out_root.mkdir(parents=True, exist_ok=True)
+        selected_srt = out_root / "selected_subtitles.srt"
+        selected_with_speaker = out_root / "selected_subtitles_with_speakers.srt"
+        selected_srt.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n", encoding="utf-8")
+        selected_with_speaker.write_text("1\n00:00:00,000 --> 00:00:01,000\n[Speaker 1] 你好\n", encoding="utf-8")
+        (out_root / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "task_id": batch_id,
+                    "batch_id": batch_id,
+                    "status": "completed",
+                    "stage": "prepared:selected_subtitles",
+                    "project_filename": "demo.mp4",
+                    "input_media_path": str((self.upload_root / "demo.mp4").resolve()),
+                    "subtitle_mode": "source",
+                    "source_lang": "English",
+                    "target_lang": "Chinese",
+                    "source_subtitles_count": 1,
+                    "translated_subtitles_count": 1,
+                    "speaker_ids": ["Speaker 1"],
+                    "segment_count": 1,
+                    "paths": {
+                        "selected_subtitles": str(selected_srt.resolve()),
+                        "selected_subtitles_with_speakers": str(selected_with_speaker.resolve()),
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        response = self.client.post("/omnivoice/auto/load-batch", data={"batch_id": batch_id})
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["resumable"])
+        self.assertEqual(payload["resume_stage"], "prepared")
+        self.assertEqual(payload["processed_segments"], 0)
+        self.assertEqual(payload["total_segments"], 1)
+
+    def test_resume_omnivoice_task_requeues_batch_with_resume_context(self):
+        """5号面板 resume 应重用 selected_subtitles 和已存在 segment checkpoint。"""
+
+        media_path = self.upload_root / "demo.mp4"
+        media_path.write_bytes(b"video-data")
+        batch_id = "20260516_224455"
+        out_root = self.omnivoice_output_root / f"omnivoice_{batch_id}"
+        segment_dir = out_root / "segment_jobs" / "segment_0001"
+        stems_root = out_root / "stems"
+        final_dir = out_root / "final"
+        speaker_root = stems_root / "speaker_refs"
+        segment_dir.mkdir(parents=True, exist_ok=True)
+        speaker_root.mkdir(parents=True, exist_ok=True)
+        final_dir.mkdir(parents=True, exist_ok=True)
+
+        selected_srt = out_root / "selected_subtitles.srt"
+        selected_with_speaker = out_root / "selected_subtitles_with_speakers.srt"
+        selected_srt.write_text(
+            "1\n00:00:00,000 --> 00:00:01,000\n你好\n\n2\n00:00:01,000 --> 00:00:02,000\n世界\n",
+            encoding="utf-8",
+        )
+        selected_with_speaker.write_text(
+            "1\n00:00:00,000 --> 00:00:01,000\n[Speaker 1] 你好\n\n2\n00:00:01,000 --> 00:00:02,000\n[Speaker 1] 世界\n",
+            encoding="utf-8",
+        )
+        source_audio = stems_root / "source_audio.wav"
+        source_vocals = stems_root / "full_source_vocals.wav"
+        source_bgm = stems_root / "full_source_bgm.wav"
+        separation_report = out_root / "separation_report.json"
+        source_audio.write_text("audio", encoding="utf-8")
+        source_vocals.write_text("vocals", encoding="utf-8")
+        source_bgm.write_text("bgm", encoding="utf-8")
+        separation_report.write_text("{}", encoding="utf-8")
+        ref_audio = speaker_root / "speaker1.wav"
+        ref_audio.write_text("ref", encoding="utf-8")
+        speaker_ref_map = out_root / "speaker_ref_map.json"
+        speaker_ref_map.write_text(
+            json.dumps(
+                {
+                    "reference_mode": "uploaded_strict",
+                    "speakers": {
+                        "Speaker 1": {
+                            "ref_audio": str(ref_audio.resolve()),
+                            "ref_text": "你好，这是我的声音音色，很高兴为你进行配音服务。",
+                            "duration": 1.0,
+                        }
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        existing_seg = segment_dir / "seg_0001.wav"
+        existing_seg.write_text("seg1", encoding="utf-8")
+        (segment_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "id": "seg_0001",
+                    "speaker_id": "Speaker 1",
+                    "start_sec": 0.0,
+                    "end_sec": 1.0,
+                    "text": "你好",
+                    "tts_audio_path": str(existing_seg.resolve()),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        (out_root / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "task_id": batch_id,
+                    "batch_id": batch_id,
+                    "status": "failed",
+                    "stage": "failed",
+                    "project_filename": "demo.mp4",
+                    "input_media_path": str(media_path.resolve()),
+                    "subtitle_mode": "translated",
+                    "source_lang": "English",
+                    "target_lang": "Chinese",
+                    "enable_source_separation": True,
+                    "source_subtitles_count": 2,
+                    "translated_subtitles_count": 2,
+                    "speaker_ids": ["Speaker 1"],
+                    "speaker_reference_mode": "uploaded_strict",
+                    "segment_count": 2,
+                    "processed_segments": 1,
+                    "paths": {
+                        "source_audio": str(source_audio.resolve()),
+                        "source_vocals": str(source_vocals.resolve()),
+                        "source_bgm": str(source_bgm.resolve()),
+                        "speaker_ref_map": str(speaker_ref_map.resolve()),
+                        "selected_subtitles": str(selected_srt.resolve()),
+                        "selected_subtitles_with_speakers": str(selected_with_speaker.resolve()),
+                        "separation_report": str(separation_report.resolve()),
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(omnivoice_dub_api, "_ensure_omnivoice_backend_ready", return_value={"ready": True}), patch.object(
+            omnivoice_dub_api.threading,
+            "Thread",
+            FakeThread,
+        ):
+            response = self.client.post(f"/omnivoice/auto/resume/{batch_id}")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["task_id"], batch_id)
+        self.assertEqual(payload["resume_stage"], "dubbing_partial")
+        self.assertTrue(FakeThread.instances)
+        kwargs = FakeThread.instances[-1].kwargs
+        self.assertIn("resume_context", kwargs)
+        self.assertTrue(kwargs["resume_context"]["reuse_selected_subtitles"])
+        self.assertTrue(kwargs["resume_context"]["reuse_stems"])
+        self.assertEqual(kwargs["resume_context"]["completed_segment_indices"], {1})
+
+    def test_run_omnivoice_job_resume_skips_completed_segments(self):
+        """resume 场景应复用已完成 segment，只补剩余条目。"""
+
+        task_id = "20260516_225566"
+        out_root = self.omnivoice_output_root / f"omnivoice_{task_id}"
+        media_path = self.upload_root / "resume-demo.mp4"
+        media_path.write_bytes(b"video-data")
+        selected_rows = [
+            {"start": 0.0, "end": 1.0, "text": "你好", "speaker_id": "Speaker 1"},
+            {"start": 1.0, "end": 2.0, "text": "世界", "speaker_id": "Speaker 1"},
+        ]
+        task = omnivoice_dub_api._create_task_payload(
+            task_id=task_id,
+            project_filename="resume-demo.mp4",
+            input_media_path=media_path,
+            subtitle_mode="translated",
+            source_lang="English",
+            target_lang="Chinese",
+            enable_source_separation=True,
+            source_count=0,
+            translated_count=2,
+            speaker_ids=["Speaker 1"],
+            out_root=out_root,
+        )
+        omnivoice_dub_api._task_store.create(task_id, task)
+
+        existing_segment_manifest = {
+            "id": "seg_0001",
+            "speaker_id": "Speaker 1",
+            "start_sec": 0.0,
+            "end_sec": 1.0,
+            "text": "你好",
+            "tts_audio_path": str((out_root / "segment_jobs" / "segment_0001" / "seg_0001.wav").resolve()),
+            "duration_sec": 1.0,
+            "normalized_duration_sec": 1.0,
+        }
+        speaker_ref_map = {"Speaker 1": {"ref_audio": str((self.tmpdir / "ref.wav").resolve()), "ref_text": "固定参考文案"}}
+        Path(speaker_ref_map["Speaker 1"]["ref_audio"]).write_text("ref", encoding="utf-8")
+        stems_root = out_root / "stems"
+        stems_root.mkdir(parents=True, exist_ok=True)
+        source_audio = stems_root / "source_audio.wav"
+        source_vocals = stems_root / "full_source_vocals.wav"
+        source_audio.write_text("audio", encoding="utf-8")
+        source_vocals.write_text("vocals", encoding="utf-8")
+        generate_calls = []
+
+        def _fake_generate(**kwargs):
+            generate_calls.append(kwargs["text"])
+            return b"wav-bytes"
+
+        def _fake_normalize_generated_segment_audio(*, input_path, output_path, target_duration_sec):
+            del input_path, target_duration_sec
+            output_path.write_text("normalized", encoding="utf-8")
+
+        def _fake_prepare_audio(**kwargs):
+            kwargs["output_audio_path"].write_text("m4a", encoding="utf-8")
+
+        def _fake_replace_video(**kwargs):
+            kwargs["output_video_path"].write_text("mp4", encoding="utf-8")
+
+        def _fake_burn_video(**kwargs):
+            kwargs["output_video_path"].write_text("burned", encoding="utf-8")
+
+        def _fake_compose_vocals_master(*, segments, output_path, source_audio_fallback=None):
+            del source_audio_fallback
+            output_path.write_text(json.dumps(segments, ensure_ascii=False), encoding="utf-8")
+
+        def _fake_mix_with_bgm(*, vocals_path, bgm_path, output_path, target_sr):
+            del vocals_path, bgm_path, target_sr
+            output_path.write_text("mix", encoding="utf-8")
+
+        with patch.object(omnivoice_dub_api, "_ensure_omnivoice_backend_ready", return_value={"ready": True}), patch.object(
+            omnivoice_dub_api,
+            "_call_remote_generate",
+            side_effect=_fake_generate,
+        ), patch.object(
+            omnivoice_dub_api,
+            "_normalize_generated_segment_audio",
+            side_effect=_fake_normalize_generated_segment_audio,
+        ), patch.object(
+            omnivoice_dub_api,
+            "compose_vocals_master",
+            side_effect=_fake_compose_vocals_master,
+        ), patch.object(
+            omnivoice_dub_api,
+            "mix_with_bgm",
+            side_effect=_fake_mix_with_bgm,
+        ), patch.object(
+            omnivoice_dub_api,
+            "prepare_dubbed_audio_for_video",
+            side_effect=_fake_prepare_audio,
+        ), patch.object(
+            omnivoice_dub_api,
+            "replace_video_audio_two_step",
+            side_effect=_fake_replace_video,
+        ), patch.object(
+            omnivoice_dub_api,
+            "burn_ass_subtitles_into_video",
+            side_effect=_fake_burn_video,
+        ), patch.object(
+            omnivoice_dub_api,
+            "ffprobe_duration",
+            return_value=2.0,
+        ), patch.object(
+            omnivoice_dub_api,
+            "has_video_stream",
+            return_value=False,
+        ), patch.object(
+            omnivoice_dub_api.sf,
+            "info",
+            return_value=type("Info", (), {"duration": 1.0})(),
+        ):
+            omnivoice_dub_api._run_omnivoice_job(
+                task_id=task_id,
+                input_media_path=media_path,
+                project_filename="resume-demo.mp4",
+                source_subtitles=[],
+                translated_subtitles=[],
+                subtitle_mode="translated",
+                source_lang="English",
+                target_lang="Chinese",
+                api_key="",
+                translate_base_url="",
+                translate_model="",
+                translate_system_prompt="",
+                omnivoice_api_url="http://127.0.0.1:3900",
+                enable_source_separation=True,
+                uploaded_speaker_ref_map=None,
+                resume_context={
+                    "selected_subtitles": selected_rows,
+                    "speaker_ref_map": speaker_ref_map,
+                    "speaker_reference_mode": "uploaded_strict",
+                    "completed_segment_indices": {1},
+                    "reusable_segment_results": [existing_segment_manifest],
+                    "reuse_selected_subtitles": True,
+                    "reuse_stems": True,
+                    "reuse_speaker_refs": True,
+                    "source_audio_path": str(source_audio.resolve()),
+                    "source_vocals_path": str(source_vocals.resolve()),
+                    "source_bgm_path": "",
+                    "separation_report_path": "",
+                    "has_bgm_track": False,
+                },
+            )
+
+        self.assertEqual(generate_calls, ["世界"])
+        task_after = omnivoice_dub_api._task_store.get(task_id)
+        self.assertIsNotNone(task_after)
+        self.assertEqual(task_after["status"], "completed")
+        self.assertEqual(task_after["processed_segments"], 2)
 
     def test_start_auto_dubbing_runtime_brief_keeps_grouped_for_source_short_merge(self):
         """开启 source short merge 后，index-tts 仍应保持 grouped synthesis。"""

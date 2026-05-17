@@ -73,6 +73,15 @@
                         </div>
                         <div class="sidebar-translate-head-actions">
                             <span id="translate-key-source" class="sidebar-translate-badge">Env</span>
+                            <span id="global-translate-test-status" class="sidebar-translate-test-status" aria-live="polite">未测试</span>
+                            <button
+                                id="global-translate-test-btn"
+                                type="button"
+                                class="ghost-btn sidebar-translate-test-btn"
+                                title="测试连通性"
+                            >
+                                测试
+                            </button>
                             <button
                                 id="global-translate-toggle"
                                 type="button"
@@ -659,6 +668,13 @@
                                         <textarea id="omnivoice-translate-system-prompt" rows="3" class="system-prompt-input"
                                             placeholder="仅在使用 source 字幕、需要先翻译时生效；translated 字幕会跳过翻译。"></textarea>
                                     </div>
+                                    <div class="input-group" style="margin-top: 12px;">
+                                        <label class="checkbox-label" for="omnivoice-enable-source-separation">
+                                            <input id="omnivoice-enable-source-separation" type="checkbox" checked>
+                                            <span>开启人声分离（默认）</span>
+                                        </label>
+                                        <p class="auto-dub-secondary-note">仅当素材本身几乎只有纯人声、没有背景音乐时，才建议关闭；关闭后会直接用原音频做人声参考，并且最终不保留原背景音。</p>
+                                    </div>
                                 </div>
 
                                 <div class="auto-dub-section-card auto-dub-secondary-card">
@@ -687,6 +703,7 @@
                                         <div class="auto-dub-restore-actions">
                                             <button id="omnivoice-refresh-batches-btn" class="ghost-btn" type="button">刷新列表</button>
                                             <button id="omnivoice-load-batch-btn" class="ghost-btn" type="button">加载结果</button>
+                                            <button id="omnivoice-resume-batch-btn" class="ghost-btn" type="button" style="display: none;">从断点继续配音</button>
                                         </div>
                                     </div>
                                     <p id="omnivoice-batch-hint" class="auto-dub-secondary-note">正在加载 OmniVoice 结果文件夹列表...</p>
@@ -702,6 +719,7 @@
                                         </div>
                                     </div>
                                     <p id="omnivoice-shared-key-note" class="auto-dub-secondary-note">OmniVoice 直接复用左侧 Translation API 配置；当前项目的 source / translated 字幕会按策略自动选择。</p>
+                                    <button id="prepare-omnivoice-subtitles-btn" class="primary-btn auto-dub-start-btn" type="button">生成译文</button>
                                     <button id="start-omnivoice-dub-btn" class="primary-btn auto-dub-start-btn" type="button">Start Auto Dub Omnivoice</button>
                                 </div>
                             </div>

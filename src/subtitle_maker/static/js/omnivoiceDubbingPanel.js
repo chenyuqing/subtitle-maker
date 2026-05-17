@@ -32,6 +32,7 @@ export function setupOmnivoiceDubbingPanel(deps) {
     const sourceLangSelect = byId('omnivoice-source');
     const targetLangSelect = byId('omnivoice-target');
     const translateSystemPromptInput = byId('omnivoice-translate-system-prompt');
+    const enableSourceSeparationCheckbox = byId('omnivoice-enable-source-separation');
     const sharedKeyNoteEl = byId('omnivoice-shared-key-note');
     const backendNoteEl = byId('omnivoice-backend-note');
     const speakerRefListEl = byId('omnivoice-speaker-ref-list');
@@ -41,6 +42,7 @@ export function setupOmnivoiceDubbingPanel(deps) {
     const batchSelect = byId('omnivoice-load-batch-select');
     const refreshBatchesBtn = byId('omnivoice-refresh-batches-btn');
     const loadBatchBtn = byId('omnivoice-load-batch-btn');
+    const resumeBatchBtn = byId('omnivoice-resume-batch-btn');
     const batchHintEl = byId('omnivoice-batch-hint');
     const statusContainer = byId('omnivoice-status-container');
     const progressFill = byId('omnivoice-progress-fill');
@@ -52,6 +54,7 @@ export function setupOmnivoiceDubbingPanel(deps) {
     const downloadLinks = resultsContainer?.querySelector('.download-links') || null;
 
     const SUBTITLE_MODE_KEY = 'sm_omnivoiceSubtitleMode';
+    const PREPARED_BATCH_STATE_KEY = 'sm_omnivoicePreparedBatchState';
     const FIXED_SPEAKER_REF_TEXT = '你好，这是我的声音音色，很高兴为你进行配音服务。';
     let pollTimer = null;
     let backendPollTimer = null;
@@ -60,6 +63,64 @@ export function setupOmnivoiceDubbingPanel(deps) {
     let speakerRefFiles = new Map();
     let omnivoiceResultLoadSeq = 0;
     let preparedBatchId = '';
+    let loadedBatchTaskId = '';
+
+    /**
+     * 按当前项目生成 prepared batch 的本地缓存快照，用于页面重启后的“跳过翻译直配音”恢复。
+     */
+    function buildPreparedBatchState(projectContext, batchId) {
+        const mediaFilename = String(projectContext?.mediaFilename || '').trim();
+        return {
+            batchId: String(batchId || '').trim(),
+            mediaFilename,
+            updatedAt: Date.now(),
+        };
+    }
+
+    /**
+     * 判断本地缓存的 prepared batch 是否仍和当前项目兼容。
+     */
+    function isPreparedBatchStateCompatible(projectContext, state) {
+        const mediaFilename = String(projectContext?.mediaFilename || '').trim();
+        const stateMediaFilename = String(state?.mediaFilename || '').trim();
+        if (!mediaFilename || !stateMediaFilename) return false;
+        return mediaFilename === stateMediaFilename;
+    }
+
+    /**
+     * 持久化 prepared batch，重启页面后可直接跳过翻译进入配音。
+     */
+    function persistPreparedBatchState(batchId, projectContext = readProjectContext()) {
+        const normalizedBatchId = String(batchId || '').trim();
+        preparedBatchId = normalizedBatchId;
+        if (!normalizedBatchId) {
+            localStorage.removeItem(PREPARED_BATCH_STATE_KEY);
+            return;
+        }
+        const state = buildPreparedBatchState(projectContext, normalizedBatchId);
+        localStorage.setItem(PREPARED_BATCH_STATE_KEY, JSON.stringify(state));
+    }
+
+    /**
+     * 从本地恢复 prepared batch；仅在媒体文件一致时恢复，避免串项目。
+     */
+    function restorePreparedBatchState() {
+        const raw = localStorage.getItem(PREPARED_BATCH_STATE_KEY);
+        if (!raw) {
+            preparedBatchId = '';
+            return;
+        }
+        try {
+            const state = JSON.parse(raw);
+            if (!isPreparedBatchStateCompatible(readProjectContext(), state)) {
+                persistPreparedBatchState('');
+                return;
+            }
+            preparedBatchId = String(state?.batchId || '').trim();
+        } catch (_) {
+            persistPreparedBatchState('');
+        }
+    }
 
     /**
      * 读取当前项目上下文。
@@ -240,6 +301,37 @@ export function setupOmnivoiceDubbingPanel(deps) {
         if (prepareBtn) {
             prepareBtn.disabled = !omnivoiceBackendReady;
         }
+        if (resumeBatchBtn && resumeBatchBtn.style.display !== 'none') {
+            resumeBatchBtn.disabled = !omnivoiceBackendReady;
+        }
+    }
+
+    /**
+     * 根据 batch 当前恢复能力刷新“从断点继续”入口。
+     */
+    function renderResumeAction(data) {
+        if (!resumeBatchBtn) return;
+        const resumable = !!data?.resumable;
+        loadedBatchTaskId = String(data?.id || data?.task_id || data?.batch_id || '').trim();
+        if (!resumable || !loadedBatchTaskId) {
+            resumeBatchBtn.style.display = 'none';
+            resumeBatchBtn.disabled = true;
+            return;
+        }
+        resumeBatchBtn.style.display = 'inline-flex';
+        resumeBatchBtn.disabled = !omnivoiceBackendReady;
+        const completed = Number(data?.processed_segments ?? data?.completed_segments ?? 0);
+        const total = Number(data?.total_segments ?? 0);
+        const resumeStage = String(data?.resume_stage || '').trim();
+        if (resumeStage === 'prepared') {
+            resumeBatchBtn.textContent = '跳过翻译继续配音';
+        } else if (resumeStage === 'dubbing_partial') {
+            resumeBatchBtn.textContent = total > 0
+                ? `从第 ${Math.min(total, completed + 1)} 条继续配音`
+                : '从断点继续配音';
+        } else {
+            resumeBatchBtn.textContent = '从断点继续配音';
+        }
     }
 
     /**
@@ -309,6 +401,12 @@ export function setupOmnivoiceDubbingPanel(deps) {
      */
     function renderProjectContextSummary() {
         const projectContext = readProjectContext();
+        if (preparedBatchId) {
+            const preparedState = buildPreparedBatchState(projectContext, preparedBatchId);
+            if (!isPreparedBatchStateCompatible(projectContext, preparedState)) {
+                persistPreparedBatchState('');
+            }
+        }
         const mediaName = projectContext?.mediaOriginalFilename || projectContext?.mediaFilename || '';
         const sourceSubtitles = Array.isArray(projectContext?.sourceSubtitles) ? projectContext.sourceSubtitles : [];
         const translatedSubtitles = Array.isArray(projectContext?.translatedSubtitles) ? projectContext.translatedSubtitles : [];
@@ -414,6 +512,7 @@ export function setupOmnivoiceDubbingPanel(deps) {
         formData.append('subtitle_mode', subtitleModeSelect?.value || 'source');
         formData.append('source_lang', sourceLangSelect?.value || 'auto');
         formData.append('target_lang', targetLangSelect?.value || 'Chinese');
+        formData.append('enable_source_separation', enableSourceSeparationCheckbox?.checked ? 'true' : 'false');
         formData.append('api_key', getTranslateApiKey ? getTranslateApiKey() : '');
         formData.append('translate_base_url', getTranslateBaseUrl ? getTranslateBaseUrl() : '');
         formData.append('translate_model', getTranslateModel ? getTranslateModel() : '');
@@ -806,8 +905,17 @@ export function setupOmnivoiceDubbingPanel(deps) {
             loadResultMediaToPlayer(data);
             renderTaskState(data, loadSeq);
             renderOmnivoiceResultAssets(data, loadSeq);
+            renderResumeAction(data);
             if (batchHintEl) {
-                batchHintEl.textContent = `已加载 ${data.project_filename || batchId}`;
+                if (data?.resumable) {
+                    const completed = Number(data?.processed_segments ?? 0);
+                    const total = Number(data?.total_segments ?? 0);
+                    batchHintEl.textContent = total > 0
+                        ? `已加载 ${data.project_filename || batchId}，可从断点继续（${completed}/${total}）`
+                        : `已加载 ${data.project_filename || batchId}，可继续恢复`;
+                } else {
+                    batchHintEl.textContent = `已加载 ${data.project_filename || batchId}`;
+                }
             }
         } catch (error) {
             if (!isLatestOmnivoiceResultLoad(loadSeq)) {
@@ -816,6 +924,7 @@ export function setupOmnivoiceDubbingPanel(deps) {
             if (batchHintEl) {
                 batchHintEl.textContent = `加载失败：${error.message}`;
             }
+            renderResumeAction(null);
         } finally {
             if (isLatestOmnivoiceResultLoad(loadSeq)) {
                 if (loadBatchBtn) loadBatchBtn.disabled = false;
@@ -827,7 +936,7 @@ export function setupOmnivoiceDubbingPanel(deps) {
     /**
      * 开始独立 OmniVoice 任务。
      */
-    async function startTask() {
+    async function startTask({ allowPreparedFallback = true } = {}) {
         try {
             beginOmnivoiceResultLoad();
             const backendStatus = await refreshBackendStatus({ scheduleRetry: false });
@@ -838,6 +947,7 @@ export function setupOmnivoiceDubbingPanel(deps) {
             if (startBtn) startBtn.disabled = true;
             if (loadBatchBtn) loadBatchBtn.disabled = true;
             if (refreshBatchesBtn) refreshBatchesBtn.disabled = true;
+            if (resumeBatchBtn) resumeBatchBtn.disabled = true;
             if (resultsContainer) resultsContainer.style.display = 'none';
             if (statusContainer) statusContainer.style.display = 'block';
             if (statusText) {
@@ -856,9 +966,16 @@ export function setupOmnivoiceDubbingPanel(deps) {
             });
             const data = await res.json();
             if (!res.ok) {
+                const detail = String(data?.detail || '');
+                const preparedInvalid = /Prepared batch not found|Prepared selected_subtitles\.srt/i.test(detail);
+                if (allowPreparedFallback && preparedBatchId && preparedInvalid) {
+                    persistPreparedBatchState('');
+                    return startTask({ allowPreparedFallback: false });
+                }
                 throw new Error(data.detail || 'Failed to start OmniVoice task');
             }
             renderTaskState(data);
+            renderResumeAction(null);
             pollStatus(data.task_id);
         } catch (error) {
             if (statusText) {
@@ -868,6 +985,60 @@ export function setupOmnivoiceDubbingPanel(deps) {
             if (startBtn) startBtn.disabled = false;
             if (loadBatchBtn) loadBatchBtn.disabled = false;
             if (refreshBatchesBtn) refreshBatchesBtn.disabled = false;
+            if (resumeBatchBtn && resumeBatchBtn.style.display !== 'none') resumeBatchBtn.disabled = false;
+        }
+    }
+
+    /**
+     * 从已加载 batch 的断点继续 OmniVoice 任务。
+     */
+    async function resumeLoadedBatch() {
+        if (!loadedBatchTaskId) {
+            if (batchHintEl) {
+                batchHintEl.textContent = '请先加载一个可恢复的 OmniVoice 结果文件夹';
+            }
+            return;
+        }
+        try {
+            beginOmnivoiceResultLoad();
+            const backendStatus = await refreshBackendStatus({ scheduleRetry: false });
+            if (!backendStatus?.ready) {
+                throw new Error(backendStatus?.detail || 'OmniVoice backend is still loading');
+            }
+            if (startBtn) startBtn.disabled = true;
+            if (prepareBtn) prepareBtn.disabled = true;
+            if (loadBatchBtn) loadBatchBtn.disabled = true;
+            if (refreshBatchesBtn) refreshBatchesBtn.disabled = true;
+            if (resumeBatchBtn) resumeBatchBtn.disabled = true;
+            if (resultsContainer) resultsContainer.style.display = 'none';
+            if (statusContainer) statusContainer.style.display = 'block';
+            if (statusText) {
+                statusText.textContent = 'Resuming from checkpoint...';
+                statusText.className = 'status-text';
+            }
+            if (progressFill) {
+                progressFill.style.width = '10%';
+            }
+            autoDubStartedAtMs = Date.now();
+            const res = await fetch(`/omnivoice/auto/resume/${encodeURIComponent(loadedBatchTaskId)}`, {
+                method: 'POST',
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                throw new Error(data.detail || 'Failed to resume OmniVoice task');
+            }
+            renderTaskState(data);
+            renderResumeAction(null);
+            pollStatus(data.task_id);
+        } catch (error) {
+            if (statusText) {
+                statusText.textContent = `Resume failed: ${error.message}`;
+                statusText.className = 'status-text error';
+            }
+            syncStartButtonState();
+            if (loadBatchBtn) loadBatchBtn.disabled = false;
+            if (refreshBatchesBtn) refreshBatchesBtn.disabled = false;
+            if (resumeBatchBtn && resumeBatchBtn.style.display !== 'none') resumeBatchBtn.disabled = false;
         }
     }
 
@@ -905,7 +1076,7 @@ export function setupOmnivoiceDubbingPanel(deps) {
             if (!res.ok) {
                 throw new Error(data.detail || 'Failed to prepare selected subtitles');
             }
-            preparedBatchId = String(data?.batch_id || data?.task_id || '').trim();
+            persistPreparedBatchState(String(data?.batch_id || data?.task_id || '').trim());
             const loadSeq = beginOmnivoiceResultLoad();
             renderTaskState(data, loadSeq);
             renderOmnivoiceResultAssets(data, loadSeq);
@@ -950,8 +1121,12 @@ export function setupOmnivoiceDubbingPanel(deps) {
     if (loadBatchBtn) {
         loadBatchBtn.addEventListener('click', loadBatch);
     }
+    if (resumeBatchBtn) {
+        resumeBatchBtn.addEventListener('click', resumeLoadedBatch);
+    }
     window.addEventListener('subtitle-maker:project-context-changed', syncProjectUi);
     window.addEventListener('subtitle-maker:translate-config-changed', syncProjectUi);
+    restorePreparedBatchState();
     syncProjectUi();
     refreshBackendStatus().catch(() => {});
     refreshBatches();

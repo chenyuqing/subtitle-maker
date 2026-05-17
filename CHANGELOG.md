@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased] - 2026-05-17
+
+### Added
+- **OmniVoice prepared batch 恢复**: 5 号面板现在可以从已生成的 `selected_subtitles.srt` 继续启动配音，不必重新走翻译阶段。
+- **OmniVoice segment 级断点续跑**: 5 号面板新增 `/omnivoice/auto/resume/{task_id}`，会复用已完成的 `segment_jobs/segment_XXXX/seg_XXXX.wav`，只继续剩余 segment。
+- **OmniVoice 恢复入口 UI**: Restore 区新增“从断点继续配音”按钮；加载 batch 后会根据 `resumable/resume_stage/processed_segments` 自动提示可恢复状态。
+
+### Fixed
+- **OmniVoice 生成译文 500**: 修复 `prepare-subtitles-from-project` 路径遗漏 `enable_source_separation` 参数导致的 `_create_task_payload()` `TypeError`。
+
 ## [Unreleased] - 2026-05-15
 
 ### Added

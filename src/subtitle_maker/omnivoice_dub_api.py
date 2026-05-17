@@ -14,7 +14,7 @@ import subprocess
 from urllib.parse import urlparse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import soundfile as sf
@@ -104,6 +104,17 @@ OMNIVOICE_SELECTED_MAX_SEG_SEC = 12.0
 OMNIVOICE_SELECTED_SPLIT_MAX_CHARS = 60
 OMNIVOICE_SELECTED_MAX_CPS = 10.0
 OMNIVOICE_SELECTED_MIN_SEG_SEC = 0.25
+OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_THRESHOLD_SEC = 90.0 * 60.0
+# 长视频分段预分离默认切成 40 分钟一块，降低 Demucs 调度和音频拆分开销。
+OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_CHUNK_SEC = 40.0 * 60.0
+OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_MIN_CHUNK_SEC = 30.0 * 60.0
+OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_MAX_CHUNK_SEC = 50.0 * 60.0
+OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_SEARCH_WINDOW_SEC = 3.0 * 60.0
+OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_SILENCE_THRESHOLD_DB = -34.0
+OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_MIN_SILENCE_SEC = 0.35
+OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_FRAME_SEC = 0.20
+OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_HOP_SEC = 0.05
+OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_BOUNDARY_SNAP_SEC = 1.0
 VOICE_GENDER_MALE_MARKERS = ("male", "man", "boy", "男", "nan")
 VOICE_GENDER_FEMALE_MARKERS = ("female", "woman", "girl", "女", "nv")
 
@@ -2066,6 +2077,7 @@ def _create_task_payload(
     subtitle_mode: str,
     source_lang: str,
     target_lang: str,
+    enable_source_separation: bool = True,
     source_count: int,
     translated_count: int,
     speaker_ids: List[str],
@@ -2095,6 +2107,7 @@ def _create_task_payload(
         "subtitle_mode": subtitle_mode,
         "source_lang": source_lang,
         "target_lang": target_lang,
+        "enable_source_separation": bool(enable_source_separation),
         "source_subtitles_count": source_count,
         "translated_subtitles_count": translated_count,
         "speaker_ids": speaker_ids,
@@ -2177,6 +2190,7 @@ def _build_manifest(
         "subtitle_mode": task["subtitle_mode"],
         "source_lang": task["source_lang"],
         "target_lang": task["target_lang"],
+        "enable_source_separation": bool(task.get("enable_source_separation", True)),
         "selected_subtitle_mode": task.get("selected_subtitle_mode"),
         "source_subtitles_count": task["source_subtitles_count"],
         "translated_subtitles_count": task["translated_subtitles_count"],
@@ -2185,6 +2199,7 @@ def _build_manifest(
         "paths": paths,
         "artifacts": artifacts,
         "segment_count": task.get("total_segments", 0),
+        "processed_segments": task.get("processed_segments", 0),
     }
     (out_root / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return manifest
@@ -2211,6 +2226,296 @@ def _load_manifest(batch_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _resolve_existing_optional_path(raw: Any) -> Optional[Path]:
+    """安全解析可选路径；空字符串不能退化为当前目录。"""
+
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    if not path.exists():
+        return None
+    return path
+
+
+def _parse_selected_subtitles_with_speaker(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """把带 `[Speaker X]` 前缀的 SRT 行还原为内部字幕结构。"""
+
+    rows: List[Dict[str, Any]] = []
+    for item in items:
+        raw_text = str(item.get("text") or "").strip()
+        if not raw_text:
+            continue
+        speaker_id = ""
+        text = raw_text
+        match = re.match(r"^\[(.+?)\]\s*(.*)$", raw_text)
+        if match:
+            speaker_id = str(match.group(1) or "").strip()
+            text = str(match.group(2) or "").strip()
+        rows.append(
+            {
+                "start": float(item.get("start", 0.0) or 0.0),
+                "end": float(item.get("end", 0.0) or 0.0),
+                "text": text,
+                "speaker_id": speaker_id,
+            }
+        )
+    return rows
+
+
+def _load_selected_subtitles_from_manifest(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """优先从带 speaker 副本恢复 selected_subtitles，避免重启后丢 speaker_id。"""
+
+    paths = dict(manifest.get("paths") or {})
+    speaker_copy_path = _resolve_existing_optional_path(paths.get("selected_subtitles_with_speakers"))
+    if speaker_copy_path is not None:
+        items = parse_srt(speaker_copy_path.read_text(encoding="utf-8"))
+        rows = _parse_selected_subtitles_with_speaker(items)
+        if rows:
+            return _ensure_speaker_ids(rows, fallback_rows=rows, force_align_by_time=False)
+
+    selected_path = _resolve_existing_optional_path(paths.get("selected_subtitles"))
+    if selected_path is not None:
+        items = parse_srt(selected_path.read_text(encoding="utf-8"))
+        return _ensure_speaker_ids(items, fallback_rows=items, force_align_by_time=False)
+    return []
+
+
+def _load_speaker_ref_map_for_resume(manifest: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """从任务目录恢复 speaker 参考音映射，供 resume 直接复用。"""
+
+    paths = dict(manifest.get("paths") or {})
+    ref_map_path = _resolve_existing_optional_path(paths.get("speaker_ref_map"))
+    if ref_map_path is None:
+        return {}
+    try:
+        payload = json.loads(ref_map_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    speakers = payload.get("speakers")
+    if not isinstance(speakers, dict):
+        return {}
+    restored: Dict[str, Dict[str, Any]] = {}
+    for speaker_id, meta in speakers.items():
+        if not isinstance(meta, dict):
+            continue
+        ref_audio_path = Path(str(meta.get("ref_audio") or "")).expanduser()
+        if not ref_audio_path.exists():
+            continue
+        restored[str(speaker_id)] = dict(meta)
+    return restored
+
+
+def _segment_row_matches_manifest(row: Dict[str, Any], segment_manifest: Dict[str, Any]) -> bool:
+    """判断磁盘 segment manifest 是否仍和当前 selected_subtitles 行一致。"""
+
+    expected_speaker = str(row.get("speaker_id") or "").strip() or "Speaker 1"
+    actual_speaker = str(segment_manifest.get("speaker_id") or "").strip() or "Speaker 1"
+    if expected_speaker != actual_speaker:
+        return False
+    if str(row.get("text") or "").strip() != str(segment_manifest.get("text") or "").strip():
+        return False
+    expected_start = float(row.get("start", 0.0) or 0.0)
+    expected_end = float(row.get("end", 0.0) or 0.0)
+    actual_start = float(segment_manifest.get("start_sec", 0.0) or 0.0)
+    actual_end = float(segment_manifest.get("end_sec", 0.0) or 0.0)
+    return abs(expected_start - actual_start) <= 0.02 and abs(expected_end - actual_end) <= 0.02
+
+
+def _collect_resumable_segment_results(
+    *,
+    segment_root: Path,
+    selected_subtitles: List[Dict[str, Any]],
+) -> Tuple[Set[int], List[Dict[str, Any]]]:
+    """扫描已有 segment 产物，只复用“音频+manifest 都完整且内容匹配”的条目。"""
+
+    completed_indices: Set[int] = set()
+    reusable_results: List[Dict[str, Any]] = []
+    for index, row in enumerate(selected_subtitles, start=1):
+        segment_dir = segment_root / f"segment_{index:04d}"
+        manifest_path = segment_dir / "manifest.json"
+        final_segment_path = segment_dir / f"seg_{index:04d}.wav"
+        if not manifest_path.exists() or not final_segment_path.exists():
+            continue
+        try:
+            segment_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not _segment_row_matches_manifest(row, segment_manifest):
+            continue
+        reusable = dict(segment_manifest)
+        reusable["tts_audio_path"] = str(final_segment_path.resolve())
+        completed_indices.add(index)
+        reusable_results.append(reusable)
+    return completed_indices, reusable_results
+
+
+def _infer_resume_state(
+    manifest: Dict[str, Any],
+    *,
+    out_root: Path,
+) -> Dict[str, Any]:
+    """根据磁盘产物推断一个 OmniVoice batch 能否恢复、恢复到哪一阶段。"""
+
+    status = str(manifest.get("status") or "").strip().lower()
+    stage = str(manifest.get("stage") or "").strip()
+    paths = dict(manifest.get("paths") or {})
+    selected_rows = _load_selected_subtitles_from_manifest(manifest)
+    total_segments = int(manifest.get("segment_count") or manifest.get("processed_segments") or len(selected_rows) or 0)
+    if total_segments <= 0:
+        total_segments = len(selected_rows)
+
+    completed_segment_indices, _ = _collect_resumable_segment_results(
+        segment_root=out_root / "segment_jobs",
+        selected_subtitles=selected_rows,
+    )
+    completed_segments = len(completed_segment_indices)
+
+    final_srt_path = _resolve_existing_optional_path(paths.get("dubbed_final_srt"))
+    if final_srt_path is not None:
+        return {
+            "resumable": False,
+            "resume_stage": "completed",
+            "completed_segments": total_segments if total_segments > 0 else completed_segments,
+            "total_segments": total_segments,
+        }
+
+    if completed_segments > 0 and total_segments > completed_segments:
+        return {
+            "resumable": True,
+            "resume_stage": "dubbing_partial",
+            "completed_segments": completed_segments,
+            "total_segments": total_segments,
+        }
+
+    selected_subtitles_path = _resolve_existing_optional_path(paths.get("selected_subtitles"))
+    if selected_subtitles_path is not None and selected_rows:
+        return {
+            "resumable": True,
+            "resume_stage": "prepared",
+            "completed_segments": completed_segments,
+            "total_segments": total_segments if total_segments > 0 else len(selected_rows),
+        }
+
+    return {
+        "resumable": status in {"failed", "cancelled"} and bool(stage),
+        "resume_stage": "unavailable",
+        "completed_segments": completed_segments,
+        "total_segments": total_segments,
+    }
+
+
+def _annotate_task_with_resume_state(
+    task: Dict[str, Any],
+    *,
+    manifest: Dict[str, Any],
+    out_root: Path,
+    from_disk: bool = False,
+) -> Dict[str, Any]:
+    """把恢复信息附着到任务记录；从磁盘加载 stale running 任务时改标为 interrupted。"""
+
+    resume_state = _infer_resume_state(manifest, out_root=out_root)
+    task["resumable"] = bool(resume_state.get("resumable"))
+    task["resume_stage"] = str(resume_state.get("resume_stage") or "")
+    task["processed_segments"] = int(resume_state.get("completed_segments") or task.get("processed_segments") or 0)
+    task["total_segments"] = int(resume_state.get("total_segments") or task.get("total_segments") or 0)
+
+    status = str(task.get("status") or "").strip().lower()
+    if from_disk and status in {"queued", "running"} and task.get("resume_stage") != "completed":
+        task["status"] = "failed"
+        task["stage"] = "failed"
+        task["error"] = "Interrupted OmniVoice job loaded from disk. Use resume to continue."
+    return task
+
+
+def _build_resume_context(
+    *,
+    manifest: Dict[str, Any],
+    out_root: Path,
+) -> Dict[str, Any]:
+    """从 batch 目录构造 resume 所需的最小上下文。"""
+
+    selected_subtitles = _load_selected_subtitles_from_manifest(manifest)
+    if not selected_subtitles:
+        raise HTTPException(status_code=409, detail="Resume selected_subtitles.srt missing or empty")
+
+    speaker_ref_map = _load_speaker_ref_map_for_resume(manifest)
+    completed_segment_indices, reusable_segment_results = _collect_resumable_segment_results(
+        segment_root=out_root / "segment_jobs",
+        selected_subtitles=selected_subtitles,
+    )
+
+    paths = dict(manifest.get("paths") or {})
+    source_audio_path = _resolve_existing_optional_path(paths.get("source_audio"))
+    source_vocals_path = _resolve_existing_optional_path(paths.get("source_vocals"))
+    source_bgm_path = _resolve_existing_optional_path(paths.get("source_bgm"))
+    separation_report_path = _resolve_existing_optional_path(paths.get("separation_report"))
+
+    return {
+        "selected_subtitles": selected_subtitles,
+        "speaker_ref_map": speaker_ref_map,
+        "speaker_reference_mode": str(manifest.get("speaker_reference_mode") or ""),
+        "completed_segment_indices": completed_segment_indices,
+        "reusable_segment_results": reusable_segment_results,
+        "reuse_selected_subtitles": True,
+        "reuse_stems": source_audio_path is not None and source_vocals_path is not None,
+        "reuse_speaker_refs": bool(speaker_ref_map),
+        "source_audio_path": str(source_audio_path.resolve()) if source_audio_path is not None else "",
+        "source_vocals_path": str(source_vocals_path.resolve()) if source_vocals_path is not None else "",
+        "source_bgm_path": str(source_bgm_path.resolve()) if source_bgm_path is not None else "",
+        "separation_report_path": str(separation_report_path.resolve()) if separation_report_path is not None else "",
+        "has_bgm_track": source_bgm_path is not None,
+    }
+
+
+def _persist_omnivoice_task_manifest(
+    *,
+    task_id: str,
+    out_root: Path,
+    source_audio_path: Path,
+    source_vocals_path: Path,
+    source_bgm_path: Path,
+    speaker_ref_map_path: Path,
+    final_srt_path: Path,
+    final_vocals_path: Path,
+    final_mix_path: Path,
+    final_video_path: Optional[Path],
+    separated_video_audio_path: Optional[Path],
+    separation_report_path: Path,
+    speaker_reference_dir: Path,
+    subtitles_path: Path,
+    subtitles_with_speaker_path: Optional[Path] = None,
+    final_ass_path: Optional[Path] = None,
+    burned_video_path: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    """把当前任务快照写回 manifest，支持中途断电后的磁盘恢复。"""
+
+    task = _task_store.get(task_id)
+    if task is None:
+        return None
+    manifest = _build_manifest(
+        task=task,
+        out_root=out_root,
+        source_audio_path=source_audio_path,
+        source_vocals_path=source_vocals_path,
+        source_bgm_path=source_bgm_path,
+        speaker_ref_map_path=speaker_ref_map_path,
+        final_srt_path=final_srt_path,
+        final_vocals_path=final_vocals_path,
+        final_mix_path=final_mix_path,
+        final_video_path=final_video_path,
+        separated_video_audio_path=separated_video_audio_path,
+        separation_report_path=separation_report_path,
+        speaker_reference_dir=speaker_reference_dir,
+        subtitles_path=subtitles_path,
+        subtitles_with_speaker_path=subtitles_with_speaker_path,
+        final_ass_path=final_ass_path,
+        burned_video_path=burned_video_path,
+    )
+    _annotate_task_with_resume_state(task, manifest=manifest, out_root=out_root, from_disk=False)
+    return manifest
+
+
 def _artifact_path_from_task(task: Dict[str, Any], artifact: str) -> Optional[Path]:
     """根据 artifact key 解析输出路径。"""
 
@@ -2232,6 +2537,823 @@ def _artifact_path_from_task(task: Dict[str, Any], artifact: str) -> Optional[Pa
     return paths.get(artifact)
 
 
+def _resolve_omnivoice_separator_device() -> str:
+    """解析 Demucs 分离阶段应使用的设备。"""
+
+    separator_device = "mps"
+    try:
+        import torch
+
+        if not torch.backends.mps.is_available():
+            separator_device = "auto"
+    except Exception:
+        separator_device = "auto"
+    return separator_device
+
+
+def _extract_omnivoice_audio_segment(
+    *,
+    input_media_path: Path,
+    output_wav: Path,
+    start_sec: float,
+    end_sec: float,
+) -> Path:
+    """按绝对时间范围抽取音频片段，供长视频分块分离使用。"""
+
+    output_wav.parent.mkdir(parents=True, exist_ok=True)
+    duration_sec = max(0.05, float(end_sec) - float(start_sec))
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-ss",
+        f"{float(start_sec):.3f}",
+        "-i",
+        str(input_media_path),
+        "-t",
+        f"{duration_sec:.3f}",
+        "-vn",
+        "-ac",
+        "2",
+        "-ar",
+        "44100",
+        str(output_wav),
+    ]
+    code, _, err = run_cmd(cmd, cwd=REPO_ROOT)
+    if code != 0:
+        raise RuntimeError(f"OmniVoice chunk audio extract failed: {err.strip()}")
+    return output_wav
+
+
+def _attempt_omnivoice_demucs_separation(
+    *,
+    input_audio_path: Path,
+    demucs_out: Path,
+    separator_device: str,
+) -> Dict[str, Any]:
+    """尝试对单条音频做人声分离，返回可用 stem 与尝试记录。"""
+
+    demucs_out.mkdir(parents=True, exist_ok=True)
+
+    attempts: List[Dict[str, Any]] = []
+    vocals_src = None
+    bgm_src = None
+    for model_name in ("htdemucs", "mdx_extra_q"):
+        cmd = [
+            sys.executable,
+            "-m",
+            "demucs.separate",
+            "-n",
+            model_name,
+            "--two-stems=vocals",
+            "-o",
+            str(demucs_out),
+            str(input_audio_path),
+        ]
+        if separator_device and separator_device != "auto":
+            cmd[5:5] = ["-d", separator_device]
+        code, _, err = run_cmd(cmd, cwd=REPO_ROOT)
+        model_root = demucs_out / model_name
+        vocals_candidates = list(model_root.glob("**/vocals.wav"))
+        bgm_candidates = list(model_root.glob("**/no_vocals.wav"))
+        if not vocals_candidates:
+            attempts.append({"model": model_name, "ok": False, "error": err.strip() or "demucs failed"})
+            continue
+        vocals_src = vocals_candidates[0]
+        bgm_src = bgm_candidates[0] if bgm_candidates else None
+        attempt_error = ""
+        if code != 0 and err.strip():
+            # 某些 Demucs 版本会在收尾阶段非零退出，但 stem 已经可用，此时保留 stderr 便于排障。
+            attempt_error = err.strip()
+        attempts.append({"model": model_name, "ok": True, "error": attempt_error})
+        break
+
+    return {
+        "separator_device": separator_device,
+        "attempts": attempts,
+        "vocals_src": vocals_src,
+        "bgm_src": bgm_src,
+    }
+
+
+def _prepare_omnivoice_source_stems_single_pass(
+    *,
+    source_audio_path: Path,
+    source_vocals_path: Path,
+    source_bgm_path: Path,
+    separation_report_path: Path,
+    demucs_out: Path,
+    separator_device: str,
+) -> Dict[str, Any]:
+    """沿用现有整段 Demucs 分离路径；失败时退化为 vocals-only。"""
+
+    separation_result = _attempt_omnivoice_demucs_separation(
+        input_audio_path=source_audio_path,
+        demucs_out=demucs_out,
+        separator_device=separator_device,
+    )
+    attempts = list(separation_result.get("attempts") or [])
+    vocals_src = separation_result.get("vocals_src")
+    bgm_src = separation_result.get("bgm_src")
+    has_bgm_track = False
+
+    if vocals_src is None:
+        shutil.copy2(source_audio_path, source_vocals_path)
+        if source_bgm_path.exists():
+            source_bgm_path.unlink()
+        separation_report_path.write_text(
+            json.dumps(
+                {
+                    "status": "failed_fallback_vocals_only",
+                    "mode": "single_pass",
+                    "attempts": attempts,
+                    "separator_device": separator_device,
+                    "source_audio": str(source_audio_path.resolve()),
+                    "source_vocals": str(source_vocals_path.resolve()),
+                    "source_bgm": None,
+                    "has_bgm_track": False,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        return {
+            "separator_device": separator_device,
+            "attempts": attempts,
+            "has_bgm_track": False,
+            "degraded_to_vocals_only": True,
+        }
+
+    shutil.copy2(vocals_src, source_vocals_path)
+    if bgm_src and bgm_src.exists():
+        shutil.copy2(bgm_src, source_bgm_path)
+        has_bgm_track = True
+    elif source_bgm_path.exists():
+        source_bgm_path.unlink()
+
+    separation_report_path.write_text(
+        json.dumps(
+            {
+                "status": "ok",
+                "mode": "single_pass",
+                "attempts": attempts,
+                "separator_device": separator_device,
+                "source_audio": str(source_audio_path.resolve()),
+                "source_vocals": str(source_vocals_path.resolve()),
+                "source_bgm": str(source_bgm_path.resolve()) if has_bgm_track else None,
+                "has_bgm_track": has_bgm_track,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "separator_device": separator_device,
+        "attempts": attempts,
+        "has_bgm_track": has_bgm_track,
+        "degraded_to_vocals_only": False,
+    }
+
+
+def _prepare_omnivoice_source_stems_passthrough(
+    *,
+    source_audio_path: Path,
+    source_vocals_path: Path,
+    source_bgm_path: Path,
+    separation_report_path: Path,
+) -> Dict[str, Any]:
+    """手动关闭分离时直接复用源音频做人声轨，并显式关闭 BGM。"""
+
+    shutil.copy2(source_audio_path, source_vocals_path)
+    if source_bgm_path.exists():
+        source_bgm_path.unlink()
+    separation_report_path.write_text(
+        json.dumps(
+            {
+                "status": "skipped_passthrough_vocals_only",
+                "mode": "passthrough",
+                "attempts": [],
+                "separator_device": None,
+                "source_audio": str(source_audio_path.resolve()),
+                "source_vocals": str(source_vocals_path.resolve()),
+                "source_bgm": None,
+                "has_bgm_track": False,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "separator_device": None,
+        "attempts": [],
+        "has_bgm_track": False,
+        "degraded_to_vocals_only": False,
+        "mode": "passthrough",
+    }
+
+
+def _build_omnivoice_cut_hint_points(
+    subtitles: Optional[List[Dict[str, Any]]],
+) -> Dict[str, List[float]]:
+    """从字幕里提取可辅助切点搜索的边界时间。"""
+
+    boundaries: List[float] = []
+    speaker_changes: List[float] = []
+    if not subtitles:
+        return {"boundaries": boundaries, "speaker_changes": speaker_changes}
+
+    normalized: List[Dict[str, Any]] = []
+    for row in subtitles:
+        if not isinstance(row, dict):
+            continue
+        try:
+            start_sec = float(row.get("start", 0.0) or 0.0)
+            end_sec = float(row.get("end", 0.0) or 0.0)
+        except Exception:
+            continue
+        if end_sec <= start_sec:
+            continue
+        normalized.append(
+            {
+                "start_sec": start_sec,
+                "end_sec": end_sec,
+                "speaker_id": str(row.get("speaker_id") or "").strip() or "Speaker 1",
+            }
+        )
+    if len(normalized) < 2:
+        return {"boundaries": boundaries, "speaker_changes": speaker_changes}
+
+    normalized.sort(key=lambda item: (item["start_sec"], item["end_sec"]))
+    for current, nxt in zip(normalized, normalized[1:]):
+        boundary_sec = float(current["end_sec"])
+        if float(nxt["start_sec"]) > float(current["end_sec"]):
+            boundary_sec = (float(current["end_sec"]) + float(nxt["start_sec"])) / 2.0
+        boundary_sec = round(max(float(current["end_sec"]), boundary_sec), 3)
+        boundaries.append(boundary_sec)
+        if str(current["speaker_id"]) != str(nxt["speaker_id"]):
+            speaker_changes.append(boundary_sec)
+    return {
+        "boundaries": sorted(set(boundaries)),
+        "speaker_changes": sorted(set(speaker_changes)),
+    }
+
+
+def _load_omnivoice_audio_window(
+    *,
+    source_audio_path: Path,
+    start_sec: float,
+    end_sec: float,
+) -> Tuple[np.ndarray, int]:
+    """按时间窗读取单声道音频，避免长视频整段载入内存。"""
+
+    safe_start_sec = max(0.0, float(start_sec))
+    safe_end_sec = max(safe_start_sec, float(end_sec))
+    if safe_end_sec <= safe_start_sec:
+        return np.zeros(0, dtype=np.float32), 0
+
+    with sf.SoundFile(str(source_audio_path)) as handle:
+        sample_rate = int(handle.samplerate)
+        start_frame = max(0, int(round(safe_start_sec * sample_rate)))
+        end_frame = max(start_frame, int(round(safe_end_sec * sample_rate)))
+        handle.seek(start_frame)
+        wav = handle.read(end_frame - start_frame, dtype="float32", always_2d=True)
+    if wav.size == 0:
+        return np.zeros(0, dtype=np.float32), sample_rate
+    mono = np.mean(wav, axis=1, dtype=np.float32)
+    return np.asarray(mono, dtype=np.float32), sample_rate
+
+
+def _analyze_omnivoice_split_window(
+    *,
+    source_audio_path: Path,
+    start_sec: float,
+    end_sec: float,
+    frame_sec: float = OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_FRAME_SEC,
+    hop_sec: float = OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_HOP_SEC,
+    silence_threshold_db: float = OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_SILENCE_THRESHOLD_DB,
+    min_silence_sec: float = OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_MIN_SILENCE_SEC,
+) -> Dict[str, Any]:
+    """分析切点搜索窗口内的能量和静音区，给智能切分提供依据。"""
+
+    mono_audio, sample_rate = _load_omnivoice_audio_window(
+        source_audio_path=source_audio_path,
+        start_sec=start_sec,
+        end_sec=end_sec,
+    )
+    if mono_audio.size == 0 or sample_rate <= 0:
+        return {
+            "times_sec": np.zeros(0, dtype=np.float32),
+            "rms_values": np.zeros(0, dtype=np.float32),
+            "silent_spans": [],
+        }
+
+    frame_samples = max(1, int(sample_rate * max(0.02, float(frame_sec))))
+    hop_samples = max(1, int(sample_rate * max(0.01, float(hop_sec))))
+    safe_threshold_rms = float(10 ** (float(silence_threshold_db) / 20.0))
+
+    squares = np.square(np.asarray(mono_audio, dtype=np.float64))
+    prefix = np.concatenate(([0.0], np.cumsum(squares, dtype=np.float64)))
+    last_start = max(0, mono_audio.shape[0] - frame_samples)
+    frame_starts = list(range(0, last_start + 1, hop_samples))
+    if not frame_starts or frame_starts[-1] != last_start:
+        frame_starts.append(last_start)
+
+    times_sec: List[float] = []
+    rms_values: List[float] = []
+    half_frame_sec = float(frame_samples) / float(sample_rate) / 2.0
+    for frame_start in frame_starts:
+        frame_end = min(len(mono_audio), frame_start + frame_samples)
+        if frame_end <= frame_start:
+            continue
+        energy = float(prefix[frame_end] - prefix[frame_start]) / float(frame_end - frame_start)
+        rms_value = float(np.sqrt(max(0.0, energy)))
+        center_sec = float(start_sec) + (float(frame_start + frame_end) / 2.0 / float(sample_rate))
+        times_sec.append(center_sec)
+        rms_values.append(rms_value)
+
+    if not times_sec:
+        return {
+            "times_sec": np.zeros(0, dtype=np.float32),
+            "rms_values": np.zeros(0, dtype=np.float32),
+            "silent_spans": [],
+        }
+
+    silent_spans: List[Tuple[float, float]] = []
+    silent_start_index: Optional[int] = None
+    for index, rms_value in enumerate(rms_values):
+        if rms_value <= safe_threshold_rms:
+            if silent_start_index is None:
+                silent_start_index = index
+            continue
+        if silent_start_index is not None:
+            span_start_sec = max(float(start_sec), times_sec[silent_start_index] - half_frame_sec)
+            span_end_sec = min(float(end_sec), times_sec[index - 1] + half_frame_sec)
+            if span_end_sec - span_start_sec >= float(min_silence_sec):
+                silent_spans.append((round(span_start_sec, 3), round(span_end_sec, 3)))
+            silent_start_index = None
+    if silent_start_index is not None:
+        span_start_sec = max(float(start_sec), times_sec[silent_start_index] - half_frame_sec)
+        span_end_sec = min(float(end_sec), times_sec[-1] + half_frame_sec)
+        if span_end_sec - span_start_sec >= float(min_silence_sec):
+            silent_spans.append((round(span_start_sec, 3), round(span_end_sec, 3)))
+
+    return {
+        "times_sec": np.asarray(times_sec, dtype=np.float32),
+        "rms_values": np.asarray(rms_values, dtype=np.float32),
+        "silent_spans": silent_spans,
+    }
+
+
+def _snap_omnivoice_split_to_subtitle_boundary(
+    *,
+    candidate_sec: float,
+    boundary_points: List[float],
+    speaker_change_points: List[float],
+    search_start_sec: float,
+    search_end_sec: float,
+    allowed_snap_start_sec: Optional[float] = None,
+    allowed_snap_end_sec: Optional[float] = None,
+    snap_tolerance_sec: float = OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_BOUNDARY_SNAP_SEC,
+) -> Dict[str, Any]:
+    """在候选切点附近优先吸附到字幕边界，并把 speaker 切换点作为并列决胜。"""
+
+    safe_candidate_sec = float(candidate_sec)
+    allowed_boundaries = [
+        float(point)
+        for point in boundary_points
+        if float(search_start_sec) <= float(point) <= float(search_end_sec)
+        and (allowed_snap_start_sec is None or float(point) >= float(allowed_snap_start_sec))
+        and (allowed_snap_end_sec is None or float(point) <= float(allowed_snap_end_sec))
+        and abs(float(point) - safe_candidate_sec) <= float(snap_tolerance_sec)
+    ]
+    if not allowed_boundaries:
+        return {
+            "split_sec": round(safe_candidate_sec, 3),
+            "snapped_to_boundary": False,
+            "snapped_to_speaker_change": False,
+        }
+
+    speaker_change_set = {round(float(point), 3) for point in speaker_change_points}
+    best_boundary = min(
+        allowed_boundaries,
+        key=lambda point: (
+            abs(float(point) - safe_candidate_sec),
+            0 if round(float(point), 3) in speaker_change_set else 1,
+            float(point),
+        ),
+    )
+    return {
+        "split_sec": round(float(best_boundary), 3),
+        "snapped_to_boundary": True,
+        "snapped_to_speaker_change": round(float(best_boundary), 3) in speaker_change_set,
+    }
+
+
+def _pick_omnivoice_adaptive_split_point(
+    *,
+    source_audio_path: Optional[Path],
+    target_sec: float,
+    search_start_sec: float,
+    search_end_sec: float,
+    boundary_points: List[float],
+    speaker_change_points: List[float],
+) -> Dict[str, Any]:
+    """在目标切点附近寻找更适合 separation 的实际切点。"""
+
+    safe_target_sec = min(max(float(target_sec), float(search_start_sec)), float(search_end_sec))
+    if source_audio_path is None or not Path(source_audio_path).exists():
+        return {
+            "split_sec": round(safe_target_sec, 3),
+            "split_reason": "fallback_fixed",
+            "snapped_to_boundary": False,
+            "snapped_to_speaker_change": False,
+        }
+
+    analysis = _analyze_omnivoice_split_window(
+        source_audio_path=Path(source_audio_path),
+        start_sec=search_start_sec,
+        end_sec=search_end_sec,
+    )
+    times_sec_raw = analysis.get("times_sec")
+    rms_values_raw = analysis.get("rms_values")
+    times_sec = np.asarray(times_sec_raw if times_sec_raw is not None else np.zeros(0, dtype=np.float32), dtype=np.float32)
+    rms_values = np.asarray(rms_values_raw if rms_values_raw is not None else np.zeros(0, dtype=np.float32), dtype=np.float32)
+    silent_spans = list(analysis.get("silent_spans") or [])
+
+    candidate_sec = safe_target_sec
+    split_reason = "fallback_fixed"
+    silence_span_for_snap: Optional[Tuple[float, float]] = None
+    if silent_spans:
+        best_start_sec, best_end_sec = min(
+            silent_spans,
+            key=lambda span: abs(((float(span[0]) + float(span[1])) / 2.0) - safe_target_sec),
+        )
+        candidate_sec = (float(best_start_sec) + float(best_end_sec)) / 2.0
+        split_reason = "silence"
+        silence_span_for_snap = (float(best_start_sec), float(best_end_sec))
+    elif times_sec.size > 0 and rms_values.size == times_sec.size:
+        rms_min = float(np.min(rms_values))
+        rms_span = max(1e-8, float(np.max(rms_values)) - rms_min)
+        distance_norm = np.abs(times_sec.astype(np.float64) - safe_target_sec) / max(
+            1.0,
+            float(search_end_sec) - float(search_start_sec),
+        )
+        rms_norm = (rms_values.astype(np.float64) - rms_min) / rms_span
+        scores = rms_norm + (0.15 * distance_norm)
+        best_index = int(np.argmin(scores))
+        candidate_sec = float(times_sec[best_index])
+        split_reason = "low_energy"
+
+    snapped = _snap_omnivoice_split_to_subtitle_boundary(
+        candidate_sec=candidate_sec,
+        boundary_points=boundary_points,
+        speaker_change_points=speaker_change_points,
+        search_start_sec=search_start_sec,
+        search_end_sec=search_end_sec,
+        allowed_snap_start_sec=silence_span_for_snap[0] if silence_span_for_snap else None,
+        allowed_snap_end_sec=silence_span_for_snap[1] if silence_span_for_snap else None,
+    )
+    return {
+        "split_sec": round(float(snapped["split_sec"]), 3),
+        "split_reason": split_reason,
+        "snapped_to_boundary": bool(snapped["snapped_to_boundary"]),
+        "snapped_to_speaker_change": bool(snapped["snapped_to_speaker_change"]),
+    }
+
+
+def _build_omnivoice_chunk_plan(
+    *,
+    total_duration_sec: float,
+    source_audio_path: Optional[Path] = None,
+    subtitle_hints: Optional[List[Dict[str, Any]]] = None,
+    chunk_duration_sec: float = OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_CHUNK_SEC,
+    min_chunk_duration_sec: float = OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_MIN_CHUNK_SEC,
+    max_chunk_duration_sec: float = OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_MAX_CHUNK_SEC,
+    search_window_sec: float = OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_SEARCH_WINDOW_SEC,
+) -> List[Dict[str, Any]]:
+    """构建长视频 separation 的智能切块计划。"""
+
+    safe_total = max(0.0, float(total_duration_sec))
+    if safe_total <= 1e-6:
+        return []
+    safe_chunk = max(1.0, float(chunk_duration_sec))
+    safe_min_chunk = max(1.0, min(float(min_chunk_duration_sec), safe_chunk))
+    safe_max_chunk = max(safe_chunk, float(max_chunk_duration_sec))
+    safe_search_window = max(1.0, float(search_window_sec))
+    hint_points = _build_omnivoice_cut_hint_points(subtitle_hints)
+    boundary_points = list(hint_points.get("boundaries") or [])
+    speaker_change_points = list(hint_points.get("speaker_changes") or [])
+
+    # 先选一个整体可行、且平均块长尽量接近目标块长的 chunk 数，避免后面把尾块挤到不合理长度。
+    min_chunk_count = max(1, int(np.ceil(safe_total / safe_max_chunk)))
+    max_chunk_count = max(min_chunk_count, int(np.floor(safe_total / safe_min_chunk)))
+    feasible_chunk_counts = [
+        count
+        for count in range(min_chunk_count, max_chunk_count + 1)
+        if (count * safe_min_chunk) <= safe_total <= (count * safe_max_chunk)
+    ]
+    if not feasible_chunk_counts:
+        feasible_chunk_counts = [min_chunk_count]
+    target_chunk_count = min(
+        feasible_chunk_counts,
+        key=lambda count: (
+            abs((safe_total / float(count)) - safe_chunk),
+            abs(float(count) - (safe_total / safe_chunk)),
+            count,
+        ),
+    )
+
+    plan: List[Dict[str, Any]] = []
+    start_sec = 0.0
+    for chunk_index in range(target_chunk_count):
+        remaining_chunks = target_chunk_count - chunk_index
+        if remaining_chunks <= 1:
+            plan.append(
+                {
+                    "start_sec": round(start_sec, 3),
+                    "end_sec": round(safe_total, 3),
+                    "target_end_sec": round(safe_total, 3),
+                    "split_reason": "tail",
+                    "snapped_to_boundary": False,
+                    "snapped_to_speaker_change": False,
+                }
+            )
+            break
+
+        remaining_sec = safe_total - start_sec
+        average_chunk_sec = remaining_sec / float(remaining_chunks)
+        target_end_sec = start_sec + min(safe_max_chunk, max(safe_min_chunk, average_chunk_sec))
+        earliest_end_sec = max(
+            start_sec + safe_min_chunk,
+            safe_total - ((remaining_chunks - 1) * safe_max_chunk),
+        )
+        latest_end_sec = min(
+            start_sec + safe_max_chunk,
+            safe_total - ((remaining_chunks - 1) * safe_min_chunk),
+        )
+        search_start_sec = max(earliest_end_sec, target_end_sec - safe_search_window)
+        search_end_sec = min(latest_end_sec, target_end_sec + safe_search_window)
+
+        split_meta = _pick_omnivoice_adaptive_split_point(
+            source_audio_path=source_audio_path,
+            target_sec=target_end_sec,
+            search_start_sec=search_start_sec,
+            search_end_sec=search_end_sec,
+            boundary_points=boundary_points,
+            speaker_change_points=speaker_change_points,
+        )
+        actual_end_sec = min(latest_end_sec, max(earliest_end_sec, float(split_meta["split_sec"])))
+        actual_end_sec = round(actual_end_sec, 3)
+        if actual_end_sec <= start_sec:
+            actual_end_sec = round(min(safe_total, max(earliest_end_sec, start_sec + 1.0)), 3)
+            split_meta["split_reason"] = "fallback_fixed"
+            split_meta["snapped_to_boundary"] = False
+            split_meta["snapped_to_speaker_change"] = False
+
+        plan.append(
+            {
+                "start_sec": round(start_sec, 3),
+                "end_sec": actual_end_sec,
+                "target_end_sec": round(target_end_sec, 3),
+                "split_reason": str(split_meta.get("split_reason") or "fallback_fixed"),
+                "snapped_to_boundary": bool(split_meta.get("snapped_to_boundary")),
+                "snapped_to_speaker_change": bool(split_meta.get("snapped_to_speaker_change")),
+            }
+        )
+        start_sec = actual_end_sec
+    return plan
+
+
+def _build_omnivoice_chunk_ranges(
+    *,
+    total_duration_sec: float,
+    source_audio_path: Optional[Path] = None,
+    subtitle_hints: Optional[List[Dict[str, Any]]] = None,
+    chunk_duration_sec: float = OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_CHUNK_SEC,
+    min_chunk_duration_sec: float = OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_MIN_CHUNK_SEC,
+    max_chunk_duration_sec: float = OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_MAX_CHUNK_SEC,
+    search_window_sec: float = OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_SEARCH_WINDOW_SEC,
+) -> List[Tuple[float, float]]:
+    """兼容旧调用，返回智能切块计划里的 start/end 范围。"""
+
+    plan = _build_omnivoice_chunk_plan(
+        total_duration_sec=total_duration_sec,
+        source_audio_path=source_audio_path,
+        subtitle_hints=subtitle_hints,
+        chunk_duration_sec=chunk_duration_sec,
+        min_chunk_duration_sec=min_chunk_duration_sec,
+        max_chunk_duration_sec=max_chunk_duration_sec,
+        search_window_sec=search_window_sec,
+    )
+    return [
+        (float(item["start_sec"]), float(item["end_sec"]))
+        for item in plan
+    ]
+
+
+def _prepare_omnivoice_source_stems_chunked(
+    *,
+    input_media_path: Path,
+    source_audio_path: Path,
+    source_vocals_path: Path,
+    source_bgm_path: Path,
+    separation_report_path: Path,
+    demucs_out: Path,
+    separator_device: str,
+    total_duration_sec: float,
+    subtitle_hints: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """对超过阈值的长视频按时间块做人声分离，并回并成整片 stem。"""
+
+    stems_root = source_audio_path.parent
+    chunk_plan = _build_omnivoice_chunk_plan(
+        total_duration_sec=total_duration_sec,
+        source_audio_path=source_audio_path,
+        subtitle_hints=subtitle_hints,
+    )
+    vocals_segments: List[Dict[str, Any]] = []
+    bgm_segments: List[Dict[str, Any]] = []
+    range_reports: List[Dict[str, Any]] = []
+    has_any_degraded_chunk = False
+    all_ranges_have_bgm = True
+
+    for index, chunk_meta in enumerate(chunk_plan, start=1):
+        start_sec = float(chunk_meta["start_sec"])
+        end_sec = float(chunk_meta["end_sec"])
+        range_dir = stems_root / f"range_{index:04d}"
+        range_dir.mkdir(parents=True, exist_ok=True)
+        range_audio_path = range_dir / "range_audio.wav"
+        range_vocals_path = range_dir / "range_vocals.wav"
+        range_bgm_path = range_dir / "range_bgm.wav"
+        _extract_omnivoice_audio_segment(
+            input_media_path=input_media_path,
+            output_wav=range_audio_path,
+            start_sec=start_sec,
+            end_sec=end_sec,
+        )
+        separation_result = _attempt_omnivoice_demucs_separation(
+            input_audio_path=range_audio_path,
+            demucs_out=demucs_out / f"range_{index:04d}",
+            separator_device=separator_device,
+        )
+        vocals_src = separation_result.get("vocals_src")
+        bgm_src = separation_result.get("bgm_src")
+        attempts = list(separation_result.get("attempts") or [])
+        chunk_has_bgm = False
+        chunk_status = "ok"
+
+        if vocals_src is None:
+            has_any_degraded_chunk = True
+            chunk_status = "failed_fallback_vocals_only"
+            shutil.copy2(range_audio_path, range_vocals_path)
+            if range_bgm_path.exists():
+                range_bgm_path.unlink()
+            all_ranges_have_bgm = False
+        else:
+            shutil.copy2(vocals_src, range_vocals_path)
+            if bgm_src and Path(bgm_src).exists():
+                shutil.copy2(Path(bgm_src), range_bgm_path)
+                chunk_has_bgm = True
+            else:
+                all_ranges_have_bgm = False
+                if range_bgm_path.exists():
+                    range_bgm_path.unlink()
+
+        vocals_segments.append(
+            {
+                "id": f"range_{index:04d}",
+                "start_sec": float(start_sec),
+                "end_sec": float(end_sec),
+                "tts_audio_path": str(range_vocals_path.resolve()),
+            }
+        )
+        if chunk_has_bgm:
+            bgm_segments.append(
+                {
+                    "id": f"range_{index:04d}",
+                    "start_sec": float(start_sec),
+                    "end_sec": float(end_sec),
+                    "tts_audio_path": str(range_bgm_path.resolve()),
+                }
+            )
+        range_reports.append(
+            {
+                "range_index": index,
+                "start_sec": float(start_sec),
+                "end_sec": float(end_sec),
+                "status": chunk_status,
+                "target_end_sec": float(chunk_meta.get("target_end_sec", end_sec) or end_sec),
+                "actual_end_sec": float(end_sec),
+                "split_reason": str(chunk_meta.get("split_reason") or "tail"),
+                "snapped_to_boundary": bool(chunk_meta.get("snapped_to_boundary")),
+                "snapped_to_speaker_change": bool(chunk_meta.get("snapped_to_speaker_change")),
+                "attempts": attempts,
+                "range_audio": str(range_audio_path.resolve()),
+                "range_vocals": str(range_vocals_path.resolve()),
+                "range_bgm": str(range_bgm_path.resolve()) if chunk_has_bgm else None,
+                "has_bgm_track": chunk_has_bgm,
+            }
+        )
+
+    compose_vocals_master(
+        segments=vocals_segments,
+        output_path=source_vocals_path,
+        source_audio_fallback=source_audio_path,
+    )
+
+    has_bgm_track = all_ranges_have_bgm and len(bgm_segments) == len(vocals_segments)
+    # 只要任一块没有可靠 BGM，就整片关闭 BGM 回并，避免出现局部原人声残留。
+    if has_bgm_track:
+        compose_vocals_master(
+            segments=bgm_segments,
+            output_path=source_bgm_path,
+            source_audio_fallback=None,
+        )
+    elif source_bgm_path.exists():
+        source_bgm_path.unlink()
+
+    top_level_status = "ok"
+    if has_any_degraded_chunk:
+        top_level_status = "partial_fallback_vocals_only"
+        if all(item.get("status") == "failed_fallback_vocals_only" for item in range_reports):
+            top_level_status = "failed_fallback_vocals_only"
+
+    separation_report_path.write_text(
+        json.dumps(
+            {
+                "status": top_level_status,
+                "mode": "chunked",
+                "separator_device": separator_device,
+                "threshold_sec": OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_THRESHOLD_SEC,
+                "chunk_duration_sec": OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_CHUNK_SEC,
+                "total_duration_sec": round(float(total_duration_sec), 3),
+                "source_audio": str(source_audio_path.resolve()),
+                "source_vocals": str(source_vocals_path.resolve()),
+                "source_bgm": str(source_bgm_path.resolve()) if has_bgm_track else None,
+                "has_bgm_track": has_bgm_track,
+                "ranges": range_reports,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "separator_device": separator_device,
+        "has_bgm_track": has_bgm_track,
+        "degraded_to_vocals_only": top_level_status != "ok",
+        "mode": "chunked",
+        "range_count": len(range_reports),
+    }
+
+
+def _prepare_omnivoice_source_stems(
+    *,
+    input_media_path: Path,
+    source_audio_path: Path,
+    source_vocals_path: Path,
+    source_bgm_path: Path,
+    separation_report_path: Path,
+    demucs_out: Path,
+    enable_source_separation: bool = True,
+    subtitle_hints: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """提取源音频并根据时长选择整段或分段人声分离策略。"""
+
+    extract_source_audio(input_media=input_media_path, output_wav=source_audio_path)
+    if not bool(enable_source_separation):
+        return _prepare_omnivoice_source_stems_passthrough(
+            source_audio_path=source_audio_path,
+            source_vocals_path=source_vocals_path,
+            source_bgm_path=source_bgm_path,
+            separation_report_path=separation_report_path,
+        )
+    separator_device = _resolve_omnivoice_separator_device()
+    total_duration_sec = max(0.0, float(ffprobe_duration(input_media_path)))
+    if total_duration_sec > OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_THRESHOLD_SEC:
+        return _prepare_omnivoice_source_stems_chunked(
+            input_media_path=input_media_path,
+            source_audio_path=source_audio_path,
+            source_vocals_path=source_vocals_path,
+            source_bgm_path=source_bgm_path,
+            separation_report_path=separation_report_path,
+            demucs_out=demucs_out,
+            separator_device=separator_device,
+            total_duration_sec=total_duration_sec,
+            subtitle_hints=subtitle_hints,
+        )
+    return _prepare_omnivoice_source_stems_single_pass(
+        source_audio_path=source_audio_path,
+        source_vocals_path=source_vocals_path,
+        source_bgm_path=source_bgm_path,
+        separation_report_path=separation_report_path,
+        demucs_out=demucs_out,
+        separator_device=separator_device,
+    )
+
+
 def _create_task_from_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
     """把磁盘 manifest 转成可回放的任务记录。"""
 
@@ -2248,6 +3370,7 @@ def _create_task_from_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
         subtitle_mode=str(manifest.get("subtitle_mode") or "auto"),
         source_lang=str(manifest.get("source_lang") or "auto"),
         target_lang=str(manifest.get("target_lang") or "Chinese"),
+        enable_source_separation=bool(manifest.get("enable_source_separation", True)),
         source_count=int(manifest.get("source_subtitles_count") or 0),
         translated_count=int(manifest.get("translated_subtitles_count") or 0),
         speaker_ids=list(manifest.get("speaker_ids") or []),
@@ -2262,6 +3385,7 @@ def _create_task_from_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
     task["result_srt"] = str((manifest.get("paths") or {}).get("dubbed_final_srt") or "") or None
     task["result_audio"] = str((manifest.get("paths") or {}).get("dubbed_mix") or "") or None
     task["batch_manifest_path"] = str((out_root / "manifest.json").resolve())
+    _annotate_task_with_resume_state(task, manifest=manifest, out_root=out_root, from_disk=True)
     _task_store.create(task_id, task)
     return task
 
@@ -2281,7 +3405,9 @@ def _run_omnivoice_job(
     translate_model: str,
     translate_system_prompt: str,
     omnivoice_api_url: str,
+    enable_source_separation: bool = True,
     uploaded_speaker_ref_map: Optional[Dict[str, Dict[str, Any]]] = None,
+    resume_context: Optional[Dict[str, Any]] = None,
 ) -> None:
     """后台执行独立 OmniVoice dubbing 链路。"""
 
@@ -2301,113 +3427,77 @@ def _run_omnivoice_job(
     source_bgm_path = stems_root / "full_source_bgm.wav"
     separation_report_path = out_root / "separation_report.json"
     speaker_ref_map_path = out_root / "speaker_ref_map.json"
+    resume_context = dict(resume_context or {})
 
     # 先确认独立 OmniVoice 后端不仅活着，而且模型已经就绪，再进入后续昂贵步骤。
     _ensure_omnivoice_backend_ready(omnivoice_api_url)
     _set_task(task_id, status="running", stage="dubbing:preparing", progress=1.0)
-    extract_source_audio(input_media=input_media_path, output_wav=source_audio_path)
 
-    # 先做人声/背景分离，再让中间链路只用人声。
-    _set_task(task_id, stage="dubbing:separating", progress=7.0)
-    separator_device = "mps"
-    try:
-        import torch
+    # 分段人声分离只需要时间边界提示，不依赖后续翻译结果；这里优先用 source 字幕，缺失时退回已给出的 translated 字幕。
+    chunk_hint_rows = source_subtitles if source_subtitles else translated_subtitles
+    chunk_hint_rows = _ensure_speaker_ids(
+        chunk_hint_rows,
+        fallback_rows=source_subtitles or translated_subtitles,
+    )
 
-        if not torch.backends.mps.is_available():
-            separator_device = "auto"
-    except Exception:
-        separator_device = "auto"
-
-    demucs_out = stems_root / "demucs_tmp"
-    demucs_out.mkdir(parents=True, exist_ok=True)
-    attempts: List[Dict[str, Any]] = []
-    vocals_src = None
-    bgm_src = None
-    has_bgm_track = False
-    for model_name in ("htdemucs", "mdx_extra_q"):
-        cmd = [
-            sys.executable,
-            "-m",
-            "demucs.separate",
-            "-n",
-            model_name,
-            "--two-stems=vocals",
-            "-o",
-            str(demucs_out),
-            str(source_audio_path),
-        ]
-        if separator_device and separator_device != "auto":
-            cmd[5:5] = ["-d", separator_device]
-        code, _, err = run_cmd(cmd, cwd=REPO_ROOT)
-        if code != 0:
-            attempts.append({"model": model_name, "ok": False, "error": err.strip() or "demucs failed"})
-            continue
-        model_root = demucs_out / model_name
-        vocals_candidates = list(model_root.glob("**/vocals.wav"))
-        bgm_candidates = list(model_root.glob("**/no_vocals.wav"))
-        if not vocals_candidates:
-            attempts.append({"model": model_name, "ok": False, "error": "vocals.wav not found"})
-            continue
-        vocals_src = vocals_candidates[0]
-        bgm_src = bgm_candidates[0] if bgm_candidates else None
-        attempts.append({"model": model_name, "ok": True, "error": ""})
-        break
-
-    if vocals_src is None:
-        separation_report_path.write_text(
-            json.dumps(
-                {
-                    "status": "failed",
-                    "attempts": attempts,
-                    "separator_device": separator_device,
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+    if bool(resume_context.get("reuse_stems")):
+        resumed_source_audio = _resolve_existing_optional_path(resume_context.get("source_audio_path"))
+        resumed_source_vocals = _resolve_existing_optional_path(resume_context.get("source_vocals_path"))
+        resumed_source_bgm = _resolve_existing_optional_path(resume_context.get("source_bgm_path"))
+        resumed_separation_report = _resolve_existing_optional_path(resume_context.get("separation_report_path"))
+        if resumed_source_audio is not None and resumed_source_audio.resolve() != source_audio_path.resolve():
+            shutil.copy2(resumed_source_audio, source_audio_path)
+        if resumed_source_vocals is not None and resumed_source_vocals.resolve() != source_vocals_path.resolve():
+            shutil.copy2(resumed_source_vocals, source_vocals_path)
+        if resumed_source_bgm is not None and resumed_source_bgm.resolve() != source_bgm_path.resolve():
+            shutil.copy2(resumed_source_bgm, source_bgm_path)
+        if resumed_separation_report is not None and resumed_separation_report.resolve() != separation_report_path.resolve():
+            shutil.copy2(resumed_separation_report, separation_report_path)
+        has_bgm_track = bool(resume_context.get("has_bgm_track"))
+    else:
+        # 先做人声/背景分离，再让中间链路只用人声。
+        _set_task(task_id, stage="dubbing:separating", progress=7.0)
+        demucs_out = stems_root / "demucs_tmp"
+        separation_meta = _prepare_omnivoice_source_stems(
+            input_media_path=input_media_path,
+            source_audio_path=source_audio_path,
+            source_vocals_path=source_vocals_path,
+            source_bgm_path=source_bgm_path,
+            separation_report_path=separation_report_path,
+            demucs_out=demucs_out,
+            enable_source_separation=enable_source_separation,
+            subtitle_hints=chunk_hint_rows,
         )
-        raise RuntimeError("OmniVoice pre-separation failed")
+        has_bgm_track = bool(separation_meta.get("has_bgm_track"))
 
-    shutil.copy2(vocals_src, source_vocals_path)
-    if bgm_src and bgm_src.exists():
-        shutil.copy2(bgm_src, source_bgm_path)
-        has_bgm_track = True
-
-    separation_report_path.write_text(
-        json.dumps(
-            {
-                "status": "ok",
-                "attempts": attempts,
-                "separator_device": separator_device,
-                "source_audio": str(source_audio_path.resolve()),
-                "source_vocals": str(source_vocals_path.resolve()),
-                "source_bgm": str(source_bgm_path.resolve()) if has_bgm_track else None,
-                "has_bgm_track": has_bgm_track,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-    selected_subtitles, selected_mode = _translate_subtitles_if_needed(
-        subtitles_mode=subtitle_mode,
-        source_rows=_optimize_omnivoice_source_rows(source_subtitles),
-        translated_rows=translated_subtitles,
-        target_lang=target_lang,
-        api_key=api_key,
-        translate_base_url=translate_base_url,
-        translate_model=translate_model,
-        translate_system_prompt=translate_system_prompt,
-        task_id=task_id,
-    )
-    selected_subtitles = _optimize_omnivoice_selected_rows(selected_subtitles)
-    selected_subtitles = _ensure_speaker_ids(
-        selected_subtitles,
-        fallback_rows=source_subtitles,
-        force_align_by_time=True,
-    )
-    selected_subtitles = _drop_empty_subtitle_rows(selected_subtitles, label="selected")
+    if bool(resume_context.get("reuse_selected_subtitles")):
+        selected_subtitles = list(resume_context.get("selected_subtitles") or [])
+        selected_mode = "translated"
+        selected_subtitles = _ensure_speaker_ids(
+            selected_subtitles,
+            fallback_rows=source_subtitles,
+            force_align_by_time=False,
+        )
+        selected_subtitles = _drop_empty_subtitle_rows(selected_subtitles, label="selected")
+    else:
+        selected_subtitles, selected_mode = _translate_subtitles_if_needed(
+            subtitles_mode=subtitle_mode,
+            source_rows=_optimize_omnivoice_source_rows(source_subtitles),
+            translated_rows=translated_subtitles,
+            target_lang=target_lang,
+            api_key=api_key,
+            translate_base_url=translate_base_url,
+            translate_model=translate_model,
+            translate_system_prompt=translate_system_prompt,
+            task_id=task_id,
+        )
+        selected_subtitles = _optimize_omnivoice_selected_rows(selected_subtitles)
+        selected_subtitles = _ensure_speaker_ids(
+            selected_subtitles,
+            fallback_rows=source_subtitles,
+            force_align_by_time=True,
+        )
+        selected_subtitles = _drop_empty_subtitle_rows(selected_subtitles, label="selected")
     selected_subtitles, adjusted_pairs = _rebalance_omnivoice_synthesis_rows(selected_subtitles)
     if adjusted_pairs > 0:
         logger.warning(
@@ -2428,6 +3518,26 @@ def _run_omnivoice_job(
     if not selected_subtitles:
         raise RuntimeError("No usable subtitles for OmniVoice dubbing")
 
+    _persist_omnivoice_task_manifest(
+        task_id=task_id,
+        out_root=out_root,
+        source_audio_path=source_audio_path,
+        source_vocals_path=source_vocals_path,
+        source_bgm_path=source_bgm_path,
+        speaker_ref_map_path=speaker_ref_map_path,
+        final_srt_path=final_dir / "dubbed_final_full.srt",
+        final_vocals_path=final_dir / "dubbed_vocals_full.wav",
+        final_mix_path=final_dir / "dubbed_mix_full.wav",
+        final_video_path=final_dir / "dubbed_video_full.mp4",
+        separated_video_audio_path=final_dir / "dubbed_audio_for_video.m4a",
+        separation_report_path=separation_report_path,
+        speaker_reference_dir=speaker_root,
+        subtitles_path=selected_subtitles_path,
+        subtitles_with_speaker_path=selected_subtitles_with_speaker_path,
+        final_ass_path=final_dir / "dubbed_final_full-styled.ass",
+        burned_video_path=final_dir / "dubbed_video_full_burned.mp4",
+    )
+
     detected_speaker_ids = sorted(
         {
             str(row.get("speaker_id") or "").strip() or "Speaker 1"
@@ -2438,7 +3548,13 @@ def _run_omnivoice_job(
     # speaker 参考音优先使用用户上传映射；缺失 speaker 自动从预存目录补齐。
     _set_task(task_id, stage="dubbing:preparing_refs", progress=12.0)
     reference_mode = "auto_aggregate"
-    if uploaded_speaker_ref_map:
+    if bool(resume_context.get("reuse_speaker_refs")):
+        speaker_ref_map = {
+            str(speaker_id): dict(meta)
+            for speaker_id, meta in dict(resume_context.get("speaker_ref_map") or {}).items()
+        }
+        reference_mode = str(manifest_mode) if (manifest_mode := resume_context.get("speaker_reference_mode")) else "resumed"
+    elif uploaded_speaker_ref_map:
         missing_speakers = [
             speaker_id
             for speaker_id in detected_speaker_ids
@@ -2494,18 +3610,49 @@ def _run_omnivoice_job(
     if not speaker_ref_map:
         raise RuntimeError("No speaker reference audio could be built")
     _set_task(task_id, speaker_reference_mode=reference_mode)
+    _persist_omnivoice_task_manifest(
+        task_id=task_id,
+        out_root=out_root,
+        source_audio_path=source_audio_path,
+        source_vocals_path=source_vocals_path,
+        source_bgm_path=source_bgm_path,
+        speaker_ref_map_path=speaker_ref_map_path,
+        final_srt_path=final_dir / "dubbed_final_full.srt",
+        final_vocals_path=final_dir / "dubbed_vocals_full.wav",
+        final_mix_path=final_dir / "dubbed_mix_full.wav",
+        final_video_path=final_dir / "dubbed_video_full.mp4",
+        separated_video_audio_path=final_dir / "dubbed_audio_for_video.m4a",
+        separation_report_path=separation_report_path,
+        speaker_reference_dir=speaker_root,
+        subtitles_path=selected_subtitles_path,
+        subtitles_with_speaker_path=selected_subtitles_with_speaker_path,
+        final_ass_path=final_dir / "dubbed_final_full-styled.ass",
+        burned_video_path=final_dir / "dubbed_video_full_burned.mp4",
+    )
 
+    completed_segment_indices = set(int(item) for item in list(resume_context.get("completed_segment_indices") or []))
+    segment_results = sorted(
+        [dict(item) for item in list(resume_context.get("reusable_segment_results") or [])],
+        key=lambda item: float(item.get("start_sec", 0.0) or 0.0),
+    )
     _set_task(
         task_id,
         total_segments=len(selected_subtitles),
-        processed_segments=0,
+        processed_segments=len(completed_segment_indices),
         stage="dubbing:generating",
         progress=15.0,
     )
 
-    segment_results: List[Dict[str, Any]] = []
     total_segments = len(selected_subtitles)
     for index, row in enumerate(selected_subtitles, start=1):
+        if index in completed_segment_indices:
+            _set_task(
+                task_id,
+                processed_segments=index,
+                progress=15.0 + (65.0 * (len(completed_segment_indices) / max(1, total_segments))),
+                stage="dubbing:generating",
+            )
+            continue
         speaker_id = str(row.get("speaker_id") or "").strip() or "Speaker 1"
         ref_meta = speaker_ref_map.get(speaker_id) or next(iter(speaker_ref_map.values()))
         ref_audio_path = Path(str(ref_meta.get("ref_audio") or "")).expanduser()
@@ -2553,12 +3700,34 @@ def _run_omnivoice_job(
         }
         (segment_dir / "manifest.json").write_text(json.dumps(segment_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         segment_results.append(segment_manifest)
+        completed_segment_indices.add(index)
         _set_task(
             task_id,
-            processed_segments=index,
+            processed_segments=len(completed_segment_indices),
             progress=15.0 + (65.0 * (index / max(1, total_segments))),
             stage="dubbing:generating",
         )
+        _persist_omnivoice_task_manifest(
+            task_id=task_id,
+            out_root=out_root,
+            source_audio_path=source_audio_path,
+            source_vocals_path=source_vocals_path,
+            source_bgm_path=source_bgm_path,
+            speaker_ref_map_path=speaker_ref_map_path,
+            final_srt_path=final_dir / "dubbed_final_full.srt",
+            final_vocals_path=final_dir / "dubbed_vocals_full.wav",
+            final_mix_path=final_dir / "dubbed_mix_full.wav",
+            final_video_path=final_dir / "dubbed_video_full.mp4",
+            separated_video_audio_path=final_dir / "dubbed_audio_for_video.m4a",
+            separation_report_path=separation_report_path,
+            speaker_reference_dir=speaker_root,
+            subtitles_path=selected_subtitles_path,
+            subtitles_with_speaker_path=selected_subtitles_with_speaker_path,
+            final_ass_path=final_dir / "dubbed_final_full-styled.ass",
+            burned_video_path=final_dir / "dubbed_video_full_burned.mp4",
+        )
+
+    segment_results.sort(key=lambda item: float(item.get("start_sec", 0.0) or 0.0))
 
     # 回填全时轴 vocals。
     _set_task(task_id, stage="dubbing:composing", progress=82.0)
@@ -2668,6 +3837,7 @@ def _run_omnivoice_job(
     task["result_audio"] = str(final_mix_path.resolve())
     task["result_srt"] = str(final_srt_path.resolve())
     _set_task(task_id, status="completed", stage="completed", progress=100.0)
+    _annotate_task_with_resume_state(task, manifest=manifest, out_root=out_root, from_disk=False)
 
 
 def _background_runner(task_id: str, **kwargs: Any) -> None:
@@ -2683,6 +3853,26 @@ def _background_runner(task_id: str, **kwargs: Any) -> None:
             stage="failed",
             progress=100.0,
             error=str(exc),
+        )
+        out_root = _resolve_output_dir(task_id)
+        _persist_omnivoice_task_manifest(
+            task_id=task_id,
+            out_root=out_root,
+            source_audio_path=out_root / "stems" / "source_audio.wav",
+            source_vocals_path=out_root / "stems" / "full_source_vocals.wav",
+            source_bgm_path=out_root / "stems" / "full_source_bgm.wav",
+            speaker_ref_map_path=out_root / "speaker_ref_map.json",
+            final_srt_path=out_root / "final" / "dubbed_final_full.srt",
+            final_vocals_path=out_root / "final" / "dubbed_vocals_full.wav",
+            final_mix_path=out_root / "final" / "dubbed_mix_full.wav",
+            final_video_path=out_root / "final" / "dubbed_video_full.mp4",
+            separated_video_audio_path=out_root / "final" / "dubbed_audio_for_video.m4a",
+            separation_report_path=out_root / "separation_report.json",
+            speaker_reference_dir=out_root / "stems" / "speaker_refs",
+            subtitles_path=out_root / "selected_subtitles.srt",
+            subtitles_with_speaker_path=out_root / "selected_subtitles_with_speakers.srt",
+            final_ass_path=out_root / "final" / "dubbed_final_full-styled.ass",
+            burned_video_path=out_root / "final" / "dubbed_video_full_burned.mp4",
         )
 
 
@@ -2706,6 +3896,7 @@ async def start_omnivoice_from_project(
     subtitle_mode: str = Form("auto"),
     source_lang: str = Form("auto"),
     target_lang: str = Form("Chinese"),
+    enable_source_separation: bool = Form(True),
     api_key: str = Form(""),
     translate_base_url: str = Form(DEFAULT_TRANSLATE_BASE_URL),
     translate_model: str = Form(DEFAULT_TRANSLATE_MODEL),
@@ -2807,6 +3998,7 @@ async def start_omnivoice_from_project(
         subtitle_mode=subtitle_mode,
         source_lang=source_lang,
         target_lang=target_lang,
+        enable_source_separation=enable_source_separation,
         source_count=len(source_rows),
         translated_count=len(translated_rows),
         speaker_ids=speaker_ids,
@@ -2833,6 +4025,7 @@ async def start_omnivoice_from_project(
             translate_model=translate_model,
             translate_system_prompt=translate_system_prompt,
             omnivoice_api_url=task["omnivoice_api_url"],
+            enable_source_separation=enable_source_separation,
             uploaded_speaker_ref_map=uploaded_speaker_ref_map,
         ),
         daemon=True,
@@ -2914,6 +4107,7 @@ async def prepare_omnivoice_subtitles_from_project(
         subtitle_mode=subtitle_mode,
         source_lang=source_lang,
         target_lang=target_lang,
+        enable_source_separation=True,
         source_count=len(source_rows),
         translated_count=len(translated_rows),
         speaker_ids=sorted({str(row.get("speaker_id") or "").strip() or "Speaker 1" for row in selected_subtitles}),
@@ -3075,6 +4269,96 @@ async def load_omnivoice_batch(batch_id: str = Form(...)) -> Dict[str, Any]:
         raise HTTPException(status_code=404, detail="Batch folder not found")
     task = _create_task_from_manifest(manifest)
     return _task_to_public(task)
+
+
+@router.post("/resume/{task_id}")
+async def resume_omnivoice_task(task_id: str) -> Dict[str, Any]:
+    """从磁盘 batch 恢复 OmniVoice 任务，自动跳过已完成阶段与 segment。"""
+
+    active = [active_id for active_id in _task_store.list_active_ids() if active_id != task_id]
+    if active:
+        raise HTTPException(status_code=409, detail="Another OmniVoice job is already running")
+
+    manifest = _load_manifest(task_id)
+    if manifest is None:
+        raise HTTPException(status_code=404, detail="OmniVoice batch not found")
+    status = str(manifest.get("status") or "").strip().lower()
+    if status == "completed":
+        raise HTTPException(status_code=409, detail="Completed OmniVoice task does not need resume")
+
+    manifest_path_text = str(manifest.get("_manifest_path") or "").strip()
+    manifest_path = Path(manifest_path_text).expanduser().resolve() if manifest_path_text else None
+    out_root = manifest_path.parent if manifest_path and manifest_path.exists() else _resolve_output_dir(task_id)
+    resume_context = _build_resume_context(manifest=manifest, out_root=out_root)
+    resume_state = _infer_resume_state(manifest, out_root=out_root)
+    if str(resume_state.get("resume_stage") or "") == "completed":
+        raise HTTPException(status_code=409, detail="Completed OmniVoice task does not need resume")
+    if not bool(resume_state.get("resumable")):
+        raise HTTPException(status_code=409, detail="OmniVoice batch is not resumable")
+
+    input_media_path = Path(str(manifest.get("input_media_path") or "")).expanduser()
+    if not input_media_path.exists():
+        raise HTTPException(status_code=404, detail=f"Resume input media missing: {input_media_path}")
+
+    resolved_task_id = str(manifest.get("task_id") or manifest.get("batch_id") or task_id).strip() or task_id
+    task = _create_task_payload(
+        task_id=resolved_task_id,
+        project_filename=str(manifest.get("project_filename") or input_media_path.name),
+        input_media_path=input_media_path,
+        subtitle_mode=str(manifest.get("subtitle_mode") or "translated"),
+        source_lang=str(manifest.get("source_lang") or "auto"),
+        target_lang=str(manifest.get("target_lang") or "Chinese"),
+        enable_source_separation=bool(manifest.get("enable_source_separation", True)),
+        source_count=int(manifest.get("source_subtitles_count") or 0),
+        translated_count=int(manifest.get("translated_subtitles_count") or 0),
+        speaker_ids=list(manifest.get("speaker_ids") or []),
+        out_root=out_root,
+    )
+    task["status"] = "queued"
+    task["stage"] = "queued"
+    task["progress"] = 0.0
+    task["selected_subtitle_mode"] = str(manifest.get("selected_subtitle_mode") or "translated")
+    task["speaker_reference_mode"] = str(manifest.get("speaker_reference_mode") or "")
+    task["processed_segments"] = int(resume_state.get("completed_segments") or 0)
+    task["total_segments"] = int(resume_state.get("total_segments") or 0)
+    task["resume_stage"] = str(resume_state.get("resume_stage") or "")
+    task["resumable"] = True
+    task["error"] = ""
+    _task_store.create(resolved_task_id, task)
+
+    thread = threading.Thread(
+        target=_background_runner,
+        kwargs=dict(
+            task_id=resolved_task_id,
+            input_media_path=input_media_path,
+            project_filename=str(task.get("project_filename") or input_media_path.name),
+            source_subtitles=[],
+            translated_subtitles=[],
+            subtitle_mode=str(task.get("subtitle_mode") or "translated"),
+            source_lang=str(task.get("source_lang") or "auto"),
+            target_lang=str(task.get("target_lang") or "Chinese"),
+            api_key="",
+            translate_base_url=DEFAULT_TRANSLATE_BASE_URL,
+            translate_model=DEFAULT_TRANSLATE_MODEL,
+            translate_system_prompt="",
+            omnivoice_api_url=str(manifest.get("omnivoice_api_url") or DEFAULT_OMNIVOICE_API_URL),
+            enable_source_separation=bool(task.get("enable_source_separation", True)),
+            uploaded_speaker_ref_map=None,
+            resume_context=resume_context,
+        ),
+        daemon=True,
+    )
+    task["process"] = thread
+    thread.start()
+    return {
+        "task_id": resolved_task_id,
+        "short_id": resolved_task_id.split("_")[0],
+        "status": "queued",
+        "stage": "queued",
+        "project_filename": task["project_filename"],
+        "resume_stage": task["resume_stage"],
+        "message": "OmniVoice task resumed",
+    }
 
 
 @router.get("/artifact/{task_id}/{artifact}")

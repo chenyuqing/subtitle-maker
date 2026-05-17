@@ -11,6 +11,7 @@
 *   **Auto Dubbing 可选字幕输入**: 在 Step 5 可上传自定义 `.srt`，自动跳过 ASR，直接进入翻译与配音。
 *   **按时间区间配音**: Step 5 支持手动时间区间与自动语音区间，仅处理选中片段。
 *   **OmniVoice Final 成片输出**: 5 号面板最终结果会同时产出 `styled ASS` 字幕与烧录字幕的 `MP4` 成片，便于直接下载和回放。
+*   **OmniVoice 断点恢复**: 5 号面板支持从已生成的 `selected_subtitles.srt` 继续配音，也支持在配音中断后从已完成的 segment 断点续跑。
 *   **灵活导出**: 支持导出 SRT 字幕文件，可选原文、译文或双语对照格式。
 *   **实时预览**:
     *   转写过程中实时显示生成字幕。
@@ -133,6 +134,7 @@ subtitle-maker/
     *   可选设置配音时间区间：仅对指定区间执行翻译与配音，区间外保留原声。
     *   时长对齐策略：当配音超出当前字幕窗口时，会先尝试借用“下一句前的静音间隔”（保留约 100ms 安全边界），只有仍超出可用窗口时才进行变速压缩。
     *   OmniVoice final 结果目录会同时包含 `dubbed_final_full.srt`、`dubbed_final_full-styled.ass`、`dubbed_video_full.mp4` 和 `dubbed_video_full_burned.mp4`。
+    *   OmniVoice Restore 区支持加载历史 batch；如果只完成了“生成译文”，会显示“跳过翻译继续配音”，如果配音中断在中途，会显示“从断点继续配音”。
 
 ## ⚠️ 注意事项
 
