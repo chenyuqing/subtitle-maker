@@ -13,6 +13,7 @@ from fastapi.responses import PlainTextResponse
 from starlette.concurrency import run_in_threadpool
 
 from subtitle_maker.domains.subtitles import deepgram_json_to_subtitles
+from subtitle_maker.domains.subtitles import optimize_srt_import_subtitles
 from subtitle_maker.domains.subtitles import normalize_subtitles_with_speakers
 from subtitle_maker.transcriber import format_srt, merge_subtitles, parse_srt
 from subtitle_maker.translator import DEFAULT_TRANSLATE_BASE_URL, DEFAULT_TRANSLATE_MODEL, Translator
@@ -42,6 +43,7 @@ async def upload_srt(
 
     subtitles = parse_srt(content_str)
     subtitles, _ = normalize_subtitles_with_speakers(subtitles)
+    subtitles = optimize_srt_import_subtitles(subtitles)
     if not subtitles:
         raise HTTPException(status_code=400, detail="Could not parse subtitles or file is empty")
 

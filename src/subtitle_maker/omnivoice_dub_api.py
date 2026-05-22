@@ -62,7 +62,10 @@ from subtitle_maker.translator import (
     TRANSLATE_API_KEY_ENV,
     Translator,
     build_translation_system_prompt,
+    normalize_language_tag_for_passthrough,
     resolve_translation_api_key,
+    normalize_cantonese_translation_text,
+    sanitize_translation_text,
 )
 
 router = APIRouter(prefix="/omnivoice/auto", tags=["omnivoice-auto"])
@@ -80,7 +83,10 @@ DEFAULT_OMNIVOICE_API_URL = "http://127.0.0.1:3900"
 DEFAULT_SPEAKER_REF_SECONDS = 8.0
 MIN_SPEAKER_REF_SECONDS = 4.0
 MAX_SPEAKER_REF_SECONDS = 15.0
-UPLOADED_SPEAKER_REF_TEXT = "你好，这是我的声音音色，很高兴为你进行配音服务。"
+UPLOADED_SPEAKER_REF_TEXT_ZH = "你好，这是我的声音音色，很高兴为你提供配音服务。"
+UPLOADED_SPEAKER_REF_TEXT_YUE = "你好，呢個系我嘅聲音音色，很高興為你提供配音服務。"
+# 兼容旧调用点：默认仍指向普通话参考文案。
+UPLOADED_SPEAKER_REF_TEXT = UPLOADED_SPEAKER_REF_TEXT_ZH
 REMOTE_GENERATE_TIMEOUT_SEC = 3600
 OMNIVOICE_STUDIO_DIR = (REPO_ROOT / "OmniVoice-Studio-main").resolve()
 OMNIVOICE_BACKEND_MAIN = OMNIVOICE_STUDIO_DIR / "backend" / "main.py"
@@ -205,6 +211,74 @@ def _normalize_subtitles_payload(raw: str, *, field_name: str) -> List[Dict[str,
     rows.sort(key=lambda item: float(item.get("start", 0.0) or 0.0))
     rows, _ = normalize_subtitles_with_speakers(rows)
     return rows
+
+
+def _is_cantonese_language_variant(language: str) -> bool:
+    """判断语言值是否属于粤语同义写法。"""
+
+    lowered = str(language or "").strip().lower()
+    if not lowered:
+        return False
+    markers = ("cantonese", "cantonese-mainland", "mainland cantonese", "yue", "粤语", "廣東話", "广东话")
+    return any(marker in lowered for marker in markers)
+
+
+def _is_mainland_cantonese_language_variant(language: str) -> bool:
+    """判断语言值是否属于“广东式口语”这一档。"""
+
+    lowered = str(language or "").strip().lower()
+    if not lowered:
+        return False
+    markers = (
+        "cantonese-mainland",
+        "mainland cantonese",
+        "mainland-cantonese",
+        "广东式粤语",
+        "廣東式粵語",
+        "繁体粤语",
+        "繁體粵語",
+        "简体粤语",
+        "簡體粵語",
+    )
+    return any(marker in lowered for marker in markers)
+
+
+def _normalize_omnivoice_language_pair(language: str, *, default: str = "") -> Tuple[str, str]:
+    """把 5 号面板语言值统一成“展示值 + 运行值”。"""
+
+    raw = str(language or "").strip()
+    if not raw:
+        return default, default
+    lowered = raw.lower()
+    if lowered == "auto":
+        return "auto", "auto"
+    if _is_mainland_cantonese_language_variant(raw):
+        return "Cantonese-Mainland", "yue"
+    if _is_cantonese_language_variant(raw):
+        return "Cantonese", "yue"
+    if lowered in {"chinese", "mandarin", "zh", "中文", "漢語", "汉语", "普通话", "普通話"}:
+        return "Chinese", "zh"
+    return raw, raw
+
+
+def _speaker_ref_text_for_target_lang(target_lang: str) -> str:
+    """按目标语种选择上传参考音默认文案。"""
+
+    return UPLOADED_SPEAKER_REF_TEXT_YUE if _is_cantonese_language_variant(target_lang) else UPLOADED_SPEAKER_REF_TEXT_ZH
+
+
+def _resolve_omnivoice_ref_voice_candidates(target_lang: str) -> List[str]:
+    """生成参考音目录的候选名，优先保留用户输入，再补展示值和运行值。"""
+
+    display_lang, runtime_lang = _normalize_omnivoice_language_pair(target_lang, default="Chinese")
+    candidates: List[str] = []
+    for candidate in (str(target_lang or "").strip(), display_lang, runtime_lang):
+        normalized = str(candidate or "").strip()
+        if normalized and normalized.lower() not in {item.lower() for item in candidates}:
+            candidates.append(normalized)
+    if display_lang == "Cantonese-Mainland" and "Cantonese" not in candidates:
+        candidates.append("Cantonese")
+    return candidates
 
 
 def _ensure_speaker_ids(
@@ -337,19 +411,79 @@ def _normalize_translation_result(
 def _resolve_ref_voices_dir(target_lang: str) -> Optional[Path]:
     """按目标语种解析预存参考音目录（ref-voices/<target_lang>/）。"""
 
-    lang = str(target_lang or "").strip()
-    if not lang:
+    candidates = _resolve_omnivoice_ref_voice_candidates(target_lang)
+    if not candidates:
         return None
-    direct = (REF_VOICES_ROOT / lang).resolve()
-    if direct.exists() and direct.is_dir():
-        return direct
     if not REF_VOICES_ROOT.exists():
         return None
-    lowered = lang.lower()
+    for lang in candidates:
+        direct = (REF_VOICES_ROOT / lang).resolve()
+        if direct.exists() and direct.is_dir():
+            return direct
+    lowered_candidates = {lang.lower() for lang in candidates}
     for child in REF_VOICES_ROOT.iterdir():
-        if child.is_dir() and child.name.lower() == lowered:
+        if child.is_dir() and child.name.lower() in lowered_candidates:
             return child.resolve()
     return None
+
+
+def _list_preset_ref_voice_audio_files(
+    *,
+    base_dir: Path,
+    excluded_source_filenames: Optional[List[str]] = None,
+) -> List[Path]:
+    """列出目录下可用的预置参考音文件。"""
+
+    audio_exts = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aac"}
+    excluded_name_set = {
+        Path(str(name or "").strip()).name.lower()
+        for name in (excluded_source_filenames or [])
+        if str(name or "").strip()
+    }
+    return [
+        path
+        for path in sorted(base_dir.rglob("*"), key=lambda p: str(p).lower())
+        if path.is_file()
+        and path.suffix.lower() in audio_exts
+        and path.name.lower() not in excluded_name_set
+    ]
+
+
+def _validate_preset_ref_voices_available(
+    *,
+    target_lang: str,
+    missing_speaker_ids: List[str],
+    excluded_source_filenames: Optional[List[str]] = None,
+) -> None:
+    """在任务启动前校验预置参考音池是否足够，避免后台跑到中途才失败。"""
+
+    if not missing_speaker_ids:
+        return
+
+    ref_dir = _resolve_ref_voices_dir(target_lang)
+    if ref_dir is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Missing preset reference voices dir for {target_lang}. "
+                f"Expected under {REF_VOICES_ROOT}. Upload all missing speaker references or add preset voices first."
+            ),
+        )
+
+    candidates = _list_preset_ref_voice_audio_files(
+        base_dir=ref_dir,
+        excluded_source_filenames=excluded_source_filenames,
+    )
+    if candidates:
+        return
+
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"Preset reference voices dir is empty for {target_lang}: {ref_dir}. "
+            "Upload all missing speaker references or add usable preset voices first."
+        ),
+    )
 
 
 def _pick_preset_ref_voices_for_missing_speakers(
@@ -372,34 +506,22 @@ def _pick_preset_ref_voices_for_missing_speakers(
             "Please create it or upload all speaker references."
         )
 
-    audio_exts = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aac"}
-    excluded_name_set = {
-        Path(str(name or "").strip()).name.lower()
-        for name in (excluded_source_filenames or [])
-        if str(name or "").strip()
-    }
-
-    def _list_audio_files(base_dir: Path) -> List[Path]:
-        """列出目录下可用的参考音，排除已上传同名文件。"""
-
-        return [
-            path
-            for path in sorted(base_dir.rglob("*"), key=lambda p: str(p).lower())
-            if path.is_file()
-            and path.suffix.lower() in audio_exts
-            and path.name.lower() not in excluded_name_set
-        ]
-
     speaker_gender_hints = dict(speaker_gender_hints or {})
     gender_pools: Dict[str, List[Path]] = {"male": [], "female": []}
     for gender in ("male", "female"):
         gender_dir = ref_dir / gender
         if gender_dir.exists() and gender_dir.is_dir():
-            gender_pools[gender] = _list_audio_files(gender_dir)
+            gender_pools[gender] = _list_preset_ref_voice_audio_files(
+                base_dir=gender_dir,
+                excluded_source_filenames=excluded_source_filenames,
+            )
             random.shuffle(gender_pools[gender])
     gender_pool_cursor = {"male": 0, "female": 0}
 
-    generic_candidates = _list_audio_files(ref_dir)
+    generic_candidates = _list_preset_ref_voice_audio_files(
+        base_dir=ref_dir,
+        excluded_source_filenames=excluded_source_filenames,
+    )
     if not generic_candidates:
         raise RuntimeError(
             f"No usable preset reference voices under {ref_dir}. "
@@ -436,7 +558,7 @@ def _pick_preset_ref_voices_for_missing_speakers(
             duration_sec = 0.0
         preset_map[speaker_id] = {
             "ref_audio": str(copied_path),
-            "ref_text": UPLOADED_SPEAKER_REF_TEXT,
+            "ref_text": _speaker_ref_text_for_target_lang(target_lang),
             "duration": duration_sec,
             "source_count": 1,
             "reference_mode": "preset_pool",
@@ -609,8 +731,53 @@ def _target_prefers_cjk_text(target_lang: str) -> bool:
     lowered = str(target_lang or "").strip().lower()
     if not lowered:
         return False
-    markers = ("chinese", "mandarin", "cantonese", "中文", "汉语", "普通话", "粤语", "廣東話", "广东话")
+    markers = ("chinese", "mandarin", "cantonese", "yue", "zh", "中文", "汉语", "漢語", "普通话", "普通話", "粤语", "廣東話", "广东话")
     return any(marker in lowered for marker in markers)
+
+
+def _should_passthrough_source_rows_without_translation(
+    *,
+    source_rows: List[Dict[str, Any]],
+    source_lang: str,
+    target_lang: str,
+) -> bool:
+    """判断 5 号面板 source 字幕是否应直接复用，避免明确同语种时重复计费翻译。"""
+
+    source_tag = normalize_language_tag_for_passthrough(source_lang)
+    target_tag = normalize_language_tag_for_passthrough(target_lang)
+    if source_tag and target_tag and source_tag not in {"", "auto"} and source_tag == target_tag:
+        return True
+    if target_tag != "zh":
+        return False
+    if source_tag not in {"", "auto"}:
+        return False
+    sample_text = "".join(str(row.get("text") or "").strip() for row in list(source_rows or [])[:12])
+    cjk_count = sum(1 for char in sample_text if "\u4e00" <= char <= "\u9fff")
+    latin_count = sum(1 for char in sample_text if ("a" <= char <= "z") or ("A" <= char <= "Z"))
+    return cjk_count > 0 and cjk_count >= max(4, latin_count * 2)
+
+
+def _sanitize_translated_rows_for_target(
+    rows: List[Dict[str, Any]],
+    *,
+    target_lang: str,
+) -> List[Dict[str, Any]]:
+    """清洗已存在的译文字幕，去掉模型说明废话并保留时轴与 speaker。"""
+
+    sanitized_rows: List[Dict[str, Any]] = []
+    for row in list(rows or []):
+        sanitized_text = sanitize_translation_text(str(row.get("text") or ""), target_lang)
+        if not sanitized_text:
+            continue
+        if _is_cantonese_language_variant(target_lang):
+            sanitized_text = normalize_cantonese_translation_text(sanitized_text, target_lang)
+        sanitized_rows.append(
+            {
+                **row,
+                "text": sanitized_text,
+            }
+        )
+    return sanitized_rows
 
 
 def _is_latin_dominant_text(text: str) -> bool:
@@ -1665,7 +1832,7 @@ def _check_omnivoice_health(api_url: str, timeout_sec: int = 5) -> None:
     url = api_url.rstrip("/") + "/health"
     request = urllib.request.Request(url, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+        with _open_omnivoice_request(request, api_url=api_url, timeout_sec=timeout_sec) as response:
             if response.status >= 400:
                 raise RuntimeError(f"health status {response.status}")
     except Exception as exc:
@@ -1678,7 +1845,7 @@ def _fetch_omnivoice_model_status(api_url: str, timeout_sec: int = 5) -> Dict[st
     url = api_url.rstrip("/") + "/model/status"
     request = urllib.request.Request(url, method="GET")
     try:
-        with urllib.request.urlopen(request, timeout=timeout_sec) as response:
+        with _open_omnivoice_request(request, api_url=api_url, timeout_sec=timeout_sec) as response:
             body = response.read().decode("utf-8", errors="replace")
             payload = json.loads(body or "{}")
             if not isinstance(payload, dict):
@@ -1696,6 +1863,27 @@ def _is_local_omnivoice_api(api_url: str) -> bool:
     if not host:
         return True
     return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def _open_omnivoice_request(request: urllib.request.Request, *, api_url: str, timeout_sec: int):
+    """访问本机 OmniVoice 服务时显式绕过系统代理，避免误判后端未就绪。"""
+
+    if _is_local_omnivoice_api(api_url):
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return opener.open(request, timeout=timeout_sec)
+    return urllib.request.urlopen(request, timeout=timeout_sec)
+
+
+def _build_omnivoice_requests_session(api_url: str):
+    """为 OmniVoice HTTP 请求构造 session，本机地址显式禁用环境代理。"""
+
+    import requests
+
+    session = requests.Session()
+    if _is_local_omnivoice_api(api_url):
+        session.trust_env = False
+        session.proxies.clear()
+    return session
 
 
 def _read_pid_file(pid_file: Path) -> Optional[int]:
@@ -1833,18 +2021,17 @@ def _call_remote_generate(
     }
 
     try:
-        import requests
-
-        response = requests.post(
-            generate_url,
-            data=data,
-            files=files,
-            timeout=REMOTE_GENERATE_TIMEOUT_SEC,
-        )
-        if response.status_code >= 400:
-            message = response.text[:800]
-            raise RuntimeError(f"OmniVoice generate failed ({response.status_code}): {message}")
-        return response.content
+        with _build_omnivoice_requests_session(api_url) as session:
+            response = session.post(
+                generate_url,
+                data=data,
+                files=files,
+                timeout=REMOTE_GENERATE_TIMEOUT_SEC,
+            )
+            if response.status_code >= 400:
+                message = response.text[:800]
+                raise RuntimeError(f"OmniVoice generate failed ({response.status_code}): {message}")
+            return response.content
     finally:
         file_handle = files["ref_audio"][1]
         try:
@@ -1858,6 +2045,7 @@ def _translate_subtitles_if_needed(
     subtitles_mode: str,
     source_rows: List[Dict[str, Any]],
     translated_rows: List[Dict[str, Any]],
+    source_lang: str,
     target_lang: str,
     api_key: str,
     translate_base_url: str,
@@ -1872,7 +2060,10 @@ def _translate_subtitles_if_needed(
     selected_mode = "translated"
     if normalized_mode == "translated":
         if translated_rows:
-            return _ensure_speaker_ids(translated_rows, fallback_rows=source_rows), "translated"
+            return _ensure_speaker_ids(
+                _sanitize_translated_rows_for_target(translated_rows, target_lang=target_lang),
+                fallback_rows=source_rows,
+            ), "translated"
         if source_rows:
             selected_rows = source_rows
             selected_mode = "source"
@@ -1880,19 +2071,42 @@ def _translate_subtitles_if_needed(
             raise HTTPException(status_code=400, detail="OmniVoice requires at least one subtitle row")
     elif normalized_mode == "source":
         if not source_rows and translated_rows:
-            return _ensure_speaker_ids(translated_rows, fallback_rows=source_rows), "translated"
+            return _ensure_speaker_ids(
+                _sanitize_translated_rows_for_target(translated_rows, target_lang=target_lang),
+                fallback_rows=source_rows,
+            ), "translated"
         if not source_rows:
             raise HTTPException(status_code=400, detail="OmniVoice requires at least one subtitle row")
         selected_rows = source_rows
         selected_mode = "source"
     else:
         if translated_rows:
-            return _ensure_speaker_ids(translated_rows, fallback_rows=source_rows), "translated"
+            return _ensure_speaker_ids(
+                _sanitize_translated_rows_for_target(translated_rows, target_lang=target_lang),
+                fallback_rows=source_rows,
+            ), "translated"
         if source_rows:
             selected_rows = source_rows
             selected_mode = "source"
         else:
             raise HTTPException(status_code=400, detail="OmniVoice requires at least one subtitle row")
+
+    if _should_passthrough_source_rows_without_translation(
+        source_rows=selected_rows,
+        source_lang=source_lang,
+        target_lang=target_lang,
+    ):
+        return _ensure_speaker_ids(
+            [
+                {
+                    **row,
+                    "text": str(row.get("text") or "").strip(),
+                }
+                for row in selected_rows
+                if str(row.get("text") or "").strip()
+            ],
+            fallback_rows=source_rows,
+        ), "source"
 
     effective_api_key = resolve_translation_api_key(api_key=api_key)
     if not effective_api_key:
@@ -1949,6 +2163,15 @@ def _translate_subtitles_if_needed(
                 logger.warning("OmniVoice translation retry failed: %s", exc)
     translated_rows = _normalize_translation_result(selected_rows, translated_texts)
     translated_rows = _ensure_speaker_ids(translated_rows, fallback_rows=source_rows)
+    translated_rows = _sanitize_translated_rows_for_target(translated_rows, target_lang=target_lang)
+    if _is_cantonese_language_variant(target_lang):
+        translated_rows = [
+            {
+                **row,
+                "text": normalize_cantonese_translation_text(str(row.get("text") or ""), target_lang),
+            }
+            for row in translated_rows
+        ]
     # 5 号链路最小兜底：翻译空行不再删除，直接回退对应 source 文本，保证 1:1 行数不缩水。
     repaired_rows: List[Dict[str, Any]] = []
     fallback_count = 0
@@ -2085,6 +2308,8 @@ def _create_task_payload(
 ) -> Dict[str, Any]:
     """创建 OmniVoice 任务初始记录。"""
 
+    display_source_lang, runtime_source_lang = _normalize_omnivoice_language_pair(source_lang, default="auto")
+    display_target_lang, runtime_target_lang = _normalize_omnivoice_language_pair(target_lang, default="Chinese")
     return {
         "id": task_id,
         "short_id": task_id.split("_")[0],
@@ -2105,8 +2330,10 @@ def _create_task_payload(
         "input_media_path": str(input_media_path),
         "input_media_url": None,
         "subtitle_mode": subtitle_mode,
-        "source_lang": source_lang,
-        "target_lang": target_lang,
+        "source_lang": display_source_lang,
+        "source_lang_runtime": runtime_source_lang,
+        "target_lang": display_target_lang,
+        "target_lang_runtime": runtime_target_lang,
         "enable_source_separation": bool(enable_source_separation),
         "source_subtitles_count": source_count,
         "translated_subtitles_count": translated_count,
@@ -2139,6 +2366,8 @@ def _build_manifest(
 ) -> Dict[str, Any]:
     """写入独立 OmniVoice manifest，供恢复与 artifact 下载使用。"""
 
+    display_source_lang, runtime_source_lang = _normalize_omnivoice_language_pair(task["source_lang"], default="auto")
+    display_target_lang, runtime_target_lang = _normalize_omnivoice_language_pair(task["target_lang"], default="Chinese")
     paths: Dict[str, Optional[str]] = {
         "source_audio": str(source_audio_path.resolve()) if source_audio_path.exists() else None,
         "source_vocals": str(source_vocals_path.resolve()) if source_vocals_path.exists() else None,
@@ -2188,8 +2417,10 @@ def _build_manifest(
         "project_filename": task["project_filename"],
         "input_media_path": task["input_media_path"],
         "subtitle_mode": task["subtitle_mode"],
-        "source_lang": task["source_lang"],
-        "target_lang": task["target_lang"],
+        "source_lang": display_source_lang,
+        "source_lang_runtime": runtime_source_lang,
+        "target_lang": display_target_lang,
+        "target_lang_runtime": runtime_target_lang,
         "enable_source_separation": bool(task.get("enable_source_separation", True)),
         "selected_subtitle_mode": task.get("selected_subtitle_mode"),
         "source_subtitles_count": task["source_subtitles_count"],
@@ -3381,6 +3612,10 @@ def _create_task_from_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
     task["progress"] = float(manifest.get("progress") or 100.0)
     task["selected_subtitle_mode"] = str(manifest.get("selected_subtitle_mode") or "")
     task["speaker_reference_mode"] = str(manifest.get("speaker_reference_mode") or "auto_aggregate")
+    task["source_lang"] = str(manifest.get("source_lang") or task["source_lang"])
+    task["source_lang_runtime"] = str(manifest.get("source_lang_runtime") or task["source_lang_runtime"])
+    task["target_lang"] = str(manifest.get("target_lang") or task["target_lang"])
+    task["target_lang_runtime"] = str(manifest.get("target_lang_runtime") or task["target_lang_runtime"])
     task["artifacts"] = list(manifest.get("artifacts") or [])
     task["result_srt"] = str((manifest.get("paths") or {}).get("dubbed_final_srt") or "") or None
     task["result_audio"] = str((manifest.get("paths") or {}).get("dubbed_mix") or "") or None
@@ -3411,6 +3646,8 @@ def _run_omnivoice_job(
 ) -> None:
     """后台执行独立 OmniVoice dubbing 链路。"""
 
+    display_source_lang, runtime_source_lang = _normalize_omnivoice_language_pair(source_lang, default="auto")
+    display_target_lang, runtime_target_lang = _normalize_omnivoice_language_pair(target_lang, default="Chinese")
     out_root = _resolve_output_dir(task_id)
     out_root.mkdir(parents=True, exist_ok=True)
     final_dir = out_root / "final"
@@ -3484,7 +3721,8 @@ def _run_omnivoice_job(
             subtitles_mode=subtitle_mode,
             source_rows=_optimize_omnivoice_source_rows(source_subtitles),
             translated_rows=translated_subtitles,
-            target_lang=target_lang,
+            source_lang=display_source_lang,
+            target_lang=display_target_lang,
             api_key=api_key,
             translate_base_url=translate_base_url,
             translate_model=translate_model,
@@ -3579,7 +3817,7 @@ def _run_omnivoice_job(
             )
             preset_map = _pick_preset_ref_voices_for_missing_speakers(
                 missing_speaker_ids=missing_speakers,
-                target_lang=target_lang,
+                target_lang=display_target_lang,
                 out_root=out_root,
                 speaker_gender_hints=speaker_gender_hints,
                 excluded_source_filenames=uploaded_source_filenames,
@@ -3599,7 +3837,7 @@ def _run_omnivoice_job(
         json.dumps(
             {
                 "reference_mode": reference_mode,
-                "fixed_ref_text": UPLOADED_SPEAKER_REF_TEXT if reference_mode == "uploaded_strict" else None,
+        "fixed_ref_text": _speaker_ref_text_for_target_lang(display_target_lang) if reference_mode == "uploaded_strict" else None,
                 "speakers": speaker_ref_map,
             },
             ensure_ascii=False,
@@ -3610,6 +3848,7 @@ def _run_omnivoice_job(
     if not speaker_ref_map:
         raise RuntimeError("No speaker reference audio could be built")
     _set_task(task_id, speaker_reference_mode=reference_mode)
+    _set_task(task_id, source_lang=display_source_lang, source_lang_runtime=runtime_source_lang, target_lang=display_target_lang, target_lang_runtime=runtime_target_lang)
     _persist_omnivoice_task_manifest(
         task_id=task_id,
         out_root=out_root,
@@ -3672,7 +3911,7 @@ def _run_omnivoice_job(
         generated_bytes = _call_remote_generate(
             api_url=omnivoice_api_url,
             text=generation_text,
-            language=target_lang,
+            language=runtime_target_lang,
             ref_audio_path=ref_audio_path,
             ref_text=ref_text_for_generation,
             instruct="",
@@ -3984,12 +4223,29 @@ async def start_omnivoice_from_project(
                 continue
             uploaded_speaker_ref_map[normalized_speaker_id] = {
                 "ref_audio": stored_path,
-                "ref_text": UPLOADED_SPEAKER_REF_TEXT,
+                "ref_text": _speaker_ref_text_for_target_lang(target_lang),
                 "duration": round(float(sf.info(stored_path).duration), 3),
                 "source_count": 1,
                 "reference_mode": "uploaded_partial",
                 "upload_filename": Path(str(ref_file.filename or "")).name,
             }
+
+    if uploaded_speaker_ref_map:
+        missing_speaker_ids = [
+            speaker_id
+            for speaker_id in speaker_ids
+            if speaker_id not in uploaded_speaker_ref_map
+        ]
+        uploaded_source_filenames = [
+            Path(str(meta.get("upload_filename") or meta.get("source_path") or meta.get("ref_audio") or "")).name
+            for meta in uploaded_speaker_ref_map.values()
+            if str(meta.get("upload_filename") or meta.get("source_path") or meta.get("ref_audio") or "").strip()
+        ]
+        _validate_preset_ref_voices_available(
+            target_lang=target_lang,
+            missing_speaker_ids=missing_speaker_ids,
+            excluded_source_filenames=uploaded_source_filenames,
+        )
 
     task = _create_task_payload(
         task_id=resolved_task_id,
@@ -4074,6 +4330,7 @@ async def prepare_omnivoice_subtitles_from_project(
         subtitles_mode=subtitle_mode,
         source_rows=_optimize_omnivoice_source_rows(source_rows),
         translated_rows=translated_rows,
+        source_lang=source_lang,
         target_lang=target_lang,
         api_key=api_key,
         translate_base_url=translate_base_url,
@@ -4238,6 +4495,7 @@ async def list_omnivoice_batches() -> Dict[str, Any]:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except Exception:
             continue
+        resume_state = _infer_resume_state(manifest, out_root=manifest_path.parent)
         collected.append(
             (
                 manifest_path.stat().st_mtime,
@@ -4253,6 +4511,10 @@ async def list_omnivoice_batches() -> Dict[str, Any]:
                     "created_at": str(manifest.get("created_at") or ""),
                     "target_lang": str(manifest.get("target_lang") or ""),
                     "subtitle_mode": str(manifest.get("subtitle_mode") or ""),
+                    "resumable": bool(resume_state.get("resumable")),
+                    "resume_stage": str(resume_state.get("resume_stage") or ""),
+                    "processed_segments": int(resume_state.get("completed_segments") or 0),
+                    "total_segments": int(resume_state.get("total_segments") or 0),
                 },
             )
         )

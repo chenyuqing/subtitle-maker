@@ -45,6 +45,8 @@ class WebLegacyRouteTests(unittest.TestCase):
         self.assertIn('id="global-translate-base-url"', response.text)
         self.assertIn('id="global-translate-model"', response.text)
         self.assertIn('id="global-translate-save-key"', response.text)
+        self.assertIn('id="global-translate-test-btn"', response.text)
+        self.assertIn('id="global-translate-test-status"', response.text)
         self.assertIn('id="auto-dub-translate-system-prompt"', response.text)
         self.assertNotIn('id="agent-api-key"', response.text)
         self.assertNotIn('id="api-key"', response.text)
@@ -103,6 +105,29 @@ class WebLegacyRouteTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 400)
         self.assertIn("subtitle_kind", response.json()["detail"])
+
+    def test_upload_srt_optimizes_same_speaker_short_turns(self):
+        response = self.client.post(
+            "/upload_srt",
+            files={
+                "file": (
+                    "demo.srt",
+                    (
+                        "1\n00:00:00,000 --> 00:00:00,320\nSpeaker 1: No.\n\n"
+                        "2\n00:00:00,320 --> 00:00:06,320\nSpeaker 1: But most guys are doing things in order not to ejaculate quite so quickly.\n"
+                    ).encode("utf-8"),
+                    "application/x-subrip",
+                )
+            },
+            data={"video_filename": "demo.mp4", "subtitle_kind": "source"},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(len(payload["subtitles"]), 2)
+        self.assertEqual(payload["subtitles"][0]["text"], "No.")
+        self.assertEqual(payload["subtitles"][1]["text"], "But most guys are doing things in order not to ejaculate quite so quickly.")
+        self.assertEqual(payload["subtitles"][0]["speaker_id"], "Speaker 1")
+        self.assertEqual(payload["subtitles"][1]["speaker_id"], "Speaker 1")
 
     def test_upload_deepgram_json_and_status_keep_legacy_task_contract(self):
         deepgram_payload = {
@@ -164,6 +189,26 @@ class WebLegacyRouteTests(unittest.TestCase):
         self.assertEqual(status_payload["video_filename"], "demo.mp4")
         self.assertEqual(len(status_payload["subtitles"]), 2)
         self.assertEqual(status_payload["subtitles"][1]["speaker_id"], "Speaker 2")
+
+    def test_translation_connection_test_endpoint_returns_ok_for_valid_config(self):
+        with patch("subtitle_maker.app.routes.translation.Translator.test_connection", return_value={"reply": "OK"}) as test_connection:
+            response = self.client.post(
+                "/translation/test",
+                data={
+                    "api_key": "dummy-key",
+                    "translate_base_url": "https://llm.example.com/v1",
+                    "translate_model": "demo-model",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["provider"], "OpenAI-compatible")
+        self.assertEqual(payload["provider_host"], "llm.example.com")
+        self.assertEqual(payload["model"], "demo-model")
+        self.assertEqual(payload["reply"], "OK")
+        test_connection.assert_called_once()
 
     def test_async_transcribe_status_translate_and_export_still_work(self):
         media_path = self.upload_dir / "demo.mp4"

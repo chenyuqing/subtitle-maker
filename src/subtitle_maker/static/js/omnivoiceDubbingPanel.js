@@ -55,7 +55,8 @@ export function setupOmnivoiceDubbingPanel(deps) {
 
     const SUBTITLE_MODE_KEY = 'sm_omnivoiceSubtitleMode';
     const PREPARED_BATCH_STATE_KEY = 'sm_omnivoicePreparedBatchState';
-    const FIXED_SPEAKER_REF_TEXT = '你好，这是我的声音音色，很高兴为你进行配音服务。';
+    const FIXED_SPEAKER_REF_TEXT_ZH = '你好，这是我的声音音色，很高兴为你提供配音服务。';
+    const FIXED_SPEAKER_REF_TEXT_YUE = '你好，呢個系我嘅聲音音色，很高興為你提供配音服務。';
     let pollTimer = null;
     let backendPollTimer = null;
     let autoDubStartedAtMs = null;
@@ -147,6 +148,46 @@ export function setupOmnivoiceDubbingPanel(deps) {
     }
 
     /**
+     * 判断当前语言值是否属于粤语同义写法。
+     */
+    function isCantoneseLanguage(value) {
+        const lowered = String(value || '').trim().toLowerCase();
+        if (!lowered) return false;
+        return ['cantonese', 'cantonese-mainland', 'mainland cantonese', 'yue', '粤语', '廣東話', '广东话'].some((marker) => lowered.includes(marker));
+    }
+
+    /**
+     * 判断当前语言值是否属于“广东式口语”这一档。
+     */
+    function isMainlandCantoneseLanguage(value) {
+        const lowered = String(value || '').trim().toLowerCase();
+        if (!lowered) return false;
+        return ['cantonese-mainland', 'mainland cantonese', 'mainland-cantonese', '广东式粤语', '廣東式粵語', '繁体粤语', '繁體粵語', '简体粤语', '簡體粵語'].some((marker) => lowered.includes(marker));
+    }
+
+    /**
+     * 返回当前粤语目标语对应的翻译风格标签。
+     */
+    function getCantoneseStyleLabel(value) {
+        return isMainlandCantoneseLanguage(value) ? '广东式口语 + 繁体粤语' : '港式口语 + 繁体粤语';
+    }
+
+    /**
+     * 根据目标语种返回当前 speaker 参考文本。
+     */
+    function getSpeakerRefTextForTargetLang() {
+        return isCantoneseLanguage(targetLangSelect?.value || '') ? FIXED_SPEAKER_REF_TEXT_YUE : FIXED_SPEAKER_REF_TEXT_ZH;
+    }
+
+    /**
+     * 切换目标语时，刷新 speaker 参考文本与提示。
+     */
+    function syncSpeakerRefCopy() {
+        renderSpeakerReferenceInputs();
+        renderSpeakerRefHint();
+    }
+
+    /**
      * 根据当前 subtitle_mode 选出本轮真正用于 speaker 映射的字幕集合。
      */
     function getEffectiveSubtitleRows(projectContext) {
@@ -201,6 +242,7 @@ export function setupOmnivoiceDubbingPanel(deps) {
         if (!speakerRefListEl || !speakerRefHintEl) return;
         const projectContext = readProjectContext();
         const speakerIds = getDetectedSpeakerIds(projectContext);
+        const speakerRefText = getSpeakerRefTextForTargetLang();
         const nextMap = new Map();
         speakerRefListEl.innerHTML = '';
 
@@ -225,7 +267,7 @@ export function setupOmnivoiceDubbingPanel(deps) {
             title.textContent = speakerId;
             const copy = document.createElement('div');
             copy.className = 'omnivoice-speaker-ref-copy';
-            copy.textContent = `参考文本固定为：${FIXED_SPEAKER_REF_TEXT}`;
+            copy.textContent = `参考文本固定为：${speakerRefText}`;
             meta.appendChild(title);
             meta.appendChild(copy);
 
@@ -267,16 +309,21 @@ export function setupOmnivoiceDubbingPanel(deps) {
     function renderSpeakerRefHint() {
         if (!speakerRefHintEl) return;
         const speakerIds = getDetectedSpeakerIds();
+        const cantoneseTarget = isCantoneseLanguage(targetLangSelect?.value || '');
+        const cantoneseStyle = getCantoneseStyleLabel(targetLangSelect?.value || '');
+        const cantoneseSuffix = cantoneseTarget
+            ? ` 当前目标语为粤语（${cantoneseStyle}）；若未上传完整参考音，后端需存在 ref-voices/Cantonese 预置目录才能自动补齐缺失 speaker。`
+            : '';
         if (speakerIds.length === 0) {
-            speakerRefHintEl.textContent = '当前项目字幕里还没有 speaker 信息；请上传带 Speaker 前缀或 speaker_id 的字幕。';
+            speakerRefHintEl.textContent = `当前项目字幕里还没有 speaker 信息；请上传带 Speaker 前缀或 speaker_id 的字幕。${cantoneseSuffix}`.trim();
             return;
         }
         const missing = speakerIds.filter((speakerId) => !speakerRefFiles.get(speakerId));
         if (missing.length === 0) {
-            speakerRefHintEl.textContent = `已就绪：${speakerIds.length} 个 speaker 都已上传参考音。`;
+            speakerRefHintEl.textContent = `已就绪：${speakerIds.length} 个 speaker 都已上传参考音。${cantoneseTarget ? ' 建议这些参考音本身就是粤语语音。' : ''}`.trim();
             return;
         }
-        speakerRefHintEl.textContent = `还缺 ${missing.length} 个 speaker 参考音：${missing.join('、')}`;
+        speakerRefHintEl.textContent = `还缺 ${missing.length} 个 speaker 参考音：${missing.join('、')}。${cantoneseSuffix}`.trim();
     }
 
     /**
@@ -312,7 +359,14 @@ export function setupOmnivoiceDubbingPanel(deps) {
     function renderResumeAction(data) {
         if (!resumeBatchBtn) return;
         const resumable = !!data?.resumable;
-        loadedBatchTaskId = String(data?.id || data?.task_id || data?.batch_id || '').trim();
+        const resumeStage = String(data?.resume_stage || '').trim();
+        loadedBatchTaskId = String(data?.id || data?.task_id || data?.batch_id || batchSelect?.value || '').trim();
+        if (resumeStage === 'completed') {
+            resumeBatchBtn.style.display = 'inline-flex';
+            resumeBatchBtn.textContent = '该批次已完成';
+            resumeBatchBtn.disabled = true;
+            return;
+        }
         if (!resumable || !loadedBatchTaskId) {
             resumeBatchBtn.style.display = 'none';
             resumeBatchBtn.disabled = true;
@@ -322,7 +376,6 @@ export function setupOmnivoiceDubbingPanel(deps) {
         resumeBatchBtn.disabled = !omnivoiceBackendReady;
         const completed = Number(data?.processed_segments ?? data?.completed_segments ?? 0);
         const total = Number(data?.total_segments ?? 0);
-        const resumeStage = String(data?.resume_stage || '').trim();
         if (resumeStage === 'prepared') {
             resumeBatchBtn.textContent = '跳过翻译继续配音';
         } else if (resumeStage === 'dubbing_partial') {
@@ -332,6 +385,43 @@ export function setupOmnivoiceDubbingPanel(deps) {
         } else {
             resumeBatchBtn.textContent = '从断点继续配音';
         }
+    }
+
+    /**
+     * 当用户在 Restore 下拉里切换批次时，预先刷新 resume 按钮和提示。
+     */
+    function syncResumeActionFromSelection() {
+        if (!batchSelect) return;
+        const selectedOption = batchSelect.options?.[batchSelect.selectedIndex] || null;
+        if (!selectedOption || !batchSelect.value) {
+            renderResumeAction(null);
+            return;
+        }
+        const resumable = selectedOption.dataset.resumable === 'true';
+        const processedSegments = Number(selectedOption.dataset.processedSegments || 0);
+        const totalSegments = Number(selectedOption.dataset.totalSegments || 0);
+        const resumeStage = String(selectedOption.dataset.resumeStage || '').trim();
+        const payload = {
+            batch_id: batchSelect.value,
+            task_id: selectedOption.dataset.taskId || batchSelect.value,
+            resumable,
+            resume_stage: resumeStage,
+            processed_segments: processedSegments,
+            total_segments: totalSegments,
+        };
+        renderResumeAction(payload);
+        if (!batchHintEl) return;
+        if (resumable) {
+            batchHintEl.textContent = totalSegments > 0
+                ? `已选择 ${selectedOption.dataset.projectFilename || batchSelect.value}，可从断点继续（${processedSegments}/${totalSegments}）`
+                : `已选择 ${selectedOption.dataset.projectFilename || batchSelect.value}，可继续恢复`;
+            return;
+        }
+        if (resumeStage === 'completed') {
+            batchHintEl.textContent = `已选择 ${selectedOption.dataset.projectFilename || batchSelect.value}，该批次已完成，可直接加载结果查看产物`;
+            return;
+        }
+        batchHintEl.textContent = `已选择 ${selectedOption.dataset.projectFilename || batchSelect.value}，可先加载结果查看产物`;
     }
 
     /**
@@ -401,6 +491,10 @@ export function setupOmnivoiceDubbingPanel(deps) {
      */
     function renderProjectContextSummary() {
         const projectContext = readProjectContext();
+        const cantoneseSource = isCantoneseLanguage(sourceLangSelect?.value || '');
+        const cantoneseTarget = isCantoneseLanguage(targetLangSelect?.value || '');
+        const mainlandCantoneseTarget = isMainlandCantoneseLanguage(targetLangSelect?.value || '');
+        const cantoneseStyle = getCantoneseStyleLabel(targetLangSelect?.value || '');
         if (preparedBatchId) {
             const preparedState = buildPreparedBatchState(projectContext, preparedBatchId);
             if (!isPreparedBatchStateCompatible(projectContext, preparedState)) {
@@ -436,6 +530,8 @@ export function setupOmnivoiceDubbingPanel(deps) {
                 projectNoteEl.textContent = '请先在 1.Upload Video + Optional SRT 中上传视频。OmniVoice 会直接复用当前项目上下文，不再单独上传。';
             } else if (sourceCount === 0 && translatedCount === 0) {
                 projectNoteEl.textContent = '当前项目还没有可用字幕。OmniVoice 只能复用当前项目字幕上下文，请先在当前项目生成或导入字幕。';
+            } else if (cantoneseTarget) {
+                projectNoteEl.textContent = `当前目标语为粤语（${cantoneseStyle}）。5 号面板会把该输出稳定映射到 OmniVoice 的 yue 语言码；建议上传粤语参考音。若只上传部分 speaker，自动补位依赖后端 ref-voices/Cantonese 预置目录。`;
             } else {
                 projectNoteEl.textContent = 'OmniVoice 会优先复用 translated 字幕，否则翻译 source 字幕；speaker 会从字幕自动识别，参考音需要你逐个上传并严格映射。';
             }
@@ -445,10 +541,13 @@ export function setupOmnivoiceDubbingPanel(deps) {
             const baseUrl = getTranslateBaseUrl ? getTranslateBaseUrl() : '';
             const model = getTranslateModel ? getTranslateModel() : '';
             if (key) {
-                sharedKeyNoteEl.textContent = `当前使用翻译 API 配置：${baseUrl || '默认 Base URL'} / ${model || '默认 Model'}。OmniVoice 只共享翻译配置，不共享 4 号面板的 backend 状态。`;
+                sharedKeyNoteEl.textContent = `当前使用翻译 API 配置：${baseUrl || '默认 Base URL'} / ${model || '默认 Model'}。OmniVoice 只共享翻译配置，不共享 4 号面板的 backend 状态。${cantoneseTarget ? ` 目标语是粤语时，source 字幕翻译会优先生成${cantoneseStyle}。` : ''}`;
             } else {
-                sharedKeyNoteEl.textContent = '如果当前项目需要翻译 source 字幕，将复用左侧 Translation API 配置或后端环境变量。';
+                sharedKeyNoteEl.textContent = `如果当前项目需要翻译 source 字幕，将复用左侧 Translation API 配置或后端环境变量。${cantoneseTarget ? ` 目标语是粤语时，会优先生成${cantoneseStyle}。` : ''}`;
             }
+        }
+        if (projectReadinessEl && cantoneseSource && cantoneseTarget && mediaName && (sourceCount > 0 || translatedCount > 0)) {
+            projectReadinessEl.textContent = `${projectReadinessEl.textContent} · ${mainlandCantoneseTarget ? '广东式粤语链路' : '港式粤语链路'}`;
         }
         if (subtitleModeSelect) {
             const previous = subtitleModeSelect.value;
@@ -858,14 +957,23 @@ export function setupOmnivoiceDubbingPanel(deps) {
             items.forEach((item) => {
                 const option = document.createElement('option');
                 option.value = item.batch_id || item.task_id || '';
-                option.textContent = `${item.batch_id || item.task_id || 'batch'} · ${item.project_filename || 'unknown'} · ${item.status || 'unknown'}`;
+                const resumeMark = item.resumable ? ` · 可断点继续${item.resume_stage ? `(${item.resume_stage})` : ''}` : '';
+                option.dataset.taskId = item.task_id || item.batch_id || '';
+                option.dataset.projectFilename = item.project_filename || '';
+                option.dataset.resumable = item.resumable ? 'true' : 'false';
+                option.dataset.resumeStage = item.resume_stage || '';
+                option.dataset.processedSegments = String(item.processed_segments ?? 0);
+                option.dataset.totalSegments = String(item.total_segments ?? 0);
+                option.textContent = `${item.batch_id || item.task_id || 'batch'} · ${item.project_filename || 'unknown'} · ${item.status || 'unknown'}${resumeMark}`;
                 batchSelect.appendChild(option);
             });
             batchHintEl.textContent = items.length > 0
                 ? `已找到 ${items.length} 个 OmniVoice 结果文件夹`
                 : '当前没有可加载的 OmniVoice 结果文件夹';
+            syncResumeActionFromSelection();
         } catch (error) {
             batchHintEl.textContent = `加载失败：${error.message}`;
+            renderResumeAction(null);
         }
     }
 
@@ -877,6 +985,7 @@ export function setupOmnivoiceDubbingPanel(deps) {
             if (batchHintEl) {
                 batchHintEl.textContent = '请先选择一个 OmniVoice 结果文件夹';
             }
+            renderResumeAction(null);
             return;
         }
         const batchId = batchSelect.value;
@@ -902,10 +1011,12 @@ export function setupOmnivoiceDubbingPanel(deps) {
             if (batchSelect) {
                 batchSelect.value = batchId;
             }
+            syncLanguageSelectorsFromTask(data);
+            loadedBatchTaskId = String(data?.id || data?.task_id || data?.batch_id || batchId || '').trim();
+            renderResumeAction(data);
             loadResultMediaToPlayer(data);
             renderTaskState(data, loadSeq);
             renderOmnivoiceResultAssets(data, loadSeq);
-            renderResumeAction(data);
             if (batchHintEl) {
                 if (data?.resumable) {
                     const completed = Number(data?.processed_segments ?? 0);
@@ -1103,10 +1214,32 @@ export function setupOmnivoiceDubbingPanel(deps) {
         renderProjectContextSummary();
     }
 
+    /**
+     * 从已加载任务回填语言选择器，确保 restore/resume 后保留原展示值。
+     */
+    function syncLanguageSelectorsFromTask(data) {
+        if (sourceLangSelect && data?.source_lang) {
+            sourceLangSelect.value = String(data.source_lang);
+        }
+        if (targetLangSelect && data?.target_lang) {
+            targetLangSelect.value = String(data.target_lang);
+            syncSpeakerRefCopy();
+        }
+    }
+
     if (subtitleModeSelect) {
         restoreSubtitleMode();
         subtitleModeSelect.addEventListener('change', () => {
             renderSpeakerReferenceInputs();
+        });
+    }
+    if (sourceLangSelect) {
+        sourceLangSelect.addEventListener('change', syncProjectUi);
+    }
+    if (targetLangSelect) {
+        targetLangSelect.addEventListener('change', () => {
+            syncSpeakerRefCopy();
+            syncProjectUi();
         });
     }
     if (startBtn) {
@@ -1120,6 +1253,9 @@ export function setupOmnivoiceDubbingPanel(deps) {
     }
     if (loadBatchBtn) {
         loadBatchBtn.addEventListener('click', loadBatch);
+    }
+    if (batchSelect) {
+        batchSelect.addEventListener('change', syncResumeActionFromSelection);
     }
     if (resumeBatchBtn) {
         resumeBatchBtn.addEventListener('click', resumeLoadedBatch);

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -539,6 +540,289 @@ class DubbingPipelineTests(unittest.TestCase):
         user_message = fake_client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
         self.assertIn("1. No. But most guys are doing things in order not to ejaculate quite so quickly.", user_message)
         self.assertNotIn("No.\nBut most guys", user_message)
+
+    def test_translator_translate_batch_uses_default_chunk_size_300(self):
+        from subtitle_maker.translator import DEFAULT_TRANSLATION_BATCH_SIZE, Translator
+
+        def _fake_create(*args, **kwargs):
+            user_content = kwargs["messages"][1]["content"]
+            batch_size = sum(
+                1
+                for line in user_content.splitlines()
+                if re.match(r"^\d+\.\s", line.strip())
+            )
+            content = "\n".join(f"{index + 1}. 好" for index in range(batch_size))
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+            )
+
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=Mock(side_effect=_fake_create)
+                )
+            )
+        )
+        translator = Translator(api_key="test-key", base_url="http://example.com", model="demo-model")
+        translator.client = fake_client
+        subtitles = ["hello"] * (DEFAULT_TRANSLATION_BATCH_SIZE + 1)
+
+        translated = translator.translate_batch(subtitles, target_lang="Chinese")
+
+        self.assertEqual(len(translated), len(subtitles))
+        self.assertEqual(fake_client.chat.completions.create.call_count, 2)
+
+    def test_translator_translate_batch_retries_incomplete_batch_by_splitting(self):
+        from subtitle_maker import translator as translator_module
+        from subtitle_maker.translator import Translator
+
+        call_batches: list[int] = []
+
+        def _fake_create(*args, **kwargs):
+            user_content = kwargs["messages"][1]["content"]
+            batch_size = sum(
+                1
+                for line in user_content.splitlines()
+                if re.match(r"^\d+\.\s", line.strip())
+            )
+            call_batches.append(batch_size)
+            if batch_size == 4:
+                content = "1. 一\n2. 二\n3. 三\n"
+            elif batch_size == 2:
+                content = "1. 一\n2. 二\n"
+            else:
+                raise AssertionError(f"unexpected batch size {batch_size}")
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+            )
+
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=Mock(side_effect=_fake_create)
+                )
+            )
+        )
+        translator = Translator(api_key="test-key", base_url="http://example.com", model="demo-model")
+        translator.client = fake_client
+
+        with patch.object(translator_module, "MIN_TRANSLATION_RETRY_CHUNK_SIZE", 2), patch.object(
+            translator_module,
+            "MAX_TRANSLATION_MISSING_RETRY_COUNT",
+            0,
+        ), patch.object(
+            translator_module,
+            "MAX_TRANSLATION_MISSING_RETRY_RATIO",
+            0.0,
+        ):
+            translated = translator.translate_batch(
+                ["a", "b", "c", "d"],
+                target_lang="Chinese",
+                chunk_size=4,
+            )
+
+        self.assertEqual(translated, ["一", "二", "一", "二"])
+        self.assertEqual(call_batches, [4, 2, 2])
+
+    def test_translator_translate_batch_retries_missing_lines_only_before_split(self):
+        from subtitle_maker import translator as translator_module
+        from subtitle_maker.translator import Translator
+
+        call_batches: list[str] = []
+
+        def _fake_create(*args, **kwargs):
+            user_content = kwargs["messages"][1]["content"]
+            if "Missing targets with nearby context:" in user_content:
+                call_batches.append("missing-only")
+                self.assertIn("Target 1:", user_content)
+                self.assertIn("CONTEXT original_line_1", user_content)
+                self.assertIn("TARGET original_line_2", user_content)
+                self.assertIn("CONTEXT original_line_3", user_content)
+                content = "1. 补回第二行\n"
+            else:
+                call_batches.append("full-batch")
+                content = "1. 第一行\n3. 第三行\n"
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+            )
+
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=Mock(side_effect=_fake_create)
+                )
+            )
+        )
+        translator = Translator(api_key="test-key", base_url="http://example.com", model="demo-model")
+        translator.client = fake_client
+
+        with patch.object(translator_module, "MAX_TRANSLATION_MISSING_RETRY_COUNT", 8), patch.object(
+            translator_module,
+            "MAX_TRANSLATION_MISSING_RETRY_RATIO",
+            0.5,
+        ):
+            translated = translator.translate_batch(
+                ["alpha", "beta", "gamma"],
+                target_lang="Chinese",
+                chunk_size=3,
+            )
+
+        self.assertEqual(translated, ["第一行", "补回第二行", "第三行"])
+        self.assertEqual(call_batches, ["full-batch", "missing-only"])
+
+    def test_translator_parse_translated_lines_merges_multiline_numbered_blocks(self):
+        from subtitle_maker.translator import Translator
+
+        translator = Translator(api_key="test-key", base_url="http://example.com", model="demo-model")
+        # 同一个编号下的多行应聚合为一条，不得把第二行错当成下一条字幕。
+        content = (
+            "1. 我其实没打算做 g stack，\n"
+            "只是后面慢慢演化成了这个方向。\n"
+            "2. 第二句保持正常。\n"
+        )
+
+        parsed = translator._parse_translated_lines(content, expected_len=2)
+
+        self.assertEqual(parsed[0], "我其实没打算做 g stack， 只是后面慢慢演化成了这个方向。")
+        self.assertEqual(parsed[1], "第二句保持正常。")
+
+    def test_translator_parse_translated_lines_ignores_noise_lines_without_index_shift(self):
+        from subtitle_maker.translator import Translator
+
+        translator = Translator(api_key="test-key", base_url="http://example.com", model="demo-model")
+        # 说明行/空行等噪声不应进入结果，更不能导致后续编号整体错位。
+        content = (
+            "以下是翻译结果：\n\n"
+            "1. 第一条。\n"
+            "注：保留专有名词英文。\n"
+            "2. 第二条。\n"
+            "Explanation: Keep names unchanged.\n"
+            "3. 第三条。\n"
+        )
+
+        parsed = translator._parse_translated_lines(content, expected_len=3)
+
+        self.assertEqual(parsed, ["第一条。", "第二条。", "第三条。"])
+
+    def test_translator_translate_batch_sanitizes_inline_model_explanations(self):
+        from subtitle_maker.translator import Translator
+
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=Mock(
+                        return_value=SimpleNamespace(
+                            choices=[
+                                SimpleNamespace(
+                                    message=SimpleNamespace(
+                                        content="1. պայք?不对。 fight. 争斗。 But Chinese output only. Let's correct in final."
+                                    )
+                                )
+                            ]
+                        )
+                    )
+                )
+            )
+        )
+        translator = Translator(api_key="test-key", base_url="http://example.com", model="demo-model")
+        translator.client = fake_client
+
+        translated = translator.translate_batch(
+            ["fight"],
+            target_lang="Chinese",
+            system_prompt=None,
+            chunk_size=1,
+        )
+
+        self.assertEqual(translated, ["争斗"])
+
+    def test_translator_translate_batch_can_skip_shared_sanitize_for_full_paragraph(self):
+        from subtitle_maker.translator import Translator
+
+        raw_translation = (
+            "1. 我今日想讲一个可能会令好多创业者唔舒服的事实。"
+            "哈佛创新实验室的导师喺课堂上讲咗一句说话，原话係 “想法到处都係。"
+            "应该讲系到处都唔值钱。” Ideas are everywhere."
+        )
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=Mock(
+                        return_value=SimpleNamespace(
+                            choices=[SimpleNamespace(message=SimpleNamespace(content=raw_translation))]
+                        )
+                    )
+                )
+            )
+        )
+        translator = Translator(api_key="test-key", base_url="http://example.com", model="demo-model")
+        translator.client = fake_client
+
+        translated = translator.translate_batch(
+            ["dummy"],
+            target_lang="Cantonese-Mainland",
+            system_prompt=None,
+            chunk_size=1,
+            sanitize_outputs=False,
+        )
+
+        self.assertEqual(
+            translated,
+            ["我今日想讲一个可能会令好多创业者唔舒服的事实。哈佛创新实验室的导师喺课堂上讲咗一句说话，原话系 “想法到处都系。应该讲系到处都唔值钱。” Ideas are everywhere."],
+        )
+
+    def test_translator_translate_batch_raises_provider_error_instead_of_error_subtitles(self):
+        from subtitle_maker.translator import TranslationProviderError, Translator
+
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=Mock(side_effect=RuntimeError("Connection error"))
+                )
+            )
+        )
+        translator = Translator(api_key="test-key", base_url="http://example.com", model="demo-model")
+        translator.client = fake_client
+
+        with self.assertRaises(TranslationProviderError) as ctx:
+            translator.translate_batch(
+                ["During sex, the average man lasts two point five minutes to six minutes."],
+                target_lang="Cantonese",
+                system_prompt=None,
+                chunk_size=1,
+            )
+
+        self.assertIn("Translation provider request failed", str(ctx.exception))
+        self.assertIn("Connection error", str(ctx.exception))
+
+    def test_translator_test_connection_sends_minimal_ping_request(self):
+        from subtitle_maker.translator import Translator
+
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(
+                completions=SimpleNamespace(
+                    create=Mock(
+                        return_value=SimpleNamespace(
+                            choices=[SimpleNamespace(message=SimpleNamespace(content="OK"))]
+                        )
+                    )
+                )
+            )
+        )
+        translator = Translator(api_key="test-key", base_url="http://example.com", model="demo-model")
+        translator.client = fake_client
+
+        result = translator.test_connection()
+
+        self.assertEqual(result["reply"], "OK")
+        request_kwargs = fake_client.chat.completions.create.call_args.kwargs
+        self.assertEqual(request_kwargs["model"], "demo-model")
+        self.assertEqual(request_kwargs["temperature"], 0.0)
+        self.assertEqual(request_kwargs["max_tokens"], 1)
+        self.assertFalse(request_kwargs["stream"])
+        self.assertEqual(request_kwargs["messages"][0]["role"], "system")
+        self.assertIn("connectivity test", request_kwargs["messages"][0]["content"])
+        self.assertEqual(request_kwargs["messages"][1], {"role": "user", "content": "ping"})
 
     def test_resolve_translation_api_key_prefers_generic_env_then_legacy_env(self):
         from subtitle_maker.translator import resolve_translation_api_key

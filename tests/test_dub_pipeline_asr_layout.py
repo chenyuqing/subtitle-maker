@@ -149,6 +149,12 @@ class DubPipelineAsrLayoutTests(unittest.TestCase):
         self.assertFalse(effective)
         self.assertEqual(reason, "input_translated_strict_alignment")
 
+    def test_merge_text_lines_keeps_english_spacing_in_cjk_mode(self) -> None:
+        """pipeline 的 CJK 合并也要保留英文词间空格。"""
+
+        merged = dub_pipeline.merge_text_lines(["我在用 Claude", "Code 开发"], cjk_mode=True)
+        self.assertIn("Claude Code", merged)
+
     def test_rebalance_source_subtitles_merges_fragmented_sentence_sample(self) -> None:
         """坏样例应被压回更接近一句一行的布局，同时保留原始时间边界。"""
         subtitles = self.build_fragmented_sample()

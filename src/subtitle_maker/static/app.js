@@ -26,6 +26,8 @@ const globalTranslateHint = document.getElementById('global-translate-hint');
 const translateKeySourceBadge = document.getElementById('translate-key-source');
 const globalTranslateCard = document.querySelector('.sidebar-translate-card');
 const globalTranslateToggleBtn = document.getElementById('global-translate-toggle');
+const globalTranslateTestBtn = document.getElementById('global-translate-test-btn');
+const globalTranslateTestStatus = document.getElementById('global-translate-test-status');
 const globalTranslateBaseUrlInput = document.getElementById('global-translate-base-url');
 const globalTranslateModelInput = document.getElementById('global-translate-model');
 
@@ -299,11 +301,53 @@ function initTranslateSettings() {
             applyTranslateCollapsed(!isCollapsed);
         });
     }
+    if (globalTranslateTestBtn) {
+        globalTranslateTestBtn.addEventListener('click', runGlobalTranslateConnectionTest);
+    }
     const savedCollapsed = localStorage.getItem(TRANSLATE_COLLAPSED_KEY);
     const legacyCollapsed = localStorage.getItem(LEGACY_TRANSLATE_COLLAPSED_KEY);
     const collapsedValue = savedCollapsed === null ? legacyCollapsed : savedCollapsed;
     applyTranslateCollapsed(collapsedValue === null ? true : collapsedValue === 'true', false);
     syncTranslateSettingsUi();
+}
+
+// 更新侧边栏“连通性测试”状态展示，统一处理文本和颜色状态。
+function setGlobalTranslateTestStatus(text, state = '') {
+    if (!globalTranslateTestStatus) return;
+    globalTranslateTestStatus.textContent = String(text || '').trim() || '未测试';
+    if (state) {
+        globalTranslateTestStatus.dataset.state = state;
+    } else {
+        delete globalTranslateTestStatus.dataset.state;
+    }
+}
+
+// 用当前 sidebar 里的 provider 配置做一次真实连通性测试。
+async function runGlobalTranslateConnectionTest() {
+    if (!globalTranslateTestBtn) return;
+    const formData = new FormData();
+    formData.append('api_key', getTranslateApiKey());
+    formData.append('translate_base_url', getTranslateBaseUrl());
+    formData.append('translate_model', getTranslateModel());
+    globalTranslateTestBtn.disabled = true;
+    setGlobalTranslateTestStatus('测试中...', 'running');
+    try {
+        const res = await fetch('/translation/test', {
+            method: 'POST',
+            body: formData,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data?.ok) {
+            const detail = String(data?.detail || '连接失败').trim();
+            throw new Error(detail);
+        }
+        setGlobalTranslateTestStatus('可用', 'ok');
+    } catch (error) {
+        setGlobalTranslateTestStatus('失败', 'error');
+        alert(`翻译连通性测试失败：${error?.message || error}`);
+    } finally {
+        globalTranslateTestBtn.disabled = false;
+    }
 }
 
 function seekVideo(deltaSeconds) {
@@ -1249,6 +1293,22 @@ if (videoPlayer) {
     });
 }
 
+// 供 5 号 OmniVoice 面板兜底写入预览字幕：当独立预览注入器不可用时，回退到全局 translated 字幕。
+window.applyOmnivoicePreviewSubtitles = function applyOmnivoicePreviewSubtitles(items) {
+    const nextItems = Array.isArray(items) ? items : [];
+    translatedSubtitlesData = nextItems;
+    if (translatedDisplay) {
+        renderSubtitles(translatedSubtitlesData, translatedDisplay);
+    }
+    overlayMode = 'translated';
+    if (displayModeSelect) {
+        displayModeSelect.value = 'translated';
+    }
+    if (videoPlayer) {
+        videoPlayer.dispatchEvent(new Event('timeupdate'));
+    }
+};
+
 // 1. Media Upload Logic (Panel 1)
 setupUploadLogic(mediaUploadArea, mediaFileInput, handleMediaUpload);
 
@@ -1375,13 +1435,6 @@ async function handleSrtUploadWrapper(file) {
         return;
     }
 
-    // SRT 导入依赖“当前项目媒体”上下文；未上传视频/音频时直接阻断，避免生成孤立字幕任务。
-    const mediaName = String(currentProjectMediaFilename || currentFilename || '').trim();
-    if (!mediaName || mediaName.toLowerCase().endsWith('.srt')) {
-        alert("请先上传视频/音频，再上传 SRT 字幕。");
-        return;
-    }
-
     try {
         await handleSrtUpload(file);
     } catch (e) {
@@ -1393,13 +1446,6 @@ async function handleSrtUploadWrapper(file) {
 async function handleDeepgramJsonUploadWrapper(file) {
     if (!file.name.toLowerCase().endsWith('.json')) {
         alert("Please select a valid .json file");
-        return;
-    }
-
-    // Deepgram JSON 同样依赖“当前项目媒体”上下文；未上传视频/音频时直接阻断，避免创建孤立字幕状态。
-    const mediaName = String(currentProjectMediaFilename || currentFilename || '').trim();
-    if (!mediaName || mediaName.toLowerCase().endsWith('.srt') || mediaName.toLowerCase().endsWith('.json')) {
-        alert("请先上传视频/音频，再导入 Deepgram JSON 字幕。");
         return;
     }
 
@@ -1884,6 +1930,9 @@ function applyImportedSubtitleResponse(data, { successText = 'SRT Upload Complet
     const segBtn = document.getElementById('export-segments-btn');
     if (segBtn) segBtn.disabled = false;
 
+    // 字幕导入会改变 Current Project 上下文；这里显式广播，供 4/5/6 号面板即时刷新。
+    notifyProjectContextChanged();
+
     switchTab('panel-results');
 }
 
@@ -2110,7 +2159,8 @@ Promise.all([
     loadFrontendModule('js/dubbingPanel.js'),
     loadFrontendModule('js/omnivoiceDubbingPanel.js'),
     loadFrontendModule('js/speakerVoicePanel.js'),
-]).then(([dubbingPanelModule, omnivoiceDubbingPanelModule, speakerVoicePanelModule]) => {
+    loadFrontendModule('js/voxcpmDubbingPanel.js'),
+]).then(([dubbingPanelModule, omnivoiceDubbingPanelModule, speakerVoicePanelModule, voxcpmDubbingPanelModule]) => {
     dubbingPanelModule.setupDubbingPanels({
         videoPlayer,
         videoPlaceholder,
@@ -2151,6 +2201,16 @@ Promise.all([
             timeToSeconds,
             getProjectDubbingContext,
         });
+    voxcpmDubbingPanelModule.setupVoxcpmDubbingPanel({
+        videoPlayer,
+        videoPlaceholder,
+        formatEtaAsSegmentProgress,
+        buildAutoDubElapsedLabel,
+        getTranslateApiKey,
+        getTranslateBaseUrl,
+        getTranslateModel,
+        getProjectDubbingContext,
+    });
     }).catch((error) => {
         console.error('Frontend module bootstrap failed', error);
     });

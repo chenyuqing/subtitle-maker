@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 SPEAKER_PREFIX_RE = re.compile(
-    r"^\s*(?P<speaker>(?:Speaker\s+\S+)|(?:[^:\n]{1,80}))\s*:\s*(?P<text>.+?)\s*$",
+    r"^\s*(?P<speaker>(?:Speaker\s+\S+)|(?:[^:：\n]{1,80}))\s*[:：]\s*(?P<text>.+?)\s*$",
     re.IGNORECASE,
 )
 
@@ -39,9 +39,15 @@ def normalize_subtitles_with_speakers(
         row = dict(item)
         # 优先保留上游已经写入的 speaker_id sidecar，再回退到正文里的 Speaker 前缀。
         existing_speaker_id = str(row.get("speaker_id") or "").strip()
-        speaker_id, clean_text = strip_speaker_prefix(str(row.get("text") or ""))
-        row["text"] = clean_text
-        final_speaker_id = existing_speaker_id or speaker_id
+        raw_text = str(row.get("text") or "")
+        if existing_speaker_id:
+            # 上游已经显式给了 speaker_id 时，正文里的普通冒号不能再被误判成 speaker 前缀。
+            row["text"] = raw_text
+            final_speaker_id = existing_speaker_id
+        else:
+            speaker_id, clean_text = strip_speaker_prefix(raw_text)
+            row["text"] = clean_text
+            final_speaker_id = speaker_id
         if final_speaker_id:
             row["speaker_id"] = final_speaker_id
             if final_speaker_id not in seen:

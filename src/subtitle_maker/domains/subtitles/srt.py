@@ -4,11 +4,22 @@ import re
 from typing import Any, Dict, List
 
 
+def _normalize_cjk_merged_text(lines: List[str]) -> str:
+    """合并中日韩字幕时保留英文词内空格，只去掉明显多余的中文间隔。"""
+
+    merged = " ".join((line or "").strip() for line in lines if (line or "").strip())
+    merged = re.sub(r"\s+", " ", merged).strip()
+    # 中文之间不需要空格，但英文短语内部的空格要保留，例如 Claude Code。
+    merged = re.sub(r"([\u4e00-\u9fff])\s+([\u4e00-\u9fff])", r"\1\2", merged)
+    # 中文与全角标点之间也不应残留空格。
+    merged = re.sub(r"\s*([，。！？、；：])\s*", r"\1", merged)
+    return merged
+
+
 def merge_text_lines(lines: List[str], *, cjk_mode: bool) -> str:
     """按语言模式把多行文本合并成一条可比较的字幕文本。"""
     if cjk_mode:
-        merged = "".join((line or "").strip() for line in lines)
-        return re.sub(r"\s+", "", merged)
+        return _normalize_cjk_merged_text(lines)
 
     merged = " ".join((line or "").strip() for line in lines)
     merged = re.sub(r"\s+", " ", merged).strip()
@@ -191,4 +202,3 @@ def build_rebalanced_subtitle(block: List[Dict[str, Any]]) -> Dict[str, Any]:
     merged["end"] = float(block[-1]["end"])
     merged["text"] = subtitle_group_text(block, cjk_mode=cjk_mode)
     return merged
-

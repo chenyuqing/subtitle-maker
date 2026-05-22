@@ -9,8 +9,10 @@ from pathlib import Path
 from subtitle_maker.domains.subtitles import (
     build_segment_speaker_metadata_from_subtitles,
     deepgram_json_to_subtitles,
+    optimize_srt_import_subtitles,
     normalize_subtitles_with_speakers,
     parse_speaker_ref_map_json,
+    subtitle_group_text,
     strip_speaker_prefix,
 )
 
@@ -51,6 +53,25 @@ class SubtitleSpeakerTests(unittest.TestCase):
         self.assertEqual(speaker_ids, ["Speaker 1", "Speaker 2"])
         self.assertEqual(normalized[0]["speaker_id"], "Speaker 1")
         self.assertEqual(normalized[1]["speaker_id"], "Speaker 2")
+
+    def test_normalize_subtitles_with_speakers_does_not_trim_normal_colon_text_when_sidecar_exists(self) -> None:
+        subtitles = [
+            {
+                "start": 0.0,
+                "end": 5.0,
+                "text": "我今天想聊一个事实。哈佛创新实验室的导师在课上说了一句话，原话是：Ideas are everywhere.",
+                "speaker_id": "Larei",
+            }
+        ]
+
+        normalized, speaker_ids = normalize_subtitles_with_speakers(subtitles)
+
+        self.assertEqual(speaker_ids, ["Larei"])
+        self.assertEqual(normalized[0]["speaker_id"], "Larei")
+        self.assertEqual(
+            normalized[0]["text"],
+            "我今天想聊一个事实。哈佛创新实验室的导师在课上说了一句话，原话是：Ideas are everywhere.",
+        )
 
     def test_build_segment_speaker_metadata_from_subtitles_only_keeps_tagged_rows(self) -> None:
         subtitles = [
@@ -251,6 +272,149 @@ class SubtitleSpeakerTests(unittest.TestCase):
         self.assertEqual(subtitles[1]["speaker_id"], "Speaker 2")
         self.assertEqual(subtitles[0]["text"], "Hello, world.")
         self.assertEqual(subtitles[1]["text"], "Second speaker.")
+
+    def test_optimize_srt_import_subtitles_merges_same_speaker_short_turns(self) -> None:
+        subtitles = [
+            {"start": 0.0, "end": 0.32, "text": "No.", "speaker_id": "Speaker 1"},
+            {
+                "start": 0.32,
+                "end": 6.32,
+                "text": "But most guys are doing things in order not to ejaculate quite so quickly.",
+                "speaker_id": "Speaker 1",
+            },
+        ]
+
+        optimized = optimize_srt_import_subtitles(subtitles)
+        self.assertEqual(len(optimized), 2)
+        self.assertEqual(optimized[0]["start"], 0.0)
+        self.assertGreater(optimized[0]["end"], optimized[0]["start"])
+        self.assertEqual(optimized[0]["text"], "No.")
+        self.assertEqual(optimized[1]["text"], "But most guys are doing things in order not to ejaculate quite so quickly.")
+        self.assertEqual(optimized[0]["speaker_id"], "Speaker 1")
+        self.assertEqual(optimized[1]["speaker_id"], "Speaker 1")
+
+    def test_optimize_srt_import_subtitles_keeps_different_speakers_separate(self) -> None:
+        subtitles = [
+            {"start": 0.0, "end": 0.32, "text": "No.", "speaker_id": "Speaker 1"},
+            {"start": 0.32, "end": 1.0, "text": "Okay.", "speaker_id": "Speaker 2"},
+        ]
+
+        optimized = optimize_srt_import_subtitles(subtitles)
+        self.assertEqual(len(optimized), 2)
+        self.assertEqual(optimized[0]["speaker_id"], "Speaker 1")
+        self.assertEqual(optimized[1]["speaker_id"], "Speaker 2")
+
+    def test_optimize_srt_import_subtitles_single_speaker_collapses_across_speaker_switches(self) -> None:
+        subtitles = [
+            {"start": 0.0, "end": 0.32, "text": "但", "speaker_id": "Speaker 1"},
+            {"start": 0.32, "end": 1.4, "text": "失败模式六呢？", "speaker_id": "Speaker 2"},
+            {
+                "start": 1.4,
+                "end": 9.4,
+                "text": "那就是，好吧，假设你的反馈循环正常工作，一切开始运转起来，你能够比以前发布更多代码，但你的大脑跟不上",
+                "speaker_id": "Speaker 2",
+            },
+            {"start": 9.4, "end": 9.72, "text": "了。", "speaker_id": "Speaker 2"},
+            {"start": 9.72, "end": 10.0, "text": "对吧？", "speaker_id": "Speaker 2"},
+        ]
+
+        optimized = optimize_srt_import_subtitles(subtitles, speaker_mode="single")
+        self.assertEqual(len(optimized), 3)
+        self.assertEqual([item["speaker_id"] for item in optimized], ["Speaker 1", "Speaker 1", "Speaker 1"])
+        self.assertEqual(optimized[0]["text"], "但失败模式六呢？")
+        self.assertIn("跟不上了。", optimized[1]["text"])
+        self.assertEqual(optimized[2]["text"], "对吧？")
+
+    def test_optimize_srt_import_subtitles_keeps_complete_sentences_together(self) -> None:
+        subtitles = [
+            {"start": 0.0, "end": 0.32, "text": "但", "speaker_id": "Speaker 1"},
+            {"start": 0.32, "end": 1.4, "text": "失败模式六呢？", "speaker_id": "Speaker 1"},
+            {
+                "start": 1.4,
+                "end": 9.4,
+                "text": "那就是，好吧，假设你的反馈循环正常工作，一切开始运转起来，你能够比以前发布更多代码，但你的大脑跟不上",
+                "speaker_id": "Speaker 1",
+            },
+            {"start": 9.4, "end": 9.72, "text": "了。", "speaker_id": "Speaker 1"},
+            {"start": 9.72, "end": 10.0, "text": "对吧？", "speaker_id": "Speaker 1"},
+        ]
+
+        optimized = optimize_srt_import_subtitles(subtitles)
+        self.assertEqual(len(optimized), 3)
+        self.assertEqual(optimized[0]["text"], "但失败模式六呢？")
+        self.assertIn("跟不上了。", optimized[1]["text"])
+        self.assertEqual(optimized[2]["text"], "对吧？")
+
+    def test_optimize_srt_import_subtitles_splits_overlong_runs_without_sentence_punctuation(self) -> None:
+        subtitles = [
+            {"start": 879.120, "end": 882.240, "text": "Um and and so training training the models to be better at", "speaker_id": "Speaker 3"},
+            {"start": 882.240, "end": 884.960, "text": "that, which I think will also make the models better at at", "speaker_id": "Speaker 3"},
+            {"start": 885.280, "end": 888.160, "text": "other things where they haven't made progress as fast as coding, like", "speaker_id": "Speaker 3"},
+            {"start": 888.160, "end": 891.200, "text": "their ability to write or their ability to kind of do do", "speaker_id": "Speaker 3"},
+            {"start": 891.280, "end": 894.800, "text": "do do you know to to do uh you know less less", "speaker_id": "Speaker 3"},
+            {"start": 894.800, "end": 896.640, "text": "objective scientific tasks.", "speaker_id": "Speaker 3"},
+            {"start": 896.640, "end": 899.440, "text": "So I think it's gonna have benefits in many in many other", "speaker_id": "Speaker 3"},
+            {"start": 899.440, "end": 903.120, "text": "areas, but you know I think we find even within software engineering", "speaker_id": "Speaker 3"},
+            {"start": 903.280, "end": 907.040, "text": "this uh you know this these these kind of um uh uh", "speaker_id": "Speaker 3"},
+            {"start": 907.280, "end": 912.800, "text": "soft or somewhat subjective um uh skills and abilities are become surprisingly", "speaker_id": "Speaker 3"},
+        ]
+
+        optimized = optimize_srt_import_subtitles(
+            subtitles,
+            speaker_mode="multi",
+            enforce_merge_duration_guard=True,
+        )
+
+        self.assertGreater(len(optimized), 1)
+        max_duration = max(float(item["end"]) - float(item["start"]) for item in optimized)
+        self.assertLessEqual(max_duration, 12.0)
+        self.assertTrue(all((item.get("speaker_id") == "Speaker 3") for item in optimized))
+
+    def test_optimize_srt_import_subtitles_default_does_not_enforce_merge_duration_guard(self) -> None:
+        subtitles = [
+            {"start": 888.160, "end": 891.200, "text": "their ability to write or their ability to kind of do do", "speaker_id": "Speaker 3"},
+            {"start": 891.280, "end": 894.800, "text": "do do you know to to do uh you know less less", "speaker_id": "Speaker 3"},
+            {"start": 894.800, "end": 896.640, "text": "objective scientific tasks.", "speaker_id": "Speaker 3"},
+            {"start": 896.640, "end": 899.440, "text": "So I think it's gonna have benefits in many in many other", "speaker_id": "Speaker 3"},
+            {"start": 899.440, "end": 903.120, "text": "areas, but you know I think we find even within software engineering", "speaker_id": "Speaker 3"},
+            {"start": 903.280, "end": 907.040, "text": "this uh you know this these these kind of um uh uh", "speaker_id": "Speaker 3"},
+            {"start": 907.280, "end": 912.800, "text": "soft or somewhat subjective um uh skills and abilities are become surprisingly", "speaker_id": "Speaker 3"},
+        ]
+
+        optimized = optimize_srt_import_subtitles(subtitles, speaker_mode="multi")
+        max_duration = max(float(item["end"]) - float(item["start"]) for item in optimized)
+        self.assertGreater(max_duration, 12.0)
+
+    def test_optimize_srt_import_subtitles_can_enforce_merge_duration_guard(self) -> None:
+        subtitles = [
+            {"start": 888.160, "end": 891.200, "text": "their ability to write or their ability to kind of do do", "speaker_id": "Speaker 3"},
+            {"start": 891.280, "end": 894.800, "text": "do do you know to to do uh you know less less", "speaker_id": "Speaker 3"},
+            {"start": 894.800, "end": 896.640, "text": "objective scientific tasks.", "speaker_id": "Speaker 3"},
+            {"start": 896.640, "end": 899.440, "text": "So I think it's gonna have benefits in many in many other", "speaker_id": "Speaker 3"},
+            {"start": 899.440, "end": 903.120, "text": "areas, but you know I think we find even within software engineering", "speaker_id": "Speaker 3"},
+            {"start": 903.280, "end": 907.040, "text": "this uh you know this these these kind of um uh uh", "speaker_id": "Speaker 3"},
+            {"start": 907.280, "end": 912.800, "text": "soft or somewhat subjective um uh skills and abilities are become surprisingly", "speaker_id": "Speaker 3"},
+        ]
+
+        optimized = optimize_srt_import_subtitles(
+            subtitles,
+            speaker_mode="multi",
+            enforce_merge_duration_guard=True,
+        )
+        max_duration = max(float(item["end"]) - float(item["start"]) for item in optimized)
+        self.assertLessEqual(max_duration, 12.0)
+
+    def test_subtitle_group_text_keeps_english_spacing_in_cjk_mode(self) -> None:
+        """CJK 合并时要保留英文词间空格，例如 Claude Code。"""
+
+        merged = subtitle_group_text(
+            [
+                {"text": "我在用 Claude"},
+                {"text": "Code 开发"},
+            ],
+            cjk_mode=True,
+        )
+        self.assertIn("Claude Code", merged)
 
 
 if __name__ == "__main__":

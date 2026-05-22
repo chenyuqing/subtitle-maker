@@ -1,5 +1,815 @@
 # TODO
 
+## 132. 2026-05-22 5 号面板仅替换有字幕说话段，其余时间保留原音
+- [ ] 现状分析
+  - [ ] 核对 5 号面板当前 final 音频/视频拼接逻辑，确认无字幕时段是否保留原音
+  - [ ] 明确现有实现与用户目标的差异，并给出代码出处
+- [ ] 功能点设计
+  - [ ] 设计“仅处理 selected_subtitles 命中的说话段，其余区间直接使用原音”的高效拼接方案
+  - [ ] 评估对开启/关闭人声分离、带/不带 BGM、resume 的影响范围
+- [ ] 风险与决策
+  - [ ] 确认是否需要新增开关，还是保持 5 号面板默认行为升级
+  - [ ] 确认 final SRT、ASS、视频换轨、烧录字幕是否仍复用同一时间轴合同
+- [ ] 实施
+  - [ ] 严格按确认后的 Spec 落地
+- [ ] 验证
+  - [ ] 增加覆盖“长静音/无字幕区保留原音”的测试
+  - [ ] 提供可验证证据
+
+## 130. 2026-05-21 5 号面板 OmniVoice 按钮异常置灰修复
+- [x] 调研
+  - [x] 确认前端置灰由 `src/subtitle_maker/static/js/omnivoiceDubbingPanel.js` 的 `syncStartButtonState()` 控制
+  - [x] 确认后端 `/omnivoice/auto/backend-status` 依赖 `src/subtitle_maker/omnivoice_dub_api.py::_ensure_omnivoice_backend_ready(...)`
+  - [x] 确认 OmniVoice 探活仍直接走 `urllib.request.urlopen(...)`，与 6 号面板此前的本地代理误判模式一致
+- [x] 实施
+  - [x] 只修改 5 号面板 OmniVoice 本机探活链路，不改按钮前端逻辑
+  - [x] 让本机 `127.0.0.1/localhost` OmniVoice health/model status 检查显式绕过系统代理
+- [x] 验证
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_omnivoice_health_checks_bypass_proxy_for_local_backend`
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py`
+- [x] Review
+  - [x] 根因已确认是 5 号面板 OmniVoice 本机探活错误走了系统代理，导致 `/omnivoice/auto/backend-status` 返回 `ready=false`，前端把“生成译文 / 开始配音”一起置灰
+  - [x] 已在 `src/subtitle_maker/omnivoice_dub_api.py` 对本机 OmniVoice health/model status 检查显式禁用代理，并补 `tests/test_dubbing_cli_api.py::test_omnivoice_health_checks_bypass_proxy_for_local_backend`
+
+## 131. 2026-05-21 5 号面板 OmniVoice /generate 请求仍走代理修复
+- [x] 调研
+  - [x] 确认失败日志来自 `src/subtitle_maker/omnivoice_dub_api.py::_call_remote_generate(...)`
+  - [x] 确认 `_call_remote_generate(...)` 仍使用 `requests.post(...)` 默认代理环境，未复用本机直连策略
+- [x] 实施
+  - [x] 只修改 5 号面板 OmniVoice `/generate` 本机请求链路，不影响远端 URL
+  - [x] 让本机 `127.0.0.1/localhost` 的 `requests` 调用显式关闭环境代理
+- [x] 验证
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_omnivoice_generate_bypasses_proxy_for_local_backend tests.test_dubbing_cli_api.DubbingCliApiTests.test_omnivoice_health_checks_bypass_proxy_for_local_backend`
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py`
+- [x] Review
+  - [x] 根因已确认是 5 号面板只修了本机探活，未修正式 `/generate` 请求，导致 `requests` 仍读取系统代理并把流量转发到 `127.0.0.1:1082`
+  - [x] 已在 `src/subtitle_maker/omnivoice_dub_api.py` 为本机 OmniVoice `requests.Session()` 显式设置 `trust_env=False` 且清空 `proxies`
+  - [x] 已补 `tests/test_dubbing_cli_api.py::test_omnivoice_generate_bypasses_proxy_for_local_backend`
+
+## 126. 2026-05-21 新增一键重启脚本 restart.sh
+- [x] 调研
+  - [x] 确认现有 `start.sh` / `stop.sh` 的职责与执行方式
+- [x] 实施
+  - [x] 新增复用 `stop.sh` + `start.sh` 的 `restart.sh`
+- [x] 验证
+  - [x] 语法校验 `bash -n restart.sh`
+- [x] Review
+  - [x] `restart.sh` 不重复实现服务管理，只串联现有停启脚本
+
+## 127. 2026-05-21 6 号面板 VoxCPM unstable 自动拆小重试
+- [x] 现状分析
+  - [x] 确认报错发生在 6 号面板 `_call_voxcpm_tts(...)` 单句合成阶段
+  - [x] 确认当前 pre-TTS 拆句后，仍存在少量句子会触发 VoxCPM `Please shorten the text or try again`
+- [x] 实施
+  - [x] 只修改 6 号面板链路，不影响 5 号面板
+  - [x] 新增针对 VoxCPM unstable 500 的自动拆小重试逻辑
+  - [x] 子句级重试成功后，在后端内拼回单段音频，避免整批任务直接失败
+- [x] 验证
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_tts_unstable_error_retries_with_smaller_chunks`
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py`
+- [x] Review
+  - [x] VoxCPM 现在遇到明确的 unstable/please shorten 报错时，会自动按更小语义单元重试，而不是直接让整批失败
+
+## 128. 2026-05-21 6 号面板清理污染的 segment 目录
+- [x] 现状分析
+  - [x] 确认失败批次中 `manifest.selected_subtitles_tts_rows[101]` 与 `segments/segment_0101/manifest.json` 文本不一致
+  - [x] 确认当前批次目录可能残留旧 run / 旧 resume 的 segment 结果，导致编号与文本漂移
+- [x] 实施
+  - [x] 新任务非 resume 时，进入 `_run_voxcpm_job(...)` 前清空旧生成产物，但保留 `uploaded_speaker_refs/`
+  - [x] resume 时只保留“当前字幕仍匹配且被判定可复用”的 segment，删除其余脏目录
+- [x] 验证
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_reset_voxcpm_output_for_fresh_run_preserves_uploaded_refs tests.test_dubbing_cli_api.DubbingCliApiTests.test_prune_voxcpm_resume_segments_removes_stale_dirs`
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py`
+- [x] Review
+  - [x] 6 号面板现在不会再把旧 segment 残留和当前 selected_subtitles_tts_rows 混在同一个 batch 目录里
+
+## 129. 2026-05-21 6 号面板剥离 Markdown 样式标记
+- [x] 现状分析
+  - [x] 确认失败批次 `selected_subtitles_rebuild.srt` 中存在 `**世界...`、纯 `**` 这类 Markdown 残留
+  - [x] 确认这类文本会直接流入 `selected_subtitles_tts_rows`
+- [x] 实施
+  - [x] 在 6 号面板内部字幕归一化阶段剥离 `**`、`__`、反引号等 Markdown 样式标记
+  - [x] 过滤掉仅剩样式符号的空行，避免生成纯 `**` 字幕段
+- [x] 验证
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_normalize_voxcpm_internal_rows_strips_markdown_emphasis_and_drops_empty_marker_rows`
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py`
+- [x] Review
+  - [x] 6 号面板 rebuild/TTS 不再吃到 Markdown 加粗残留，像 `**世界...` 会还原成正常正文，纯 `**` 行会被丢弃
+
+## 125. 2026-05-21 6 号面板 Start 按钮异常置灰修复
+- [x] 现状分析
+  - [x] 复现 6 号面板开始按钮置灰条件，并确认前端唯一控制点
+  - [x] 对比 `/voxcpm/auto/backend-status` 与 `http://127.0.0.1:7860/api/health` 的真实返回差异
+  - [x] 定位是前端锁死、后端探活误判，还是本机自动拉起链路异常
+- [x] 实施
+  - [x] 只修 6 号面板 backend ready 判定链路，不影响 5 号面板
+  - [x] 让本机 VoxCPM health check 对冷启动/瞬时断连更稳，避免按钮被误灰
+- [x] 验证
+  - [ ] 通过本地接口验证 `/voxcpm/auto/backend-status` 能恢复 `ready=true`
+  - [ ] 验证 6 号面板开始按钮恢复可点击
+- [x] Review
+  - [x] 记录根因、改动点与验证证据
+  - [x] 根因已确认是 6 号面板后端探活错误走了本地代理，`curl http://127.0.0.1:7860/api/health` 成功，而旧版 Python `urllib` 请求失败
+  - [x] 已在 `src/subtitle_maker/voxcpm_dub_api.py` 对本机地址显式禁用代理，并补 `tests/test_dubbing_cli_api.py::test_voxcpm_http_json_bypasses_proxy_for_local_backend`
+
+## 124. 2026-05-20 6 号面板播客脚本真值字幕与粤语翻译解耦修复
+- [x] 功能点确认
+  - [x] 只修改 6 号面板链路，不影响 5 号面板
+  - [x] 播客脚本解析后的源内容必须完整保留，并与原播客脚本文字内容一致
+  - [x] `selected_subtitles.srt` 继续作为解析后源内容真值，不能再被粤语翻译结果覆盖或裁断
+  - [x] 任何目标语翻译都必须基于这份完整真值执行，翻译结果与后续配音消费的数据使用独立副本，不反向污染 `selected_subtitles.srt`
+  - [x] 必须额外落盘 `selected_subtitles_translated.srt` 作为翻译后的证据文件，供用户直接核对翻译结果
+  - [x] 对 `Chinese -> Chinese` 继续保持直通，不调用翻译 API
+- [x] 风险与决策
+  - [x] 把 6 号面板的“源真值字幕”与“翻译/配音工作字幕”拆成两份独立文件合同
+  - [x] 只在明显 `[Error] / 更正说明` 型脏输出时启用激进翻译清洗，正常长粤语段落整段保留
+  - [x] resume / manifest / artifact 全部继续围绕 TTS 工作副本恢复，但对用户暴露源真值与翻译真值两份证据文件
+  - [x] 把 final 阶段的 `rebuild` 短句拆分前移到翻译前，让翻译工作副本先按完整句切短，再逐句翻译回填
+  - [x] 保留现有 final rebuild 给剪辑使用；翻译前 rebuild 单独实现“完整句优先”规则，不再复用 final rebuild 的 20 字硬拆语义
+- [x] 实施
+  - [x] 在 `src/subtitle_maker/voxcpm_dub_api.py` 新增 `selected_subtitles_translated.srt` 落盘、manifest 路径与 artifact 暴露
+  - [x] 在 `src/subtitle_maker/voxcpm_dub_api.py` 新增 `selected_subtitles_rebuild.srt` 落盘，并让翻译输入优先消费这份短句工作副本
+  - [x] 调整 `_translate_subtitles_if_needed(...)` 返回“源真值 rows + 翻译 rows + mode”
+  - [x] 调整 6 号面板翻译清洗逻辑，避免长粤语整段被截成单句
+  - [x] 调整 `_run_voxcpm_job(...)`，让 `selected_subtitles.srt` 固定保留源真值，TTS 只消费翻译副本或源真值副本
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py`
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_translate_subtitles_if_needed_preserves_speaker_ids tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_translate_subtitles_if_needed_sanitizes_reused_translated_rows tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_translate_subtitles_if_needed_retries_latin_dominant_rows_for_cantonese_target tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_translate_subtitles_if_needed_keeps_full_cantonese_paragraph tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_translate_subtitles_if_needed_skips_translation_for_chinese_source_to_chinese tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_translate_subtitles_if_needed_skips_translation_for_cantonese_source_to_cantonese tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_selected_subtitles_stays_original_while_tts_copy_splits tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_run_job_writes_translated_selected_subtitles_separately tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_subtitle_only_builds_natural_srt_and_black_video tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_splits_long_rows_before_tts_and_keeps_speaker_ids`
+- [x] Review
+  - [x] 6 号面板现在固定输出 `selected_subtitles.srt` 作为解析后源真值，发生翻译时额外输出 `selected_subtitles_translated.srt`
+  - [x] 6 号面板长粤语整段翻译不再被清洗器截成一句，配音使用翻译副本或其 TTS 工作副本，不再污染源真值字幕
+  - [x] 6 号面板翻译前 `selected_subtitles_rebuild.srt` 已改为“完整句优先 + 相邻短句可合并”的工作副本，不再复用 final 阶段 20 字硬拆
+
+## 123. 2026-05-20 6 号面板新增 1080x1440 (3:4) 字幕视频规格
+- [x] 现状分析
+  - [x] 确认后端 `VOXCPM_SUBTITLE_VIDEO_LAYOUTS` / `_normalize_voxcpm_subtitle_video_preset(...)` 当前仅支持 3 个规格
+  - [x] 确认前端下拉与 Video Variants 列表都需要显式新增 1080x1440 选项
+- [x] 实施
+  - [x] 在 6 号面板后端新增 `1080x1440` layout 参数
+  - [x] 扩展 6 号面板 video preset 归一逻辑，识别 `1080x1440 / 3:4`
+  - [x] 更新前端下拉和 Video Variants 列表
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py`
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_voxcpm_centered_ass_from_rows_supports_three_four_layout tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_voxcpm_centered_ass_from_rows_supports_portrait_layout tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_voxcpm_centered_ass_from_rows_supports_four_three_layout`
+- [x] Review
+  - [x] 6 号面板初始生成与 Video Variants 补生成都能选择 `1080x1440 (3:4)`
+
+## 122. 2026-05-20 6 号面板 selected_subtitles 还原为原始播客解析内容
+- [x] 现状分析
+  - [x] 确认 `selected_subtitles.srt` 当前主链路写的是原始选中字字幕，但 restore / 视频补生成链路仍残留旧中间文件语义
+  - [x] 确认 resume / load-batch / artifact 已改为以 manifest 内的 `selected_subtitles_tts_rows` 作为 TTS 工作副本来源
+  - [x] 确认长句拆分里残留 `strip()` 会吞英文句间空格，破坏“仅分段，不改文本内容”合同
+- [x] 实施
+  - [x] 把 `selected_subtitles.srt` 固定为原始解析/翻译后的选中字字幕，不再承载 TTS 工作副本
+  - [x] 把 TTS 长句拆分结果仅保留在内存和 manifest 的 `selected_subtitles_tts_rows`
+  - [x] 清理 6 号面板 manifest / restore / 视频补生成中残留的 `selected_subtitles_pre_tts` / `selected_subtitles_tts` 文件路径依赖
+  - [x] 去掉 pre-TTS 拆分链路会改写文本的 `strip()`，确保分段拼回原文逐字一致
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py`
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_podcast_script_content_survives_pre_tts_split tests.test_dubbing_cli_api.DubbingCliApiTests.test_split_voxcpm_long_text_before_tts_keeps_spaces_inside_english_phrases tests.test_dubbing_cli_api.DubbingCliApiTests.test_split_voxcpm_long_podcast_row_groups_complete_sentences_only tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_splits_long_rows_before_tts_and_keeps_speaker_ids tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_selected_subtitles_stays_original_while_tts_copy_splits`
+- [x] Review
+  - [x] 6 号面板现在保证 `selected_subtitles.srt` 保留原始播客解析内容，实际配音文本只做无损分段，拼回去与原文逐字一致
+
+## 121. 2026-05-20 6 号面板 selected_subtitles 语义纠正
+- [x] 实施
+  - [x] 把 `selected_subtitles.srt` 改回“原始选中字字幕”语义，不再回写 pre-TTS 拆分结果
+  - [x] 新增 `selected_subtitles_tts.srt` 作为 VoxCPM TTS 工作副本，承载长句拆分后的内容
+  - [x] 让 manifest/artifacts/download/resume 全部优先消费 `selected_subtitles_tts.srt`
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py`
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_splits_long_rows_before_tts_and_keeps_speaker_ids tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_selected_subtitles_stays_original_while_tts_copy_splits tests.test_dubbing_cli_api.DubbingCliApiTests.test_load_voxcpm_batch_marks_failed_batch_resumable_from_selected_subtitles tests.test_dubbing_cli_api.DubbingCliApiTests.test_resume_voxcpm_task_requeues_failed_batch`
+- [x] Review
+  - 用户现在看到的 `selected_subtitles.srt` 不会再是“二创后的 TTS 中间文件”
+  - 内部配音继续使用 `selected_subtitles_tts.srt`，不影响已有长句拆分策略
+
+## 120. 2026-05-19 6 号面板播客字幕内容一致性审计
+- [x] 调研
+  - [x] 直接解析 `/Users/tim/Downloads/podcast-/哈佛iLab四个U框架-单人播客.md`，确认解析器当前保留“我今天想聊...”等开头正文
+  - [x] 对比历史 `selected_subtitles.srt`，确认用户反馈的是文字内容缺失，不是格式/时间戳差异
+- [x] 实施
+  - [x] 在 6 号面板输出目录新增 `selected_subtitles_pre_tts.srt`，记录翻译/直通后、pre-TTS 拆分前的选中字幕真值
+  - [x] 在 manifest/artifacts/download 映射中暴露 `selected_srt_pre_tts`
+  - [x] 修正 pre-TTS 完整句重组时英文句末接中文缺空格的问题
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py`
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_splits_long_rows_before_tts_and_keeps_speaker_ids tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_podcast_script_content_survives_pre_tts_split tests.test_dubbing_cli_api.DubbingCliApiTests.test_split_voxcpm_long_text_before_tts_keeps_spaces_inside_english_phrases tests.test_dubbing_cli_api.DubbingCliApiTests.test_split_voxcpm_long_podcast_row_groups_complete_sentences_only`
+- [x] Review
+  - 当前后端用该 md 复现为 `parsed=8`、`split=33`，split 第 1 条仍包含“我今天想聊一个可能会让很多创业者不舒服的事实”
+  - 新批次可直接检查 `selected_subtitles_pre_tts.srt` 判断内容是否在 pre-TTS 拆分前已经缺失
+
+## 119. 2026-05-19 6 号面板播客脚本长字幕行拆分纠偏
+- [x] 实施
+  - [x] 将 6 号面板 pre-TTS 拆分从“显示换行/长度硬切”纠正为“播客脚本长字幕行的完整句分段”
+  - [x] 拆分只允许落在完整句边界：中文 `。！？；`，英文 `.?!;`
+  - [x] 禁止按逗号、顿号、连接词或长度在句子内部硬切，保留英文词间空格
+  - [x] 相邻短完整句允许合并，降低 VoxCPM TTS API 调用次数
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py`
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_splits_long_rows_before_tts_and_keeps_speaker_ids tests.test_dubbing_cli_api.DubbingCliApiTests.test_split_voxcpm_long_text_before_tts_keeps_spaces_inside_english_phrases tests.test_dubbing_cli_api.DubbingCliApiTests.test_split_voxcpm_long_text_before_tts_prefers_punctuation_boundaries tests.test_dubbing_cli_api.DubbingCliApiTests.test_split_voxcpm_mixed_text_breaks_on_english_period_before_chinese tests.test_dubbing_cli_api.DubbingCliApiTests.test_split_voxcpm_long_podcast_row_groups_complete_sentences_only`
+- [x] Review
+  - 6 号面板现在会先把播客脚本长行按“完整句”拆成较少的 TTS 段，再把这些段写回 `selected_subtitles.srt`
+  - `Ideas are everywhere. They're worthless.` 这类短完整句组不会再被按连接词或字数切碎
+  - `因为交税无可避免，所以会计行业、QuickBooks、TurboTax全都是从这里衍生出来的。` 会保持为一整句，不会再出现 `从这 / 里衍生出来的`
+
+## 118. 2026-05-19 Speaker 前缀支持全角冒号
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/domains/subtitles/speakers.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/subtitles/speakers.py) 扩展 `strip_speaker_prefix()` 的正则，让 `Speaker 1:` 和 `Speaker 1：` 都能被剥离
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 补回归测试，锁住全角冒号前缀也不会被喂进 6 号面板 TTS
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/domains/subtitles/speakers.py tests/test_dubbing_cli_api.py` 通过
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_voxcpm_from_project_strips_fullwidth_speaker_prefix_before_passthrough` 通过（1 test, OK）
+- [x] Review
+  - [src/subtitle_maker/domains/subtitles/speakers.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/subtitles/speakers.py) 的 speaker 前缀正则现在同时支持半角 `:` 和全角 `：`
+  - 这意味着 6 号面板无论字幕正文写成 `Speaker 1: ...` 还是 `Speaker 1：...`，都会先剥掉标签，再把净正文送进 TTS
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已锁住全角冒号场景，避免后续再回归
+
+## 117. 2026-05-19 6 号面板直通时先剥离 Speaker 前缀
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 让 `source_subtitles_json` / `translated_subtitles_json` 在进入 6 号面板主链路前先经过 `normalize_subtitles_with_speakers(...)`
+  - [x] 确保“同语种直通跳过翻译”时，也不会把正文里的 `Speaker 1:` 标签直接喂给 TTS
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 补回归测试，锁住 `Speaker 1:` 会被剥掉但 `speaker_id` 仍然保留
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_voxcpm_from_project_strips_speaker_prefix_before_passthrough tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_translate_subtitles_if_needed_skips_translation_for_cantonese_source_to_cantonese` 通过（2 tests, OK）
+- [x] Review
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 现在会在 6 号面板接收项目字幕 JSON 后，先统一剥离正文里的 `Speaker N:` 前缀，再进入 speaker 检测、跳过翻译和配音链路
+  - 这意味着即使你把 `Source Language` 明确设成 `Cantonese`，走“同语种直通”不翻译，TTS 也不会再把 `Speaker 1:` 读出来
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已锁住这个直通场景，避免后续再回归
+
+## 116. 2026-05-19 6 号面板字幕改回白字
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 把 6 号面板 ASS 的 `PrimaryColour` 从黑色改回白色，保留 `Outline=4`
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 更新样式断言，锁住白字 + `Outline=4`
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_voxcpm_centered_ass_from_rows_wraps_lines_and_uses_typewriter_dialogues` 通过（1 test, OK）
+- [x] Review
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 的 6 号面板字幕已改回白字 `&H00FFFFFF`
+  - `Outline=4`、黑色描边和半透明青色底条都保持不变，因此当前组合是“白字 + 粗黑描边 + 透明青色底条”
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已锁住白字颜色值和 `,4,4,0,5,` 样式片段
+
+## 115. 2026-05-19 6 号面板去掉 Source Language 的 Auto
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 删除 6 号面板 `Source Language` 的 `Auto Detect` 选项
+  - [x] 在 [src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js) 把 `source_lang` 的前端默认回退从 `auto` 改成明确语言值
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 把 6 号面板接口的 `source_lang` 默认值从 `auto` 改成明确语言值，和前端保持一致
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py` 通过
+- [x] Review
+  - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 的 6 号面板 `Source Language` 已去掉 `Auto Detect`，现在首项就是 `Chinese`
+  - [src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js) 与 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 的默认值也同步改成了明确语言，避免前端没选值时又回退成 `auto`
+  - 这次只改 6 号面板，没有动 5 号面板
+
+## 114. 2026-05-19 6 号面板字幕改回黑字并加粗描边
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 把 6 号面板 ASS 的 `PrimaryColour` 改回黑色，并把 `Outline` 从 `2` 调成 `4`
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 更新样式断言，锁住黑字 + `Outline=4`
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_voxcpm_centered_ass_from_rows_wraps_lines_and_uses_typewriter_dialogues` 通过（1 test, OK）
+- [x] Review
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 的 6 号面板字幕现在改成黑字 `&H00000000`，并把描边粗细提升到 `Outline=4`
+  - 半透明青色底条 `&HEEFFFF00` 保持不变，因此当前组合是“黑字 + 粗黑描边 + 透明青色底条”
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已锁住样式片段 `,4,4,0,5,` 与黑字颜色值
+
+## 113. 2026-05-19 6 号面板字幕字体加黑色描边
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 把 6 号面板 ASS 的 `Outline` 从 `0` 调成 `2`，保留现有黑色 `OutlineColour`
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 更新样式断言，锁住描边粗细
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_voxcpm_centered_ass_from_rows_wraps_lines_and_uses_typewriter_dialogues` 通过（1 test, OK）
+- [x] Review
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 的 6 号面板字幕样式现在是橘色字 `&H0033A5FF` + 黑色描边 `OutlineColour=&H00000000` + 半透明青色底条 `&HEEFFFF00`
+  - 描边粗细已设为 `Outline=2`，不改布局、字号和打字机效果
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已锁住样式片段 `,4,2,0,5,`，避免后续回退成无描边版本
+
+## 112. 2026-05-19 5/6 号面板统一同语种跳过翻译
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 新增统一语言归一 helper，把 `Chinese/Cantonese/English/Japanese/Spanish/...` 规整成稳定语言标签
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 把跳过翻译规则收敛成“明确同语种直通”；仅 `Chinese <- auto` 继续保留中文文本启发式，`Cantonese <- auto` 不再误跳过
+  - [x] 在 [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 接入同样的同语种直通逻辑
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 补 5/6 号面板的 `English -> English` 回归测试，锁住非中文语种也不会再重复计费翻译
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/translator.py src/subtitle_maker/voxcpm_dub_api.py src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_translate_subtitles_if_needed_skips_translation_for_english_source_to_english tests.test_dubbing_cli_api.DubbingCliApiTests.test_omnivoice_translate_subtitles_if_needed_skips_translation_for_english_source_to_english tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_translate_subtitles_if_needed_skips_translation_for_cantonese_source_to_cantonese` 通过（3 tests, OK）
+- [x] Review
+  - [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 现在提供统一语言归一 helper，把 UI/接口里的 `Chinese/Cantonese/Cantonese-Mainland/English/...` 收敛成稳定 tag，供后端复用
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 与 [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 现在都支持“明确同语种直通”：`English -> English`、`Cantonese -> Cantonese`、`Chinese -> Chinese` 等都不会再走翻译 API
+  - 只有 `source_lang=auto` 时，当前仍只对 `target_lang=Chinese` 保留“中文文本启发式直通”；这避免了 `target=Cantonese` 但 source 实际是普通话文本时被误判成无需翻译
+
+## 111. 2026-05-19 粤语 source 字幕配粤语时跳过翻译计费
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 扩展 `_should_passthrough_source_rows_without_translation(...)`，让 `Cantonese/Cantonese-Mainland` 目标语在 source 已是粤语时直接复用原文，不再调用翻译 API
+  - [x] 保持这条直通仍会经过 6 号面板现有的字幕清洗与 speaker 保留逻辑，只跳过外部翻译计费
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 补回归测试，锁住 `source_lang=粤语, target_lang=Cantonese` 不会实例化 Translator
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_translate_subtitles_if_needed_skips_translation_for_cantonese_source_to_cantonese` 通过（1 test, OK）
+- [x] Review
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 现在支持“同语种直通”：当 source 明确是粤语，target 是 `Cantonese/Cantonese-Mainland` 时，6 号面板会直接复用原文，不再走翻译 API
+  - 这条直通只跳过外部翻译计费，不会绕过现有的字幕清洗、speaker 保留和后续配音链路
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已锁住粤语 source -> 粤语 target 不应实例化 `Translator`
+
+## 110. 2026-05-19 6 号面板字幕字体改为橘色
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 把 6 号面板 ASS 的 `PrimaryColour` 从白色改成橘色
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 更新样式断言，锁住新的字体颜色值
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_voxcpm_centered_ass_from_rows_wraps_lines_and_uses_typewriter_dialogues` 通过（1 test, OK）
+- [x] Review
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 的 6 号面板 ASS 主字幕颜色现在从 `&H00FFFFFF` 改成了橘色 `&H0033A5FF`
+  - 底条仍保持更透明的青色 `&HEEFFFF00`，只改字体颜色，不动字号、布局和打字机效果
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已锁住橘色字体值，避免后续回退
+
+## 109. 2026-05-19 6 号面板 final 带 speaker SRT 时间戳全 0 修复
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 修复 `_build_speaker_prefixed_rows(...)` 对 `start_sec/end_sec` manifest 的兼容，避免 final 带 speaker SRT 回退成全 0 时间戳
+  - [x] 同文件把 `_compose_natural_sequence_mix(...)` 产出的 `final_rows` 补上 `speaker_id`，并让 `dubbed_final_full_with_speakers.srt` 直接复用 final 重建后的时间轴，而不是继续吃 segment 原始窗
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 补断言，锁住 `dubbed_final_full_with_speakers.srt` 的时间戳应与 final SRT 一致递增
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_subtitle_only_builds_natural_srt_and_black_video` 通过（1 test, OK）
+- [x] Review
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 现在会在 final 自然拼接阶段把 `speaker_id` 一起带进重建后的 `final_rows`
+  - 同文件导出 `dubbed_final_full_with_speakers.srt` 时，已改为直接对 `final_rows_for_output` 加 speaker 前缀，因此时间戳会与 `dubbed_final_full.srt` 保持一致，不再出现全 0 或回落到 segment 原始窗
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已锁住 final 带 speaker SRT 与主 final SRT 的时间轴一致性
+
+## 108. 2026-05-19 6 号面板字幕 bar 透明度继续下调
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 把 6 号面板 ASS 底条 `BackColour` 调成更透明的青色
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 更新样式断言，锁住新的 alpha 值
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_voxcpm_centered_ass_from_rows_wraps_lines_and_uses_typewriter_dialogues` 通过（1 test, OK）
+- [x] Review
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 的 6 号面板 ASS 底条现在从 `&HCCFFFF00` 调成了 `&HEEFFFF00`
+  - 这次改动的本质是把 ASS alpha 提高到 `EE`，按 ASS 语义会比之前更透明，不再像上一次那样偏实
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已锁住新值，避免再回退
+
+## 107. 2026-05-19 翻译 API 连接失败不再伪造 Error 字幕
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 去掉 `translate_batch(...)` 的 `[Error] 原文` 伪字幕回退，改为抛出明确的翻译 provider 异常
+  - [x] 保持 6 号面板翻译阶段在 provider 不可用时直接失败，让前端显示真实错误，而不是继续产出带 `[Error]` 的 `selected_subtitles.srt`
+  - [x] 在 [tests/test_dubbing_runtime.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_runtime.py) 补运行时回归测试，锁住连接失败会抛错而不是返回假字幕
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/translator.py tests/test_dubbing_runtime.py` 通过
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_translate_batch_raises_provider_error_instead_of_error_subtitles` 通过（1 test, OK）
+- [x] Review
+  - [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 现在在翻译 provider 请求失败时会抛出 `TranslationProviderError`，不再把异常吞掉并伪造 `[Error] 原文` 结果
+  - 这意味着 6 号面板如果翻译 API 连接失败、超时或上游异常，会直接进入失败态并显示真实错误，而不会再把错误文本写进 `selected_subtitles.srt`
+  - [tests/test_dubbing_runtime.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_runtime.py) 已锁住“连接失败 -> 抛明确 provider 错误”的行为，避免后续又回退成假字幕
+
+## 106. 2026-05-19 6 号面板粤语 selected_subtitles 英文残留兜底修复
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 为 6 号面板 source->translate 链路补上英文主导译文二次重译，避免 `[Error] ...` 或整句英文直接写入 `selected_subtitles.srt`
+  - [x] 统一 6 号面板直接复用 `translated` 字幕时的目标语后处理，确保粤语复用态和新翻译态都走同一套清洗/规整
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 补回归测试，锁住 Cantonese 目标语下英文残留行会被重试替换
+- [x] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_translate_subtitles_if_needed_retries_latin_dominant_rows_for_cantonese_target tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_translate_subtitles_if_needed_sanitizes_reused_translated_rows` 通过（2 tests, OK）
+- [x] Review
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 现在会把 6 号面板中文目标语翻译结果中的“英文主导漏译行”识别出来，并做一次更严格的定向重译；像 `[Error] During sex...` 这类结果不会再直接写进 `selected_subtitles.srt`
+  - 同文件新增了 6 号面板统一字幕后处理 helper，因此不论是“直接复用 translated 字幕”还是“source->translate 新翻译”，都会走同一套 `sanitize + 粤语口语规整`，避免恢复态和新任务行为漂移
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已锁住 Cantonese 目标语下“首次返回英文错误行、二次重试返回粤语”的回归场景，后续再回退会直接测出来
+
+## 105. 2026-05-19 6 号面板黑底字幕视频改为半透明青色 bar
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 的 `_build_voxcpm_centered_ass_from_rows(...)` 把 6 号面板 ASS 样式改为白字 + 半透明青色底条
+  - [x] 使用 `BorderStyle=4` 启用底条盒子，并把 `BackColour` 改成半透明青色，保持视频底色仍为黑色
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 补最小断言，锁住新样式值
+- [x] 验证
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_voxcpm_centered_ass_from_rows_wraps_lines_and_uses_typewriter_dialogues tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_simplified_variant_converts_cantonese_final_outputs` 通过（2 tests, OK）
+- [x] Review
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 现在会把 6 号面板字幕视频 ASS 样式写成“黑底视频 + 白字 + 更淡的半透明青色底条”，并保留现有中间打字机效果
+  - 这次只改了 6 号面板 ASS 模板，不改视频底色、不新增前端控件；因此初次生成和后续补生成的视频规格都会自动套用同一套半透明青色 bar 样式
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已锁住 `BackColour=&HCCFFFF00` 与 `BorderStyle=4` 这两个关键样式值，避免后续回退成无底条版本
+
+## 104. 2026-05-19 6 号面板 final 额外导出 20 字限长的 rebuild SRT
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 的 final 阶段新增 `dubbed_final_full-rebuild.srt`
+  - [x] 复用 [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 的 final SRT 重构算法，并在 6 号面板固定 `max_chars=20`
+  - [x] 把 `dubbed_final_full-rebuild.srt` 接入 manifest 路径与 `srt_rebuild` artifact
+- [x] 验证
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_subtitle_only_builds_natural_srt_and_black_video tests.test_dubbing_cli_api.DubbingCliApiTests.test_load_voxcpm_batch_restores_task_view` 通过（2 tests, OK）
+- [x] Review
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 现在会在生成 `dubbed_final_full.srt` 后，额外生成 `dubbed_final_full-rebuild.srt`；它复用了 5 号面板的 final SRT 重构算法，把长句拆到每条最多 20 个字，并按文本长度重新估算更细的时间戳
+  - 同文件的 manifest / artifact 合同已新增 `dubbed_final_srt_rebuild` 路径和 `srt_rebuild` 下载项，因此 6 号面板结果区与 `load-batch` 都能看到并恢复这份新字幕文件
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已锁住 rebuild 文件生成、20 字限长、时间戳单调递增和 manifest 暴露新路径这几个关键合同
+
+## 103. 2026-05-19 播客脚本解析跳过括号包裹的一句话总结标记
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/domains/subtitles/podcast_script.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/subtitles/podcast_script.py) 扩展跳过规则，让 `(**一句话总结：**)` 与 `（**一句话总结：**）` 这类包裹形式也被视为非配音标记
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 新增回归测试，锁住这类标记不会混入解析结果
+- [x] 验证
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/domains/subtitles/podcast_script.py tests/test_dubbing_cli_api.py` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_parse_voxcpm_podcast_script_skips_parenthesized_one_line_summary_marker tests.test_dubbing_cli_api.DubbingCliApiTests.test_parse_voxcpm_podcast_script_supports_multi_speaker_markdown tests.test_dubbing_cli_api.DubbingCliApiTests.test_parse_voxcpm_podcast_script_supports_role_header_and_body_on_next_line` 通过（3 tests, OK）
+- [x] Review
+  - [src/subtitle_maker/domains/subtitles/podcast_script.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/subtitles/podcast_script.py) 现在会把 `(**一句话总结：**)` 和 `（**一句话总结：**）` 视为非正文块，和原来的 `**一句话总结：**` 一样直接跳过
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已锁住这条格式，不会再把“一句话总结”标记混进 6 号面板的解析预览或后续配音正文
+
+## 101. 2026-05-19 6 号面板中文播客脚本配中文时跳过翻译计费
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 的 `_translate_subtitles_if_needed(...)` 增加“中文 source -> Chinese target”直通逻辑，并把判断放在翻译 API key 校验之前
+  - [x] 增加保守中文文本启发式；当 `source_lang=Chinese` 时直接直通，`source_lang=auto` 时仅在字幕文本明显以中文为主时才跳过翻译
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 补定向测试，锁住“中文播客脚本配中文不应调用翻译 API”
+- [x] 验证
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_translate_subtitles_if_needed_skips_translation_for_chinese_source_to_chinese tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_translate_subtitles_if_needed_preserves_speaker_ids tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_translate_subtitles_if_needed_sanitizes_reused_translated_rows` 通过（3 tests, OK）
+- [x] Review
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 现在会在 6 号面板 `source` 模式下优先判断“是否中文 source -> Chinese target”；命中时直接复用原文字幕，不再调用翻译 API，也不会再要求翻译 key
+  - 同文件的直通分支只做原文 `strip()`，不会误套译文清洗规则，因此原有中文标点和像 `AI` 这样的字母词会被完整保留
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已锁住这条合同，避免后续回退成“中文播客脚本配中文仍然走翻译计费”
+
+## 102. 2026-05-19 6 号面板完成后支持补生成其他字幕视频规格
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 扩展 manifest / artifact 合同，持久化 `subtitle_video_variants`、`generated_subtitle_video_presets` 与 `preferred_video_artifact_key`
+  - [x] 新增 `POST /voxcpm/auto/render-video-variant`，对已完成批次按指定 preset 只重做 ASS 与黑底字幕视频，不重跑配音
+  - [x] 在 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 与 [src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js) 新增 `Video Variants` 区，已生成规格置灰，未生成规格可点击补生成
+- [x] 验证
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - `node --check src/subtitle_maker/static/js/voxcpmDubbingPanel.js` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_load_voxcpm_batch_restores_task_view tests.test_dubbing_cli_api.DubbingCliApiTests.test_render_voxcpm_video_variant_generates_new_preset_without_rerunning_tts tests.test_dubbing_cli_api.DubbingCliApiTests.test_render_voxcpm_video_variant_skips_existing_preset` 通过（3 tests, OK）
+- [x] Review
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 现在把 6 号面板字幕视频规格当成一组独立后处理产物来管理：主规格继续保留默认 `dubbed_video_full.mp4` / `dubbed_final_full-styled.ass`，补生成规格则写成 `dubbed_video_full-{preset}.mp4` / `dubbed_final_full-styled-{preset}.ass`，不会覆盖原产物
+  - 同文件新增 `render-video-variant` 接口，只读取已完成批次的 final SRT + final mix 重新生成 ASS/黑底视频，不重跑翻译、不重跑配音；已存在规格会直接返回当前状态，不重复生成
+  - manifest 现在会持久化 `subtitle_video_variants`、`generated_subtitle_video_presets` 与 `preferred_video_artifact_key`，因此 `load-batch` 后前端能稳定知道哪些规格已生成、哪个视频应优先播放
+  - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html)、[src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js)、[src/subtitle_maker/static/style.css](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/style.css) 已新增 `Video Variants` 结果区：已生成规格置灰，不可重复点；新补生成成功后下载列表和上方播放器会立即刷新到该规格
+
+## 96. 2026-05-19 6 号面板新增播客脚本上传与解析
+- [x] 现状
+  - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 的 6 号面板目前只有 `Current Project / Setup / Speaker Refs / Restore / Run` 五块，没有单独的“播客脚本上传”控件；当前入口假设字幕已经存在于项目态里
+  - [src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js) 的 `renderProjectSummary()`、`getEffectiveSubtitleRows()`、`buildCurrentProjectRequest()` 当前只会从 `getProjectDubbingContext()` 里读取 `sourceSubtitles / translatedSubtitles`，再把它们透传成 `source_subtitles_json / translated_subtitles_json`
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 的 `start_voxcpm_from_project(...)` 只接受已经结构化好的 `source_subtitles_json / translated_subtitles_json`，没有接收“播客脚本原文件”或“播客脚本文本”的后端入口
+  - 6 号面板当前的 speaker 检测逻辑来自 [src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js) 的 `normalizeSpeakerIdsForPanelRows()` / `getDetectedSpeakerIds()`，它要求上游已经有 `speaker_id` 或至少能从现有字幕顺序继承 speaker；因此如果播客脚本不能先解析成带 `speaker_id` 的字幕行，后面的 Speaker Refs UI 就不会正常工作
+  - 现有字幕解析主能力集中在 [src/subtitle_maker/transcriber.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/transcriber.py) 的 `parse_srt(...)` 和 [src/subtitle_maker/app/routes/subtitles.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/app/routes/subtitles.py) 的上传字幕路由，当前是面向 SRT / JSON 字幕，不是面向 Markdown 播客脚本
+  - `/Users/tim/Downloads/podcast-/OpenAI超级应用与AGI起飞-播客脚本.md` 是双人播客格式：有标题、素材来源、章节标题、音乐/情绪舞台提示，以及正文角色行 `**Larei:**【情绪=...】...` / `**Tensor:**【情绪=...】...`
+  - `/Users/tim/Downloads/podcast-/OpenAI超级应用与AGI起飞-单人播客.md` 与 `/Users/tim/Downloads/podcast-/哈佛iLab四个U框架-单人播客.md` 是单人播客格式：同样有标题、元信息、音乐提示、制作备注表，但正文基本只有 `**Larei:**【情绪=...】...`
+  - 这 3 个样例共同特征是：真正要进配音链路的内容都在 `**角色名:**【情绪=...】正文` 这种行里；像 `# 标题`、`> 素材来源`、`---`、`## 章节`、`（音乐...）`、`(**顿悟预告：**)`、`## 制作备注`、Markdown 表格都属于应跳过的非配音内容
+- [x] 功能点
+  - 在 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 的 6 号面板新增一个独立的 `Podcast Script` 卡片，不和 `Current Project` 绑死。
+  - 该卡片至少要有：
+    - 一个上传 `.md / .txt` 播客脚本文件的控件
+    - 一个解析按钮
+    - 一个简短预览区，展示解析到的 speaker 数和台词行数
+    - 一个状态提示，告诉用户当前是“优先使用项目字幕”还是“优先使用播客脚本解析结果”
+  - 解析目标不是生成带时间戳的 SRT，而是先生成 6 号面板可直接消费的“结构化字幕行草稿”：
+    - `text`
+    - `speaker_id`
+    - 可选保留 `emotion` / `stage_direction` 作为 sidecar 元数据，供后续调试或 prompt 使用
+    - `start / end` 先不要求真实时间轴；6 号面板本来就走自然时长重建 final timeline
+  - 解析规则按样例收敛：
+    - 匹配 `**角色名:**【情绪=...】正文`
+    - 匹配 `**角色名:** 正文`
+    - 允许同一角色正文跨多行续写，直到遇到下一个角色头或明显的非正文块
+    - 跳过标题、素材来源、章节标题、分隔线、音乐提示、顿悟预告、制作备注表格等非配音内容
+    - 单人播客默认解析成单一 `speaker_id`
+    - 双人播客按脚本里的角色名稳定映射到 speaker
+  - 6 号面板解析完成后，应把结果灌进当前面板自己的“临时字幕上下文”，这样后续已有链路可以继续复用：
+    - Speaker Refs 根据解析出的 `speaker_id` 刷新上传槽位
+    - `Start VoxCPM Dubbing` 可以直接把解析结果作为 `source_subtitles_json`
+    - 若当前项目里已经有 `translatedSubtitles`，需要明确优先级，避免脚本结果被静默覆盖
+  - 推荐优先级合同：
+    - 若用户已成功解析播客脚本，则 6 号面板优先使用脚本解析结果
+    - 若没有脚本解析结果，才回退 `Current Project` 的 `translatedSubtitles / sourceSubtitles`
+    - 不要把脚本解析结果全局写回其他面板；先限定在 6 号面板本地状态
+  - 后端需要新增一个轻量解析入口，接收播客脚本文本并返回结构化台词行，而不是要求前端自己做复杂 Markdown 解析。
+  - 返回合同建议至少包括：
+    - `rows`
+    - `speaker_ids`
+    - `detected_mode`：`single` / `multi`
+    - `title`
+    - `source_label`
+    - `skipped_blocks_count`
+  - 改动边界：
+    - 本轮只解决“上传并解析播客脚本进入 6 号面板”
+    - 不要求给播客脚本自动生成真实时间戳
+    - 不要求修改 1 号、4 号、5 号面板
+    - 不要求把情绪标签真正接入 VoxCPM 推理参数，先解析保留即可
+- [x] 风险与决策
+  - 风险 1：如果把播客脚本解析放在前端做，Markdown 规则一旦扩展，状态机会散落在 [src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js) 里，后续测试和恢复都会很难做。
+    - 推荐：解析主逻辑放后端，前端只负责上传、触发和展示结果。
+  - 风险 2：如果把解析结果直接写回全局 `Current Project` 字幕状态，会影响 1/4/5 号面板，并让“播客脚本”与“项目字幕”语义混在一起。
+    - 推荐：先限定为 6 号面板本地状态，只在 6 号面板启动请求里透传。
+  - 风险 3：如果强行给播客脚本伪造时间戳，会制造一种“像字幕但不是真字幕”的假象，后续所有按时间处理的逻辑都会被污染。
+    - 推荐：本轮完全不生成真实时间轴；6 号面板继续沿用“自然时长生成后再重建 final timeline”的现有合同。
+  - 风险 4：样例里的情绪标签、音乐提示、顿悟预告都属于脚本语义，但并不等于应该朗读的文本；如果不明确边界，容易把舞台说明念出来。
+    - 推荐：只朗读角色台词行；音乐提示、章节标题、制作备注等全部跳过；情绪标签只保留成 sidecar，不进 `text`。
+  - 风险 5：双人稿和单人稿混用同一套解析时，如果 speaker 识别不稳定，会直接影响 Speaker Refs 上传槽位和最终多 speaker 配音。
+    - 推荐：角色名作为权威 speaker 键，不再二次猜测；例如 `Larei`、`Tensor` 原样映射到 `speaker_id`。
+  - 风险 6：如果 6 号面板同时存在“项目字幕”和“脚本解析结果”，但优先级不明确，用户会看到解析成功却实际没被用上。
+    - 推荐：显式规则固定为“脚本解析结果优先，项目字幕兜底”，并在 UI 提示当前实际使用源。
+  - 关键决策 1：解析入口放哪里
+    - 选项 A：前端 JS 直接解析 Markdown
+    - 选项 B：后端新增解析接口
+    - 推荐：选项 B
+    - 理由：更容易测试、复用和维护，也符合现有 6 号面板“前端只组装状态，后端做核心处理”的结构。
+  - 关键决策 2：解析结果的生命周期
+    - 选项 A：写回全局项目态
+    - 选项 B：只保留在 6 号面板本地态
+    - 推荐：选项 B
+    - 理由：最小化影响范围，避免把“播客脚本”误当成通用字幕格式污染其他面板。
+  - 关键决策 3：speaker_id 的命名
+    - 选项 A：保留原角色名，如 `Larei / Tensor`
+    - 选项 B：统一改写成 `Speaker 1 / Speaker 2`
+    - 推荐：选项 A
+    - 理由：Speaker Refs 界面直接显示角色名更可读，也能减少双人播客里“谁是谁”的映射心智负担。
+  - 关键决策 4：情绪标签的处理
+    - 选项 A：直接拼进要朗读的正文
+    - 选项 B：只做 sidecar 元数据保留
+    - 推荐：选项 B
+    - 理由：当前 6 号面板没有稳定消费情绪标签的 TTS 合同，先保留结构，不污染正文。
+  - 关键决策 5：启动链路如何复用现有实现
+    - 选项 A：为播客脚本另起一套 start API
+    - 选项 B：解析完成后仍走现有 `start-from-project`，只是把脚本结果填进 `source_subtitles_json`
+    - 推荐：选项 B
+    - 理由：可以最大限度复用 6 号面板已有 Speaker Refs、resume、results、final render 链路。
+  - 推荐实现方案
+    - 后端新增一个播客脚本解析 helper 和 `/voxcpm/auto/parse-podcast-script` 接口
+    - 前端 6 号面板新增 `Podcast Script` 卡片，支持上传、解析、预览、清空
+    - 前端维护 6 号面板本地 `parsedPodcastRows / parsedPodcastSpeakerIds / parsedPodcastMeta`
+    - `buildCurrentProjectRequest()` 优先发送脚本解析结果；若为空再回退当前项目字幕
+    - Speaker Refs 检测逻辑改成优先读脚本解析结果，再读项目字幕
+    - 增加定向测试，锁住双人/单人脚本解析、非正文块跳过、角色名 speaker 保留，以及 6 号面板启动优先级合同
+- [x] 实施
+  - [x] 新增 [src/subtitle_maker/domains/subtitles/podcast_script.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/subtitles/podcast_script.py)，实现播客脚本 Markdown 解析 helper，并导出到 [src/subtitle_maker/domains/subtitles/__init__.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/subtitles/__init__.py)
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 新增 `/voxcpm/auto/parse-podcast-script` 接口，接收 `.md/.txt` 脚本并返回结构化台词行
+  - [x] 在 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 的 6 号面板新增 `Podcast Script` 卡片和上传/解析/清空控件
+  - [x] 在 [src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js) 增加本地 `parsedPodcastRows / parsedPodcastSpeakerIds / parsedPodcastMeta` 状态，并把启动优先级改成“脚本解析结果优先，项目字幕兜底”
+  - [x] 让 Speaker Refs 与 6 号面板概览区优先读取脚本解析结果，从而直接按 `Larei / Tensor` 这类角色名刷新上传槽位
+- [x] 验证
+  - `node --check src/subtitle_maker/static/js/voxcpmDubbingPanel.js` 通过
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/domains/subtitles/podcast_script.py src/subtitle_maker/domains/subtitles/__init__.py src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_parse_voxcpm_podcast_script_supports_multi_speaker_markdown tests.test_dubbing_cli_api.DubbingCliApiTests.test_parse_voxcpm_podcast_script_supports_single_speaker_markdown tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_voxcpm_from_project_accepts_parsed_podcast_rows tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_voxcpm_from_project_allows_zero_uploaded_speaker_refs` 通过（4 tests, OK）
+- [x] Review
+  - [src/subtitle_maker/domains/subtitles/podcast_script.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/subtitles/podcast_script.py) 现在会只抽取 `**角色名:**【情绪=...】正文` 这类台词行，跳过标题、章节、音乐提示、顿悟预告和制作备注表格；双人稿保留角色名作为 `speaker_id`，单人稿则稳定输出单 speaker
+  - 同文件会为每条播客脚本台词生成一段“估算朗读时长”，只供 6 号面板自然配音入口使用；这不是对外承诺的真实字幕时间轴
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 新增 `parse-podcast-script` 接口，前端不需要自己解析 Markdown
+  - [src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js) 增加了播客脚本本地状态、解析摘要展示和清空逻辑；一旦解析成功，`buildCurrentProjectRequest()` 会优先把脚本结果作为 `source_subtitles_json` 送进现有 6 号面板启动链路
+  - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 的 6 号面板新增独立 `Podcast Script` 卡片，和 `Current Project` 分离，符合“只在 6 号面板本地生效”的边界
+  - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html)、[src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js)、[src/subtitle_maker/static/style.css](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/style.css) 已补紧凑预览区：解析成功后默认展示前 4 条台词，可展开查看全部，固定高度滚动，不再出现“解析成功但看不到解析后文本”的问题
+
+## 95. 2026-05-19 翻译结果混入模型说明性废话清洗
+- [x] 现状
+  - [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 的 `_is_translation_noise_line(...)` 只会过滤“独立成行”的说明文字，但如果模型把解释、自我纠正和最终译文混在同一行里，当前不会被剥掉
+  - [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 的 `translate_batch(...)` 当前只做编号解析和粤语规整，没有做“正文级脏译文清洗”
+  - [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 与 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 在“直接复用 translated 字幕”分支会原样吃已有译文，历史脏行会直接流进最终配音
+- [x] 功能点
+  - 在共享翻译层新增“译文正文清洗” helper，优先去掉 `But Chinese output only`、`Let's correct in final` 这类模型说明性废话
+  - 对中文目标语种增加一个保守的候选提取规则：当同一条输出里混入外语说明和中文候选时，优先保留更像最终中文译文的片段
+  - 让 `translate_batch(...)` 在落结果前统一经过该清洗
+  - 让 5/6 号面板在“直接复用 translated 字幕”时也再过一遍同样的清洗，避免历史脏译文绕过翻译层
+- [x] 风险与决策
+  - 决策 1：规则只瞄准明显的模型自言自语和英文说明，不做激进的全局删词，避免误伤正常混排字幕
+  - 决策 2：先放在共享翻译层，再由 5/6 号复用译文入口补一道兜底，保证“新翻译”和“历史已翻译字幕”都能受益
+  - 决策 3：本轮不改字幕行数、不动时间戳，只清洗单行正文文本
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 新增 `sanitize_translation_text(...)`，清洗 `But Chinese output only`、`Let's correct in final` 这类模型说明尾巴，并在中文目标语下优先提取更像最终译文的中文片段
+  - [x] 让 `Translator.translate_batch(...)` 在批量翻译结果落盘前统一经过 `sanitize_translation_text(...)`
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 的“直接复用 translated 字幕”分支和 source->translate 分支都接入同一清洗
+  - [x] 在 [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 新增 `_sanitize_translated_rows_for_target(...)`，让 5 号面板直接复用历史译文时也会剥离模型说明性废话
+  - [x] 补共享翻译层与 6 号面板译文复用回归测试
+- [x] 验证
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/translator.py src/subtitle_maker/voxcpm_dub_api.py src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_runtime.py tests/test_dubbing_cli_api.py` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_translate_batch_sanitizes_inline_model_explanations tests.test_dubbing_runtime.DubbingPipelineTests.test_translator_parse_translated_lines_ignores_noise_lines_without_index_shift tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_translate_subtitles_if_needed_sanitizes_reused_translated_rows tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_translate_subtitles_if_needed_preserves_speaker_ids tests.test_dubbing_cli_api.DubbingCliApiTests.test_translate_subtitles_if_needed_retries_latin_dominant_rows_for_chinese_target` 通过（5 tests, OK）
+- [x] Review
+  - [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 现在会对翻译正文做二次清洗：先去掉显式英文说明尾巴，再在中文目标语场景下，从混合候选里优先挑出真正的中文译文片段
+  - 同文件的 `translate_batch(...)` 已统一接入该清洗，所以新发起的翻译批次不会再把这类模型自言自语直接写进译文结果
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 即使直接复用已有 `translated` 字幕，也会先清洗单行正文，再进入 6 号面板配音
+  - [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 同样补了历史译文兜底清洗，避免 5 号面板 restore / 复用旧译文时把脏行原样带进最终结果
+
+## 88. 2026-05-17 5 号面板新增 Cantonese-Mainland 目标语
+- [x] 现状
+  - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 的 5 号面板 `#omnivoice-target` 当前只有 `Chinese / Cantonese / English / ...`，没有“广东式口语 + 简体粤语”目标语选项
+  - [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 的 `_is_cantonese_target_lang()` 与 `_cantonese_prompt_constraints()` 当前把所有粤语目标语统一成“港式口语 + 繁体”约束
+  - [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 的 `_normalize_omnivoice_language_pair()` 当前仅支持 `Cantonese -> yue`，没有保留“港式/广东式”两档展示值
+  - [src/subtitle_maker/static/js/omnivoiceDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/omnivoiceDubbingPanel.js) 当前前端提示只区分“是不是粤语”，没有区分港式繁体和广东式简体
+- [x] 功能点
+  - 在 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 的 5 号面板 `Target Language` 中新增 `Cantonese-Mainland`
+  - 在 [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 中把粤语翻译约束拆成两档：`Cantonese=港式口语+繁体`，`Cantonese-Mainland=广东式口语+简体`
+  - 在 [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 中保留展示值 `Cantonese/Cantonese-Mainland`，但 runtime 统一映射到 `yue`
+  - 保持 `ref-voices/Cantonese` 作为两种粤语目标语共用的预置参考音目录，不新增 `ref-voices/Cantonese-Mainland`
+  - 在 [src/subtitle_maker/static/js/omnivoiceDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/omnivoiceDubbingPanel.js) 中补两档粤语的前端提示文案
+- [x] 风险与决策
+  - 决策 1：本次只拆“翻译风格”和“展示值”，不拆 OmniVoice runtime 语言码；两档都继续走 `yue`
+  - 决策 2：speaker ref 固定文案本轮仍共用同一条粤语参考句，不扩成港式/广东式两套录音文案
+  - 决策 3：`Cantonese-Mainland` 复用 `ref-voices/Cantonese`，避免把翻译风格需求扩大成新的参考音目录合同
+- [ ] 实施
+  - [x] 更新 5 号面板目标语选项与粤语提示文案
+  - [x] 更新翻译 prompt 约束与 OmniVoice 语言规范化
+  - [x] 补 `Cantonese-Mainland` 的恢复链路与回归测试
+- [x] 验证
+  - `node --check src/subtitle_maker/static/js/omnivoiceDubbingPanel.js` 通过
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/translator.py src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_translator_build_prompt_distinguishes_two_cantonese_styles tests.test_dubbing_cli_api.DubbingCliApiTests.test_omnivoice_preset_ref_voices_supports_cantonese_mainland_alias tests.test_dubbing_cli_api.DubbingCliApiTests.test_load_omnivoice_batch_preserves_cantonese_mainland_display_lang tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_omnivoice_job_normalizes_cantonese_mainland_to_yue_for_generation tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_omnivoice_job_normalizes_cantonese_to_yue_for_generation` 通过（5 tests, OK）
+- [x] Review
+  - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 的 5 号面板 `Target Language` 新增 `Cantonese-Mainland`，并明确说明它与 `Cantonese` 的差别只在翻译风格：前者广东式口语 + 简体，后者港式口语 + 繁体
+  - [src/subtitle_maker/static/js/omnivoiceDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/omnivoiceDubbingPanel.js) 新增 `isMainlandCantoneseLanguage(...)` 与粤语风格提示；`load-batch` 会把 `target_lang/source_lang` 回填到 5 号面板表单，避免 restore 后丢失 `Cantonese-Mainland`
+  - [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 把粤语翻译约束拆成两档：`Cantonese=Hong Kong style + Traditional`，`Cantonese-Mainland=Guangdong/Mainland style + Simplified`
+  - [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 现在会保留展示值 `Cantonese/Cantonese-Mainland`，但 runtime 统一映射到 `yue`；`Cantonese-Mainland` 仍复用 `ref-voices/Cantonese`
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 新增 `Cantonese-Mainland` 的 prompt/runtime/load-batch/ref-voices 回归，锁住本次合同
+
+## 89. 2026-05-17 粤语翻译 prompt 强化地道词汇与语气约束
+- [x] 现状
+  - [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 的 `_cantonese_prompt_constraints(...)` 目前只限制“港式/广东式 + 繁简体 + 避免书面语”，对地道词汇和语气助词约束还不够硬
+  - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 仍保留旧版单一粤语约束，只支持 `Cantonese`，未同步 `Cantonese-Mainland`
+  - 如果只改 `translator.py`，会出现“5 号主翻译更地道，但 review redub / 时长改写又退回旧 prompt”的状态裂缝
+- [x] 功能点
+  - 强化 [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 的粤语约束，明确要求优先使用地道粤语词汇，如 `嘢 / 唔係 / 咩 / 搞掂 / 呢個 / 咁 / 返工 / 食飯`
+  - 在两档粤语约束里都显式写入“绝对禁止书面语或生硬直译”
+  - 在两档粤语约束里都显式要求语气自然，允许适量使用 `㗎 / 啫 / 啦 / 呢 / 呀 / 咩`
+  - 同步升级 [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的粤语约束，并补 `Cantonese-Mainland` 识别
+- [x] 风险与决策
+  - 决策 1：本次只强化 prompt 约束，不做词典级后处理，先以最小改动提高模型输出口味
+  - 决策 2：`translator.py` 与 `pipeline.py` 两处约束同步收紧，避免主翻译和改写链路口径漂移
+  - 决策 3：示例词汇作为“强偏好”写入 prompt，但不做逐词替换规则，避免误伤语义
+- [ ] 实施
+  - [x] 更新 `translator.py` 的港式/广东式粤语约束
+  - [x] 更新 `pipeline.py` 的粤语识别与改写约束
+  - [x] 补定向测试，锁住地道词汇/语气助词/禁书面语约束
+- [x] 验证
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/translator.py src/subtitle_maker/domains/dubbing/pipeline.py tests/test_dubbing_cli_api.py` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_cantonese_prompt_enforces_authentic_vocabulary_and_particles tests.test_dubbing_cli_api.DubbingCliApiTests.test_pipeline_cantonese_constraints_distinguish_two_styles tests.test_dubbing_cli_api.DubbingCliApiTests.test_translator_build_prompt_distinguishes_two_cantonese_styles` 通过（3 tests, OK）
+- [x] Review
+  - [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 的两档粤语翻译约束已收紧：明确要求优先使用 `嘢 / 唔係 / 咩 / 搞掂 / 呢個(呢个) / 咁 / 返工 / 食飯(食饭)` 等地道粤语词汇，允许自然加入 `㗎 / 啫 / 啦 / 呢 / 呀 / 咩`，并显式禁止书面语和生硬直译
+  - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 已同步升级改写/时长改写链路的粤语约束，并补 `Cantonese-Mainland` 识别，避免 4 号/重写链路回退到旧 prompt
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 新增两组定向断言，锁住两处 prompt 源都包含“地道词汇 / 语气助词 / 禁书面语直译”的硬限制
+
+## 90. 2026-05-17 粤语译文后处理规整
+- [x] 现状
+  - 仅靠 prompt 约束仍会在 [outputs/dub_jobs/omnivoice_20260517_144446/selected_subtitles.srt](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/omnivoice_20260517_144446/selected_subtitles.srt) 里残留大量普通话结构，例如 `了 / 把 / 被 / 这样 / 里 / 给 / 让 / 像 / 着`
+  - [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 与 [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 在翻译结果落盘前都没有粤语专用文本规整层
+  - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的改写链路也可能把已经口语化的粤语再拉回普通话残留
+- [x] 功能点
+  - 在 [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 新增 `normalize_cantonese_translation_text(...)`，专门规整粤语译文中的高频普通话残留
+  - 在 [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 的 5 号翻译结果落盘前应用同一规整层
+  - 在 [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的时长改写链路也应用同一规整层，避免后续重写再把粤语拉回书面语
+  - 覆盖用户点名的高频模式：`了->咗`、`把->将`、`被->俾`、`这/这样/这里->呢/咁样/呢度`、`里->入面`、`给->俾`、`让->令/等`、`像->好似`、`着->住`
+- [x] 风险与决策
+  - 决策 1：后处理只改表面文本，不改时间戳、不改 speaker、不改句子数
+  - 决策 2：规整层只在粤语目标语生效，不碰中文/英文结果
+  - 决策 3：规则先覆盖高频稳定模式，不做过度激进的全局词典替换，避免误伤语义
+- [x] 实施
+  - [x] 新增粤语译文规整 helper，并接入 `Translator.translate_batch(...)`
+  - [x] 接入 5 号面板翻译落盘前规整
+  - [x] 接入 4 号面板改写链路规整
+  - [x] 补定向测试，锁住常见普通话残留的替换结果
+- [x] 验证
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/translator.py src/subtitle_maker/domains/dubbing/pipeline.py src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_cantonese_translation_normalizer_rewrites_common_mandarin_residue tests.test_dubbing_cli_api.DubbingCliApiTests.test_cantonese_translation_normalizer_leaves_non_cantonese_unchanged tests.test_dubbing_cli_api.DubbingCliApiTests.test_pipeline_cantonese_constraints_distinguish_two_styles` 通过（3 tests, OK）
+- [x] Review
+  - [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 现在会在粤语翻译后做确定性口语规整，优先压掉 `了 / 把 / 被 / 这样 / 里 / 给 / 让 / 像 / 着` 这类普通话结构残留
+  - [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 的 5 号字幕落盘会复用同一层规整，确保 `selected_subtitles.srt` 不再直接保留明显的半普半粤形态
+  - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的改写结果也会走同一层规整，避免后续重写阶段把口语化结果重新拉回书面语
+
+## 91. 2026-05-17 粤语后处理白名单再扩展
+- [ ] 现状
+  - 现有 [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 的粤语规整层已经覆盖一批高频普通话残留，但用户最新样本里仍能看到 `断语 / 阅历 / 不好以为 / 可系 / 把孩子送进 / 被年轻嘅领导边缘化` 这类不够口语化的表达
+  - 目前测试只覆盖了少量基础替换，还没有把这批新残留锁进回归
+- [ ] 功能点
+  - 继续扩展 `normalize_cantonese_translation_text(...)` 的白名单规则，优先覆盖用户最近点名的高频不地道表达
+  - 补充定向测试，验证港式繁体与广东式简体两档都能吃到这批规整，但不会改动非粤语目标语
+- [ ] 风险与决策
+  - 决策 1：继续只做文本表面规整，不碰时间戳 / speaker / 句子结构
+  - 决策 2：仍然只覆盖高频稳定模式，不做激进全局词典重写，避免误伤语义
+- [ ] 实施
+  - [x] 扩展 `normalize_cantonese_translation_text(...)` 的高频白名单
+  - [x] 补粤语规整定向测试
+- [ ] 验证
+
+- [ ] 追加观察
+  - 这批新增规则要继续保持“短语级替换优先”，不要把 `也 / 与 / 这种` 直接改成全局字符替换，否则会误伤正常粤语句子
+
+## 92. 2026-05-18 Cantonese-Mainland 改为繁体输出
+- [ ] 现状
+  - [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 当前把 `Cantonese-Mainland` 明确约束为 `Prefer Simplified Chinese characters`
+  - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的粤语重写约束也沿用“广东式口语 + 简体”
+  - [src/subtitle_maker/static/js/omnivoiceDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/omnivoiceDubbingPanel.js) 与 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 对 `Cantonese-Mainland` 的文案仍写成“广东式口语 + 简体粤语”
+- [ ] 功能点
+  - 把 `Cantonese-Mainland` 的输出字形从简体改为繁体，但保持“广东式口语 / Mainland style”这一档风格语义
+  - 同步调整粤语后处理的字形收尾，避免 `呢个 / 食饭` 这类简体字形继续落盘
+  - 同步更新 5 号面板文案与测试断言
+- [ ] 风险与决策
+  - 决策 1：保留 `Cantonese-Mainland` 这个展示值与 `yue` runtime，不改恢复/底座合同
+  - 决策 2：本次只收口“字形策略”，不删除 Mainland 风格分档本身
+- [ ] 实施
+  - [x] 把 `translator.py` / `pipeline.py` 的 Mainland 粤语约束改成繁体输出
+  - [x] 把 Mainland 粤语后处理的字形收尾改成繁体落盘
+  - [x] 更新 5 号面板文案与测试断言
+- [x] 验证
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/translator.py src/subtitle_maker/domains/dubbing/pipeline.py src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - `node --check src/subtitle_maker/static/js/omnivoiceDubbingPanel.js` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_translator_build_prompt_distinguishes_two_cantonese_styles tests.test_dubbing_cli_api.DubbingCliApiTests.test_cantonese_prompt_enforces_authentic_vocabulary_and_particles tests.test_dubbing_cli_api.DubbingCliApiTests.test_pipeline_cantonese_constraints_distinguish_two_styles tests.test_dubbing_cli_api.DubbingCliApiTests.test_cantonese_translation_normalizer_rewrites_common_mandarin_residue tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_omnivoice_job_normalizes_cantonese_mainland_to_yue_for_generation tests.test_dubbing_cli_api.DubbingCliApiTests.test_load_omnivoice_batch_preserves_cantonese_mainland_display_lang` 通过（6 tests, OK）
+- [x] Review
+  - [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 现在把 `Cantonese-Mainland` 收口为“广东式口语 + 繁体输出”，不再强制简体示例词和简体 function words
+  - [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) 的改写/时长重写链路也同步改成繁体，避免主翻译和后续重写口径漂移
+  - [src/subtitle_maker/static/js/omnivoiceDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/omnivoiceDubbingPanel.js) 与 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 已把 Mainland 档文案从“简体粤语”改成“繁体粤语”
+
+## 93. 2026-05-19 6 号面板粤语字幕脚本默认繁体、可切简体
+- [x] 现状
+  - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 的 6 号面板已经有 `Subtitle Script` 相关控件，但当前语义需要收紧到“只在粤语时显示”
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 里 final 字幕脚本转换逻辑原本对所有中文都可能生效，需要只在 `target_lang = Cantonese` 时启用
+  - [src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js) 需要按目标语切换控件显隐，避免 Chinese 也受这个脚本开关影响
+- [x] 功能点
+  - 6 号面板默认输出繁体粤语，只有手动切到简体时才把最终字幕做繁转简
+  - `Chinese` 目标语不显示这个开关，也不走这条转换
+  - 最终输出统一从 final render 阶段派生，保持 SRT / ASS / 视频一致
+- [x] 风险与决策
+  - 决策 1：脚本开关只作用于粤语目标语，不扩散到中文普通话
+  - 决策 2：默认值固定繁体，减少粤语结果被普通话式简体污染
+  - 决策 3：转换只发生在 final render，避免干扰翻译和配音链路
+- [x] 实施
+  - [x] 前端仅在粤语目标语下显示 `Cantonese Subtitle Script`
+  - [x] 后端仅在粤语 final 渲染时根据开关决定是否繁转简
+  - [x] 补粤语繁体/简体转换回归测试
+- [x] 验证
+  - `node --check src/subtitle_maker/static/js/voxcpmDubbingPanel.js` 通过
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py src/subtitle_maker/domains/subtitles/zh_script.py tests/test_dubbing_cli_api.py` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_convert_chinese_script_rows_supports_cantonese_traditional_and_simplified tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_simplified_variant_converts_cantonese_final_outputs` 通过（2 tests, OK）
+
+## 94. 2026-05-19 6 号面板字幕视频支持 16:9 / 9:16 / 4:3
+- [x] 现状
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 的 `_build_voxcpm_centered_ass_from_rows()` 当前把 ASS `PlayResX/PlayResY` 写死为 `1920/1080`，样式也固定 `Fontsize=120`、`MarginL/R=140`、`MarginV=80`
+  - 同文件的 `_wrap_voxcpm_ass_text_lines()` 当前固定 `max_units_per_line=24`，`_chunk_voxcpm_wrapped_lines()` 固定 `max_lines_per_page=4`，没有按画幅动态调整
+  - [src/subtitle_maker/domains/media/compose.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/media/compose.py) 的 `build_black_video_with_ass_subtitles()` 默认 `width=1920`、`height=1080`
+  - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 的 6 号面板 Setup 当前没有“字幕视频比例/分辨率”下拉
+  - [src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js) 启动请求也还没有透传输出画幅参数
+- [x] 功能点
+  - 在 6 号面板新增字幕视频画幅下拉，至少支持：
+    - `1920x1080 (16:9)`，保持当前横屏默认
+    - `1080x1920 (9:16)`，竖屏
+    - `1440x1080 (4:3)`
+  - 让 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 根据所选画幅动态生成 ASS 布局参数，包括但不限于：
+    - `PlayResX/PlayResY`
+    - `Fontsize`
+    - `MarginL/MarginR/MarginV`
+    - 每行允许宽度
+    - 每页最大行数
+  - 让 `build_black_video_with_ass_subtitles()` 吃到对应宽高，输出真正匹配画幅的黑底字幕视频
+  - 保证三种画幅下字幕都不会横向越界，也不会因为纵向页数/打字机分页不合理而看不全
+  - 恢复 / load-batch / manifest 需要保留该字段，避免历史批次重载后画幅丢失
+- [x] 风险与决策
+  - 决策 1：不要只改 ffmpeg 输出尺寸，ASS 排版参数必须跟着画幅联动，否则 9:16 和 4:3 仍会出现超界或最后几行看不全
+  - 决策 2：三种画幅应共用一套“布局配置表”而不是散落常量，避免后续加新比例时再次复制逻辑
+  - 决策 3：默认值保持 `1920x1080 (16:9)`，避免破坏现有用户习惯
+- [x] 实施
+  - [x] 在 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 的 6 号面板 Setup 新增 `Subtitle Video Aspect` 下拉，支持 `1920x1080 / 1080x1920 / 1440x1080`
+  - [x] 在 [src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js) 启动请求透传 `subtitle_video_preset`，并在 load-batch / status 返回后回填当前选项
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 新增 `VOXCPM_SUBTITLE_VIDEO_LAYOUTS` 统一配置表，并让 ASS 布局、换行宽度、分页行数、黑底视频宽高都按画幅联动
+  - [x] 把 `subtitle_video_preset` 接入 6 号面板任务 payload、manifest、load-batch、resume_context 和 resume 重入链路
+  - [x] 补三种画幅的 ASS / manifest / 黑底视频宽高定向测试
+- [x] 验证
+  - `node --check src/subtitle_maker/static/js/voxcpmDubbingPanel.js` 通过
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_load_voxcpm_batch_restores_task_view tests.test_dubbing_cli_api.DubbingCliApiTests.test_resume_voxcpm_task_requeues_failed_batch tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_voxcpm_centered_ass_from_rows_wraps_lines_and_uses_typewriter_dialogues tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_voxcpm_centered_ass_from_rows_supports_portrait_layout tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_voxcpm_centered_ass_from_rows_supports_four_three_layout tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_voxcpm_centered_ass_from_rows_keeps_full_long_subtitle_visible_before_end tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_passes_selected_video_preset_to_black_video_builder` 通过（7 tests, OK）
+- [x] Review
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 新增 `DEFAULT_VOXCPM_SUBTITLE_VIDEO_PRESET`、`VOXCPM_SUBTITLE_VIDEO_LAYOUTS`、`_normalize_voxcpm_subtitle_video_preset(...)`、`_get_voxcpm_subtitle_video_layout(...)`，把字幕视频尺寸、字号、边距、每行宽度、每页最大行数集中在一处
+  - 同文件的 `_build_voxcpm_centered_ass_from_rows(...)` 不再写死 `1920x1080 / 120`，而是按画幅动态生成 `PlayResX/PlayResY`、`Fontsize`、`MarginL/R/V`；`_build_voxcpm_typewriter_dialogues_with_layout(...)` 负责把换行和分页规则也跟着画幅联动
+  - 同文件的 `_run_voxcpm_job(...)` 现在会把所选画幅一路写进 manifest，并在最终 `build_black_video_with_ass_subtitles(...)` 时传入真实 `width/height`，保证黑底视频和 ASS 布局一致
+  - [src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js) 现在会在启动时提交 `subtitle_video_preset`，在加载历史批次或轮询状态时回填当前画幅下拉，避免 restore 后 UI 丢状态
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 新增竖屏 / 4:3 ASS 断言、load-batch / resume 保留画幅字段断言，以及黑底视频构建器收到 `1080x1920` 宽高的断言，锁住本次合同
+
+
+## 87. 2026-05-17 5 号面板接入粤语配音链路
+- [ ] 现状
+  - 5 号面板前端已经提供 `Cantonese` 的源语言和目标语言选项，见 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 和 [src/subtitle_maker/static/js/omnivoiceDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/omnivoiceDubbingPanel.js)
+  - OmniVoice 底座明确支持粤语：`Cantonese -> yue`，见 [/Users/tim/Documents/vibe-coding/MVP/OmniVoice/omnivoice/utils/lang_map.py](/Users/tim/Documents/vibe-coding/MVP/OmniVoice/omnivoice/utils/lang_map.py) 与 [/Users/tim/Documents/vibe-coding/MVP/OmniVoice/omnivoice/models/omnivoice.py](/Users/tim/Documents/vibe-coding/MVP/OmniVoice/omnivoice/models/omnivoice.py)
+  - 5 号面板当前真正参与 OmniVoice 合成的是 `target_lang`，在 [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 的 `_call_remote_generate(...)` 调用链里以 `language=target_lang` 透传到底座
+  - `source_lang` 当前在 5 号面板链路里主要被写入任务 payload / manifest，并未显式接入字幕翻译策略、参考音选择或 OmniVoice 生成参数，见 [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 的 `start_omnivoice_from_project(...)`、`prepare_omnivoice_subtitles_from_project(...)`、`_create_task_payload(...)`
+  - 译文翻译层已经有粤语专用约束，会提示输出港式口语、避免普通话书面语，见 [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 的 `_is_cantonese_target_lang(...)`、`_cantonese_prompt_constraints(...)`、`Translator._build_prompt(...)`
+  - 5 号面板缺 speaker 时会按 `ref-voices/<target_lang>/` 自动补预置参考音，见 [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 的 `_resolve_ref_voices_dir(...)` 与 `_pick_preset_ref_voices_for_missing_speakers(...)`
+  - 当前仓库本地只有 `/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/ref-voices/Chinese`，没有 `ref-voices/Cantonese`，因此粤语任务若依赖“缺失 speaker 自动补预置参考音”，会因为目录缺失而失败
+  - 当前测试覆盖了 OmniVoice 预置参考音填充、prepare/start/resume 等主合同，但还没有“5 号面板粤语链路”专项合同，见 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py)
+- [ ] 功能点
+  - 在 [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 新增一层粤语语言规范化 helper，把 `Cantonese / 粤语 / 廣東話 / yue` 统一收敛成同一内部表示，避免 `prepare_omnivoice_subtitles_from_project(...)`、`start_omnivoice_from_project(...)`、`resume_omnivoice_task(...)` 三个入口出现语言写法漂移
+  - 让规范化后的目标语言继续沿着现有 `_call_remote_generate(..., language=target_lang)` 路径传到底座，确保 OmniVoice 真正吃到 `yue`
+  - 让 `source_lang` 继续作为任务/manifest 的稳定元数据保留，并在恢复任务时原样回放，避免重启后语言语义丢失
+  - 保持翻译层现有的粤语专用 prompt 约束，只把目标语言规范化，不额外削弱翻译阶段的港式口语与繁体偏好
+  - 对 `ref-voices/<target_lang>/` 的缺失保持显式失败，不做静默跨语种回退；如果任务缺 speaker 且没有粤语预置参考音目录，就直接报出清晰错误，提示用户上传完整 speaker refs 或补齐目录
+  - 补一组专项回归测试，锁住 `Cantonese -> yue` 的入口规范化、resume 保持语言语义、以及缺失 `ref-voices/Cantonese` 时的明确报错合同
+- [ ] 风险与决策
+  - 决策 1：内部规范化只做“语言表示统一”，不改用户 UI 选项文本，避免前端和后端出现两个概念
+  - 决策 2：不把粤语自动降级到 `Chinese` 预置参考音池，否则会让参考音语义和目标语种混淆，后续听感问题更难排查
+  - 决策 3：`source_lang` 先只做稳定传递与恢复，不在本次改造里强行把它接进 ASR 或重分段逻辑，避免把“粤语输出支持”扩成另一条大改造链路
+- [x] 验证
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_omnivoice_preset_ref_voices_supports_cantonese_alias tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_omnivoice_job_normalizes_cantonese_to_yue_for_generation tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_manifest_includes_styled_ass_artifact_and_path` 通过（3 tests, OK）
+  - `node --check src/subtitle_maker/static/js/omnivoiceDubbingPanel.js` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_validate_preset_ref_voices_available_rejects_empty_cantonese_dir tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_omnivoice_from_project_rejects_partial_cantonese_refs_when_preset_pool_empty` 通过（2 tests, OK）
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_speaker_ref_text_switches_by_target_lang` 通过（1 test, OK）
+- [x] Review
+  - [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 新增粤语语言规范化 helper：`_normalize_omnivoice_language_pair(...)`、`_is_cantonese_language_variant(...)`、`_resolve_omnivoice_ref_voice_candidates(...)`
+  - 5 号面板的 `target_lang` 现在会拆成展示值和运行值，`Cantonese` 会在底座调用时稳定落到 `yue`
+  - `source_lang` 继续作为任务/manifest 元数据保留，并在恢复时原样回放，避免重启后语义丢失
+  - 缺失 speaker 的预置参考音目录现在支持 `yue` / `Cantonese` 别名解析；不存在对应目录时仍会明确报错，不会静默回退到其他语种
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 新增粤语专项回归：粤语别名参考音目录、`Cantonese -> yue` 合成调用、manifest runtime 字段恢复
+  - [src/subtitle_maker/static/js/omnivoiceDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/omnivoiceDubbingPanel.js) 补充粤语前端提示：目标语选粤语时，会明确提示 `yue` 映射、建议上传粤语参考音，以及缺失 `ref-voices/Cantonese` 时自动补位的依赖条件
+  - 5 号面板 partial upload 现在会在启动前校验预置参考音池是否可用，空的 `ref-voices/Cantonese` 不再拖到后台阶段才失败
+  - Speaker Refs 的默认参考文本现在会随 `Target Language` 切换：`Chinese` 用普通话文案，`Cantonese` 用粤语文案；前端显示与后端写入保持一致
+
 ## 86. 2026-05-16 5 号面板统一支持翻译复用与配音断点续跑
 - [x] 现状
   - 5 号面板当前只有 `prepared_batch_id` 级别的窄复用能力，本质是复用 `selected_subtitles.srt`
@@ -5844,3 +6654,318 @@
   - `uv run python -m unittest tests.test_dubbing_cli_api -k DubbingCliApiFailureParsingTests`：`Ran 2 tests ... OK`
 - 根因结论：
   - 4 号面板这次失败不是参考音频问题，是翻译 provider 返回 `401 Unauthorized`。
+
+## 93. 2026-05-18 评估并实现 6 号面板 VoxCPM 自然朗读链路
+- [x] 现状
+  - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 当前侧栏只有 5 个主面板入口：上传、字幕、切片、4 号 `Auto Dubbing`、5 号 `Auto Dub Omnivoice`
+  - [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js) 的 4 号面板明确固定走 `index-tts`，`getCurrentTtsBackend()` 直接返回 `index-tts`
+  - [src/subtitle_maker/static/js/omnivoiceDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/omnivoiceDubbingPanel.js) 的 5 号面板是独立 OmniVoice 链路，只共享当前项目上下文与翻译配置，不复用 4 号面板 backend 状态
+  - [src/subtitle_maker/backends/base.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/backends/base.py) 的 `TtsSynthesisRequest` 统一合同包含 `ref_audio_path / ref_text / language / target_duration_sec`
+  - [/Users/tim/Documents/vibe-coding/MVP/VoxCPM/app.py](/Users/tim/Documents/vibe-coding/MVP/VoxCPM/app.py) 当前 API 只暴露 `text / prompt_audio / prompt_text / cfg_value / inference_timesteps / normalize / denoise`，未暴露目标时长控制
+  - [/Users/tim/Documents/vibe-coding/MVP/VoxCPM/src/voxcpm/model/voxcpm.py](/Users/tim/Documents/vibe-coding/MVP/VoxCPM/src/voxcpm/model/voxcpm.py) 模型层只有“异常偏长检测/重试”，没有 `duration/speed/target_duration` 生成参数
+  - [/Users/tim/Documents/vibe-coding/MVP/VoxCPM/app.py](/Users/tim/Documents/vibe-coding/MVP/VoxCPM/app.py) 已内建 `粤语 / 廣東話 / cantonese / yue / zh-yue` 语言别名归一化
+  - [/Users/tim/Documents/vibe-coding/MVP/VoxCPM/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/VoxCPM/templates/index.html) 与 [/Users/tim/Documents/vibe-coding/MVP/VoxCPM/使用说明.md](/Users/tim/Documents/vibe-coding/MVP/VoxCPM/使用说明.md) 也已把粤语作为支持语种暴露给用户
+- [x] 功能点
+  - 输出 6 号面板轻量 Spec，明确是否值得新增独立 VoxCPM 配音链路
+  - 若值得新增，定义它与 4 号 `index-tts`、5 号 `OmniVoice` 的职责边界
+  - 给出最小实现路径：前端入口、独立后端 API、时长策略、参考音策略、恢复策略
+ - [x] 风险与决策
+  - 决策 1：6 号面板改成自然朗读型 VoxCPM，不再强制 fit 到原字幕时间窗
+  - 决策 2：6 号面板允许“仅字幕 + 参考音频”启动，不再强制上传视频
+  - 决策 3：最终固定额外输出黑底字幕视频，字幕居中，字号 `120`
+- [x] 实施
+- [x] 实现 VoxCPM 独立后端 API 与任务产物合同
+- [x] 接入 6 号面板模板、前端控制器与 `static/app.js` 初始化
+- [x] 补批次级 resume
+  - [x] 后端落盘 `selected_subtitles.srt / source_audio / ref 配置 / segment manifest`
+  - [x] `load-batch` 基于磁盘真实推断 `resumable/resume_stage`
+  - [x] `/voxcpm/auto/resume/{task_id}` 复用已完成 segment，只续跑缺失条目
+  - [x] 6 号面板 Restore 区补 resume 按钮与交互
+- [x] 补最小回归测试与静态校验
+- [x] 切换为纯字幕自然朗读模式与黑底字幕视频输出
+- [x] 验证
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py src/subtitle_maker/app/main.py tests/test_dubbing_cli_api.py` 通过
+  - `node --check src/subtitle_maker/static/js/voxcpmDubbingPanel.js` 通过
+  - `node --check src/subtitle_maker/static/app.js` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_backend_status_proxies_health_payload tests.test_dubbing_cli_api.DubbingCliApiTests.test_list_voxcpm_batches_reads_manifest tests.test_dubbing_cli_api.DubbingCliApiTests.test_load_voxcpm_batch_restores_task_view` 通过（3 tests, OK）
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_backend_status_proxies_health_payload tests.test_dubbing_cli_api.DubbingCliApiTests.test_list_voxcpm_batches_reads_manifest tests.test_dubbing_cli_api.DubbingCliApiTests.test_load_voxcpm_batch_restores_task_view tests.test_dubbing_cli_api.DubbingCliApiTests.test_load_voxcpm_batch_marks_failed_batch_resumable_from_selected_subtitles tests.test_dubbing_cli_api.DubbingCliApiTests.test_resume_voxcpm_task_requeues_failed_batch tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_resume_skips_completed_segments` 通过（6 tests, OK）
+- `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py src/subtitle_maker/domains/media/compose.py tests/test_dubbing_cli_api.py` 通过
+- `node --check src/subtitle_maker/static/js/voxcpmDubbingPanel.js` 通过
+- `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_backend_status_proxies_health_payload tests.test_dubbing_cli_api.DubbingCliApiTests.test_list_voxcpm_batches_reads_manifest tests.test_dubbing_cli_api.DubbingCliApiTests.test_load_voxcpm_batch_restores_task_view tests.test_dubbing_cli_api.DubbingCliApiTests.test_load_voxcpm_batch_marks_failed_batch_resumable_from_selected_subtitles tests.test_dubbing_cli_api.DubbingCliApiTests.test_resume_voxcpm_task_requeues_failed_batch tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_resume_skips_completed_segments tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_soft_align_segment_keeps_natural_duration_without_fit tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_soft_align_segment_trims_leading_silence_without_fit tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_voxcpm_from_project_allows_subtitle_only_mode tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_subtitle_only_builds_natural_srt_and_black_video tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_black_video_with_ass_subtitles_uses_black_canvas_and_ass_filter` 通过（11 tests, OK）
+- [x] Review
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 现在会在任务中途持续落盘 `selected_subtitles.srt`、`source_audio.wav`、参考音频路径、推理参数与每条 `segments/segment_XXXX/manifest.json`，并提供 `_infer_voxcpm_resume_state(...)`、`_build_voxcpm_resume_context(...)`、`/voxcpm/auto/resume/{task_id}` 真正续跑缺失 segment
+  - [src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js) 与 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 的 6 号面板 Restore 区已新增 resume 按钮，并按 `prepared / dubbing_partial / completed` 动态显示按钮文案
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 新增 6 号面板恢复回归：失败批次加载可恢复态、resume 重新入队、续跑只生成缺失 segment
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 已切到纯字幕自然朗读链路：不再强制 `fit_audio_to_duration(...)`，而是只做保守裁静音，并按每句真实生成时长顺序重建最终 `dubbed_final_full.srt`
+  - 同文件新增 6 号面板专用 ASS 导出模板与黑底视频产物：最终会生成 `dubbed_mix_full.wav`、`dubbed_final_full-styled.ass`、`dubbed_video_full.mp4`
+  - [src/subtitle_maker/domains/media/compose.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/media/compose.py) 新增 `build_black_video_with_ass_subtitles(...)`，统一用 FFmpeg `color + ass` 生成黑底字幕视频
+  - [src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js) 与 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 已同步改成“只要字幕 + 参考音频即可启动”的文案和前端校验
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 新增纯字幕启动、自然时长 SRT 重建、黑底 ASS 视频生成回归测试，锁住本次新合同
+
+## 94. 2026-05-18 6 号面板接入多 speaker 识别与按性别自动补齐参考音
+- [x] 现状
+  - [src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js) 当前只有单个 `Reference Audio` + `Reference Text` 输入，没有像 5 号面板那样按 `speaker_id` 渲染多条上传槽位
+  - 同文件 `buildCurrentProjectRequest()` 当前只会提交单个 `ref_audio_file/ref_text`，6 号面板后端因此只能按“整批共用一份参考音”运行
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 当前 `_run_voxcpm_job(...)` 对每一条字幕都调用同一组 `ref_audio_path/ref_text`，没有按 `speaker_id` 分流
+  - [src/subtitle_maker/static/js/omnivoiceDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/omnivoiceDubbingPanel.js) 已实现基于字幕 `speaker_id` 的稳定 speaker 列表提取和逐 speaker 上传 UI
+  - [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 已实现缺失参考音自动补位链路：`_infer_missing_speaker_gender_hints(...)` 先从原音频 probe 缺失 speaker 的男女，再由预置 `ref-voices/<lang>/male|female/` 随机选一个补齐
+  - [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 还实现了 `_infer_voice_gender_label(...)`、本地模型 `_classify_voice_gender_with_local_model(...)` 与 pitch 兜底，用于在自动补位前判断男女
+- [x] 功能点
+  - 在 [src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js) 复用 5 号面板的 speaker 识别逻辑，按当前字幕稳定提取 `speaker_id` 列表，并在 6 号面板渲染逐 speaker 上传槽位
+  - 保留原有单 `Reference Audio` + `Reference Text` 入口，兼容单 speaker 或用户只想整批共用一份参考音的路径
+  - 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 支持接收 `speaker_ref_files + speaker_ref_speaker_ids_json`，允许只上传部分 speaker
+  - 运行时按字幕 `speaker_id` 逐句选参考音；未上传的 speaker 优先基于原音频 probe 性别，再从预置参考音池补齐；纯字幕无媒体时降级为直接随机预置补位
+  - 把 `speaker_ids / speaker_reference_mode / speaker_ref_map` 写入 manifest 与 resume context，保证 6 号面板后续恢复链路能复用本次 speaker 路由
+- [x] 风险与决策
+  - 决策 1：6 号面板继续允许“部分上传 + 自动补位”，不沿用 5 号面板早期的“0 或全上传”强约束，因为用户明确要求未上传 speaker 时自动随机选
+  - 决策 2：性别判断只在“有媒体且已抽出 `source_audio.wav`”时启用；纯字幕模式没有可 probe 音频时，直接走 `preset_only`，不伪造性别结论
+  - 决策 3：缺失 speaker 的默认参考文本继续随 `target_lang` 切换，保证自动补位音频和提示文案语义一致
+- [x] 实施
+  - [x] 更新 6 号面板前端 speaker 列表、上传槽位、提示文案与请求透传
+  - [x] 更新 `voxcpm_dub_api.py` 的任务 payload / manifest / resume context / 逐句 speaker 路由
+  - [x] 接入“部分上传 + 性别探测补位 + 无媒体降级 preset_only”三条后端分支
+  - [x] 补 6 号面板多 speaker 定向回归测试
+- [x] 验证
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - `node --check src/subtitle_maker/static/js/voxcpmDubbingPanel.js` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_collect_detected_speaker_ids_prefers_previous_row_before_speaker_1 tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_voxcpm_from_project_accepts_partial_speaker_refs tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_resume_skips_completed_segments tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_partial_speaker_refs_fill_missing_speakers tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_without_media_uses_preset_only_mode tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_subtitle_only_builds_natural_srt_and_black_video` 通过（6 tests, OK）
+- [x] Review
+  - [src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js) 现在会基于当前字幕自动归一化 `speaker_id`，动态渲染 `Speaker Refs` 上传区，并把 `speaker_ref_speaker_ids_json + speaker_ref_files` 一起提交给后端
+  - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 的 6 号面板现已移除 `Single reference audio + text` 控件，只保留按 speaker 上传参考音的入口；0 上传时直接走后端 `preset_only`
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 新增 `_normalize_speaker_ids_for_rows(...)`、`_collect_detected_speaker_ids(...)`、`_build_voxcpm_uploaded_speaker_ref_map(...)`，并让 `_run_voxcpm_job(...)` 按 speaker 路由 `ref_audio/ref_text`
+  - 缺失 speaker 时，6 号面板现在会优先从 `source_audio.wav` 推断男女，再走预置参考音池补位；纯字幕无媒体时则明确降级成 `preset_only`
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已补回归，锁住“上一行优先补 speaker”“部分上传可启动”“自动混合补位”“纯字幕 preset_only”“resume 不回退”的核心合同
+
+## 95. 2026-05-18 修复 6 号面板 VoxCPM 接口偶发 `IncompleteRead` 导致整批失败
+- [x] 现状
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 的 `_http_json(...)` 之前对 `urllib.request.urlopen(...)` 的响应只读一次，任何截断响应都会直接抛异常，中断整批任务
+  - 同文件 `_call_voxcpm_tts(...)` 直接复用 `_http_json(...)` 调本地 VoxCPM API，因此单句 TTS 返回体略大或连接抖动时，会把一次短暂传输异常放大成整批失败
+- [x] 功能点
+  - 在 `_http_json(...)` 中为 `IncompleteRead` 增加有限次数自动重试，只处理“响应体被截断”这一类瞬时错误，不扩大到所有异常
+  - 保持原有 `HTTPError / URLError` 语义不变，避免把真实接口错误误判成可重试成功
+  - 补单测锁住“首次截断、二次成功”这条运行时合同
+- [x] 风险与决策
+  - 决策 1：首版只在 `_http_json(...)` 做轻量重试，不改整条 6 号面板调度策略，先收掉已确认的截断响应问题
+  - 决策 2：重试次数保持很小，避免服务端持续坏响应时无上限拖长整批任务
+- [x] 实施
+  - [x] 在 `src/subtitle_maker/voxcpm_dub_api.py` 引入 `IncompleteRead` 并为 `_http_json(...)` 增加有限重试
+  - [x] 在 `tests/test_dubbing_cli_api.py` 新增 `test_voxcpm_http_json_retries_incomplete_read`
+- [x] 验证
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_voxcpm_http_json_retries_incomplete_read` 通过（1 test, OK）
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_partial_speaker_refs_fill_missing_speakers` 通过（1 test, OK）
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_subtitle_only_builds_natural_srt_and_black_video` 通过（1 test, OK）
+- [x] Review
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 的 `_http_json(...)` 现在会在 `IncompleteRead` 时记录 warning，并做最多 2 次短退避重试；只有重试耗尽后才抛出 `RuntimeError`
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已锁住这次修复，确保未来不会再回退成“首次截断即整批失败”
+
+## 96. 2026-05-18 修复 6 号面板长句黑底字幕视频末尾两行显示不全
+- [x] 现状
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 当前 `_build_voxcpm_typewriter_dialogues(...)` 会把整条长字幕按逐字累积方式堆到同一页
+  - 在 120 字号下，超长句容易被拆成过多行，导致中部字幕整体高度超出黑底视频安全区，最后两行看不全
+- [x] 功能点
+  - 为 6 号面板 ASS 生成增加“分页打字机”逻辑：每页最多 4 行，超长句自动分页显示
+  - 保留打字机效果，但每页结尾都保留完整文本一小段时间，避免最后几行只在最后一瞬间出现
+- [x] 风险与决策
+  - 决策 1：不缩小 120 字号，也不改中部字幕布局，优先通过分页解决长句垂直溢出
+  - 决策 2：分页仍保持从左到右、从上到下显现，只是把超长句拆成多页顺序展示
+- [x] 实施
+  - [x] 在 `src/subtitle_maker/voxcpm_dub_api.py` 新增分页逻辑与页级 typewriter 生成
+  - [x] 调整超长句换行/保留策略，确保单页不超过 4 行
+  - [x] 在 `tests/test_dubbing_cli_api.py` 新增长句分页可见性回归测试
+- [x] 验证
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_voxcpm_centered_ass_from_rows_wraps_lines_and_uses_typewriter_dialogues tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_voxcpm_centered_ass_from_rows_keeps_full_long_subtitle_visible_before_end` 通过（2 tests, OK）
+- [x] Review
+  - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 现在会先把长句折行为多行，再按“每页最多 4 行”分页；每页单独做打字机显现和结尾完整停留，避免一整页堆到 8 至 10 行
+  - [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已锁住“最后一页完整停留 + 任意页不超过 4 行”的合同
+
+## 97. 2026-05-18 调整 6 号面板 Run / Restore 卡片顺序
+- [x] 实施
+  - [x] 交换 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 中 6 号面板 `Run` 与 `Restore` 卡片位置
+- [x] 验证
+  - `node --check src/subtitle_maker/static/js/voxcpmDubbingPanel.js` 通过
+
+## 98. 2026-05-18 修复 6 号面板完成态未显示总耗时
+- [x] 实施
+  - [x] 给 6 号面板接入 `buildAutoDubElapsedLabel(...)`
+  - [x] 完成态和加载已完成批次时显示 `用时 mm:ss / h:mm:ss`
+- [x] 验证
+  - `node --check src/subtitle_maker/static/js/voxcpmDubbingPanel.js` 通过
+  - `node --check src/subtitle_maker/static/app.js` 通过
+
+## 99. 2026-05-19 调整 6 号面板 Current Project / Setup 为并排布局
+- [x] 实施
+  - [x] 复用 `auto-dub-top-grid` 双栏，把 [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 中 `Current Project` 与 `Setup` 放到同一行
+- [x] 验证
+  - `node --check src/subtitle_maker/static/js/voxcpmDubbingPanel.js` 通过
+  - `node --check src/subtitle_maker/static/app.js` 通过
+
+## 100. 2026-05-19 给 6 号面板补齐和 5 号面板一致的实时计时显示
+- [x] 实施
+  - [x] 在 6 号面板状态区增加独立 `ETA / 用时` 显示位
+  - [x] 运行中实时刷新 elapsed，完成后保留最终 `用时`
+- [x] 验证
+  - `node --check src/subtitle_maker/static/js/voxcpmDubbingPanel.js` 通过
+  - `node --check src/subtitle_maker/static/app.js` 通过
+
+## Spec-10（2026-05-19 6 号面板 final 字幕视频增加简体/繁体中文字幕开关）1/3 现状分析
+- 目标：在 6 号面板前端增加一个开关，控制 final 黑底字幕视频使用简体中文字幕还是繁体中文字幕；默认简体。
+- 现状 1：6 号面板 `Setup` 区当前只有 `Source Language / Target Language / CFG Value / Inference Steps / Custom System Prompt`，还没有任何“字幕字形”或“简繁转换”相关控件。
+  - 证据：
+    - [src/subtitle_maker/templates/index.html](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/templates/index.html) 的 6 号面板 `Setup` 卡片只渲染 `voxcpm-source`、`voxcpm-target`、`voxcpm-cfg-value`、`voxcpm-inference-steps`、`voxcpm-translate-system-prompt`
+    - [src/subtitle_maker/static/js/voxcpmDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/voxcpmDubbingPanel.js) 的 `buildCurrentProjectRequest()` 只提交 `source_lang / target_lang / cfg_value / inference_timesteps / translate_system_prompt / speaker_ref_*`，没有字幕字形参数
+- 现状 2：6 号面板 final 字幕视频是由最终 `final_rows` 直接生成 ASS，再调用 FFmpeg 烧到黑底视频上；当前没有“额外派生一份简体/繁体字幕文本”的步骤。
+  - 证据：
+    - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 的 `_run_voxcpm_job(...)` 在最终阶段把 `final_rows` 写到 `dubbed_final_full.srt`
+    - 同文件 `_build_voxcpm_centered_ass_from_rows(...)` 接收的也是 `rows` 原文，当前签名没有任何 script/variant 参数
+    - 同文件 `_run_voxcpm_job(...)` 随后把 `final_rows` 直接喂给 `_build_voxcpm_centered_ass_from_rows(...)` 生成 [dubbed_final_full-styled.ass](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py)
+    - [src/subtitle_maker/domains/media/compose.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/media/compose.py) 的 `build_black_video_with_ass_subtitles(...)` 只是消费现成 ASS 文件，不负责简繁转换
+- 现状 3：当前项目里已经有“粤语目标语种统一按繁体落盘”的既有规则，但这套规则属于翻译输出规范，不等于“视频字幕字形开关”。
+  - 证据：
+    - [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 的 `normalize_cantonese_translation_text(...)` 与相关注释明确说明：粤语目标语种当前统一繁体落盘，只区分港式/广东式口语风格
+    - 这意味着如果要做“final 视频字幕简体/繁体开关”，应是 6 号面板 final 渲染层的新派生选项，不能直接混同为 `target_lang`
+- 现状 4：6 号面板后端启动与恢复链路当前已经会把 `target_lang / subtitle_mode / speaker_ids / paths / artifacts` 持久化到 manifest，但还没有“字幕视频字形偏好”的持久化字段。
+  - 证据：
+    - [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 的 `start_voxcpm_from_project(...)` 只接收 `target_lang` 等现有表单字段
+    - 同文件 `_persist_voxcpm_task_manifest(...)` / `load_voxcpm_batch(...)` 当前恢复的是 `target_lang`、`speaker_reference_mode`、`artifacts` 等字段，没有字幕视频字形偏好
+
+## Spec-10（2026-05-19 6 号面板 final 字幕视频增加简体/繁体中文字幕开关）2/3 功能点与改动边界
+- 功能点 1：在 6 号面板 `Setup` 区新增一个独立开关，控制 final 字幕视频的中文脚本输出。
+  - 推荐 UI：`Final Subtitles Script`
+  - 选项：`Simplified (默认)` / `Traditional`
+  - 语义：只控制 final 字幕文件与黑底字幕视频的字形，不改变音频、不改变配音语言、不改变 speaker 选择
+- 功能点 2：前端把该开关随启动/恢复请求一并提交，并在任务恢复视图中可读回当前值。
+  - 请求字段建议命名为 `subtitle_script_variant`
+  - 默认值固定为 `simplified`
+  - `load-batch / resume` 需要把该值从 manifest 带回前端，避免恢复后界面和实际产物不一致
+- 功能点 3：后端 final 渲染阶段按该开关派生中文脚本，再生成最终字幕文件和黑底视频。
+  - 转换点放在 final `rows -> SRT/ASS` 的输出前，而不是翻译阶段
+  - 这样可以保证：
+    - 翻译阶段仍保留当前粤语/普通话口语质量规则
+    - 同一批内容可以只切换显示字形，不重复跑翻译和配音
+  - 受影响产物至少包括：
+    - `dubbed_final_full.srt`
+    - `dubbed_final_full_with_speakers.srt`
+    - `dubbed_final_full-styled.ass`
+    - `dubbed_video_full.mp4`
+- 功能点 4：仅对中文 final 字幕生效，英文路径保持不变。
+  - `target_lang = English` 时，开关无效
+  - `target_lang = Chinese / Cantonese / Cantonese-Mainland` 时，按用户选择的脚本输出
+- 功能点 5：恢复与审计必须保留该字段。
+  - manifest 需要记录 `subtitle_script_variant`
+  - `load-batch` 视图要展示当前批次采用的是简体还是繁体
+  - 这样才能保证 resume / 重新加载后，final 输出和 UI 状态一致
+- 改动边界：
+  - 不改音频生成策略
+  - 不改翻译 API 的口语化约束
+  - 不改 speaker 逻辑
+  - 不把这个开关扩散到 5 号面板或其他面板
+
+## Spec-10（2026-05-19 6 号面板 final 字幕视频增加简体/繁体中文字幕开关）3/3 风险、关键决策与推荐方案
+- 风险 1：如果把简繁转换放在翻译阶段，会误伤粤语口语化规则。
+  - 原因：当前 `normalize_cantonese_translation_text(...)` 已经在翻译层做了粤语目标语种的专门收尾；再把简繁混进去，容易把“港式/广东式口语”和“字形切换”绑死，后续难以维护。
+  - 推荐：把简繁转换放到 final 渲染前，只作用于输出字幕文本，不作用于翻译结果的内部语义。
+- 风险 2：如果只改前端不落盘，恢复 / reload 后界面会和产物不一致。
+  - 推荐：把 `subtitle_script_variant` 写进任务 manifest、load-batch、resume context 和任务公开状态，让前端能从磁盘批次恢复当前脚本选择。
+- 风险 3：如果对所有语言都强制做简繁转换，英文或其他非中文内容会被污染。
+  - 推荐：只在 `target_lang` 属于中文系时启用；英文直接跳过。
+- 风险 4：如果 final SRT、final ASS、final video 使用不同脚本源，会造成下载产物互相不一致。
+  - 推荐：在 final 阶段统一生成一个“已按脚本 variant 处理过的最终 rows”，然后所有 final 产物都从这份 rows 生成。
+- 风险 5：如果把这个开关做成“粤语专属”，语义会和用户预期的“简体/繁体字幕”不一致。
+  - 推荐：按“中文 final 输出脚本”定义，而不是按语言细分到粤语专属；这样最符合当前需求。
+- 关键决策 1：脚本转换层级
+  - 选项 A：翻译阶段做简繁切换
+  - 选项 B：final 渲染阶段做简繁切换
+  - 推荐：选项 B
+  - 理由：最小化对翻译质量和 speaker 逻辑的影响，且更符合“只影响 final 字幕视频”的需求。
+- 关键决策 2：默认值
+  - 选项 A：默认繁体
+  - 选项 B：默认简体
+  - 推荐：选项 B
+  - 理由：用户已明确要求默认简体。
+- 关键决策 3：作用范围
+  - 选项 A：只影响粤语
+  - 选项 B：影响所有中文 final 字幕
+  - 推荐：选项 B
+  - 理由：用户已明确否定“只影响粤语”的范围，且更符合“简体/繁体中文字幕”的产品语义。
+- 推荐实现方案：
+  - 前端在 6 号面板 `Setup` 增加 `subtitle_script_variant` 单选/切换控件，默认 `simplified`
+  - `buildCurrentProjectRequest()` 透传该字段到后端
+  - `_create_task_payload(...)`、manifest、load-batch、resume context 全部持久化该字段
+  - `_run_voxcpm_job(...)` 在生成 final rows 后，调用统一的脚本转换函数，再输出 SRT / ASS / MP4
+  - 输出产物命名保持不变，避免破坏现有下载路由
+- 结论：
+  - 这是一个前端可见、后端可恢复、只作用于 final 输出的轻量开关，推荐直接按“final 渲染阶段转换”落地。
+- [x] 实施
+  - [x] 在 6 号面板 `Setup` 增加 `subtitle_script_variant` 开关，默认 `simplified`
+  - [x] 让 6 号面板启动/恢复请求透传 `subtitle_script_variant`
+  - [x] 在 6 号面板 final 渲染前统一做简繁转换，并同步到 final SRT / ASS / 视频
+  - [x] 把 `subtitle_script_variant` 写入 manifest / load-batch / resume context
+  - [x] 补 6 号面板简繁切换与恢复回归测试
+- [x] 验证
+  - `./.venv/bin/python -m py_compile src/subtitle_maker/domains/subtitles/zh_script.py src/subtitle_maker/domains/subtitles/__init__.py src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py` 通过
+  - `node --check src/subtitle_maker/static/js/voxcpmDubbingPanel.js` 通过
+  - `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_convert_chinese_script_rows_supports_simplified_and_traditional tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_subtitle_only_builds_natural_srt_and_black_video tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_traditional_variant_converts_final_outputs tests.test_dubbing_cli_api.DubbingCliApiTests.test_load_voxcpm_batch_restores_task_view` 通过（4 tests, OK）
+- [x] 6 号面板字幕描边加粗
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 把 ASS 样式 `Outline` 从 `4` 提升到 `10`
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 更新 6 号面板样式断言，锁住 `Outline=10`
+  - [x] 验证 `test_build_voxcpm_centered_ass_from_rows_wraps_lines_and_uses_typewriter_dialogues`
+- [x] 6 号面板描边改橘色
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 把 ASS `OutlineColour` 从纯黑改为橘色 `&H000066FF`
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 更新样式断言，锁住橘色描边
+  - [x] 验证 `test_build_voxcpm_centered_ass_from_rows_wraps_lines_and_uses_typewriter_dialogues`
+- [x] 6 号面板橘色描边厚度调整
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 把橘色描边 `Outline` 从 `10` 调整为 `6`
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 更新样式断言，锁住 `Outline=6`
+  - [x] 验证 `test_build_voxcpm_centered_ass_from_rows_wraps_lines_and_uses_typewriter_dialogues`
+- [x] 6 号面板改为黑字白描边
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 把 ASS 样式改为黑字 `&H00000000` + 白色描边 `&H00FFFFFF`
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 更新样式断言，锁住黑字白描边
+  - [x] 验证 `test_build_voxcpm_centered_ass_from_rows_wraps_lines_and_uses_typewriter_dialogues`
+- [x] 6 号面板恢复白字黑描边并放大字号
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 把 ASS 样式恢复为白字 `&H00FFFFFF` + 黑色描边 `&H00000000`
+  - [x] 同文件把三个规格字号按 20% 上调：`1920x1080` 从 `120` 到 `144`，`1080x1920` 从 `85` 到 `102`，`1440x1080` 从 `100` 到 `120`
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 更新三种规格的字号断言和主样式颜色断言
+  - [x] 验证 6 号面板 ASS 样式与三种规格字号测试
+- [x] 6 号面板改为橙色描边并减细
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 把描边改为橙色 `&H000066FF`
+  - [x] 同文件把描边厚度从 `6` 调整为 `4`
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 更新样式断言，锁住橙色描边与 `Outline=4`
+  - [x] 验证 `test_build_voxcpm_centered_ass_from_rows_wraps_lines_and_uses_typewriter_dialogues`
+- Review
+  - 6 号面板黑底字幕视频当前样式为白字、橙色描边 `Outline=4`、半透明青色底条，且三个规格字号均上调 20%
+
+## 6 号面板字幕视频对齐优化（播客长句）
+
+- [x] 现状分析确认
+  - [x] 核对 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 的 `_compose_natural_sequence_mix(...)`、`_build_voxcpm_centered_ass_from_rows(...)` 与 final 输出链路，确认黑底字幕视频当前仍直接消费整句 `final_rows_for_output`
+  - [x] 核对同文件 final 阶段的 `dubbed_final_full-rebuild.srt` 生成逻辑，确认它已经把长句拆成更短的 rebuild 行并重算时间戳，但尚未用于 ASS / MP4 渲染
+- [x] 功能点待确认
+  - [x] 确认 6 号面板主方案改为“翻译后、TTS 前的前置长句拆分”，不再依赖 rebuild 纠偏
+  - [x] 确认拆分后的短句直接进入 `selected_subtitles.srt`、segment manifest、final srt 与字幕视频渲染链路
+- [x] 风险与决策待确认
+  - [x] 确认只改 6 号面板，不动 5 号面板
+  - [x] 确认 `selected_subtitles.srt`、`selected_subtitles_with_speakers.srt`、`dubbed_final_full.srt`、`dubbed_final_full_with_speakers.srt` 都接受变成短句真值
+  - [x] 确认 `dubbed_final_full-rebuild.srt` 先保留为 fallback/debug 产物
+- [ ] 实施
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 增加 6 号面板前置长句拆分 helper，按标点/语义优先切分超长句并继承 `speaker_id`
+  - [x] 在同文件 `_run_voxcpm_job(...)` 接入前置拆分步骤，并让 `selected_subtitles.srt` / segment / final 输出统一吃短句真值
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 补 6 号面板前置拆分回归测试，覆盖 speaker 继承、selected subtitles 短句化、final 短句化
+  - [x] 评估 `dubbed_final_full-rebuild.srt` 在新流程下是否仍需保留当前生成逻辑
+- [ ] 验证
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py`
+  - [x] `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_subtitle_only_builds_natural_srt_and_black_video tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_splits_long_rows_before_tts_and_keeps_speaker_ids tests.test_dubbing_cli_api.DubbingCliApiTests.test_build_voxcpm_centered_ass_from_rows_wraps_lines_and_uses_typewriter_dialogues`
+- Review
+  - 6 号面板现在会在翻译后、TTS 前对超长句做前置拆分，`selected_subtitles.srt`、segment manifest、final SRT 与黑底字幕视频都会直接复用短句真值；`dubbed_final_full-rebuild.srt` 暂时保留为 fallback/debug 产物
+- [x] 6 号面板前置拆分保留英文词间空格
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 修正 CJK 兜底硬切逻辑，避免把中英混排里的英文短语压成连写
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 增加中英混排回归测试，锁住 `Ideas are everywhere` / `They're worthless` 等英文短语空格
+  - [x] 验证 `./.venv/bin/python -m py_compile src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py`
+  - [x] 验证 `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_split_voxcpm_long_text_before_tts_keeps_spaces_inside_english_phrases tests.test_dubbing_cli_api.DubbingCliApiTests.test_run_voxcpm_job_splits_long_rows_before_tts_and_keeps_speaker_ids`
+- [x] 6 号面板前置拆分严格沿标点优先断句
+  - [x] 在 [src/subtitle_maker/voxcpm_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/voxcpm_dub_api.py) 增强中英混排切句：只要文本里含中文，也会优先识别英文句号 `.`、中文强标点和软标点，避免 `Ideas are everywhere.They're worthless...` 这类整段黏连
+  - [x] 同文件对仍偏长的句子继续优先按软标点细分，减少落到字符级硬切的概率
+  - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 增加回归测试，锁住 `Ideas are everywhere.` / `They're worthless.` 必须先断开，以及 `因为交税无可避免，` 这种优先沿标点切分
+  - [x] 验证 `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_split_voxcpm_long_text_before_tts_keeps_spaces_inside_english_phrases tests.test_dubbing_cli_api.DubbingCliApiTests.test_split_voxcpm_long_text_before_tts_prefers_punctuation_boundaries tests.test_dubbing_cli_api.DubbingCliApiTests.test_split_voxcpm_mixed_text_breaks_on_english_period_before_chinese`

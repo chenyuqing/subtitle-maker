@@ -56,6 +56,7 @@ from subtitle_maker.translator import (
 from subtitle_maker.domains.subtitles import (
     build_segment_speaker_metadata_from_subtitles,
     normalize_subtitles_with_speakers,
+    optimize_srt_import_subtitles,
     parse_speaker_ref_map_json,
     parse_speaker_reference_specs_json,
 )
@@ -443,6 +444,39 @@ def _build_readable_task_id() -> str:
     return candidate
 
 
+def _collapse_single_reference_payload(
+    *,
+    single_ref_audio: str,
+    single_ref_text: str,
+    speaker_ref_map_json: str,
+) -> tuple[str, str, str]:
+    """把“仅上传 1 份 speaker 参考音”的情况收敛成 single speaker 输入。
+
+    这样后续的 CLI 校验、命令构建和字幕优化都可以走更简单的单 speaker 分支。
+    """
+
+    normalized_single_ref_audio = str(single_ref_audio or "").strip()
+    normalized_single_ref_text = str(single_ref_text or "").strip()
+    normalized_speaker_ref_map_json = str(speaker_ref_map_json or "").strip()
+    if normalized_single_ref_audio:
+        return normalized_single_ref_audio, normalized_single_ref_text, ""
+    if not normalized_speaker_ref_map_json:
+        return normalized_single_ref_audio, normalized_single_ref_text, normalized_speaker_ref_map_json
+    try:
+        speaker_ref_specs = parse_speaker_reference_specs_json(normalized_speaker_ref_map_json)
+    except Exception:
+        return normalized_single_ref_audio, normalized_single_ref_text, normalized_speaker_ref_map_json
+    if len(speaker_ref_specs) != 1:
+        return normalized_single_ref_audio, normalized_single_ref_text, normalized_speaker_ref_map_json
+
+    speaker_spec = next(iter(speaker_ref_specs.values()))
+    ref_audio_path = str(speaker_spec.get("ref_audio_path") or "").strip()
+    if not ref_audio_path:
+        return normalized_single_ref_audio, normalized_single_ref_text, normalized_speaker_ref_map_json
+    ref_text = str(speaker_spec.get("ref_text") or "").strip()
+    return ref_audio_path, normalized_single_ref_text or ref_text, ""
+
+
 def _normalize_auto_dubbing_request(
     *,
     subtitle_mode: str,
@@ -530,13 +564,13 @@ def _normalize_auto_dubbing_request(
         raise HTTPException(status_code=400, detail="Invalid dubbing_mode")
     # Auto Dubbing 现阶段固定只走 index-tts，兼容旧字段但不再接受切换。
     normalized_tts_backend = "index-tts"
-    # `dubbing_mode` 不再以表单选择为真值，而是按字幕里是否存在稳定 speaker 信息自动推断。
+    # `dubbing_mode` 不再以表单选择为真值，而是优先看 speaker 参考音是否已经收敛为单人，
+    # 再回退到字幕里是否存在稳定 speaker 信息。
     normalized_detected_speaker_ids = [
         str(speaker_id or "").strip()
         for speaker_id in (detected_speaker_ids or [])
         if str(speaker_id or "").strip()
     ]
-    normalized_dubbing_mode = "multi" if normalized_detected_speaker_ids else "single"
     rewrite_translation_enabled = _read_bool_form(rewrite_translation, field_name="rewrite_translation")
     parsed_time_ranges = _parse_time_ranges_form(time_ranges)
     normalized_translate_base_url = (translate_base_url or "").strip() or DEFAULT_TRANSLATE_BASE_URL
@@ -569,6 +603,12 @@ def _normalize_auto_dubbing_request(
         parse_speaker_ref_map_json(speaker_ref_map_json or "")
         if str(speaker_ref_map_json or "").strip()
         else {}
+    )
+    normalized_has_single_reference_audio = bool(normalized_single_ref_audio)
+    normalized_dubbing_mode = (
+        "single"
+        if normalized_has_single_reference_audio
+        else ("multi" if normalized_detected_speaker_ids else "single")
     )
     if normalized_dubbing_mode == "single":
         if len(normalized_speaker_ref_map) > 0:
@@ -639,6 +679,7 @@ def _write_subtitles_json_to_srt(
     upload_dir: Path,
     subtitles_json: str,
     subtitle_mode: str,
+    speaker_mode: str = "auto",
 ) -> Optional[Path]:
     """把主 workflow 内存中的字幕数组落成 SRT，供 CLI 直接复用当前项目上下文。"""
 
@@ -683,6 +724,7 @@ def _write_subtitles_json_to_srt(
         raise HTTPException(status_code=400, detail="Invalid subtitles_json: no valid subtitle rows")
 
     subtitle_items, _ = normalize_subtitles_with_speakers(subtitle_items)
+    subtitle_items = optimize_srt_import_subtitles(subtitle_items, speaker_mode=speaker_mode)
     srt_path = upload_dir / f"project_{subtitle_mode}.srt"
     srt_path.write_text(format_srt(subtitle_items), encoding="utf-8")
     return srt_path
@@ -1186,13 +1228,34 @@ def _normalize_cli_failure_line(line: str, max_length: int = 500) -> str:
 
 
 def _extract_cli_failure_detail(stdout_tail: List[str]) -> Optional[str]:
+    def _normalize_provider_auth_error(line: str) -> Optional[str]:
+        """把 provider 返回的 401 文案转成可读的鉴权提示。"""
+
+        lowered = line.lower()
+        if "error code: 401" not in lowered and "401 unauthorized" not in lowered:
+            return None
+        if "/chat/completions" in lowered or "internal server error" in lowered:
+            return (
+                "Pipeline failed: Translation provider authentication failed "
+                "(HTTP 401). Please verify API key/base URL/model or switch provider."
+            )
+        return (
+            "Pipeline failed: Upstream authentication failed (HTTP 401). "
+            "Please verify API credentials."
+        )
+
     # 第一优先级：直接抽取 pipeline 明确给出的失败原因，避免被 traceback 包装信息覆盖。
     for raw_line in reversed(stdout_tail):
         line = (raw_line or "").strip()
         if not line:
             continue
+        normalized_auth_error = _normalize_provider_auth_error(line)
+        if normalized_auth_error:
+            return normalized_auth_error
         if line.startswith("Pipeline failed:"):
-            return _normalize_cli_failure_line(line)
+            return _normalize_cli_failure_line(
+                normalized_auth_error or line
+            )
         if line.startswith("[ERROR]"):
             parts = line.split(" - ", 1)
             if len(parts) == 2:
@@ -1205,6 +1268,9 @@ def _extract_cli_failure_detail(stdout_tail: List[str]) -> Optional[str]:
         line = (raw_line or "").strip()
         if not line:
             continue
+        normalized_auth_error = _normalize_provider_auth_error(line)
+        if normalized_auth_error:
+            return normalized_auth_error
         if line.startswith("[INFO]") or line.startswith("HTTP Request:"):
             continue
         if line.startswith("Traceback ") or line == "Traceback (most recent call last):":
@@ -1977,7 +2043,8 @@ async def start_auto_dubbing(
     if input_srt_path is not None:
         parsed_subtitles = parse_srt(input_srt_path.read_text(encoding="utf-8"))
         _, detected_speaker_ids = normalize_subtitles_with_speakers(parsed_subtitles)
-    normalized_single_ref_audio = single_ref_audio
+    normalized_single_ref_audio = str(single_ref_audio or "").strip()
+    normalized_single_ref_text = str(single_ref_text or "").strip()
     if single_ref_audio_file is not None and single_ref_audio_file.filename:
         normalized_single_ref_audio = _store_uploaded_reference_file(
             upload_dir=upload_dir,
@@ -2017,6 +2084,21 @@ async def start_auto_dubbing(
                 }
             )
         normalized_speaker_ref_map_json = json.dumps(speaker_file_specs, ensure_ascii=False)
+
+    normalized_single_ref_audio, normalized_single_ref_text, normalized_speaker_ref_map_json = _collapse_single_reference_payload(
+        single_ref_audio=normalized_single_ref_audio,
+        single_ref_text=normalized_single_ref_text,
+        speaker_ref_map_json=normalized_speaker_ref_map_json,
+    )
+    reference_mode_hint = "single" if normalized_single_ref_audio else ("multi" if normalized_speaker_ref_map_json.strip() else "auto")
+    if input_srt_path is not None:
+        subtitle_items = parse_srt(input_srt_path.read_text(encoding="utf-8"))
+        subtitle_items, _ = normalize_subtitles_with_speakers(subtitle_items)
+    subtitle_items = optimize_srt_import_subtitles(subtitle_items, speaker_mode=reference_mode_hint)
+    if not subtitle_items:
+        raise HTTPException(status_code=400, detail="Auto dubbing requires subtitle_file with valid subtitles")
+    input_srt_path.write_text(format_srt(subtitle_items), encoding="utf-8")
+
     options = _normalize_auto_dubbing_request(
         subtitle_mode=subtitle_mode,
         dubbing_mode=dubbing_mode,
@@ -2029,7 +2111,7 @@ async def start_auto_dubbing(
         tts_backend=tts_backend,
         tts_model_path=tts_model_path,
         single_ref_audio=normalized_single_ref_audio,
-        single_ref_text=single_ref_text,
+        single_ref_text=normalized_single_ref_text,
         speaker_ref_map_json=normalized_speaker_ref_map_json,
         detected_speaker_ids=detected_speaker_ids,
         index_tts_api_url=index_tts_api_url,
@@ -2132,27 +2214,11 @@ async def start_auto_dubbing_from_project(
                 }
             )
     normalized_subtitles, _ = normalize_subtitles_with_speakers(normalized_subtitles)
-
-    input_srt_path = _write_subtitles_json_to_srt(
-        upload_dir=upload_dir,
-        subtitles_json=subtitles_json,
-        subtitle_mode=subtitle_mode,
-    )
-    if input_srt_path is None:
+    if not normalized_subtitles:
         raise HTTPException(status_code=400, detail="Auto dubbing requires subtitles_json from current project")
-    detected_speaker_ids: List[str] = []
-    if normalized_subtitles:
-        _, detected_speaker_ids = normalize_subtitles_with_speakers(normalized_subtitles)
 
-    input_speaker_metadata_path: Optional[Path] = None
-    segment_speaker_metadata = build_segment_speaker_metadata_from_subtitles(normalized_subtitles)
-    if segment_speaker_metadata:
-        input_speaker_metadata_path = input_srt_path.parent / "_input_project.speakers.json"
-        input_speaker_metadata_path.write_text(
-            json.dumps(segment_speaker_metadata, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    normalized_single_ref_audio = single_ref_audio
+    normalized_single_ref_audio = str(single_ref_audio or "").strip()
+    normalized_single_ref_text = str(single_ref_text or "").strip()
     if single_ref_audio_file is not None and single_ref_audio_file.filename:
         normalized_single_ref_audio = _store_uploaded_reference_file(
             upload_dir=upload_dir,
@@ -2191,7 +2257,39 @@ async def start_auto_dubbing_from_project(
                     "ref_text": str(speaker_texts_payload.get(str(speaker_id or "").strip()) or "").strip(),
                 }
             )
-        normalized_speaker_ref_map_json = json.dumps(speaker_file_specs, ensure_ascii=False)
+        if len(speaker_file_specs) == 1 and not normalized_single_ref_audio:
+            normalized_single_ref_audio = str(speaker_file_specs[0].get("ref_audio_path") or "").strip()
+            normalized_single_ref_text = normalized_single_ref_text or str(speaker_file_specs[0].get("ref_text") or "").strip()
+            normalized_speaker_ref_map_json = ""
+        else:
+            normalized_speaker_ref_map_json = json.dumps(speaker_file_specs, ensure_ascii=False)
+
+    normalized_single_ref_audio, normalized_single_ref_text, normalized_speaker_ref_map_json = _collapse_single_reference_payload(
+        single_ref_audio=normalized_single_ref_audio,
+        single_ref_text=normalized_single_ref_text,
+        speaker_ref_map_json=normalized_speaker_ref_map_json,
+    )
+    reference_mode_hint = "single" if normalized_single_ref_audio else ("multi" if normalized_speaker_ref_map_json.strip() else "auto")
+
+    input_srt_path = upload_dir / f"project_{subtitle_mode}.srt"
+    subtitle_items = optimize_srt_import_subtitles(normalized_subtitles, speaker_mode=reference_mode_hint)
+    input_srt_path.write_text(format_srt(subtitle_items), encoding="utf-8")
+    detected_speaker_ids = sorted(
+        {
+            str(item.get("speaker_id") or "").strip()
+            for item in subtitle_items
+            if str(item.get("speaker_id") or "").strip()
+        }
+    )
+
+    input_speaker_metadata_path: Optional[Path] = None
+    segment_speaker_metadata = build_segment_speaker_metadata_from_subtitles(subtitle_items)
+    if segment_speaker_metadata:
+        input_speaker_metadata_path = input_srt_path.parent / "_input_project.speakers.json"
+        input_speaker_metadata_path.write_text(
+            json.dumps(segment_speaker_metadata, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     options = _normalize_auto_dubbing_request(
         subtitle_mode=subtitle_mode,
         dubbing_mode=dubbing_mode,
@@ -2204,7 +2302,7 @@ async def start_auto_dubbing_from_project(
         tts_backend=tts_backend,
         tts_model_path=tts_model_path,
         single_ref_audio=normalized_single_ref_audio,
-        single_ref_text=single_ref_text,
+        single_ref_text=normalized_single_ref_text,
         speaker_ref_map_json=normalized_speaker_ref_map_json,
         detected_speaker_ids=detected_speaker_ids,
         index_tts_api_url=index_tts_api_url,

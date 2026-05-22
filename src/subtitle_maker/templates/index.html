@@ -62,6 +62,10 @@
                         <span class="step-num">5</span>
                         <span class="nav-label">Auto Dub Omnivoice</span>
                     </button>
+                    <button class="nav-item" data-target="panel-auto-dub-voxcpm">
+                        <span class="step-num">6</span>
+                        <span class="nav-label">Auto Dub VoxCPM</span>
+                    </button>
                 </nav>
 
             <div class="sidebar-footer">
@@ -198,7 +202,7 @@
                                     <input type="file" id="srt-file-input" accept=".srt" style="display: none;">
                                     <div class="upload-icon">📄</div>
                                     <p class="upload-text">Click or Drag & Drop SRT File</p>
-                                    <p class="upload-hint">需先上传视频/音频，再导入 SRT</p>
+                                    <p class="upload-hint">可单独导入 SRT；如已上传媒体，会自动绑定到当前项目</p>
                                 </div>
                                 <div class="upload-inline-field">
                                     <label for="srt-subtitle-kind">SRT Type</label>
@@ -214,6 +218,7 @@
                                     <input type="file" id="deepgram-json-file-input" accept=".json,application/json" style="display: none;">
                                     <div class="upload-icon">🧩</div>
                                     <p class="upload-text">Click or Drag & Drop Deepgram JSON</p>
+                                    <p class="upload-hint">可单独导入 Deepgram JSON；如已上传媒体，会自动绑定到当前项目</p>
                                     <p class="upload-hint">上传 Deepgram diarization 导出的 listen-prerecorded JSON</p>
                                 </div>
                             </div>
@@ -654,11 +659,12 @@
                                             <label for="omnivoice-target">Target Language</label>
                                             <select id="omnivoice-target">
                                                 <option value="Chinese" selected>Chinese</option>
+                                                <option value="Cantonese">Cantonese</option>
+                                                <option value="Cantonese-Mainland">Cantonese-Mainland</option>
                                                 <option value="English">English</option>
                                                 <option value="Japanese">Japanese</option>
                                                 <option value="French">French</option>
                                                 <option value="German">German</option>
-                                                <option value="Cantonese">Cantonese</option>
                                                 <option value="Spanish">Spanish</option>
                                             </select>
                                         </div>
@@ -684,7 +690,7 @@
                                             <div class="auto-dub-section-title">按 speaker 上传参考音频</div>
                                         </div>
                                     </div>
-                                    <p class="auto-dub-secondary-note">5 号面板会按当前项目字幕里的 speaker 自动识别上传槽位。每个 speaker 请上传一段参考音，建议内容固定为：<strong>你好，这是我的声音音色，很高兴为你进行配音服务。</strong></p>
+                                    <p class="auto-dub-secondary-note">5 号面板会按当前项目字幕里的 speaker 自动识别上传槽位。每个 speaker 请上传一段参考音，参考文本会随 Target Language 自动切换：<strong>Chinese</strong> 用“你好，这是我的声音音色，很高兴为你提供配音服务。”，<strong>Cantonese</strong> 与 <strong>Cantonese-Mainland</strong> 都用“你好，呢個系我嘅聲音音色，很高興為你提供配音服務。”；区别只体现在翻译阶段：前者偏港式口语 + 繁体，后者偏广东式口语 + 繁体。</p>
                                     <div id="omnivoice-speaker-ref-list" class="omnivoice-speaker-ref-list"></div>
                                     <p id="omnivoice-speaker-ref-hint" class="auto-dub-secondary-note">等待当前项目字幕中的 speaker 列表...</p>
                                 </div>
@@ -743,6 +749,217 @@
                         </div>
                     </div>
                 </div>
+
+                <div id="panel-auto-dub-voxcpm" class="panel" style="display: none;">
+                    <div class="card auto-dub-card">
+                        <h2>🎛️ Auto Dub VoxCPM</h2>
+                        <div class="auto-dub-shell">
+                            <div class="auto-dub-top-grid">
+                                <div class="auto-dub-section-card auto-dub-project-card">
+                                    <div class="auto-dub-section-head">
+                                        <div>
+                                            <div class="auto-dub-section-kicker">Current Project</div>
+                                            <div class="auto-dub-section-title">VoxCPM 实验配音链路</div>
+                                        </div>
+                                        <span id="voxcpm-project-readiness" class="auto-dub-inline-hint">等待项目状态</span>
+                                    </div>
+                                    <div class="auto-dub-project-summary-grid">
+                                        <div class="auto-dub-project-item">
+                                            <span class="auto-dub-project-label">媒体</span>
+                                            <strong id="voxcpm-project-media">未上传媒体</strong>
+                                        </div>
+                                        <div class="auto-dub-project-item">
+                                            <span class="auto-dub-project-label">任务</span>
+                                            <strong id="voxcpm-project-task">未生成</strong>
+                                        </div>
+                                        <div class="auto-dub-project-item">
+                                            <span class="auto-dub-project-label">原字幕</span>
+                                            <strong id="voxcpm-project-source-count">0 行</strong>
+                                        </div>
+                                        <div class="auto-dub-project-item">
+                                            <span class="auto-dub-project-label">译文</span>
+                                            <strong id="voxcpm-project-translated-count">0 行</strong>
+                                        </div>
+                                    </div>
+                                    <p id="voxcpm-project-note" class="auto-dub-secondary-note">6 号面板只要字幕 + 参考音频就能运行，优先保留自然语速和情绪表达，不承诺像 5 号面板那样严格按字幕秒数控长，并固定输出黑底居中字幕视频。</p>
+                                    <p id="voxcpm-backend-note" class="auto-dub-secondary-note">正在检查 VoxCPM 后端状态...</p>
+                                </div>
+                                <div class="auto-dub-section-card auto-dub-config-card">
+                                    <div class="auto-dub-section-head">
+                                        <div>
+                                            <div class="auto-dub-section-kicker">Setup</div>
+                                            <div class="auto-dub-section-title">VoxCPM dubbing parameters</div>
+                                        </div>
+                                    </div>
+                                    <div class="auto-dub-config-grid">
+                                        <div class="input-group">
+                                            <label for="voxcpm-source">Source Language</label>
+                                            <select id="voxcpm-source">
+                                                <option value="Chinese" selected>Chinese (中文)</option>
+                                                <option value="English">English</option>
+                                                <option value="Cantonese">Cantonese (粤语)</option>
+                                            </select>
+                                        </div>
+                                        <div class="input-group">
+                                            <label for="voxcpm-target">Target Language</label>
+                                            <select id="voxcpm-target">
+                                                <option value="Chinese" selected>Chinese</option>
+                                                <option value="Cantonese">Cantonese</option>
+                                                <option value="Cantonese-Mainland">Cantonese-Mainland</option>
+                                                <option value="English">English</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                    <div class="auto-dub-config-grid" style="margin-top: 12px;">
+                                        <div class="input-group">
+                                            <label for="voxcpm-cfg-value">CFG Value</label>
+                                            <input type="number" id="voxcpm-cfg-value" value="2.0" min="0.5" max="6" step="0.1">
+                                        </div>
+                                        <div class="input-group">
+                                            <label for="voxcpm-inference-steps">Inference Steps</label>
+                                            <input type="number" id="voxcpm-inference-steps" value="10" min="4" max="30" step="1">
+                                        </div>
+                                    </div>
+                                    <div class="auto-dub-config-grid" style="margin-top: 12px;">
+                                        <div class="input-group">
+                                            <label for="voxcpm-subtitle-script-variant">Cantonese Subtitle Script</label>
+                                            <select id="voxcpm-subtitle-script-variant">
+                                                <option value="traditional" selected>Traditional Chinese (default)</option>
+                                                <option value="simplified">Simplified Chinese</option>
+                                            </select>
+                                        </div>
+                                        <div class="input-group">
+                                            <label for="voxcpm-subtitle-video-preset">Subtitle Video Aspect</label>
+                                            <select id="voxcpm-subtitle-video-preset">
+                                                <option value="1920x1080" selected>1920x1080 (16:9)</option>
+                                                <option value="1080x1920">1080x1920 (9:16)</option>
+                                                <option value="1440x1080">1440x1080 (4:3)</option>
+                                                <option value="1080x1440">1080x1440 (3:4)</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                    <div class="input-group" style="margin-top: 12px;">
+                                        <label for="voxcpm-translate-system-prompt">Custom System Prompt (Optional)</label>
+                                        <textarea id="voxcpm-translate-system-prompt" rows="3" class="system-prompt-input"
+                                            placeholder="只在 source 字幕需要先翻译时生效。"></textarea>
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div class="auto-dub-section-card auto-dub-secondary-card">
+                                <div class="auto-dub-section-head">
+                                    <div>
+                                        <div class="auto-dub-section-kicker">Podcast Script</div>
+                                        <div class="auto-dub-section-title">Upload and parse a podcast script</div>
+                                    </div>
+                                    <div class="auto-dub-actions-inline">
+                                        <button id="voxcpm-parse-podcast-btn" class="ghost-btn" type="button">Parse Script</button>
+                                        <button id="voxcpm-clear-podcast-btn" class="ghost-btn" type="button">Clear</button>
+                                    </div>
+                                </div>
+                                <div class="input-group">
+                                    <label for="voxcpm-podcast-script-file">Podcast Script File</label>
+                                    <input id="voxcpm-podcast-script-file" type="file" accept=".md,.txt,text/markdown,text/plain">
+                                </div>
+                                <div class="auto-dub-project-summary-grid" style="margin-top: 12px;">
+                                    <div class="auto-dub-project-item">
+                                        <span class="auto-dub-project-label">脚本标题</span>
+                                        <strong id="voxcpm-podcast-title">未解析</strong>
+                                    </div>
+                                    <div class="auto-dub-project-item">
+                                        <span class="auto-dub-project-label">Speaker</span>
+                                        <strong id="voxcpm-podcast-speaker-count">0 个</strong>
+                                    </div>
+                                    <div class="auto-dub-project-item">
+                                        <span class="auto-dub-project-label">台词行</span>
+                                        <strong id="voxcpm-podcast-line-count">0 行</strong>
+                                    </div>
+                                    <div class="auto-dub-project-item">
+                                        <span class="auto-dub-project-label">模式</span>
+                                        <strong id="voxcpm-podcast-mode">未解析</strong>
+                                    </div>
+                                </div>
+                                <p id="voxcpm-podcast-hint" class="auto-dub-secondary-note">支持上传 `.md / .txt` 播客脚本。解析成功后，6 号面板会优先使用脚本结果，而不是当前项目字幕。</p>
+                                <div id="voxcpm-podcast-preview" class="voxcpm-podcast-preview" style="display: none;">
+                                    <div class="voxcpm-podcast-preview-head">
+                                        <span class="voxcpm-podcast-preview-title">Parsed Preview</span>
+                                        <button id="voxcpm-podcast-preview-toggle" class="ghost-btn" type="button" style="display: none;">Show all</button>
+                                    </div>
+                                    <div id="voxcpm-podcast-preview-list" class="voxcpm-podcast-preview-list"></div>
+                                </div>
+                            </div>
+
+                            <div class="auto-dub-section-card auto-dub-secondary-card">
+                                <div class="auto-dub-section-head">
+                                    <div>
+                                        <div class="auto-dub-section-kicker">Speaker Refs</div>
+                                        <div class="auto-dub-section-title">按 speaker 上传参考音频（可选）</div>
+                                    </div>
+                                </div>
+                                <p class="auto-dub-secondary-note">每个 speaker 请上传一段参考音，参考文本会随 Target Language 自动切换：<strong>Chinese</strong> 用“你好，这是我的声音音色，很高兴为你提供配音服务。”，<strong>Cantonese</strong> 与 <strong>Cantonese-Mainland</strong> 都用“你好，呢個系我嘅聲音音色，很高興為你提供配音服務。”</p>
+                                <div id="voxcpm-speaker-ref-hint" class="auto-dub-inline-note">检测到 speaker 后会显示上传控件。可以一个都不传；未上传的 speaker 会由后端优先按男女补齐，纯字幕模式下则直接随机补位。</div>
+                                <div id="voxcpm-speaker-ref-list" class="voxcpm-speaker-ref-list"></div>
+                            </div>
+
+                            <div class="auto-dub-section-card auto-dub-secondary-card">
+                                <div class="auto-dub-section-head">
+                                    <div>
+                                        <div class="auto-dub-section-kicker">Restore</div>
+                                        <div class="auto-dub-section-title">Load an existing VoxCPM result folder</div>
+                                    </div>
+                                    <div class="auto-dub-actions-inline">
+                                        <button id="voxcpm-refresh-batches-btn" class="ghost-btn" type="button">Refresh</button>
+                                        <button id="voxcpm-load-batch-btn" class="ghost-btn" type="button">Load Result</button>
+                                        <button id="voxcpm-resume-batch-btn" class="ghost-btn" type="button" style="display: none;">从断点继续配音</button>
+                                    </div>
+                                </div>
+                                <div class="input-group">
+                                    <label for="voxcpm-load-batch-select">Result Folder</label>
+                                    <select id="voxcpm-load-batch-select">
+                                        <option value="">正在加载 VoxCPM 结果文件夹...</option>
+                                    </select>
+                                </div>
+                                <p id="voxcpm-batch-hint" class="auto-dub-secondary-note">正在加载 VoxCPM 结果文件夹列表...</p>
+                            </div>
+
+                            <div class="auto-dub-section-card auto-dub-action-card">
+                                <div class="auto-dub-section-head">
+                                    <div>
+                                        <div class="auto-dub-section-kicker">Run</div>
+                                        <div class="auto-dub-section-title">Launch a dedicated VoxCPM dubbing job</div>
+                                    </div>
+                                </div>
+                                <p id="voxcpm-shared-key-note" class="auto-dub-secondary-note">VoxCPM 复用左侧 Translation API 配置；最终会输出自然朗读音频、重建时间轴字幕，以及字号 120 的黑底居中字幕视频。</p>
+                                <button id="start-voxcpm-dub-btn" class="primary-btn auto-dub-start-btn" type="button">Start VoxCPM Dubbing</button>
+                            </div>
+
+                            <div id="voxcpm-status-container" class="auto-dub-status-card" style="display: none;">
+                                <div class="progress-bar">
+                                    <div id="voxcpm-progress-fill" class="progress-fill"></div>
+                                </div>
+                                <div class="status-meta">
+                                    <span id="voxcpm-task-id">Task —</span>
+                                    <span id="voxcpm-line-progress">Lines —</span>
+                                    <span id="voxcpm-eta">ETA —</span>
+                                </div>
+                                <div id="voxcpm-status-text" class="status-text">Waiting</div>
+                            </div>
+
+                            <div id="voxcpm-results" class="export-section auto-dub-results-card" style="display: none;">
+                                <h3>VoxCPM Outputs</h3>
+                                <div class="voxcpm-video-variants">
+                                    <div class="voxcpm-video-variants-head">
+                                        <strong>Video Variants</strong>
+                                        <span id="voxcpm-video-variants-hint" class="auto-dub-secondary-note">完成后可补生成其他规格，无需重新配音。</span>
+                                    </div>
+                                    <div id="voxcpm-video-variants-list" class="voxcpm-video-variants-list"></div>
+                                </div>
+                                <div class="download-links"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Panel 2: Transcribe -->
                 <div id="panel-transcribe" class="panel" style="display: none;">
                     <div class="card">

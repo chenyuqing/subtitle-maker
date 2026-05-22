@@ -40,6 +40,7 @@ function setupAutoDubbing(config, deps) {
         describeAutoStage,
         normalizeShortMergeTargetSeconds,
         applyAutoDubSubtitleItems,
+        audioTrackController,
         getTranslateApiKey,
         getTranslateBaseUrl,
         getTranslateModel,
@@ -89,8 +90,6 @@ function setupAutoDubbing(config, deps) {
     const refreshBatchesBtn = byId('refresh-batches-btn');
     const loadBatchBtn = byId('load-batch-btn');
     const batchHintEl = byId('batch-hint');
-    const audioTrackSwitcher = document.getElementById('audio-track-switcher');
-    const audioTrackModeSelect = document.getElementById('audio-track-mode');
     const autoDubRangesList = byId('time-ranges-list');
     const autoDubRangeError = byId('range-error');
     const autoDubRangeInputsEl = byId('range-inputs');
@@ -120,9 +119,6 @@ function setupAutoDubbing(config, deps) {
     let translatedShortMergeHintOverride = '';
     let lastEffectiveSubtitleMode = 'source';
     let autoDubRangePrecisionExpanded = false;
-    const dubbedAudioPlayer = new Audio();
-    dubbedAudioPlayer.preload = 'metadata';
-    let dubbedAudioUrl = null;
     /**
      * 读取当前全局 TTS backend，统一控制 UI 和表单行为。
      */
@@ -511,65 +507,10 @@ function setupAutoDubbing(config, deps) {
     syncAutoDubRangePrecision(false);
 
     /**
-     * 根据可用音轨更新播放器模式：original=原视频声音，dubbed=配音音频。
-     */
-    function applyAudioTrackMode(mode) {
-        if (!videoPlayer) return;
-        const targetMode = mode === 'dubbed' ? 'dubbed' : 'original';
-        const hasDubbed = !!dubbedAudioUrl;
-        if (targetMode === 'dubbed' && !hasDubbed) {
-            return;
-        }
-
-        if (targetMode === 'original') {
-            videoPlayer.muted = false;
-            dubbedAudioPlayer.pause();
-            return;
-        }
-
-        videoPlayer.muted = true;
-        dubbedAudioPlayer.playbackRate = videoPlayer.playbackRate || 1;
-        try {
-            dubbedAudioPlayer.currentTime = videoPlayer.currentTime || 0;
-        } catch (e) {
-            console.debug('sync dubbed audio time failed', e);
-        }
-        if (!videoPlayer.paused) {
-            dubbedAudioPlayer.play().catch(() => {});
-        }
-    }
-
-    /**
      * 在导入新媒体或新任务结果时重置音轨状态，避免沿用旧任务的配音链接。
      */
     function resetAudioTrackState() {
-        dubbedAudioUrl = null;
-        dubbedAudioPlayer.pause();
-        dubbedAudioPlayer.removeAttribute('src');
-        dubbedAudioPlayer.load();
-        if (audioTrackModeSelect) {
-            audioTrackModeSelect.value = 'original';
-        }
-        if (audioTrackSwitcher) {
-            audioTrackSwitcher.style.display = 'none';
-        }
-        if (videoPlayer) {
-            videoPlayer.muted = false;
-        }
-    }
-
-    /**
-     * 根据后端返回结果提取可播放的配音音频链接。
-     */
-    function pickDubbedAudioUrl(data) {
-        if (data && typeof data.result_audio === 'string' && data.result_audio) {
-            return data.result_audio;
-        }
-        const artifacts = Array.isArray(data?.artifacts) ? data.artifacts : [];
-        const preferred = artifacts.find((item) => item?.key === 'preferred_audio' && item.url)
-            || artifacts.find((item) => item?.key === 'mix' && item.url)
-            || artifacts.find((item) => item?.key === 'vocals' && item.url);
-        return preferred?.url || null;
+        audioTrackController?.resetAudioTrackState?.();
     }
 
     /**
@@ -811,43 +752,6 @@ function setupAutoDubbing(config, deps) {
         } catch (error) {
             console.warn('Auto load dubbing subtitles failed:', error);
         }
-    }
-
-    if (videoPlayer) {
-        videoPlayer.addEventListener('play', () => {
-            if (audioTrackModeSelect?.value === 'dubbed' && dubbedAudioUrl) {
-                dubbedAudioPlayer.play().catch(() => {});
-            }
-        });
-        videoPlayer.addEventListener('pause', () => {
-            dubbedAudioPlayer.pause();
-        });
-        videoPlayer.addEventListener('seeking', () => {
-            if (audioTrackModeSelect?.value === 'dubbed' && dubbedAudioUrl) {
-                try {
-                    dubbedAudioPlayer.currentTime = videoPlayer.currentTime || 0;
-                } catch (e) {
-                    console.debug('seek sync failed', e);
-                }
-            }
-        });
-        videoPlayer.addEventListener('ratechange', () => {
-            dubbedAudioPlayer.playbackRate = videoPlayer.playbackRate || 1;
-        });
-        videoPlayer.addEventListener('ended', () => {
-            dubbedAudioPlayer.pause();
-            try {
-                dubbedAudioPlayer.currentTime = 0;
-            } catch (e) {
-                console.debug('reset dubbed audio failed', e);
-            }
-        });
-    }
-
-    if (audioTrackModeSelect) {
-        audioTrackModeSelect.addEventListener('change', () => {
-            applyAudioTrackMode(audioTrackModeSelect.value);
-        });
     }
 
     if (projectSubtitleModeSelect) {
@@ -1126,6 +1030,7 @@ function setupAutoDubbing(config, deps) {
             if (taskLabel) taskLabel.textContent = 'Task —';
             if (lineProgressEl) lineProgressEl.textContent = 'Lines —';
             if (etaEl) etaEl.textContent = 'ETA —';
+            audioTrackController?.resetAudioTrackState?.();
 
             try {
                 const request = buildCurrentProjectRequest(apiKey);
@@ -1240,6 +1145,7 @@ function setupAutoDubbing(config, deps) {
             }
             if (!batchId) return;
             loadBatchBtn.disabled = true;
+            audioTrackController?.resetAudioTrackState?.();
             try {
                 const formData = new FormData();
                 formData.append('batch_id', batchId);
@@ -1495,22 +1401,7 @@ function setupAutoDubbing(config, deps) {
         links.innerHTML = '';
 
         autoLoadAutoDubSubtitles(data);
-
-        dubbedAudioUrl = pickDubbedAudioUrl(data);
-        if (dubbedAudioUrl) {
-            dubbedAudioUrl = withCacheBust(dubbedAudioUrl);
-            dubbedAudioPlayer.src = dubbedAudioUrl;
-            dubbedAudioPlayer.load();
-            if (audioTrackSwitcher) {
-                audioTrackSwitcher.style.display = 'inline-flex';
-            }
-            if (audioTrackModeSelect) {
-                audioTrackModeSelect.value = 'original';
-            }
-            applyAudioTrackMode('original');
-        } else {
-            resetAudioTrackState();
-        }
+        audioTrackController?.mountResultAudio?.(data, { defaultMode: 'original' });
 
         const artifacts = Array.isArray(data.artifacts) ? data.artifacts : [];
         artifacts.forEach((artifact, index) => {

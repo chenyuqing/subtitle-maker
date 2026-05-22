@@ -476,6 +476,63 @@ def burn_ass_subtitles_into_video(
         raise RuntimeError(
             "failed to burn ASS subtitles into video: "
             f"stderr={err.strip()}\nstdout={out}\ncmd={' '.join(cmd)}"
+    )
+    return output_video_path
+
+
+def build_black_video_with_ass_subtitles(
+    *,
+    audio_path: Path,
+    ass_subtitle_path: Path,
+    output_video_path: Path,
+    width: int = 1920,
+    height: int = 1080,
+    fps: int = 24,
+    video_codec: str = "libx264",
+    crf: int = 16,
+    preset: str = "slow",
+) -> Path:
+    """基于最终音频与 ASS 字幕生成黑底视频，适合纯朗读型产物。"""
+
+    safe_width = max(16, int(width))
+    safe_height = max(16, int(height))
+    safe_fps = max(1, int(fps))
+    safe_duration = max(0.05, float(probe_ffprobe_duration(audio_path)))
+    output_video_path.parent.mkdir(parents=True, exist_ok=True)
+    escaped_subtitle_path = _ffmpeg_filter_escape(str(ass_subtitle_path.resolve()))
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        f"color=c=black:s={safe_width}x{safe_height}:r={safe_fps}:d={safe_duration:.6f}",
+        "-i",
+        str(audio_path),
+        "-shortest",
+        "-vf",
+        f"ass='{escaped_subtitle_path}'",
+        "-c:v",
+        video_codec,
+        "-crf",
+        str(int(crf)),
+        "-preset",
+        str(preset),
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
+        str(output_video_path),
+    ]
+    code, out, err = run_cmd(cmd)
+    if code != 0:
+        raise RuntimeError(
+            "failed to build black video with ASS subtitles: "
+            f"stderr={err.strip()}\nstdout={out}\ncmd={' '.join(cmd)}"
         )
     return output_video_path
 

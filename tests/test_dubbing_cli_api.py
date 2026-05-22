@@ -1,25 +1,34 @@
 from __future__ import annotations
 
+import io
 import json
 import shutil
 import tempfile
 import unittest
+from http.client import IncompleteRead
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import soundfile as sf
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 API_TEST_SKIP_REASON = ""
 try:
     from subtitle_maker import dubbing_cli_api
     from subtitle_maker import omnivoice_dub_api
+    from subtitle_maker import voxcpm_dub_api
+    from subtitle_maker import translator as translator_module
     from subtitle_maker import web
+    from subtitle_maker.domains.dubbing import pipeline as dubbing_pipeline
     from subtitle_maker.domains.media import compose as media_compose
 except ModuleNotFoundError as exc:  # pragma: no cover - 仅在缺三方依赖的本地环境触发
     dubbing_cli_api = None
     omnivoice_dub_api = None
+    voxcpm_dub_api = None
+    translator_module = None
+    dubbing_pipeline = None
     web = None
     media_compose = None
     API_TEST_SKIP_REASON = f"missing dependency {exc.name}"
@@ -56,10 +65,13 @@ class DubbingCliApiTests(unittest.TestCase):
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.omnivoice_output_root = self.output_root / "omnivoice"
         self.omnivoice_output_root.mkdir(parents=True, exist_ok=True)
+        self.voxcpm_output_root = self.output_root / "voxcpm"
+        self.voxcpm_output_root.mkdir(parents=True, exist_ok=True)
 
         dubbing_cli_api._tasks.clear()
         dubbing_cli_api.legacy_runtime.tasks.clear()
         omnivoice_dub_api._task_store.clear()
+        voxcpm_dub_api._task_store.clear()
         FakeThread.instances = []
 
         self.patchers = [
@@ -68,6 +80,7 @@ class DubbingCliApiTests(unittest.TestCase):
             patch.object(dubbing_cli_api, "TOOL_PATH", self.tool_path),
             patch.object(dubbing_cli_api.legacy_runtime, "UPLOAD_DIR", str(self.upload_root)),
             patch.object(omnivoice_dub_api, "OUTPUT_ROOT", self.omnivoice_output_root),
+            patch.object(voxcpm_dub_api, "OUTPUT_ROOT", self.voxcpm_output_root),
         ]
         for patcher in self.patchers:
             patcher.start()
@@ -75,6 +88,7 @@ class DubbingCliApiTests(unittest.TestCase):
         self.addCleanup(dubbing_cli_api._tasks.clear)
         self.addCleanup(dubbing_cli_api.legacy_runtime.tasks.clear)
         self.addCleanup(omnivoice_dub_api._task_store.clear)
+        self.addCleanup(voxcpm_dub_api._task_store.clear)
         self.addCleanup(lambda: shutil.rmtree(self.tmpdir, ignore_errors=True))
 
     def _patch_start_runtime(self):
@@ -254,6 +268,2763 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(len(output_rows), 2)
         self.assertEqual(output_rows[0]["text"], "[Speaker 1] 你好")
         self.assertEqual(output_rows[1]["text"], "[Speaker 2] 世界")
+
+    def test_voxcpm_backend_status_proxies_health_payload(self):
+        """6 号面板后端状态接口应把 VoxCPM health 转成 ready 标识。"""
+
+        with patch.object(voxcpm_dub_api, "_ensure_voxcpm_backend_ready", return_value={"status": "ok", "device": "mps"}):
+            response = self.client.get("/voxcpm/auto/backend-status")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["ready"])
+        self.assertEqual(payload["device"], "mps")
+
+    def test_reset_voxcpm_output_for_fresh_run_preserves_uploaded_refs(self):
+        """新任务清场时应删除旧 segment/final，但保留用户上传参考音。"""
+
+        out_root = self.voxcpm_output_root / "voxcpm_reset_case"
+        (out_root / "segments" / "segment_0001").mkdir(parents=True, exist_ok=True)
+        (out_root / "segments" / "segment_0001" / "manifest.json").write_text("{}", encoding="utf-8")
+        (out_root / "final").mkdir(parents=True, exist_ok=True)
+        (out_root / "final" / "dubbed_final_full.srt").write_text("old", encoding="utf-8")
+        (out_root / "uploaded_speaker_refs").mkdir(parents=True, exist_ok=True)
+        (out_root / "uploaded_speaker_refs" / "speaker.wav").write_text("ref", encoding="utf-8")
+        (out_root / "selected_subtitles.srt").write_text("old srt", encoding="utf-8")
+
+        voxcpm_dub_api._reset_voxcpm_output_for_fresh_run(out_root=out_root)
+
+        self.assertFalse((out_root / "segments").exists())
+        self.assertFalse((out_root / "final").exists())
+        self.assertFalse((out_root / "selected_subtitles.srt").exists())
+        self.assertTrue((out_root / "uploaded_speaker_refs").exists())
+        self.assertTrue((out_root / "uploaded_speaker_refs" / "speaker.wav").exists())
+
+    def test_prune_voxcpm_resume_segments_removes_stale_dirs(self):
+        """resume 前应删掉不可复用 segment，只保留当前字幕仍匹配的完成段。"""
+
+        segment_root = self.voxcpm_output_root / "voxcpm_prune_case" / "segments"
+        for index in [1, 2, 3]:
+            seg_dir = segment_root / f"segment_{index:04d}"
+            seg_dir.mkdir(parents=True, exist_ok=True)
+            (seg_dir / "manifest.json").write_text("{}", encoding="utf-8")
+
+        voxcpm_dub_api._prune_voxcpm_resume_segments(
+            segment_root=segment_root,
+            completed_indices={1, 3},
+        )
+
+        self.assertTrue((segment_root / "segment_0001").exists())
+        self.assertFalse((segment_root / "segment_0002").exists())
+        self.assertTrue((segment_root / "segment_0003").exists())
+
+    def test_normalize_voxcpm_internal_rows_strips_markdown_emphasis_and_drops_empty_marker_rows(self):
+        """6 号面板内部字幕归一化应剥离 Markdown 样式标记，并丢掉纯标记空行。"""
+
+        rows = [
+            {"start": 0.0, "end": 1.0, "text": "」呢系一個**循環**嘅敘事。", "speaker_id": "Speaker 1"},
+            {"start": 1.0, "end": 2.0, "text": "**世界唔系線性，世界系周期嘅。", "speaker_id": "Speaker 1"},
+            {"start": 2.0, "end": 2.5, "text": "**", "speaker_id": "Speaker 1"},
+        ]
+
+        normalized = voxcpm_dub_api._normalize_voxcpm_internal_rows(rows)
+
+        self.assertEqual(
+            [str(item.get("text") or "") for item in normalized],
+            ["」呢系一個循環嘅敘事。", "世界唔系線性，世界系周期嘅。"],
+        )
+
+    def test_voxcpm_http_json_bypasses_proxy_for_local_backend(self):
+        """6 号面板访问本机 VoxCPM 服务时，必须绕过系统代理。"""
+
+        class _FakeResponse:
+            """最小本地响应对象。"""
+
+            def __init__(self, body: bytes):
+                self.body = body
+
+            def read(self):
+                return self.body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        opener_mock = MagicMock()
+        opener_mock.open.return_value = _FakeResponse(b'{"status":"ok","device":"mps"}')
+
+        with (
+            patch.object(voxcpm_dub_api.urllib.request, "build_opener", return_value=opener_mock) as build_opener_mock,
+            patch.object(voxcpm_dub_api.urllib.request, "urlopen") as urlopen_mock,
+        ):
+            payload = voxcpm_dub_api._http_json(
+                method="GET",
+                url="http://127.0.0.1:7860/api/health",
+                timeout_sec=1.0,
+            )
+
+        self.assertEqual(payload["status"], "ok")
+        build_opener_mock.assert_called_once()
+        opener_mock.open.assert_called_once()
+        urlopen_mock.assert_not_called()
+
+    def test_omnivoice_health_checks_bypass_proxy_for_local_backend(self):
+        """5 号面板访问本机 OmniVoice 服务时，health/model status 检查必须绕过系统代理。"""
+
+        class _FakeResponse:
+            """最小本地响应对象。"""
+
+            def __init__(self, body: bytes, status: int = 200):
+                self.body = body
+                self.status = status
+
+            def read(self):
+                return self.body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        opener_mock = MagicMock()
+        opener_mock.open.side_effect = [
+            _FakeResponse(b"", status=200),
+            _FakeResponse(b'{"status":"ready","loading":false}'),
+        ]
+
+        with (
+            patch.object(omnivoice_dub_api.urllib.request, "build_opener", return_value=opener_mock) as build_opener_mock,
+            patch.object(omnivoice_dub_api.urllib.request, "urlopen") as urlopen_mock,
+        ):
+            omnivoice_dub_api._check_omnivoice_health("http://127.0.0.1:3900")
+            payload = omnivoice_dub_api._fetch_omnivoice_model_status("http://127.0.0.1:3900")
+
+        self.assertEqual(payload["status"], "ready")
+        self.assertEqual(build_opener_mock.call_count, 2)
+        self.assertEqual(opener_mock.open.call_count, 2)
+        urlopen_mock.assert_not_called()
+
+    def test_omnivoice_generate_bypasses_proxy_for_local_backend(self):
+        """5 号面板访问本机 OmniVoice /generate 时，正式请求也必须绕过系统代理。"""
+
+        class _FakeResponse:
+            """最小 requests 响应对象。"""
+
+            def __init__(self, content: bytes):
+                self.status_code = 200
+                self.content = content
+                self.text = ""
+
+        class _FakeSession:
+            """记录 trust_env/proxies 和 post 调用的最小 session。"""
+
+            def __init__(self):
+                self.trust_env = True
+                self.proxies = {"http": "http://127.0.0.1:1082"}
+                self.post_calls = []
+
+            def post(self, url, **kwargs):
+                self.post_calls.append((url, kwargs))
+                return _FakeResponse(b"fake-wav")
+
+            def close(self):
+                return None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        ref_audio = self.tmpdir / "ref.wav"
+        ref_audio.write_bytes(b"RIFFfake")
+        fake_session = _FakeSession()
+
+        with patch("requests.Session", return_value=fake_session) as session_ctor:
+            payload = omnivoice_dub_api._call_remote_generate(
+                api_url="http://127.0.0.1:3900",
+                text="你好",
+                language="zh",
+                ref_audio_path=ref_audio,
+                ref_text="你好，这是我的声音音色，很高兴为你提供配音服务。",
+                instruct="",
+                duration=2.0,
+            )
+
+        self.assertEqual(payload, b"fake-wav")
+        session_ctor.assert_called_once()
+        self.assertFalse(fake_session.trust_env)
+        self.assertEqual(fake_session.proxies, {})
+        self.assertEqual(len(fake_session.post_calls), 1)
+        self.assertEqual(fake_session.post_calls[0][0], "http://127.0.0.1:3900/generate")
+
+    def test_ensure_voxcpm_backend_ready_auto_starts_local_service(self):
+        """6 号面板指向本机 7860 时，应先尝试自动拉起 VoxCPM 服务。"""
+
+        with (
+            patch.object(voxcpm_dub_api, "_start_local_voxcpm_backend", return_value={"started": True, "pid": 123}),
+            patch.object(voxcpm_dub_api, "_check_voxcpm_backend", return_value={"status": "ok", "device": "mps"}) as check_mock,
+        ):
+            payload = voxcpm_dub_api._ensure_voxcpm_backend_ready("http://127.0.0.1:7860")
+
+        self.assertEqual(payload["status"], "ok")
+        check_mock.assert_called_once_with("http://127.0.0.1:7860")
+
+    def test_voxcpm_translation_uses_shared_system_prompt_contract(self):
+        """6 号面板翻译 system prompt 应与 5 号面板保持一致。"""
+
+        prompt = translator_module.build_translation_system_prompt("保留技术术语英文原文。")
+
+        self.assertIn("用户附加要求", prompt)
+        self.assertIn("保留技术术语英文原文。", prompt)
+
+    def test_convert_chinese_script_rows_supports_cantonese_traditional_and_simplified(self):
+        """6 号面板粤语脚本转换应默认繁体，切到简体才转换。"""
+
+        rows = [{"start": 0.0, "end": 1.0, "text": "你好，呢個系我嘅聲音音色，很高興為你提供配音服務。", "speaker_id": "Speaker 1"}]
+        traditional_rows = voxcpm_dub_api._apply_voxcpm_final_script_variant(rows, "traditional", target_lang="Cantonese")
+        simplified_rows = voxcpm_dub_api._apply_voxcpm_final_script_variant(rows, "simplified", target_lang="Cantonese")
+        chinese_rows = voxcpm_dub_api._apply_voxcpm_final_script_variant(rows, "simplified", target_lang="Chinese")
+        self.assertEqual(traditional_rows[0]["text"], rows[0]["text"])
+        self.assertIn("呢个", simplified_rows[0]["text"])
+        self.assertIn("声音", simplified_rows[0]["text"])
+        self.assertEqual(chinese_rows[0]["text"], rows[0]["text"])
+
+    def test_voxcpm_soft_align_segment_keeps_natural_duration_without_fit(self):
+        """6 号面板应保留自然时长，不再强制 fit 到原字幕窗。"""
+
+        raw_path = self.tmpdir / "voxcpm_raw.wav"
+        out_path = self.tmpdir / "voxcpm_fit.wav"
+        sf.write(raw_path, np.zeros(32000, dtype=np.float32), 16000)
+
+        with patch.object(voxcpm_dub_api, "audio_duration", side_effect=[2.0, 2.0]):
+            meta = voxcpm_dub_api._soft_align_segment(
+                input_path=raw_path,
+                output_path=out_path,
+                target_duration_sec=1.25,
+            )
+
+        self.assertEqual(meta["mode"], "natural_passthrough")
+        self.assertEqual(meta["aligned_duration_sec"], 2.0)
+        self.assertEqual(meta["target_duration_sec"], 1.25)
+        self.assertTrue(out_path.exists())
+
+    def test_voxcpm_soft_align_segment_trims_leading_silence_without_fit(self):
+        """6 号面板逐句整理时应先保守裁掉句首前导静音，但不再强制 fit。"""
+
+        raw_path = self.tmpdir / "voxcpm_raw_trim.wav"
+        out_path = self.tmpdir / "voxcpm_trim_fit.wav"
+        trimmed_probe = self.tmpdir / "voxcpm_raw_trim_trim.wav"
+        sf.write(raw_path, np.zeros(32000, dtype=np.float32), 16000)
+        trimmed_probe.write_bytes(b"trimmed")
+
+        with (
+            patch.object(voxcpm_dub_api, "audio_duration", side_effect=[2.0, 1.5, 1.0]),
+            patch.object(voxcpm_dub_api, "trim_silence_edges", return_value=(2.0, 1.5)),
+        ):
+            meta = voxcpm_dub_api._soft_align_segment(
+                input_path=raw_path,
+                output_path=out_path,
+                target_duration_sec=1.0,
+            )
+
+        self.assertTrue(meta["trimmed_input"])
+        self.assertEqual(meta["mode"], "natural_trimmed")
+        self.assertEqual(meta["trimmed_raw_duration_sec"], 2.0)
+        self.assertEqual(meta["trimmed_output_duration_sec"], 1.5)
+
+    def test_list_voxcpm_batches_reads_manifest(self):
+        """6 号面板结果列表应从 voxcpm_* manifest 读取。"""
+
+        out_root = self.voxcpm_output_root / "voxcpm_20260518_000001"
+        out_root.mkdir(parents=True, exist_ok=True)
+        (out_root / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "batch_id": "20260518_000001",
+                    "task_id": "20260518_000001",
+                    "project_filename": "demo.mp4",
+                    "status": "completed",
+                    "created_at": "2026-05-18T00:00:00Z",
+                    "target_lang": "Cantonese",
+                    "subtitle_mode": "translated",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        response = self.client.get("/voxcpm/auto/batches")
+        self.assertEqual(response.status_code, 200)
+        items = response.json()["items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["batch_id"], "20260518_000001")
+        self.assertEqual(items[0]["target_lang"], "Cantonese")
+
+    def test_load_voxcpm_batch_restores_task_view(self):
+        """6 号面板加载批次应恢复结果视图和产物列表。"""
+
+        out_root = self.voxcpm_output_root / "voxcpm_20260518_000002"
+        out_root.mkdir(parents=True, exist_ok=True)
+        final_dir = out_root / "final"
+        final_dir.mkdir(parents=True, exist_ok=True)
+        final_srt = final_dir / "dubbed_final_full.srt"
+        final_mix = final_dir / "dubbed_mix_full.wav"
+        final_video = final_dir / "dubbed_video_full.mp4"
+        final_srt.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n", encoding="utf-8")
+        sf.write(final_mix, np.zeros(16000, dtype=np.float32), 16000)
+        final_video.write_text("video", encoding="utf-8")
+        manifest_path = out_root / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "batch_id": "20260518_000002",
+                    "task_id": "20260518_000002",
+                    "project_filename": "demo.mp4",
+                    "input_media_path": str((self.upload_root / "demo.mp4").resolve()),
+                    "status": "completed",
+                    "stage": "completed",
+                    "progress": 100.0,
+                    "subtitle_mode": "translated",
+                    "selected_subtitle_mode": "translated",
+                    "source_lang": "English",
+                    "target_lang": "Chinese",
+                    "voxcpm_api_url": "http://127.0.0.1:7860",
+                    "subtitle_video_preset": "1080x1920",
+                    "source_subtitles_count": 0,
+                    "translated_subtitles_count": 1,
+                    "processed_segments": 1,
+                    "segment_count": 1,
+                    "generated_subtitle_video_presets": ["1080x1920"],
+                    "subtitle_video_variants": [
+                        {
+                            "preset": "1080x1920",
+                            "ass_artifact_key": "ass_1080x1920",
+                            "video_artifact_key": "video_1080x1920",
+                            "ass_url": "/voxcpm/auto/artifact/20260518_000002/ass_1080x1920",
+                            "video_url": "/voxcpm/auto/artifact/20260518_000002/video_1080x1920",
+                            "ass_path": str((final_dir / "dubbed_final_full-styled-1080x1920.ass").resolve()),
+                            "video_path": str(final_video.resolve()),
+                        }
+                    ],
+                    "preferred_video_artifact_key": "video_1080x1920",
+                    "artifacts": [
+                        {"key": "srt", "label": "Dubbed Final SRT", "url": "/voxcpm/auto/artifact/20260518_000002/srt"},
+                        {"key": "mix", "label": "Dubbed Mix WAV", "url": "/voxcpm/auto/artifact/20260518_000002/mix"},
+                        {"key": "video", "label": "Dubbed Video MP4", "url": "/voxcpm/auto/artifact/20260518_000002/video"},
+                    ],
+                    "paths": {
+                        "dubbed_final_srt": str(final_srt.resolve()),
+                        "dubbed_mix": str(final_mix.resolve()),
+                        "dubbed_video_full": str(final_video.resolve()),
+                        "manifest": str(manifest_path.resolve()),
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        response = self.client.post("/voxcpm/auto/load-batch", data={"batch_id": "20260518_000002"})
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(payload["selected_subtitle_mode"], "translated")
+        self.assertEqual(payload["result_video"], str(final_video.resolve()))
+        self.assertEqual(payload["subtitle_video_preset"], "1080x1920")
+        self.assertEqual(len(payload["artifacts"]), 3)
+        self.assertEqual(payload["generated_subtitle_video_presets"], ["1080x1920"])
+        self.assertEqual(payload["preferred_video_artifact_key"], "video_1080x1920")
+        self.assertEqual(payload["subtitle_video_variants"][0]["preset"], "1080x1920")
+
+    def test_render_voxcpm_video_variant_generates_new_preset_without_rerunning_tts(self):
+        """6 号面板已完成批次应可单独补生成其他视频规格，不重跑配音。"""
+
+        out_root = self.voxcpm_output_root / "voxcpm_20260519_000001"
+        out_root.mkdir(parents=True, exist_ok=True)
+        final_dir = out_root / "final"
+        final_dir.mkdir(parents=True, exist_ok=True)
+        final_srt = final_dir / "dubbed_final_full.srt"
+        final_srt.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好，世界。\n", encoding="utf-8")
+        final_mix = final_dir / "dubbed_mix_full.wav"
+        sf.write(final_mix, np.zeros(16000, dtype=np.float32), 16000)
+        final_ass = final_dir / "dubbed_final_full-styled.ass"
+        final_ass.write_text("ass", encoding="utf-8")
+        final_video = final_dir / "dubbed_video_full.mp4"
+        final_video.write_text("video", encoding="utf-8")
+        manifest_path = out_root / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "batch_id": "20260519_000001",
+                    "task_id": "20260519_000001",
+                    "project_filename": "demo.mp4",
+                    "input_media_path": "",
+                    "status": "completed",
+                    "stage": "completed",
+                    "progress": 100.0,
+                    "subtitle_mode": "translated",
+                    "selected_subtitle_mode": "translated",
+                    "source_lang": "English",
+                    "target_lang": "Chinese",
+                    "voxcpm_api_url": "http://127.0.0.1:7860",
+                    "subtitle_video_preset": "1920x1080",
+                    "source_subtitles_count": 0,
+                    "translated_subtitles_count": 1,
+                    "processed_segments": 1,
+                    "segment_count": 1,
+                    "cfg_value": 2.0,
+                    "inference_timesteps": 10,
+                    "generated_subtitle_video_presets": ["1920x1080"],
+                    "subtitle_video_variants": [
+                        {
+                            "preset": "1920x1080",
+                            "ass_artifact_key": "ass_1920x1080",
+                            "video_artifact_key": "video_1920x1080",
+                            "ass_url": "/voxcpm/auto/artifact/20260519_000001/ass_1920x1080",
+                            "video_url": "/voxcpm/auto/artifact/20260519_000001/video_1920x1080",
+                            "ass_path": str(final_ass.resolve()),
+                            "video_path": str(final_video.resolve()),
+                        }
+                    ],
+                    "preferred_video_artifact_key": "video_1920x1080",
+                    "artifacts": [
+                        {"key": "video", "label": "Dubbed Video MP4 (1920x1080)", "url": "/voxcpm/auto/artifact/20260519_000001/video"},
+                        {"key": "mix", "label": "Dubbed Mix WAV", "url": "/voxcpm/auto/artifact/20260519_000001/mix"},
+                        {"key": "ass", "label": "Dubbed Final ASS", "url": "/voxcpm/auto/artifact/20260519_000001/ass"},
+                    ],
+                    "paths": {
+                        "dubbed_final_srt": str(final_srt.resolve()),
+                        "dubbed_mix": str(final_mix.resolve()),
+                        "dubbed_final_ass": str(final_ass.resolve()),
+                        "dubbed_video_full": str(final_video.resolve()),
+                        "subtitle_video_variants": {
+                            "1920x1080": {
+                                "ass": str(final_ass.resolve()),
+                                "video": str(final_video.resolve()),
+                            }
+                        },
+                        "manifest": str(manifest_path.resolve()),
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(
+            voxcpm_dub_api,
+            "build_black_video_with_ass_subtitles",
+            side_effect=lambda **kwargs: Path(kwargs["output_video_path"]).write_text("video-variant", encoding="utf-8") or kwargs["output_video_path"],
+        ) as render_mock:
+            response = self.client.post(
+                "/voxcpm/auto/render-video-variant",
+                data={"batch_id": "20260519_000001", "subtitle_video_preset": "1080x1920"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(render_mock.call_count, 1)
+        self.assertIn("1080x1920", payload["generated_subtitle_video_presets"])
+        self.assertEqual(payload["preferred_video_artifact_key"], "video_1080x1920")
+        variant_presets = {item["preset"] for item in payload["subtitle_video_variants"]}
+        self.assertEqual(variant_presets, {"1920x1080", "1080x1920"})
+        self.assertTrue((final_dir / "dubbed_video_full-1080x1920.mp4").exists())
+        self.assertTrue((final_dir / "dubbed_final_full-styled-1080x1920.ass").exists())
+
+    def test_render_voxcpm_video_variant_skips_existing_preset(self):
+        """已生成过的规格再次请求时，应直接返回，不重复渲染。"""
+
+        out_root = self.voxcpm_output_root / "voxcpm_20260519_000002"
+        out_root.mkdir(parents=True, exist_ok=True)
+        final_dir = out_root / "final"
+        final_dir.mkdir(parents=True, exist_ok=True)
+        final_srt = final_dir / "dubbed_final_full.srt"
+        final_srt.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n", encoding="utf-8")
+        final_mix = final_dir / "dubbed_mix_full.wav"
+        sf.write(final_mix, np.zeros(16000, dtype=np.float32), 16000)
+        final_ass = final_dir / "dubbed_final_full-styled.ass"
+        final_ass.write_text("ass", encoding="utf-8")
+        final_video = final_dir / "dubbed_video_full.mp4"
+        final_video.write_text("video", encoding="utf-8")
+        manifest_path = out_root / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "batch_id": "20260519_000002",
+                    "task_id": "20260519_000002",
+                    "project_filename": "demo.mp4",
+                    "input_media_path": "",
+                    "status": "completed",
+                    "stage": "completed",
+                    "progress": 100.0,
+                    "subtitle_mode": "translated",
+                    "source_lang": "English",
+                    "target_lang": "Chinese",
+                    "subtitle_video_preset": "1920x1080",
+                    "generated_subtitle_video_presets": ["1920x1080"],
+                    "subtitle_video_variants": [
+                        {
+                            "preset": "1920x1080",
+                            "ass_artifact_key": "ass_1920x1080",
+                            "video_artifact_key": "video_1920x1080",
+                            "ass_url": "/voxcpm/auto/artifact/20260519_000002/ass_1920x1080",
+                            "video_url": "/voxcpm/auto/artifact/20260519_000002/video_1920x1080",
+                            "ass_path": str(final_ass.resolve()),
+                            "video_path": str(final_video.resolve()),
+                        }
+                    ],
+                    "preferred_video_artifact_key": "video_1920x1080",
+                    "artifacts": [],
+                    "paths": {
+                        "dubbed_final_srt": str(final_srt.resolve()),
+                        "dubbed_mix": str(final_mix.resolve()),
+                        "dubbed_final_ass": str(final_ass.resolve()),
+                        "dubbed_video_full": str(final_video.resolve()),
+                        "subtitle_video_variants": {
+                            "1920x1080": {
+                                "ass": str(final_ass.resolve()),
+                                "video": str(final_video.resolve()),
+                            }
+                        },
+                        "manifest": str(manifest_path.resolve()),
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(voxcpm_dub_api, "build_black_video_with_ass_subtitles") as render_mock:
+            response = self.client.post(
+                "/voxcpm/auto/render-video-variant",
+                data={"batch_id": "20260519_000002", "subtitle_video_preset": "1920x1080"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(render_mock.call_count, 0)
+        payload = response.json()
+        self.assertEqual(payload["generated_subtitle_video_presets"], ["1920x1080"])
+
+    def test_start_voxcpm_from_project_allows_subtitle_only_mode(self):
+        """6 号面板应允许仅凭字幕启动，不再强制要求视频或单参考音。"""
+
+        with (
+            patch.object(voxcpm_dub_api.threading, "Thread", FakeThread),
+            patch.object(voxcpm_dub_api, "_resolve_project_media_path", side_effect=HTTPException(status_code=404, detail="Current project media not found")),
+        ):
+            response = self.client.post(
+                "/voxcpm/auto/start-from-project",
+                data={
+                    "filename": "",
+                    "original_filename": "",
+                    "task_id": "task_1",
+                    "source_subtitles_json": json.dumps([{"start": 0.0, "end": 1.0, "text": "Hello"}], ensure_ascii=False),
+                    "translated_subtitles_json": json.dumps([], ensure_ascii=False),
+                    "subtitle_mode": "source",
+                    "source_lang": "English",
+                    "target_lang": "Chinese",
+                    "api_key": "secret",
+                    "ref_text": "你好，这是我的声音。",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        task = voxcpm_dub_api._task_store.get(payload["task_id"])
+        self.assertIsNotNone(task)
+        self.assertEqual(task["input_media_path"], "")
+        self.assertEqual(task["speaker_reference_mode"], "preset_only")
+        self.assertTrue(FakeThread.instances)
+        self.assertTrue(FakeThread.instances[-1].started)
+
+    def test_start_voxcpm_from_project_allows_zero_uploaded_speaker_refs(self):
+        """6 号面板未上传任何 speaker 参考音时，也应允许直接走 preset_only。"""
+
+        with (
+            patch.object(voxcpm_dub_api.threading, "Thread", FakeThread),
+            patch.object(voxcpm_dub_api, "_resolve_project_media_path", side_effect=HTTPException(status_code=404, detail="Current project media not found")),
+        ):
+            response = self.client.post(
+                "/voxcpm/auto/start-from-project",
+                data={
+                    "filename": "",
+                    "original_filename": "",
+                    "task_id": "task_no_refs",
+                    "source_subtitles_json": json.dumps(
+                        [
+                            {"start": 0.0, "end": 1.0, "text": "Hello", "speaker_id": "Speaker 1"},
+                            {"start": 1.0, "end": 2.0, "text": "World", "speaker_id": "Speaker 2"},
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    "translated_subtitles_json": json.dumps([], ensure_ascii=False),
+                    "subtitle_mode": "source",
+                    "source_lang": "English",
+                    "target_lang": "Chinese",
+                    "api_key": "secret",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        task = voxcpm_dub_api._task_store.get(payload["task_id"])
+        self.assertIsNotNone(task)
+        self.assertEqual(task["speaker_ids"], ["Speaker 1", "Speaker 2"])
+        self.assertEqual(task["speaker_reference_mode"], "preset_only")
+        self.assertTrue(FakeThread.instances)
+        self.assertEqual(FakeThread.instances[-1].kwargs["uploaded_speaker_ref_map"], {})
+
+    def test_parse_voxcpm_podcast_script_supports_multi_speaker_markdown(self):
+        """6 号面板应能解析双人播客脚本，只提取角色台词行。"""
+
+        script = (
+            "# Demo Podcast\n\n"
+            "> 素材来源：unit test\n\n"
+            "## Opening Hook\n\n"
+            "（音乐淡入：悬疑）\n\n"
+            "**Larei:**【情绪=好奇】你知道 OpenAI 最近做了一件事吗？\n\n"
+            "**Tensor:**【情绪=困惑】等等，这是真的吗？\n\n"
+            "## 制作备注\n\n"
+            "| 元素 | 建议 |\n"
+        ).encode("utf-8")
+
+        response = self.client.post(
+            "/voxcpm/auto/parse-podcast-script",
+            files=[("script_file", ("podcast.md", script, "text/markdown"))],
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["title"], "Demo Podcast")
+        self.assertEqual(payload["detected_mode"], "multi")
+        self.assertEqual(payload["speaker_ids"], ["Larei", "Tensor"])
+        self.assertEqual(len(payload["rows"]), 2)
+        self.assertEqual(payload["rows"][0]["speaker_id"], "Larei")
+        self.assertEqual(payload["rows"][0]["emotion"], "情绪=好奇")
+        self.assertIn("OpenAI", payload["rows"][0]["text"])
+        self.assertGreater(payload["rows"][0]["end"], payload["rows"][0]["start"])
+
+    def test_parse_voxcpm_podcast_script_supports_single_speaker_markdown(self):
+        """6 号面板应能解析单人播客脚本，并保持单 speaker 模式。"""
+
+        script = (
+            "# 单人播客\n\n"
+            "**Larei:**【情绪=直接】我今天想聊一个事实。\n"
+            "它其实比表面看起来更重要。\n\n"
+            "(音乐淡出)\n"
+        ).encode("utf-8")
+
+        response = self.client.post(
+            "/voxcpm/auto/parse-podcast-script",
+            files=[("script_file", ("solo.md", script, "text/markdown"))],
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["detected_mode"], "single")
+        self.assertEqual(payload["speaker_ids"], ["Larei"])
+        self.assertEqual(len(payload["rows"]), 1)
+        self.assertEqual(payload["rows"][0]["speaker_id"], "Larei")
+        self.assertIn("我今天想聊一个事实", payload["rows"][0]["text"])
+        self.assertIn("它其实比表面看起来更重要", payload["rows"][0]["text"])
+
+    def test_parse_voxcpm_podcast_script_supports_role_header_and_body_on_next_line(self):
+        """真实播客脚本常见“角色头单独一行，正文在下一行”，解析器应支持。"""
+
+        script = (
+            "# 双人播客\n\n"
+            "**Larei:**【情绪=好奇】\n\n"
+            "你知道 OpenAI 最近做了一件事吗？\n\n"
+            "**Tensor:**【情绪=困惑】\n"
+            "等等，这是真的吗？\n"
+        ).encode("utf-8")
+
+        response = self.client.post(
+            "/voxcpm/auto/parse-podcast-script",
+            files=[("script_file", ("realistic.md", script, "text/markdown"))],
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["speaker_ids"], ["Larei", "Tensor"])
+        self.assertEqual(len(payload["rows"]), 2)
+        self.assertIn("你知道 OpenAI 最近做了一件事吗", payload["rows"][0]["text"])
+        self.assertIn("等等，这是真的吗", payload["rows"][1]["text"])
+
+    def test_parse_voxcpm_podcast_script_skips_parenthesized_one_line_summary_marker(self):
+        """`(**一句话总结：**)` 这类包裹标记不应混入解析后的正文。"""
+
+        script = (
+            "# 总结播客\n\n"
+            "**Larei:**【情绪=平静】第一段正文。\n\n"
+            "(**一句话总结：**)\n\n"
+            "**Tensor:**【情绪=认真】第二段正文。\n"
+        ).encode("utf-8")
+
+        response = self.client.post(
+            "/voxcpm/auto/parse-podcast-script",
+            files=[("script_file", ("summary.md", script, "text/markdown"))],
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(len(payload["rows"]), 2)
+        joined = "\n".join(str(row["text"]) for row in payload["rows"])
+        self.assertNotIn("一句话总结", joined)
+        self.assertIn("第一段正文", joined)
+        self.assertIn("第二段正文", joined)
+
+    def test_voxcpm_collect_detected_speaker_ids_prefers_previous_row_before_speaker_1(self):
+        """6 号面板 speaker 归一化应先继承上一行，再兜底 Speaker 1。"""
+
+        rows = [
+            {"start": 0.0, "end": 1.0, "text": "第一句", "speaker_id": "Speaker 2"},
+            {"start": 1.0, "end": 2.0, "text": "第二句", "speaker_id": ""},
+            {"start": 2.0, "end": 3.0, "text": "第三句", "speaker_id": "Speaker 1"},
+        ]
+
+        speaker_ids = voxcpm_dub_api._collect_detected_speaker_ids(rows)
+
+        self.assertEqual(speaker_ids, ["Speaker 2", "Speaker 1"])
+
+    def test_start_voxcpm_from_project_accepts_parsed_podcast_rows(self):
+        """6 号面板播客脚本解析结果应可直接复用现有 start-from-project 链路。"""
+
+        with (
+            patch.object(voxcpm_dub_api.threading, "Thread", FakeThread),
+            patch.object(voxcpm_dub_api, "_resolve_project_media_path", side_effect=HTTPException(status_code=404, detail="Current project media not found")),
+        ):
+            response = self.client.post(
+                "/voxcpm/auto/start-from-project",
+                data={
+                    "filename": "",
+                    "original_filename": "podcast.md",
+                    "task_id": "task_podcast",
+                    "source_subtitles_json": json.dumps(
+                        [
+                            {"start": 0.0, "end": 1.8, "text": "第一句播客台词", "speaker_id": "Larei"},
+                            {"start": 1.98, "end": 3.4, "text": "第二句播客台词", "speaker_id": "Tensor"},
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    "translated_subtitles_json": json.dumps([], ensure_ascii=False),
+                    "subtitle_mode": "source",
+                    "source_lang": "Chinese",
+                    "target_lang": "Chinese",
+                    "api_key": "secret",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        task = voxcpm_dub_api._task_store.get(payload["task_id"])
+        self.assertIsNotNone(task)
+        self.assertEqual(task["speaker_ids"], ["Larei", "Tensor"])
+        self.assertTrue(FakeThread.instances)
+        self.assertEqual(
+            [row["speaker_id"] for row in FakeThread.instances[-1].kwargs["source_rows"]],
+            ["Larei", "Tensor"],
+        )
+
+    def test_voxcpm_translate_subtitles_if_needed_preserves_speaker_ids(self):
+        """6 号面板 source->translate 后不能丢 speaker_id，否则会把多 speaker 配音串成同一人。"""
+
+        source_rows = [
+            {"start": 0.0, "end": 1.0, "text": "Hello one", "speaker_id": "Speaker 1"},
+            {"start": 1.0, "end": 2.0, "text": "Hello two", "speaker_id": "Speaker 2"},
+        ]
+
+        class _FakeTranslator:
+            """返回稳定两行译文，便于验证 speaker_id 是否被透传。"""
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def translate_batch(self, *args, **kwargs):
+                return ["你好一", "你好二"]
+
+        with patch.object(voxcpm_dub_api, "Translator", _FakeTranslator):
+            source_selected_rows, translated_selected_rows, mode = voxcpm_dub_api._translate_subtitles_if_needed(
+                subtitle_mode="source",
+                source_rows=source_rows,
+                translated_rows=[],
+                source_lang="English",
+                target_lang="Chinese",
+                api_key="dummy-key",
+                translate_base_url="https://api.example.com",
+                translate_model="test-model",
+                translate_system_prompt="",
+            )
+
+        self.assertEqual(mode, "source")
+        self.assertEqual([row["speaker_id"] for row in source_selected_rows], ["Speaker 1", "Speaker 2"])
+        self.assertEqual([row["speaker_id"] for row in translated_selected_rows], ["Speaker 1", "Speaker 2"])
+
+    def test_voxcpm_translate_subtitles_if_needed_sanitizes_reused_translated_rows(self):
+        """6 号面板直接复用现有译文时，也应清掉模型说明性废话。"""
+
+        translated_rows = [
+            {
+                "start": 97.68,
+                "end": 109.2,
+                "text": "պայք?不对。 fight. 争斗。 But Chinese output only. Let's correct in final.",
+                "speaker_id": "Speaker 1",
+            }
+        ]
+
+        source_selected_rows, translated_selected_rows, mode = voxcpm_dub_api._translate_subtitles_if_needed(
+            subtitle_mode="translated",
+            source_rows=[],
+            translated_rows=translated_rows,
+            source_lang="auto",
+            target_lang="Chinese",
+            api_key="",
+            translate_base_url="",
+            translate_model="",
+            translate_system_prompt="",
+        )
+
+        self.assertEqual(mode, "translated")
+        self.assertEqual(len(source_selected_rows), 1)
+        self.assertEqual(len(translated_selected_rows), 1)
+        self.assertEqual(translated_selected_rows[0]["text"], "争斗")
+
+    def test_voxcpm_translate_subtitles_if_needed_retries_latin_dominant_rows_for_cantonese_target(self):
+        """6 号面板配粤语时，英文主导漏译行应做定向重试，不能直接写进 selected_subtitles.srt。"""
+
+        source_rows = [
+            {
+                "start": 0.0,
+                "end": 4.879,
+                "text": "During sex, the average man lasts two point five minutes to six minutes.",
+                "speaker_id": "Speaker 1",
+            }
+        ]
+
+        class _FakeTranslator:
+            """首次返回英文错误行，二次重试返回粤语，验证兜底是否生效。"""
+
+            def __init__(self, *args, **kwargs):
+                self.calls = 0
+
+            def translate_batch(self, *args, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return ["[Error] During sex, the average man lasts two point five minutes to six minutes."]
+                return ["做愛嗰陣，一般男人通常維持兩分半到六分鐘。"]
+
+        with patch.object(voxcpm_dub_api, "Translator", _FakeTranslator):
+            source_selected_rows, translated_selected_rows, mode = voxcpm_dub_api._translate_subtitles_if_needed(
+                subtitle_mode="source",
+                source_rows=source_rows,
+                translated_rows=[],
+                source_lang="English",
+                target_lang="Cantonese",
+                api_key="dummy-key",
+                translate_base_url="https://api.example.com",
+                translate_model="test-model",
+                translate_system_prompt="",
+            )
+
+        self.assertEqual(mode, "source")
+        self.assertEqual(len(source_selected_rows), 1)
+        self.assertEqual(len(translated_selected_rows), 1)
+        self.assertNotIn("[Error]", translated_selected_rows[0]["text"])
+        self.assertFalse(voxcpm_dub_api._is_voxcpm_latin_dominant_text(translated_selected_rows[0]["text"]))
+        self.assertIn("做愛嗰陣", translated_selected_rows[0]["text"])
+
+    def test_voxcpm_translate_subtitles_if_needed_keeps_full_cantonese_paragraph(self):
+        """6 号面板翻译长粤语整段时，不应被清洗器截成单句。"""
+
+        source_rows = [
+            {
+                "start": 0.0,
+                "end": 20.0,
+                "text": "原始中文整段",
+                "speaker_id": "Larei",
+            }
+        ]
+
+        long_translation = (
+            "我今日想讲一个可能会令好多创业者唔舒服嘅事实。"
+            "哈佛创新实验室嘅导师喺课堂上讲过一句说话，原话系：“想法到处都系，根本唔值钱。” "
+            "Ideas are everywhere. They're worthless. "
+            "你可能觉得自己有一个关于 X、Y、Z 嘅超劲想法。"
+            "但系喺佢未绑到一个具体嘅人、一个具体嘅痛点之前——佢其实咩都唔系。"
+            "而公司失败嘅头号原因，就系佢哋冇解决一个足够有价值嘅问题。"
+        )
+
+        class _FakeTranslator:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def translate_batch(self, *args, **kwargs):
+                self.kwargs = kwargs
+                return [long_translation]
+
+        with patch.object(voxcpm_dub_api, "Translator", _FakeTranslator):
+            source_selected_rows, translated_selected_rows, mode = voxcpm_dub_api._translate_subtitles_if_needed(
+                subtitle_mode="source",
+                source_rows=source_rows,
+                translated_rows=[],
+                source_lang="Chinese",
+                target_lang="Cantonese-Mainland",
+                api_key="dummy-key",
+                translate_base_url="https://api.example.com",
+                translate_model="test-model",
+                translate_system_prompt="",
+            )
+
+        self.assertEqual(mode, "source")
+        self.assertEqual(source_selected_rows[0]["text"], "原始中文整段")
+        self.assertIn("我今日想讲一个可能会令好多创业者唔舒服嘅事实。", translated_selected_rows[0]["text"])
+        self.assertIn("而公司失败嘅头号原因", translated_selected_rows[0]["text"])
+        self.assertIn("Ideas are everywhere.", translated_selected_rows[0]["text"])
+        self.assertGreater(len(translated_selected_rows[0]["text"]), 80)
+
+    def test_voxcpm_translate_subtitles_if_needed_skips_translation_for_chinese_source_to_chinese(self):
+        """6 号面板中文播客脚本配中文时，应直接复用原文，避免额外翻译计费。"""
+
+        source_rows = [
+            {"start": 0.0, "end": 1.0, "text": "你好，欢迎来到今天的节目。", "speaker_id": "Larei"},
+            {"start": 1.0, "end": 2.0, "text": "我们今天聊一下 AI。", "speaker_id": "Tensor"},
+        ]
+
+        class _FailTranslator:
+            """如果这条测试还走进翻译器，就直接失败。"""
+
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("中文到中文不应调用翻译 API")
+
+        with patch.object(voxcpm_dub_api, "Translator", _FailTranslator):
+            source_selected_rows, translated_selected_rows, mode = voxcpm_dub_api._translate_subtitles_if_needed(
+                subtitle_mode="source",
+                source_rows=source_rows,
+                translated_rows=[],
+                source_lang="Chinese",
+                target_lang="Chinese",
+                api_key="",
+                translate_base_url="",
+                translate_model="",
+                translate_system_prompt="",
+            )
+
+        self.assertEqual(mode, "source")
+        self.assertEqual([row["text"] for row in source_selected_rows], [row["text"] for row in source_rows])
+        self.assertEqual([row["speaker_id"] for row in source_selected_rows], ["Larei", "Tensor"])
+        self.assertEqual(translated_selected_rows, [])
+
+    def test_voxcpm_translate_subtitles_if_needed_skips_translation_for_cantonese_source_to_cantonese(self):
+        """6 号面板 source 已是粤语、target 也是粤语时，应直接复用原文，避免额外翻译计费。"""
+
+        source_rows = [
+            {"start": 0.0, "end": 1.0, "text": "你好，呢個係第一句。", "speaker_id": "Speaker 1"},
+            {"start": 1.0, "end": 2.0, "text": "我哋而家開始。", "speaker_id": "Speaker 2"},
+        ]
+
+        class _FailTranslator:
+            """如果这条测试还走进翻译器，就直接失败。"""
+
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("粤语到粤语不应调用翻译 API")
+
+        with patch.object(voxcpm_dub_api, "Translator", _FailTranslator):
+            source_selected_rows, translated_selected_rows, mode = voxcpm_dub_api._translate_subtitles_if_needed(
+                subtitle_mode="source",
+                source_rows=source_rows,
+                translated_rows=[],
+                source_lang="粤语",
+                target_lang="Cantonese",
+                api_key="",
+                translate_base_url="",
+                translate_model="",
+                translate_system_prompt="",
+            )
+
+        self.assertEqual(mode, "source")
+        self.assertEqual([row["text"] for row in source_selected_rows], [row["text"] for row in source_rows])
+        self.assertEqual([row["speaker_id"] for row in source_selected_rows], ["Speaker 1", "Speaker 2"])
+        self.assertEqual(translated_selected_rows, [])
+
+    def test_start_voxcpm_from_project_strips_speaker_prefix_before_passthrough(self):
+        """6 号面板 source 直通时，也必须先剥掉正文里的 Speaker 前缀，不能把标签直接喂给 TTS。"""
+
+        media_path = self.upload_root / "demo.mp4"
+        media_path.write_bytes(b"video-data")
+
+        with patch.object(voxcpm_dub_api.threading, "Thread", FakeThread):
+            response = self.client.post(
+                "/voxcpm/auto/start-from-project",
+                data={
+                    "filename": "demo.mp4",
+                    "original_filename": "demo.mp4",
+                    "task_id": "voxcpm-project-task",
+                    "source_subtitles_json": json.dumps(
+                        [{"start": 0.0, "end": 1.2, "text": "Speaker 1: 喺做爱嗰阵，一般男人可以顶二分半到六分钟"}],
+                        ensure_ascii=False,
+                    ),
+                    "translated_subtitles_json": "[]",
+                    "subtitle_mode": "source",
+                    "source_lang": "Cantonese",
+                    "target_lang": "Cantonese",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(FakeThread.instances)
+        source_rows = FakeThread.instances[-1].kwargs["source_rows"]
+        self.assertEqual(source_rows[0]["speaker_id"], "Speaker 1")
+        self.assertEqual(source_rows[0]["text"], "喺做爱嗰阵，一般男人可以顶二分半到六分钟")
+
+    def test_start_voxcpm_from_project_strips_fullwidth_speaker_prefix_before_passthrough(self):
+        """全角冒号的 Speaker 前缀也必须在 6 号面板直通前被剥掉。"""
+
+        media_path = self.upload_root / "demo.mp4"
+        media_path.write_bytes(b"video-data")
+
+        with patch.object(voxcpm_dub_api.threading, "Thread", FakeThread):
+            response = self.client.post(
+                "/voxcpm/auto/start-from-project",
+                data={
+                    "filename": "demo.mp4",
+                    "original_filename": "demo.mp4",
+                    "task_id": "voxcpm-project-task-fullwidth",
+                    "source_subtitles_json": json.dumps(
+                        [{"start": 0.0, "end": 1.2, "text": "Speaker 1：喺做爱嗰阵，一般男人可以顶二分半到六分钟"}],
+                        ensure_ascii=False,
+                    ),
+                    "translated_subtitles_json": "[]",
+                    "subtitle_mode": "source",
+                    "source_lang": "Cantonese",
+                    "target_lang": "Cantonese",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(FakeThread.instances)
+        source_rows = FakeThread.instances[-1].kwargs["source_rows"]
+        self.assertEqual(source_rows[0]["speaker_id"], "Speaker 1")
+        self.assertEqual(source_rows[0]["text"], "喺做爱嗰阵，一般男人可以顶二分半到六分钟")
+
+    def test_start_voxcpm_from_project_persists_custom_translate_provider(self):
+        """6 号面板手填的翻译 base_url/model 不能在任务 payload 里回退成默认值。"""
+
+        media_path = self.upload_root / "demo.mp4"
+        media_path.write_bytes(b"video-data")
+
+        with patch.object(voxcpm_dub_api.threading, "Thread", FakeThread):
+            response = self.client.post(
+                "/voxcpm/auto/start-from-project",
+                data={
+                    "filename": "demo.mp4",
+                    "original_filename": "demo.mp4",
+                    "task_id": "voxcpm-project-task-provider",
+                    "source_subtitles_json": json.dumps(
+                        [{"start": 0.0, "end": 1.2, "text": "hello project", "speaker_id": "Speaker 1"}],
+                        ensure_ascii=False,
+                    ),
+                    "translated_subtitles_json": "[]",
+                    "subtitle_mode": "source",
+                    "source_lang": "English",
+                    "target_lang": "Chinese",
+                    "translate_base_url": "https://example.com/v1",
+                    "translate_model": "gpt-5.4-mini",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        task = voxcpm_dub_api._task_store.get(payload["task_id"])
+        self.assertIsNotNone(task)
+        self.assertEqual(task["translate_base_url"], "https://example.com/v1")
+        self.assertEqual(task["translate_model"], "gpt-5.4-mini")
+        self.assertTrue(FakeThread.instances)
+        thread_kwargs = FakeThread.instances[-1].kwargs
+        self.assertEqual(thread_kwargs["translate_base_url"], "https://example.com/v1")
+        self.assertEqual(thread_kwargs["translate_model"], "gpt-5.4-mini")
+
+    def test_voxcpm_translate_subtitles_if_needed_skips_translation_for_english_source_to_english(self):
+        """6 号面板明确 English -> English 时，也应直接复用原文。"""
+
+        source_rows = [
+            {"start": 0.0, "end": 1.0, "text": "Hello and welcome.", "speaker_id": "Speaker 1"},
+            {"start": 1.0, "end": 2.0, "text": "We start now.", "speaker_id": "Speaker 2"},
+        ]
+
+        class _FailTranslator:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("English 到 English 不应调用翻译 API")
+
+        with patch.object(voxcpm_dub_api, "Translator", _FailTranslator):
+            rows, mode = voxcpm_dub_api._translate_subtitles_if_needed(
+                subtitle_mode="source",
+                source_rows=source_rows,
+                translated_rows=[],
+                source_lang="English",
+                target_lang="English",
+                api_key="",
+                translate_base_url="",
+                translate_model="",
+                translate_system_prompt="",
+            )
+
+        self.assertEqual(mode, "source")
+        self.assertEqual([row["text"] for row in rows], [row["text"] for row in source_rows])
+        self.assertEqual([row["speaker_id"] for row in rows], ["Speaker 1", "Speaker 2"])
+
+    def test_voxcpm_http_json_retries_incomplete_read(self):
+        """VoxCPM HTTP 响应被截断时，应自动重试一次，而不是整批任务直接失败。"""
+
+        class _FakeResponse:
+            """最小 urlopen 响应对象。"""
+
+            def __init__(self, body: bytes):
+                self.body = body
+
+            def read(self):
+                return self.body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        attempts = {"count": 0}
+
+        def fake_urlopen(*args, **kwargs):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise IncompleteRead(b'{"audio_base64":"abc"', 10)
+            return _FakeResponse(b'{"audio_base64":"ok"}')
+
+        with patch.object(voxcpm_dub_api.urllib.request, "urlopen", side_effect=fake_urlopen):
+            payload = voxcpm_dub_api._http_json(
+                method="POST",
+                url="http://127.0.0.1:7860/api/tts",
+                payload={"text": "hello"},
+                timeout_sec=1.0,
+            )
+
+        self.assertEqual(attempts["count"], 2)
+        self.assertEqual(payload["audio_base64"], "ok")
+
+    def test_start_voxcpm_from_project_accepts_partial_speaker_refs(self):
+        """6 号面板应允许只上传部分 speaker 参考音，其余 speaker 交给运行时补位。"""
+
+        ref_wav = io.BytesIO()
+        sf.write(ref_wav, np.zeros(8000, dtype=np.float32), 16000, format="WAV")
+
+        with (
+            patch.object(voxcpm_dub_api.threading, "Thread", FakeThread),
+            patch.object(voxcpm_dub_api, "_resolve_project_media_path", side_effect=HTTPException(status_code=404, detail="Current project media not found")),
+        ):
+            response = self.client.post(
+                "/voxcpm/auto/start-from-project",
+                files=[
+                    ("speaker_ref_files", ("speaker1.wav", ref_wav.getvalue(), "audio/wav")),
+                ],
+                data={
+                    "filename": "",
+                    "original_filename": "",
+                    "task_id": "task_partial",
+                    "source_subtitles_json": json.dumps(
+                        [
+                            {"start": 0.0, "end": 1.0, "text": "Hello", "speaker_id": "Speaker 1"},
+                            {"start": 1.0, "end": 2.0, "text": "World", "speaker_id": "Speaker 2"},
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    "translated_subtitles_json": json.dumps([], ensure_ascii=False),
+                    "subtitle_mode": "source",
+                    "source_lang": "English",
+                    "target_lang": "Chinese",
+                    "api_key": "secret",
+                    "speaker_ref_speaker_ids_json": json.dumps(["Speaker 1"], ensure_ascii=False),
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        task = voxcpm_dub_api._task_store.get(payload["task_id"])
+        self.assertIsNotNone(task)
+        self.assertEqual(task["speaker_ids"], ["Speaker 1", "Speaker 2"])
+        self.assertEqual(task["speaker_reference_mode"], "uploaded_partial")
+        self.assertTrue(FakeThread.instances)
+        kwargs = FakeThread.instances[-1].kwargs
+        self.assertEqual(sorted(kwargs["uploaded_speaker_ref_map"].keys()), ["Speaker 1"])
+        self.assertEqual(
+            kwargs["uploaded_speaker_ref_map"]["Speaker 1"]["ref_text"],
+            "你好，这是我的声音音色，很高兴为你提供配音服务。",
+        )
+        self.assertEqual(kwargs["ref_text"], "")
+        self.assertTrue(FakeThread.instances[-1].started)
+
+    def test_load_voxcpm_batch_marks_failed_batch_resumable_from_selected_subtitles(self):
+        """6 号面板加载失败批次时，应基于磁盘 selected_subtitles 标记 prepared 可恢复态。"""
+
+        out_root = self.voxcpm_output_root / "voxcpm_20260518_000003"
+        out_root.mkdir(parents=True, exist_ok=True)
+        selected_path = out_root / "selected_subtitles.srt"
+        selected_path.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n", encoding="utf-8")
+        source_audio = out_root / "source_audio.wav"
+        sf.write(source_audio, np.zeros(16000, dtype=np.float32), 16000)
+        ref_dir = out_root / "refs"
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        ref_audio = ref_dir / "ref.wav"
+        sf.write(ref_audio, np.zeros(8000, dtype=np.float32), 16000)
+        manifest_path = out_root / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "batch_id": "20260518_000003",
+                    "task_id": "20260518_000003",
+                    "project_filename": "demo.mp4",
+                    "input_media_path": str((self.upload_root / "demo.mp4").resolve()),
+                    "status": "failed",
+                    "stage": "failed",
+                    "progress": 100.0,
+                    "subtitle_mode": "translated",
+                    "selected_subtitle_mode": "translated",
+                    "source_lang": "English",
+                    "target_lang": "Chinese",
+                    "voxcpm_api_url": "http://127.0.0.1:7860",
+                    "ref_audio_path": str(ref_audio.resolve()),
+                    "ref_text": "你好，这是我的声音。",
+                    "cfg_value": 2.0,
+                    "inference_timesteps": 10,
+                    "processed_segments": 0,
+                    "segment_count": 1,
+                    "paths": {
+                        "source_audio": str(source_audio.resolve()),
+                        "selected_subtitles": str(selected_path.resolve()),
+                        "manifest": str(manifest_path.resolve()),
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        response = self.client.post("/voxcpm/auto/load-batch", data={"batch_id": "20260518_000003"})
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["resumable"])
+        self.assertEqual(payload["resume_stage"], "prepared")
+        self.assertEqual(payload["total_segments"], 1)
+
+    def test_load_voxcpm_batch_restores_translate_provider_from_manifest(self):
+        """6 号面板 load-batch 恢复任务视图时，不能把翻译 provider 回退成默认值。"""
+
+        batch_id = "20260518_000003_provider"
+        out_root = self.voxcpm_output_root / f"voxcpm_{batch_id}"
+        out_root.mkdir(parents=True, exist_ok=True)
+        selected_path = out_root / "selected_subtitles.srt"
+        selected_path.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n", encoding="utf-8")
+        manifest_path = out_root / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "batch_id": batch_id,
+                    "task_id": batch_id,
+                    "project_filename": "demo.mp4",
+                    "input_media_path": str((self.upload_root / "demo.mp4").resolve()),
+                    "status": "failed",
+                    "stage": "failed",
+                    "progress": 100.0,
+                    "subtitle_mode": "translated",
+                    "selected_subtitle_mode": "translated",
+                    "source_lang": "English",
+                    "target_lang": "Chinese",
+                    "voxcpm_api_url": "http://127.0.0.1:7860",
+                    "translate_base_url": "https://example.com/v1",
+                    "translate_model": "gpt-5.4-mini",
+                    "paths": {
+                        "selected_subtitles": str(selected_path.resolve()),
+                        "manifest": str(manifest_path.resolve()),
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        response = self.client.post("/voxcpm/auto/load-batch", data={"batch_id": batch_id})
+        self.assertEqual(response.status_code, 200)
+        task = voxcpm_dub_api._task_store.get(batch_id)
+        self.assertIsNotNone(task)
+        self.assertEqual(task["translate_base_url"], "https://example.com/v1")
+        self.assertEqual(task["translate_model"], "gpt-5.4-mini")
+
+    def test_resume_voxcpm_task_requeues_failed_batch(self):
+        """6 号面板 resume 应恢复失败批次并把 resume_context 传入后台线程。"""
+
+        out_root = self.voxcpm_output_root / "voxcpm_20260518_000004"
+        out_root.mkdir(parents=True, exist_ok=True)
+        input_media = self.upload_root / "demo.mp4"
+        input_media.write_bytes(b"fake-video")
+        selected_path = out_root / "selected_subtitles.srt"
+        selected_path.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n", encoding="utf-8")
+        source_audio = out_root / "source_audio.wav"
+        sf.write(source_audio, np.zeros(16000, dtype=np.float32), 16000)
+        ref_dir = out_root / "refs"
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        ref_audio = ref_dir / "ref.wav"
+        sf.write(ref_audio, np.zeros(8000, dtype=np.float32), 16000)
+        manifest_path = out_root / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "batch_id": "20260518_000004",
+                    "task_id": "20260518_000004",
+                    "project_filename": "demo.mp4",
+                    "input_media_path": str(input_media.resolve()),
+                    "status": "failed",
+                    "stage": "failed",
+                    "progress": 100.0,
+                    "subtitle_mode": "translated",
+                    "selected_subtitle_mode": "translated",
+                    "source_lang": "English",
+                    "target_lang": "Chinese",
+                    "voxcpm_api_url": "http://127.0.0.1:7860",
+                    "ref_audio_path": str(ref_audio.resolve()),
+                    "ref_text": "你好，这是我的声音。",
+                    "cfg_value": 2.5,
+                    "inference_timesteps": 12,
+                    "subtitle_video_preset": "1440x1080",
+                    "processed_segments": 0,
+                    "segment_count": 1,
+                    "paths": {
+                        "source_audio": str(source_audio.resolve()),
+                        "selected_subtitles": str(selected_path.resolve()),
+                        "manifest": str(manifest_path.resolve()),
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(voxcpm_dub_api.threading, "Thread", FakeThread):
+            response = self.client.post("/voxcpm/auto/resume/20260518_000004")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["resume_stage"], "prepared")
+        self.assertTrue(FakeThread.instances)
+        self.assertTrue(FakeThread.instances[-1].started)
+        resume_context = FakeThread.instances[-1].kwargs["resume_context"]
+        self.assertEqual(resume_context["selected_subtitle_mode"], "translated")
+        self.assertEqual(Path(resume_context["source_audio_path"]).name, "source_audio.wav")
+        self.assertEqual(Path(resume_context["ref_audio_path"]).name, "ref.wav")
+        self.assertEqual(resume_context["subtitle_video_preset"], "1440x1080")
+
+    def test_resume_voxcpm_task_reuses_translate_provider_from_manifest(self):
+        """6 号面板 resume 后台线程必须复用原批次的翻译 provider。"""
+
+        batch_id = "20260518_000004_provider"
+        out_root = self.voxcpm_output_root / f"voxcpm_{batch_id}"
+        out_root.mkdir(parents=True, exist_ok=True)
+        input_media = self.upload_root / "demo-provider.mp4"
+        input_media.write_bytes(b"fake-video")
+        selected_path = out_root / "selected_subtitles.srt"
+        selected_path.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n", encoding="utf-8")
+        source_audio = out_root / "source_audio.wav"
+        sf.write(source_audio, np.zeros(16000, dtype=np.float32), 16000)
+        ref_dir = out_root / "refs"
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        ref_audio = ref_dir / "ref.wav"
+        sf.write(ref_audio, np.zeros(8000, dtype=np.float32), 16000)
+        manifest_path = out_root / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "batch_id": batch_id,
+                    "task_id": batch_id,
+                    "project_filename": "demo.mp4",
+                    "input_media_path": str(input_media.resolve()),
+                    "status": "failed",
+                    "stage": "failed",
+                    "progress": 100.0,
+                    "subtitle_mode": "translated",
+                    "selected_subtitle_mode": "translated",
+                    "source_lang": "English",
+                    "target_lang": "Chinese",
+                    "voxcpm_api_url": "http://127.0.0.1:7860",
+                    "translate_base_url": "https://example.com/v1",
+                    "translate_model": "gpt-5.4-mini",
+                    "ref_audio_path": str(ref_audio.resolve()),
+                    "ref_text": "你好，这是我的声音。",
+                    "cfg_value": 2.5,
+                    "inference_timesteps": 12,
+                    "paths": {
+                        "source_audio": str(source_audio.resolve()),
+                        "selected_subtitles": str(selected_path.resolve()),
+                        "manifest": str(manifest_path.resolve()),
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(voxcpm_dub_api.threading, "Thread", FakeThread):
+            response = self.client.post(f"/voxcpm/auto/resume/{batch_id}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(FakeThread.instances)
+        kwargs = FakeThread.instances[-1].kwargs
+        self.assertEqual(kwargs["translate_base_url"], "https://example.com/v1")
+        self.assertEqual(kwargs["translate_model"], "gpt-5.4-mini")
+
+    def test_run_voxcpm_job_resume_skips_completed_segments(self):
+        """6 号面板 resume 续跑时，应复用已完成 segment，只生成缺失条目。"""
+
+        task_id = "20260518_000005"
+        out_root = self.voxcpm_output_root / f"voxcpm_{task_id}"
+        out_root.mkdir(parents=True, exist_ok=True)
+        input_media = self.upload_root / "demo.mp4"
+        input_media.write_bytes(b"fake-video")
+        source_audio = out_root / "source_audio.wav"
+        sf.write(source_audio, np.zeros(64000, dtype=np.float32), 16000)
+        ref_dir = out_root / "refs"
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        ref_audio = ref_dir / "ref.wav"
+        sf.write(ref_audio, np.zeros(8000, dtype=np.float32), 16000)
+        segments_dir = out_root / "segments" / "segment_0001"
+        segments_dir.mkdir(parents=True, exist_ok=True)
+        seg1_final = segments_dir / "seg_0001.wav"
+        sf.write(seg1_final, np.zeros(16000, dtype=np.float32), 16000)
+        (segments_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "id": "seg_0001",
+                    "start_sec": 0.0,
+                    "end_sec": 1.0,
+                    "text": "第一句",
+                    "paths": {
+                        "dubbed_vocals": str(seg1_final.resolve()),
+                        "dubbed_mix": str(seg1_final.resolve()),
+                    },
+                },
+            ),
+            encoding="utf-8",
+        )
+        selected_rows = [
+            {"start": 0.0, "end": 1.0, "text": "第一句"},
+            {"start": 1.0, "end": 2.0, "text": "第二句"},
+        ]
+        selected_path = out_root / "selected_subtitles.srt"
+        selected_path.write_text(voxcpm_dub_api.format_srt(selected_rows), encoding="utf-8")
+        task = voxcpm_dub_api._create_task_payload(
+            task_id=task_id,
+            project_filename="demo.mp4",
+            input_media_path=input_media,
+            subtitle_mode="translated",
+            source_lang="English",
+            target_lang="Chinese",
+            source_count=0,
+            translated_count=2,
+            out_root=out_root,
+            voxcpm_api_url="http://127.0.0.1:7860",
+        )
+        voxcpm_dub_api._task_store.create(task_id, task)
+        resume_context = {
+            "selected_rows": selected_rows,
+            "completed_segment_indices": {1},
+            "reusable_segment_results": [
+                {
+                    "id": "seg_0001",
+                    "start_sec": 0.0,
+                    "end_sec": 1.0,
+                    "text": "第一句",
+                    "paths": {
+                        "dubbed_vocals": str(seg1_final.resolve()),
+                        "dubbed_mix": str(seg1_final.resolve()),
+                    },
+                }
+            ],
+            "source_audio_path": str(source_audio.resolve()),
+            "ref_audio_path": str(ref_audio.resolve()),
+            "ref_text": "你好，这是我的声音。",
+            "selected_subtitle_mode": "translated",
+            "cfg_value": 2.0,
+            "inference_timesteps": 10,
+        }
+
+        call_texts = []
+
+        def fake_tts(**kwargs):
+            call_texts.append(kwargs["text"])
+            wav = io.BytesIO()
+            sf.write(wav, np.zeros(16000, dtype=np.float32), 16000, format="WAV")
+            return {"audio_base64": voxcpm_dub_api.base64.b64encode(wav.getvalue()).decode("utf-8")}
+
+        with (
+            patch.object(voxcpm_dub_api, "_ensure_voxcpm_backend_ready", return_value={"status": "ok", "device": "mps"}),
+            patch.object(voxcpm_dub_api, "_call_voxcpm_tts", side_effect=fake_tts),
+            patch.object(voxcpm_dub_api, "build_full_timeline_mix", side_effect=lambda **kwargs: kwargs["output_wav"].write_bytes(b"mix") or kwargs["output_wav"]),
+            patch.object(voxcpm_dub_api, "has_video_stream", return_value=False),
+            patch.object(voxcpm_dub_api, "build_black_video_with_ass_subtitles", side_effect=lambda **kwargs: Path(kwargs["output_video_path"]).write_text("video", encoding="utf-8") or kwargs["output_video_path"]),
+        ):
+            voxcpm_dub_api._run_voxcpm_job(
+                task_id=task_id,
+                input_media_path=input_media,
+                source_rows=[],
+                translated_rows=[],
+                subtitle_mode="translated",
+                source_lang="English",
+                target_lang="Chinese",
+                api_key="",
+                translate_base_url="",
+                translate_model="",
+                translate_system_prompt="",
+                ref_audio_path=ref_audio,
+                ref_text="你好，这是我的声音。",
+                voxcpm_api_url="http://127.0.0.1:7860",
+                cfg_value=2.0,
+                inference_timesteps=10,
+                resume_context=resume_context,
+            )
+
+        self.assertEqual(call_texts, ["第二句"])
+        self.assertTrue((out_root / "segments" / "segment_0002" / "seg_0002.wav").exists())
+
+    def test_run_voxcpm_job_partial_speaker_refs_fill_missing_speakers(self):
+        """6 号面板只上传部分 speaker 参考音时，应自动补齐缺失 speaker。"""
+
+        task_id = "20260518_000005_partial"
+        out_root = self.voxcpm_output_root / f"voxcpm_{task_id}"
+        out_root.mkdir(parents=True, exist_ok=True)
+        input_media = self.upload_root / "demo_partial.mp4"
+        input_media.write_bytes(b"fake-video")
+        uploaded_dir = out_root / "uploaded"
+        uploaded_dir.mkdir(parents=True, exist_ok=True)
+        speaker1_ref = uploaded_dir / "speaker1.wav"
+        sf.write(speaker1_ref, np.zeros(8000, dtype=np.float32), 16000)
+        task = voxcpm_dub_api._create_task_payload(
+            task_id=task_id,
+            project_filename="demo_partial.mp4",
+            input_media_path=input_media,
+            subtitle_mode="translated",
+            source_lang="English",
+            target_lang="Chinese",
+            source_count=0,
+            translated_count=2,
+            out_root=out_root,
+            voxcpm_api_url="http://127.0.0.1:7860",
+            speaker_ids=["Speaker 1", "Speaker 2"],
+        )
+        voxcpm_dub_api._task_store.create(task_id, task)
+
+        selected_rows = [
+            {"start": 0.0, "end": 1.0, "text": "第一句", "speaker_id": "Speaker 1"},
+            {"start": 1.0, "end": 2.0, "text": "第二句", "speaker_id": "Speaker 2"},
+        ]
+        uploaded_speaker_ref_map = {
+            "Speaker 1": {
+                "ref_audio": str(speaker1_ref.resolve()),
+                "ref_text": "上传的 Speaker 1 参考文本",
+                "reference_mode": "uploaded_partial",
+                "upload_filename": "speaker1.wav",
+            }
+        }
+        auto_ref = out_root / "auto_speaker2.wav"
+        sf.write(auto_ref, np.zeros(8000, dtype=np.float32), 16000)
+        tts_prompt_pairs = []
+
+        def fake_extract_source_audio(_input_path, output_path):
+            """为缺失 speaker 性别探测准备 source_audio。"""
+
+            sf.write(output_path, np.zeros(16000, dtype=np.float32), 16000)
+
+        def fake_tts(**kwargs):
+            """记录每句使用的参考音，验证 speaker 路由是否正确。"""
+
+            tts_prompt_pairs.append((kwargs["text"], Path(str(kwargs["prompt_audio_path"])).name, kwargs["prompt_text"]))
+            wav = io.BytesIO()
+            sf.write(wav, np.zeros(16000, dtype=np.float32), 16000, format="WAV")
+            return {"audio_base64": voxcpm_dub_api.base64.b64encode(wav.getvalue()).decode("utf-8")}
+
+        with (
+            patch.object(voxcpm_dub_api, "_ensure_voxcpm_backend_ready", return_value={"status": "ok", "device": "mps"}),
+            patch.object(voxcpm_dub_api, "extract_source_audio", side_effect=fake_extract_source_audio),
+            patch.object(voxcpm_dub_api, "_infer_missing_speaker_gender_hints", return_value={"Speaker 2": "female"}) as infer_mock,
+            patch.object(voxcpm_dub_api, "_validate_preset_ref_voices_available") as validate_mock,
+            patch.object(
+                voxcpm_dub_api,
+                "_pick_preset_ref_voices_for_missing_speakers",
+                return_value={
+                    "Speaker 2": {
+                        "ref_audio": str(auto_ref.resolve()),
+                        "ref_text": "你好，这是我的声音音色，很高兴为你提供配音服务。",
+                        "reference_mode": "preset_pool",
+                        "upload_filename": "auto_speaker2.wav",
+                    }
+                },
+            ) as pick_mock,
+            patch.object(voxcpm_dub_api, "_call_voxcpm_tts", side_effect=fake_tts),
+            patch.object(voxcpm_dub_api, "build_black_video_with_ass_subtitles", side_effect=lambda **kwargs: Path(kwargs["output_video_path"]).write_text("video", encoding="utf-8") or kwargs["output_video_path"]),
+        ):
+            voxcpm_dub_api._run_voxcpm_job(
+                task_id=task_id,
+                input_media_path=input_media,
+                source_rows=[],
+                translated_rows=selected_rows,
+                subtitle_mode="translated",
+                source_lang="English",
+                target_lang="Chinese",
+                api_key="",
+                translate_base_url="",
+                translate_model="",
+                translate_system_prompt="",
+                ref_audio_path=None,
+                ref_text="",
+                uploaded_speaker_ref_map=uploaded_speaker_ref_map,
+                voxcpm_api_url="http://127.0.0.1:7860",
+                cfg_value=2.0,
+                inference_timesteps=10,
+            )
+
+        infer_mock.assert_called_once()
+        validate_mock.assert_called_once()
+        pick_mock.assert_called_once()
+        self.assertEqual(
+            pick_mock.call_args.kwargs["speaker_gender_hints"],
+            {"Speaker 2": "female"},
+        )
+        self.assertEqual(
+            tts_prompt_pairs,
+            [
+                ("第一句", "speaker1.wav", "上传的 Speaker 1 参考文本"),
+                ("第二句", "auto_speaker2.wav", "你好，这是我的声音音色，很高兴为你提供配音服务。"),
+            ],
+        )
+        task = voxcpm_dub_api._task_store.get(task_id)
+        self.assertEqual(task["speaker_reference_mode"], "uploaded_mixed")
+        manifest = json.loads((out_root / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["speaker_reference_mode"], "uploaded_mixed")
+        self.assertEqual(sorted(manifest["speaker_ref_map"].keys()), ["Speaker 1", "Speaker 2"])
+
+    def test_run_voxcpm_job_without_media_uses_preset_only_mode(self):
+        """6 号面板纯字幕多 speaker 且无上传参考音时，应直接走预置参考音补位。"""
+
+        task_id = "20260518_000005_preset"
+        out_root = self.voxcpm_output_root / f"voxcpm_{task_id}"
+        out_root.mkdir(parents=True, exist_ok=True)
+        task = voxcpm_dub_api._create_task_payload(
+            task_id=task_id,
+            project_filename="subtitle_only_multi",
+            input_media_path=None,
+            subtitle_mode="translated",
+            source_lang="English",
+            target_lang="Chinese",
+            source_count=0,
+            translated_count=2,
+            out_root=out_root,
+            voxcpm_api_url="http://127.0.0.1:7860",
+            speaker_ids=["Speaker 1", "Speaker 2"],
+        )
+        voxcpm_dub_api._task_store.create(task_id, task)
+
+        selected_rows = [
+            {"start": 0.0, "end": 1.0, "text": "第一句", "speaker_id": "Speaker 1"},
+            {"start": 1.0, "end": 2.0, "text": "第二句", "speaker_id": "Speaker 2"},
+        ]
+        speaker1_ref = out_root / "preset_speaker1.wav"
+        speaker2_ref = out_root / "preset_speaker2.wav"
+        sf.write(speaker1_ref, np.zeros(8000, dtype=np.float32), 16000)
+        sf.write(speaker2_ref, np.zeros(8000, dtype=np.float32), 16000)
+        tts_prompt_names = []
+
+        def fake_tts(**kwargs):
+            """记录每句走的是哪份预置参考音。"""
+
+            tts_prompt_names.append(Path(str(kwargs["prompt_audio_path"])).name)
+            wav = io.BytesIO()
+            sf.write(wav, np.zeros(16000, dtype=np.float32), 16000, format="WAV")
+            return {"audio_base64": voxcpm_dub_api.base64.b64encode(wav.getvalue()).decode("utf-8")}
+
+        with (
+            patch.object(voxcpm_dub_api, "_ensure_voxcpm_backend_ready", return_value={"status": "ok", "device": "mps"}),
+            patch.object(voxcpm_dub_api, "_validate_preset_ref_voices_available") as validate_mock,
+            patch.object(
+                voxcpm_dub_api,
+                "_pick_preset_ref_voices_for_missing_speakers",
+                return_value={
+                    "Speaker 1": {
+                        "ref_audio": str(speaker1_ref.resolve()),
+                        "ref_text": "Speaker 1 默认文本",
+                        "reference_mode": "preset_pool",
+                    },
+                    "Speaker 2": {
+                        "ref_audio": str(speaker2_ref.resolve()),
+                        "ref_text": "Speaker 2 默认文本",
+                        "reference_mode": "preset_pool",
+                    },
+                },
+            ) as pick_mock,
+            patch.object(voxcpm_dub_api, "_call_voxcpm_tts", side_effect=fake_tts),
+            patch.object(voxcpm_dub_api, "build_black_video_with_ass_subtitles", side_effect=lambda **kwargs: Path(kwargs["output_video_path"]).write_text("video", encoding="utf-8") or kwargs["output_video_path"]),
+        ):
+            voxcpm_dub_api._run_voxcpm_job(
+                task_id=task_id,
+                input_media_path=None,
+                source_rows=[],
+                translated_rows=selected_rows,
+                subtitle_mode="translated",
+                source_lang="English",
+                target_lang="Chinese",
+                api_key="",
+                translate_base_url="",
+                translate_model="",
+                translate_system_prompt="",
+                ref_audio_path=None,
+                ref_text="",
+                uploaded_speaker_ref_map=None,
+                voxcpm_api_url="http://127.0.0.1:7860",
+                cfg_value=2.0,
+                inference_timesteps=10,
+            )
+
+        validate_mock.assert_called_once()
+        pick_mock.assert_called_once()
+        self.assertEqual(
+            pick_mock.call_args.kwargs["missing_speaker_ids"],
+            ["Speaker 1", "Speaker 2"],
+        )
+        self.assertEqual(tts_prompt_names, ["preset_speaker1.wav", "preset_speaker2.wav"])
+        task = voxcpm_dub_api._task_store.get(task_id)
+        self.assertEqual(task["speaker_reference_mode"], "preset_only")
+        manifest = json.loads((out_root / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["speaker_reference_mode"], "preset_only")
+
+    def test_run_voxcpm_job_subtitle_only_builds_natural_srt_and_black_video(self):
+        """6 号面板纯字幕模式应按真实音频时长重建 SRT，并输出黑底字幕视频。"""
+
+        task_id = "20260518_000006"
+        out_root = self.voxcpm_output_root / f"voxcpm_{task_id}"
+        out_root.mkdir(parents=True, exist_ok=True)
+        task = voxcpm_dub_api._create_task_payload(
+            task_id=task_id,
+            project_filename="subtitle_only",
+            input_media_path=None,
+            subtitle_mode="translated",
+            source_lang="English",
+            target_lang="Chinese",
+            source_count=0,
+            translated_count=2,
+            out_root=out_root,
+            voxcpm_api_url="http://127.0.0.1:7860",
+            speaker_ids=["Speaker 1", "Speaker 2"],
+        )
+        voxcpm_dub_api._task_store.create(task_id, task)
+
+        selected_rows = [
+            {"start": 0.0, "end": 1.0, "text": "第一句", "speaker_id": "Speaker 1"},
+            {"start": 1.0, "end": 2.0, "text": "第二句", "speaker_id": "Speaker 2"},
+        ]
+        durations = [1.8, 2.2]
+        speaker1_ref = out_root / "preset_speaker1.wav"
+        speaker2_ref = out_root / "preset_speaker2.wav"
+        sf.write(speaker1_ref, np.zeros(8000, dtype=np.float32), 16000)
+        sf.write(speaker2_ref, np.zeros(8000, dtype=np.float32), 16000)
+
+        def fake_tts(**kwargs):
+            wav = io.BytesIO()
+            sf.write(wav, np.zeros(16000, dtype=np.float32), 16000, format="WAV")
+            return {"audio_base64": voxcpm_dub_api.base64.b64encode(wav.getvalue()).decode("utf-8")}
+
+        def fake_soft_align_segment(**kwargs):
+            output_path = kwargs["output_path"]
+            sf.write(output_path, np.zeros(16000, dtype=np.float32), 16000)
+            return {
+                "mode": "natural_passthrough",
+                "raw_duration_sec": 1.0,
+                "aligned_duration_sec": 1.0,
+                "target_duration_sec": 12.0,
+                "trimmed_input": False,
+                "trimmed_raw_duration_sec": 1.0,
+                "trimmed_output_duration_sec": 1.0,
+            }
+
+        def fake_soft_align_segment(**kwargs):
+            output_path = kwargs["output_path"]
+            duration = durations.pop(0)
+            sf.write(output_path, np.zeros(int(16000 * duration), dtype=np.float32), 16000)
+            return {
+                "mode": "natural_passthrough",
+                "raw_duration_sec": duration,
+                "aligned_duration_sec": duration,
+                "target_duration_sec": kwargs["target_duration_sec"],
+                "trimmed_input": False,
+                "trimmed_raw_duration_sec": duration,
+                "trimmed_output_duration_sec": duration,
+            }
+
+        with (
+            patch.object(voxcpm_dub_api, "_ensure_voxcpm_backend_ready", return_value={"status": "ok", "device": "mps"}),
+            patch.object(voxcpm_dub_api, "_validate_preset_ref_voices_available"),
+            patch.object(
+                voxcpm_dub_api,
+                "_pick_preset_ref_voices_for_missing_speakers",
+                return_value={
+                    "Speaker 1": {
+                        "ref_audio": str(speaker1_ref.resolve()),
+                        "ref_text": "Speaker 1 默认文本",
+                        "reference_mode": "preset_pool",
+                    },
+                    "Speaker 2": {
+                        "ref_audio": str(speaker2_ref.resolve()),
+                        "ref_text": "Speaker 2 默认文本",
+                        "reference_mode": "preset_pool",
+                    },
+                },
+            ),
+            patch.object(voxcpm_dub_api, "_call_voxcpm_tts", side_effect=fake_tts),
+            patch.object(voxcpm_dub_api, "_soft_align_segment", side_effect=fake_soft_align_segment),
+            patch.object(voxcpm_dub_api, "build_black_video_with_ass_subtitles", side_effect=lambda **kwargs: Path(kwargs["output_video_path"]).write_text("video", encoding="utf-8") or kwargs["output_video_path"]),
+        ):
+            voxcpm_dub_api._run_voxcpm_job(
+                task_id=task_id,
+                input_media_path=None,
+                source_rows=[],
+                translated_rows=selected_rows,
+                subtitle_mode="translated",
+                source_lang="English",
+                target_lang="Chinese",
+                api_key="",
+                translate_base_url="",
+                translate_model="",
+                translate_system_prompt="",
+                ref_audio_path=None,
+                ref_text="",
+                voxcpm_api_url="http://127.0.0.1:7860",
+                cfg_value=2.0,
+                inference_timesteps=10,
+            )
+
+        final_srt = out_root / "final" / "dubbed_final_full.srt"
+        final_rebuild_srt = out_root / "final" / "dubbed_final_full-rebuild.srt"
+        final_srt_with_speakers = out_root / "final" / "dubbed_final_full_with_speakers.srt"
+        selected_srt_with_speakers = out_root / "selected_subtitles_with_speakers.srt"
+        final_ass = out_root / "final" / "dubbed_final_full-styled.ass"
+        final_video = out_root / "final" / "dubbed_video_full.mp4"
+        self.assertTrue(final_srt.exists())
+        self.assertTrue(final_rebuild_srt.exists())
+        self.assertTrue(final_srt_with_speakers.exists())
+        self.assertTrue(selected_srt_with_speakers.exists())
+        self.assertTrue(final_ass.exists())
+        self.assertTrue(final_video.exists())
+        parsed = voxcpm_dub_api.parse_srt(final_srt.read_text(encoding="utf-8"))
+        rebuild_parsed = voxcpm_dub_api.parse_srt(final_rebuild_srt.read_text(encoding="utf-8"))
+        speaker_copy_parsed = voxcpm_dub_api.parse_srt(final_srt_with_speakers.read_text(encoding="utf-8"))
+        self.assertEqual(len(parsed), 2)
+        self.assertAlmostEqual(float(parsed[0]["start"]), 0.0, places=2)
+        self.assertAlmostEqual(float(parsed[0]["end"]), 1.8, places=2)
+        self.assertGreater(float(parsed[1]["start"]), float(parsed[0]["end"]))
+        self.assertEqual(len(speaker_copy_parsed), 2)
+        self.assertAlmostEqual(float(speaker_copy_parsed[0]["start"]), float(parsed[0]["start"]), places=2)
+        self.assertAlmostEqual(float(speaker_copy_parsed[0]["end"]), float(parsed[0]["end"]), places=2)
+        self.assertAlmostEqual(float(speaker_copy_parsed[1]["start"]), float(parsed[1]["start"]), places=2)
+        self.assertAlmostEqual(float(speaker_copy_parsed[1]["end"]), float(parsed[1]["end"]), places=2)
+        self.assertTrue(rebuild_parsed)
+        last_end = -1.0
+        for row in rebuild_parsed:
+            self.assertLessEqual(len(str(row["text"])), 20)
+            self.assertGreater(float(row["end"]), float(row["start"]))
+            self.assertGreaterEqual(float(row["start"]), last_end)
+            last_end = float(row["end"])
+        speaker_copy_text = final_srt_with_speakers.read_text(encoding="utf-8")
+        selected_speaker_copy_text = selected_srt_with_speakers.read_text(encoding="utf-8")
+        self.assertIn("[Speaker 1] 第一句", speaker_copy_text)
+        self.assertIn("[Speaker 2] 第二句", speaker_copy_text)
+        self.assertIn("[Speaker 1] 第一句", selected_speaker_copy_text)
+        self.assertIn("[Speaker 2] 第二句", selected_speaker_copy_text)
+        self.assertIn("Fontsize, PrimaryColour", final_ass.read_text(encoding="utf-8"))
+        self.assertIn("Arial Unicode MS,144", final_ass.read_text(encoding="utf-8"))
+        manifest = json.loads((out_root / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["subtitle_script_variant"], "traditional")
+        self.assertEqual(
+            manifest["paths"]["selected_subtitles_with_speakers"],
+            str(selected_srt_with_speakers.resolve()),
+        )
+        self.assertEqual(
+            manifest["paths"]["dubbed_final_srt_with_speakers"],
+            str(final_srt_with_speakers.resolve()),
+        )
+        self.assertEqual(
+            manifest["paths"]["dubbed_final_srt_rebuild"],
+            str(final_rebuild_srt.resolve()),
+        )
+        artifact_keys = {item["key"] for item in manifest.get("artifacts") or []}
+        self.assertIn("selected_srt_with_speaker", artifact_keys)
+        self.assertIn("srt_rebuild", artifact_keys)
+        self.assertIn("srt_with_speaker", artifact_keys)
+
+    def test_run_voxcpm_job_splits_long_rows_before_tts_and_keeps_speaker_ids(self):
+        """6 号面板应走 selected -> rebuild -> TTS，且 speaker_id 在短句工作副本中保持稳定。"""
+
+        task_id = "20260519_000010"
+        out_root = self.voxcpm_output_root / f"voxcpm_{task_id}"
+        out_root.mkdir(parents=True, exist_ok=True)
+        task = voxcpm_dub_api._create_task_payload(
+            task_id=task_id,
+            project_filename="podcast_long_row",
+            input_media_path=None,
+            subtitle_mode="source",
+            source_lang="Chinese",
+            target_lang="Chinese",
+            source_count=1,
+            translated_count=0,
+            out_root=out_root,
+            voxcpm_api_url="http://127.0.0.1:7860",
+            speaker_ids=["Speaker 2"],
+        )
+        voxcpm_dub_api._task_store.create(task_id, task)
+
+        long_text = (
+            "想法到处都是。应该说是到处都不值钱。你可能觉得自己有一个关于 X、Y、Z 的超棒想法。"
+            "但在它被绑定到一个具体的人、一个具体的痛点之前，它什么都不是。"
+        )
+        selected_rows = [
+            {"start": 0.0, "end": 8.0, "text": long_text, "speaker_id": "Speaker 2"},
+        ]
+        generated_texts: List[str] = []
+        speaker2_ref = out_root / "preset_speaker2.wav"
+        sf.write(speaker2_ref, np.zeros(8000, dtype=np.float32), 16000)
+
+        def fake_tts(**kwargs):
+            generated_texts.append(str(kwargs["text"]))
+            wav = io.BytesIO()
+            sf.write(wav, np.zeros(16000, dtype=np.float32), 16000, format="WAV")
+            return {"audio_base64": voxcpm_dub_api.base64.b64encode(wav.getvalue()).decode("utf-8")}
+
+        def fake_soft_align_segment(**kwargs):
+            output_path = kwargs["output_path"]
+            duration = 1.6
+            sf.write(output_path, np.zeros(int(16000 * duration), dtype=np.float32), 16000)
+            return {
+                "mode": "natural_passthrough",
+                "raw_duration_sec": duration,
+                "aligned_duration_sec": duration,
+                "target_duration_sec": kwargs["target_duration_sec"],
+                "trimmed_input": False,
+                "trimmed_raw_duration_sec": duration,
+                "trimmed_output_duration_sec": duration,
+            }
+
+        with (
+            patch.object(voxcpm_dub_api, "_ensure_voxcpm_backend_ready", return_value={"status": "ok", "device": "mps"}),
+            patch.object(voxcpm_dub_api, "_validate_preset_ref_voices_available"),
+            patch.object(
+                voxcpm_dub_api,
+                "_pick_preset_ref_voices_for_missing_speakers",
+                return_value={
+                    "Speaker 2": {
+                        "ref_audio": str(speaker2_ref.resolve()),
+                        "ref_text": "Speaker 2 默认文本",
+                        "reference_mode": "preset_pool",
+                    },
+                },
+            ),
+            patch.object(voxcpm_dub_api, "_call_voxcpm_tts", side_effect=fake_tts),
+            patch.object(voxcpm_dub_api, "_soft_align_segment", side_effect=fake_soft_align_segment),
+            patch.object(voxcpm_dub_api, "build_black_video_with_ass_subtitles", side_effect=lambda **kwargs: Path(kwargs["output_video_path"]).write_text("video", encoding="utf-8") or kwargs["output_video_path"]),
+        ):
+            voxcpm_dub_api._run_voxcpm_job(
+                task_id=task_id,
+                input_media_path=None,
+                source_rows=selected_rows,
+                translated_rows=[],
+                subtitle_mode="source",
+                source_lang="Chinese",
+                target_lang="Chinese",
+                api_key="",
+                translate_base_url="",
+                translate_model="",
+                translate_system_prompt="",
+                ref_audio_path=None,
+                ref_text="",
+                voxcpm_api_url="http://127.0.0.1:7860",
+                cfg_value=2.0,
+                inference_timesteps=10,
+            )
+
+        self.assertGreater(len(generated_texts), 1)
+        self.assertEqual(
+            generated_texts[0],
+            "想法到处都是。应该说是到处都不值钱。",
+        )
+        self.assertEqual("".join(generated_texts), long_text)
+        self.assertTrue(all(text.strip() for text in generated_texts))
+
+        selected_srt = out_root / "selected_subtitles.srt"
+        selected_rebuild_srt = out_root / "selected_subtitles_rebuild.srt"
+        selected_srt_with_speakers = out_root / "selected_subtitles_with_speakers.srt"
+        final_srt = out_root / "final" / "dubbed_final_full.srt"
+        self.assertTrue(selected_srt.exists())
+        self.assertTrue(selected_rebuild_srt.exists())
+        self.assertTrue(selected_srt_with_speakers.exists())
+        self.assertTrue(final_srt.exists())
+        self.assertIn(long_text, selected_srt.read_text(encoding="utf-8"))
+
+        selected_parsed = voxcpm_dub_api.parse_srt(selected_srt.read_text(encoding="utf-8"))
+        selected_rebuild_parsed = voxcpm_dub_api.parse_srt(selected_rebuild_srt.read_text(encoding="utf-8"))
+        selected_speaker_parsed = voxcpm_dub_api.parse_srt(selected_srt_with_speakers.read_text(encoding="utf-8"))
+        final_parsed = voxcpm_dub_api.parse_srt(final_srt.read_text(encoding="utf-8"))
+        self.assertEqual(len(selected_parsed), 1)
+        self.assertEqual([str(item.get("text") or "") for item in selected_rebuild_parsed], generated_texts)
+        self.assertEqual(len(selected_speaker_parsed), len(generated_texts))
+        self.assertEqual(len(final_parsed), len(generated_texts))
+        self.assertTrue(all("[Speaker 2]" in str(item.get("text") or "") for item in selected_speaker_parsed))
+        self.assertEqual([str(item.get("text") or "") for item in final_parsed], generated_texts)
+        segment_manifests = sorted((out_root / "segments").glob("segment_*/manifest.json"))
+        self.assertEqual(len(segment_manifests), len(generated_texts))
+        for manifest_path in segment_manifests:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(str(payload.get("speaker_id") or "").strip(), "Speaker 2")
+        manifest = json.loads((out_root / "manifest.json").read_text(encoding="utf-8"))
+        tts_rows = list(manifest.get("selected_subtitles_tts_rows") or [])
+        self.assertEqual([str(item.get("text") or "") for item in tts_rows], generated_texts)
+        self.assertEqual(
+            str((manifest.get("paths") or {}).get("selected_subtitles_rebuild") or ""),
+            str(selected_rebuild_srt.resolve()),
+        )
+        self.assertTrue(all(str(item.get("text") or "").strip() for item in tts_rows))
+
+    def test_voxcpm_podcast_script_content_survives_pre_tts_split(self):
+        """播客脚本文字内容进入 selected_subtitles 时不能丢开头正文。"""
+
+        source_text = (
+            "我今天想聊一个可能会让很多创业者不舒服的事实。 "
+            "哈佛创新实验室的导师在课上说了一句话，原话是：\"想法到处都是。应该说是到处都不值钱。\" "
+            "Ideas are everywhere. They're worthless. "
+            "你可能觉得自己有一个关于 X、Y、Z 的超棒想法。但在它被绑定到一个具体的人、一个具体的痛点之前——它什么都不是。"
+        )
+        rows = [{"start": 0.0, "end": 24.0, "text": source_text, "speaker_id": "Larei"}]
+
+        split_rows = voxcpm_dub_api._split_voxcpm_rows_before_tts(voxcpm_dub_api._normalize_speaker_ids_for_rows(rows))
+        merged_text = "".join(str(row.get("text") or "") for row in split_rows)
+
+        self.assertIn("我今天想聊一个可能会让很多创业者不舒服的事实。", merged_text)
+        self.assertIn("哈佛创新实验室的导师在课上说了一句话", merged_text)
+        self.assertIn("Ideas are everywhere. They're worthless.", merged_text)
+        self.assertNotIn("Ideasareeverywhere", merged_text)
+        self.assertEqual("".join(str(row.get("text") or "") for row in split_rows), source_text)
+
+    def test_build_voxcpm_translation_rebuild_rows_prefers_complete_sentences(self):
+        """翻译前 rebuild 应优先保持完整句，并允许合并相邻短完整句。"""
+
+        source_text = (
+            "Ideas are everywhere. They're worthless. 你可能觉得自己有一个关于 X、Y、Z 的超棒想法。"
+            "但在它被绑定到一个具体的人、一个具体的痛点之前，它什么都不是。"
+            "而公司失败的头号原因，就是它们没有解决一个足够有价值的问题。"
+            "今天我想拆解的，是哈佛 i-Lab 教给创业者的一个极其实用的框架：四个 U。"
+        )
+        rows = [{"start": 0.0, "end": 30.0, "text": source_text, "speaker_id": "Speaker 2"}]
+
+        rebuild_rows = voxcpm_dub_api._build_voxcpm_translation_rebuild_rows(rows)
+
+        self.assertEqual("".join(str(row.get("text") or "") for row in rebuild_rows), source_text)
+        self.assertEqual(
+            [str(row.get("text") or "") for row in rebuild_rows],
+            [
+                "Ideas are everywhere. They're worthless. 你可能觉得自己有一个关于 X、Y、Z 的超棒想法。但在它被绑定到一个具体的人、一个具体的痛点之前，它什么都不是。",
+                "而公司失败的头号原因，就是它们没有解决一个足够有价值的问题。今天我想拆解的，是哈佛 i-Lab 教给创业者的一个极其实用的框架：四个 U。",
+            ],
+        )
+        self.assertTrue(all(str(row.get("speaker_id") or "").strip() == "Speaker 2" for row in rebuild_rows))
+
+    def test_build_voxcpm_translation_rebuild_rows_keeps_speaker_id_out_of_text(self):
+        """翻译前 rebuild 应保留 sidecar speaker_id，但正文不能再带 Speaker 前缀。"""
+
+        rows = [
+            {
+                "start": 0.0,
+                "end": 6.0,
+                "text": "Speaker 1：喺做爱嗰阵，一般男人可以顶二分半到六分钟。",
+                "speaker_id": "Speaker 1",
+            }
+        ]
+
+        rebuild_rows = voxcpm_dub_api._build_voxcpm_translation_rebuild_rows(rows)
+
+        self.assertEqual(len(rebuild_rows), 1)
+        self.assertEqual(str(rebuild_rows[0].get("speaker_id") or ""), "Speaker 1")
+        self.assertEqual(str(rebuild_rows[0].get("text") or ""), "喺做爱嗰阵，一般男人可以顶二分半到六分钟。")
+
+    def test_voxcpm_selected_subtitles_stays_original_while_tts_copy_splits(self):
+        """selected_subtitles.srt 必须保留原始选中字字幕，拆分只写入 TTS 工作副本。"""
+
+        task_id = "20260520_000001"
+        out_root = self.voxcpm_output_root / f"voxcpm_{task_id}"
+        out_root.mkdir(parents=True, exist_ok=True)
+        task = voxcpm_dub_api._create_task_payload(
+            task_id=task_id,
+            project_filename="podcast_original_selected",
+            input_media_path=None,
+            subtitle_mode="source",
+            source_lang="Chinese",
+            target_lang="Chinese",
+            source_count=1,
+            translated_count=0,
+            out_root=out_root,
+            voxcpm_api_url="http://127.0.0.1:7860",
+            speaker_ids=["Larei"],
+        )
+        voxcpm_dub_api._task_store.create(task_id, task)
+
+        original_text = (
+            "我今天想聊一个可能会让很多创业者不舒服的事实。哈佛创新实验室的导师在课上说了一句话，原话是："
+            "\"想法到处都是。应该说是到处都不值钱。\" Ideas are everywhere. They're worthless. "
+            "你可能觉得自己有一个关于 X、Y、Z 的超棒想法。但在它被绑定到一个具体的人、一个具体的痛点之前——它什么都不是。"
+        )
+        source_rows = [{"start": 0.0, "end": 24.0, "text": original_text, "speaker_id": "Larei"}]
+        ref_audio = out_root / "preset_larei.wav"
+        sf.write(ref_audio, np.zeros(8000, dtype=np.float32), 16000)
+
+        def fake_tts(**kwargs):
+            wav = io.BytesIO()
+            sf.write(wav, np.zeros(16000, dtype=np.float32), 16000, format="WAV")
+            return {"audio_base64": voxcpm_dub_api.base64.b64encode(wav.getvalue()).decode("utf-8")}
+
+        def fake_soft_align_segment(**kwargs):
+            output_path = kwargs["output_path"]
+            duration = 1.2
+            sf.write(output_path, np.zeros(int(16000 * duration), dtype=np.float32), 16000)
+            return {
+                "mode": "natural_passthrough",
+                "raw_duration_sec": duration,
+                "aligned_duration_sec": duration,
+                "target_duration_sec": kwargs["target_duration_sec"],
+                "trimmed_input": False,
+                "trimmed_raw_duration_sec": duration,
+                "trimmed_output_duration_sec": duration,
+            }
+
+        with (
+            patch.object(voxcpm_dub_api, "_ensure_voxcpm_backend_ready", return_value={"status": "ok", "device": "mps"}),
+            patch.object(voxcpm_dub_api, "_validate_preset_ref_voices_available"),
+            patch.object(
+                voxcpm_dub_api,
+                "_pick_preset_ref_voices_for_missing_speakers",
+                return_value={
+                    "Larei": {
+                        "ref_audio": str(ref_audio.resolve()),
+                        "ref_text": "Larei 默认文本",
+                        "reference_mode": "preset_pool",
+                    },
+                },
+            ),
+            patch.object(voxcpm_dub_api, "_call_voxcpm_tts", side_effect=fake_tts),
+            patch.object(voxcpm_dub_api, "_soft_align_segment", side_effect=fake_soft_align_segment),
+            patch.object(voxcpm_dub_api, "build_black_video_with_ass_subtitles", side_effect=lambda **kwargs: Path(kwargs["output_video_path"]).write_text("video", encoding="utf-8") or kwargs["output_video_path"]),
+        ):
+            voxcpm_dub_api._run_voxcpm_job(
+                task_id=task_id,
+                input_media_path=None,
+                source_rows=source_rows,
+                translated_rows=[],
+                subtitle_mode="source",
+                source_lang="Chinese",
+                target_lang="Chinese",
+                api_key="",
+                translate_base_url="",
+                translate_model="",
+                translate_system_prompt="",
+                ref_audio_path=None,
+                ref_text="",
+                voxcpm_api_url="http://127.0.0.1:7860",
+                cfg_value=2.0,
+                inference_timesteps=10,
+            )
+
+        selected_original = voxcpm_dub_api.parse_srt((out_root / "selected_subtitles.srt").read_text(encoding="utf-8"))
+        selected_tts = list(json.loads((out_root / "manifest.json").read_text(encoding="utf-8")).get("selected_subtitles_tts_rows") or [])
+        self.assertEqual(len(selected_original), 1)
+        self.assertEqual(str(selected_original[0]["text"]), original_text)
+        self.assertGreater(len(selected_tts), 1)
+
+    def test_voxcpm_tts_unstable_error_retries_with_smaller_chunks(self):
+        """VoxCPM 单句返回明确的缩短文本错误时，应自动拆小重试并继续完成任务。"""
+
+        task_id = "20260521_000127"
+        out_root = self.voxcpm_output_root / f"voxcpm_{task_id}"
+        out_root.mkdir(parents=True, exist_ok=True)
+        task = voxcpm_dub_api._create_task_payload(
+            task_id=task_id,
+            project_filename="unstable_retry",
+            input_media_path=None,
+            subtitle_mode="source",
+            source_lang="Chinese",
+            target_lang="Chinese",
+            source_count=1,
+            translated_count=0,
+            out_root=out_root,
+            voxcpm_api_url="http://127.0.0.1:7860",
+            speaker_ids=["Speaker 1"],
+        )
+        voxcpm_dub_api._task_store.create(task_id, task)
+
+        source_rows = [
+            {
+                "start": 0.0,
+                "end": 6.0,
+                "text": "第一句真的有点长。第二句也继续补上。",
+                "speaker_id": "Speaker 1",
+            }
+        ]
+        ref_audio = out_root / "preset.wav"
+        sf.write(ref_audio, np.zeros(8000, dtype=np.float32), 16000)
+        call_texts: List[str] = []
+
+        def fake_tts(**kwargs):
+            text = str(kwargs["text"])
+            call_texts.append(text)
+            if text == "第一句真的有点长。第二句也继续补上。":
+                raise RuntimeError(
+                    'VoxCPM api http 500: {"error":"Generation remained unstable after 3 attempts '
+                    '(best ratio=16.00, best duration=2.56s, duration limit=6.00s). Please shorten the text or try again."}'
+                )
+            wav = io.BytesIO()
+            sf.write(wav, np.zeros(8000, dtype=np.float32), 16000, format="WAV")
+            return {"audio_base64": voxcpm_dub_api.base64.b64encode(wav.getvalue()).decode("utf-8")}
+
+        with (
+            patch.object(voxcpm_dub_api, "_ensure_voxcpm_backend_ready", return_value={"status": "ok", "device": "mps"}),
+            patch.object(voxcpm_dub_api, "_validate_preset_ref_voices_available"),
+            patch.object(
+                voxcpm_dub_api,
+                "_pick_preset_ref_voices_for_missing_speakers",
+                return_value={
+                    "Speaker 1": {
+                        "ref_audio": str(ref_audio.resolve()),
+                        "ref_text": "默认参考文本",
+                        "reference_mode": "preset_pool",
+                    },
+                },
+            ),
+            patch.object(voxcpm_dub_api, "_call_voxcpm_tts", side_effect=fake_tts),
+            patch.object(voxcpm_dub_api, "build_black_video_with_ass_subtitles", side_effect=lambda **kwargs: Path(kwargs["output_video_path"]).write_text("video", encoding="utf-8") or kwargs["output_video_path"]),
+        ):
+            voxcpm_dub_api._run_voxcpm_job(
+                task_id=task_id,
+                input_media_path=None,
+                source_rows=source_rows,
+                translated_rows=[],
+                subtitle_mode="source",
+                source_lang="Chinese",
+                target_lang="Chinese",
+                api_key="",
+                translate_base_url="",
+                translate_model="",
+                translate_system_prompt="",
+                ref_audio_path=None,
+                ref_text="",
+                voxcpm_api_url="http://127.0.0.1:7860",
+                cfg_value=2.0,
+                inference_timesteps=10,
+            )
+
+        self.assertEqual(
+            call_texts,
+            ["第一句真的有点长。第二句也继续补上。", "第一句真的有点长。", "第二句也继续补上。"],
+        )
+        self.assertTrue((out_root / "segments" / "segment_0001" / "seg_0001.wav").exists())
+        task_payload = voxcpm_dub_api._task_store.get(task_id)
+        self.assertEqual(task_payload["status"], "completed")
+
+    def test_voxcpm_run_job_writes_translated_selected_subtitles_separately(self):
+        """6 号面板应走 selected -> rebuild -> translated 三段链路，且不污染源真值。"""
+
+        task_id = "20260520_000099"
+        out_root = self.voxcpm_output_root / f"voxcpm_{task_id}"
+        out_root.mkdir(parents=True, exist_ok=True)
+        task = voxcpm_dub_api._create_task_payload(
+            task_id=task_id,
+            project_filename="podcast_translated_selected",
+            input_media_path=None,
+            subtitle_mode="source",
+            source_lang="Chinese",
+            target_lang="Cantonese-Mainland",
+            source_count=1,
+            translated_count=0,
+            out_root=out_root,
+            voxcpm_api_url="http://127.0.0.1:7860",
+            speaker_ids=["Larei"],
+        )
+        voxcpm_dub_api._task_store.create(task_id, task)
+
+        source_text = (
+            "Ideas are everywhere. They're worthless. 你可能觉得自己有一个关于 X、Y、Z 的超棒想法。"
+            "但在它被绑定到一个具体的人、一个具体的痛点之前，它什么都不是。"
+            "而公司失败的头号原因，就是它们没有解决一个足够有价值的问题。"
+            "今天我想拆解的，是哈佛 i-Lab 教给创业者的一个极其实用的框架：四个 U。"
+        )
+        source_rows = [{"start": 0.0, "end": 18.0, "text": source_text, "speaker_id": "Larei"}]
+        ref_audio = out_root / "preset_larei.wav"
+        sf.write(ref_audio, np.zeros(8000, dtype=np.float32), 16000)
+
+        translated_batches = []
+
+        class _FakeTranslator:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def translate_batch(self, subtitles, *args, **kwargs):
+                translated_batches.append(list(subtitles))
+                return [f"译文第 {index + 1} 句" for index, _ in enumerate(subtitles)]
+
+        def fake_tts(**kwargs):
+            wav = io.BytesIO()
+            sf.write(wav, np.zeros(16000, dtype=np.float32), 16000, format="WAV")
+            return {"audio_base64": voxcpm_dub_api.base64.b64encode(wav.getvalue()).decode("utf-8")}
+
+        def fake_soft_align_segment(**kwargs):
+            output_path = kwargs["output_path"]
+            sf.write(output_path, np.zeros(16000, dtype=np.float32), 16000)
+            return {
+                "mode": "natural_passthrough",
+                "raw_duration_sec": 1.0,
+                "aligned_duration_sec": 1.0,
+                "target_duration_sec": 12.0,
+                "trimmed_input": False,
+                "trimmed_raw_duration_sec": 1.0,
+                "trimmed_output_duration_sec": 1.0,
+            }
+
+        with (
+            patch.object(voxcpm_dub_api, "Translator", _FakeTranslator),
+            patch.object(voxcpm_dub_api, "_ensure_voxcpm_backend_ready", return_value={"status": "ok", "device": "mps"}),
+            patch.object(voxcpm_dub_api, "_validate_preset_ref_voices_available"),
+            patch.object(
+                voxcpm_dub_api,
+                "_pick_preset_ref_voices_for_missing_speakers",
+                return_value={
+                    "Larei": {
+                        "ref_audio": str(ref_audio.resolve()),
+                        "ref_text": "Larei 默认文本",
+                        "reference_mode": "preset_pool",
+                    },
+                },
+            ),
+            patch.object(voxcpm_dub_api, "_call_voxcpm_tts", side_effect=fake_tts),
+            patch.object(voxcpm_dub_api, "_soft_align_segment", side_effect=fake_soft_align_segment),
+            patch.object(voxcpm_dub_api, "build_black_video_with_ass_subtitles", side_effect=lambda **kwargs: Path(kwargs["output_video_path"]).write_text("video", encoding="utf-8") or kwargs["output_video_path"]),
+        ):
+            voxcpm_dub_api._run_voxcpm_job(
+                task_id=task_id,
+                input_media_path=None,
+                source_rows=source_rows,
+                translated_rows=[],
+                subtitle_mode="source",
+                source_lang="Chinese",
+                target_lang="Cantonese-Mainland",
+                api_key="dummy-key",
+                translate_base_url="https://api.example.com",
+                translate_model="test-model",
+                translate_system_prompt="",
+                ref_audio_path=None,
+                ref_text="",
+                voxcpm_api_url="http://127.0.0.1:7860",
+                cfg_value=2.0,
+                inference_timesteps=10,
+            )
+
+        selected_original = voxcpm_dub_api.parse_srt((out_root / "selected_subtitles.srt").read_text(encoding="utf-8"))
+        selected_rebuild = voxcpm_dub_api.parse_srt((out_root / "selected_subtitles_rebuild.srt").read_text(encoding="utf-8"))
+        selected_translated = voxcpm_dub_api.parse_srt((out_root / "selected_subtitles_translated.srt").read_text(encoding="utf-8"))
+        manifest = json.loads((out_root / "manifest.json").read_text(encoding="utf-8"))
+        artifact_keys = [item["key"] for item in manifest.get("artifacts") or []]
+        self.assertEqual(selected_original[0]["text"], source_text)
+        self.assertGreater(len(selected_rebuild), 1)
+        self.assertEqual(len(translated_batches), 1)
+        self.assertEqual([row["text"] for row in selected_rebuild], translated_batches[0])
+        self.assertEqual(
+            [row["text"] for row in selected_translated],
+            [f"译文第 {index + 1} 句" for index in range(len(selected_rebuild))],
+        )
+        self.assertIn("selected_srt", artifact_keys)
+        self.assertIn("selected_srt_rebuild", artifact_keys)
+        self.assertIn("selected_srt_translated", artifact_keys)
+
+    def test_split_voxcpm_long_text_before_tts_keeps_spaces_inside_english_phrases(self):
+        """6 号面板前置拆分处理中英混排长句时，不应吃掉英文词间空格。"""
+
+        text = (
+            "Ideas are everywhere. They're worthless. 你可能觉得自己有一个关于 X、Y、Z 的超棒想法。"
+            "但在它被绑定到一个具体的人、一个具体的痛点之前，它什么都不是。"
+        )
+
+        segments = voxcpm_dub_api._split_voxcpm_long_text_before_tts(text)
+
+        self.assertGreater(len(segments), 1)
+        merged = "".join(segments)
+        self.assertIn("Ideas are everywhere.", merged)
+        self.assertIn("They're worthless.", merged)
+        self.assertNotIn("Ideasareeverywhere", merged)
+        self.assertNotIn("They'reworthless", merged)
+        self.assertEqual(merged, text)
+        self.assertEqual(
+            segments,
+            [
+                "Ideas are everywhere. They're worthless.",
+                " 你可能觉得自己有一个关于 X、Y、Z 的超棒想法。但在它被绑定到一个具体的人、一个具体的痛点之前，它什么都不是。",
+            ],
+        )
+
+    def test_split_voxcpm_long_text_before_tts_prefers_punctuation_boundaries(self):
+        """6 号面板前置拆分不能在完整句内部按软标点或长度硬切。"""
+
+        text = "因为交税无可避免，所以会计行业、QuickBooks、TurboTax全都是从这里衍生出来的。"
+
+        segments = voxcpm_dub_api._split_voxcpm_long_text_before_tts(text)
+
+        self.assertEqual(segments, [text])
+        self.assertNotIn("从这", segments)
+        self.assertNotIn("里衍生出来的。", segments)
+
+    def test_split_voxcpm_mixed_text_breaks_on_english_period_before_chinese(self):
+        """中英混排短句应保持完整句组，避免 TTS API 被拆太碎。"""
+
+        text = "Ideas are everywhere. They're worthless.你可能觉得自己有一个关于X、Y、Z的超棒想法。"
+
+        segments = voxcpm_dub_api._split_voxcpm_long_text_before_tts(text)
+
+        self.assertEqual(segments, [text])
+
+    def test_split_voxcpm_long_text_merges_adjacent_english_sentences_before_chinese(self):
+        """连续英文完整句应优先并成一组，避免 `Ideas are everywhere.` / `They're worthless.` 分裂。"""
+
+        text = (
+            '我今天想聊一个可能会让很多创业者不舒服的事实。 哈佛创新实验室的导师在课上说了一句话，'
+            '原话是："想法到处都是。应该说是到处都不值钱。" Ideas are everywhere. They\'re worthless. '
+            '你可能觉得自己有一个关于 X、Y、Z 的超棒想法。但在它被绑定到一个具体的人、一个具体的痛点之前——它什么都不是。'
+            ' 而公司失败的头号原因，就是它们没有解决一个足够有价值的问题。 今天我想拆解的，是哈佛 i-Lab 教给创业者的一个极其实用的框架：四个 U。'
+        )
+
+        segments = voxcpm_dub_api._split_voxcpm_long_text_before_tts(text)
+
+        self.assertEqual("".join(segments), text)
+        self.assertIn('我今天想聊一个可能会让很多创业者不舒服的事实。', segments[0])
+        self.assertIn(
+            '哈佛创新实验室的导师在课上说了一句话，原话是："想法到处都是。应该说是到处都不值钱。" Ideas are everywhere. They\'re worthless.',
+            segments[1],
+        )
+        self.assertIn("Ideas are everywhere. They're worthless.", segments[1])
+
+    def test_normalize_cantonese_translation_text_keeps_spaces_across_english_boundaries(self):
+        """粤语规整后，中英边界应保留可读空格，不能生成 `。Ideas` 或 `.你可能`。"""
+
+        text = (
+            "我今日想講一個可能會令好多創業者唔舒服嘅事實。"
+            "哈佛創新實驗室嘅導師喺堂上講咗一句話，原話系想法周圍都有。"
+            "應該話系周圍都唔值錢。Ideas are everywhere."
+            "They’re worthless.你可能覺得自己有一個關於 X、Y、Z 嘅超正想法。"
+        )
+
+        normalized = voxcpm_dub_api.normalize_cantonese_translation_text(text, "Cantonese-Mainland")
+
+        self.assertIn("唔值錢。 Ideas are everywhere.", normalized)
+        self.assertIn("They’re worthless. 你可能覺得自己", normalized)
+        self.assertNotIn("。Ideas", normalized)
+        self.assertNotIn(".你可能", normalized)
+
+    def test_split_voxcpm_long_podcast_row_groups_complete_sentences_only(self):
+        """播客长字幕行应拆成完整句组，不能把一句话拆到不同 TTS 段。"""
+
+        text = (
+            "Ideas are everywhere. They're worthless. 你可能觉得自己有一个关于 X、Y、Z 的超棒想法。"
+            "但在它被绑定到一个具体的人、一个具体的痛点之前，它什么都不是。"
+            "而公司失败的头号原因，就是它们没有解决一个足够有价值的问题。"
+            "今天我想拆解的，是哈佛 i-Lab 教给创业者的一个极其实用的框架：四个 U。"
+        )
+
+        segments = voxcpm_dub_api._split_voxcpm_long_text_before_tts(text)
+
+        self.assertEqual("".join(segments), text)
+        self.assertEqual(
+            segments,
+            [
+                "Ideas are everywhere. They're worthless. 你可能觉得自己有一个关于 X、Y、Z 的超棒想法。但在它被绑定到一个具体的人、一个具体的痛点之前，它什么都不是。",
+                "而公司失败的头号原因，就是它们没有解决一个足够有价值的问题。今天我想拆解的，是哈佛 i-Lab 教给创业者的一个极其实用的框架：四个 U。",
+            ],
+        )
+        self.assertTrue(all("Ideasareeverywhere" not in segment for segment in segments))
+        self.assertTrue(all("觉得自己" in segment or "觉得自" not in segment for segment in segments))
+
+    def test_run_voxcpm_job_simplified_variant_converts_cantonese_final_outputs(self):
+        """6 号面板粤语切到简体时，final SRT/ASS/视频字幕文本应统一简体输出。"""
+
+        task_id = "20260518_000006_traditional"
+        out_root = self.voxcpm_output_root / f"voxcpm_{task_id}"
+        out_root.mkdir(parents=True, exist_ok=True)
+        task = voxcpm_dub_api._create_task_payload(
+            task_id=task_id,
+            project_filename="subtitle_only",
+            input_media_path=None,
+            subtitle_mode="translated",
+            source_lang="粤语",
+            target_lang="Cantonese",
+            source_count=0,
+            translated_count=1,
+            out_root=out_root,
+            voxcpm_api_url="http://127.0.0.1:7860",
+            subtitle_script_variant="traditional",
+            speaker_ids=["Speaker 1"],
+        )
+        voxcpm_dub_api._task_store.create(task_id, task)
+
+        selected_rows = [
+            {"start": 0.0, "end": 1.0, "text": "你好，呢個系我嘅聲音音色，很高興為你提供配音服務。", "speaker_id": "Speaker 1"},
+        ]
+
+        def fake_tts(**kwargs):
+            wav = io.BytesIO()
+            sf.write(wav, np.zeros(16000, dtype=np.float32), 16000, format="WAV")
+            return {"audio_base64": voxcpm_dub_api.base64.b64encode(wav.getvalue()).decode("utf-8")}
+
+        with (
+            patch.object(voxcpm_dub_api, "_ensure_voxcpm_backend_ready", return_value={"status": "ok", "device": "mps"}),
+            patch.object(voxcpm_dub_api, "_validate_preset_ref_voices_available"),
+            patch.object(
+                voxcpm_dub_api,
+                "_pick_preset_ref_voices_for_missing_speakers",
+                return_value={
+                    "Speaker 1": {
+                        "ref_audio": str((out_root / "preset_speaker1.wav").resolve()),
+                        "ref_text": "你好，呢個系我嘅聲音音色，很高興為你提供配音服務。",
+                        "reference_mode": "preset_pool",
+                    }
+                },
+            ),
+            patch.object(voxcpm_dub_api, "_call_voxcpm_tts", side_effect=fake_tts),
+            patch.object(voxcpm_dub_api, "build_black_video_with_ass_subtitles", side_effect=lambda **kwargs: Path(kwargs["output_video_path"]).write_text("video", encoding="utf-8") or kwargs["output_video_path"]),
+        ):
+            voxcpm_dub_api._run_voxcpm_job(
+                task_id=task_id,
+                input_media_path=None,
+                source_rows=[],
+                translated_rows=selected_rows,
+                subtitle_mode="translated",
+                source_lang="粤语",
+                target_lang="Cantonese",
+                api_key="",
+                translate_base_url="",
+                translate_model="",
+                translate_system_prompt="",
+                ref_audio_path=None,
+                ref_text="",
+                voxcpm_api_url="http://127.0.0.1:7860",
+                cfg_value=2.0,
+                inference_timesteps=10,
+                subtitle_script_variant="simplified",
+            )
+
+        final_srt = (out_root / "final" / "dubbed_final_full.srt").read_text(encoding="utf-8")
+        final_ass = (out_root / "final" / "dubbed_final_full-styled.ass").read_text(encoding="utf-8")
+        self.assertIn("声音", final_srt)
+        self.assertIn("服务", final_srt)
+        self.assertIn("声音", final_ass)
+        manifest = json.loads((out_root / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["subtitle_script_variant"], "simplified")
+
+    def test_build_voxcpm_centered_ass_from_rows_wraps_lines_and_uses_typewriter_dialogues(self):
+        """6 号面板 ASS 应自动换行并拆成多段 Dialogue，避免 120 字号时横向超界。"""
+
+        ass_text = voxcpm_dub_api._build_voxcpm_centered_ass_from_rows(
+            [
+                {
+                    "start": 0.0,
+                    "end": 2.0,
+                    "text": "这是一段很长很长的字幕内容用来验证中间字幕会自动换行而且逐字显示",
+                }
+            ],
+            source_name="demo.srt",
+        )
+
+        self.assertIn("Arial Unicode MS,144", ass_text)
+        self.assertIn("&H00FFFFFF", ass_text)
+        self.assertIn("&H000066FF", ass_text)
+        self.assertIn("&HEEFFFF00", ass_text)
+        self.assertIn(",4,4,0,5,", ass_text)
+        self.assertIn(r"\N", ass_text)
+        self.assertGreaterEqual(ass_text.count("Dialogue:"), 2)
+
+    def test_build_voxcpm_centered_ass_from_rows_supports_portrait_layout(self):
+        """6 号面板竖屏字幕视频应切换成 1080x1920 画幅与 102 字号。"""
+
+        ass_text = voxcpm_dub_api._build_voxcpm_centered_ass_from_rows(
+            [
+                {
+                    "start": 0.0,
+                    "end": 3.0,
+                    "text": "呢段字幕要验证 9:16 竖屏时会收窄每行字符数，而且能分成更多行。",
+                }
+            ],
+            source_name="portrait.srt",
+            subtitle_video_preset="1080x1920",
+        )
+
+        self.assertIn("PlayResX: 1080", ass_text)
+        self.assertIn("PlayResY: 1920", ass_text)
+        self.assertIn("Arial Unicode MS,102", ass_text)
+        dialogue_lines = [line for line in ass_text.splitlines() if line.startswith("Dialogue:")]
+        self.assertTrue(dialogue_lines)
+        for line in dialogue_lines:
+            text = line.rsplit(",,", 1)[-1]
+            self.assertLessEqual(text.count(r"\N") + 1, 6)
+
+    def test_build_voxcpm_centered_ass_from_rows_supports_four_three_layout(self):
+        """6 号面板 4:3 字幕视频应切换成 1440x1080 画幅与 120 字号。"""
+
+        ass_text = voxcpm_dub_api._build_voxcpm_centered_ass_from_rows(
+            [
+                {
+                    "start": 0.0,
+                    "end": 3.0,
+                    "text": "这段字幕用来验证 4:3 画幅时的字号和页内行数限制。",
+                }
+            ],
+            source_name="four-three.srt",
+            subtitle_video_preset="1440x1080",
+        )
+
+        self.assertIn("PlayResX: 1440", ass_text)
+        self.assertIn("PlayResY: 1080", ass_text)
+        self.assertIn("Arial Unicode MS,120", ass_text)
+
+    def test_build_voxcpm_centered_ass_from_rows_supports_three_four_layout(self):
+        """6 号面板 3:4 字幕视频应切换成 1080x1440 画幅与 112 字号。"""
+
+        ass_text = voxcpm_dub_api._build_voxcpm_centered_ass_from_rows(
+            [
+                {
+                    "start": 0.0,
+                    "end": 3.0,
+                    "text": "这段字幕用来验证 3:4 画幅时的字号和页内行数限制。",
+                }
+            ],
+            source_name="three-four.srt",
+            subtitle_video_preset="1080x1440",
+        )
+
+        self.assertIn("PlayResX: 1080", ass_text)
+        self.assertIn("PlayResY: 1440", ass_text)
+        self.assertIn("Arial Unicode MS,112", ass_text)
+
+    def test_build_voxcpm_centered_ass_from_rows_keeps_full_long_subtitle_visible_before_end(self):
+        """超长句应分页显示，且最后一页在结尾前完整保留一段时间。"""
+
+        long_text = (
+            "我喺過去一年入面見過好幾個男仔，佢哋都同一個太太結咗婚，而佢太太最珍惜嘅，"
+            "就系十到十五分鐘真正有節奏、好有力、好深入嘅性交，最後仲要達到高潮。"
+        )
+        ass_text = voxcpm_dub_api._build_voxcpm_centered_ass_from_rows(
+            [
+                {
+                    "start": 57.359,
+                    "end": 69.724,
+                    "text": long_text,
+                }
+            ],
+            source_name="demo.srt",
+        )
+
+        self.assertIn("最後仲要達到高潮。", ass_text)
+        dialogue_lines = [line for line in ass_text.splitlines() if line.startswith("Dialogue:")]
+        self.assertTrue(dialogue_lines)
+        self.assertTrue(
+            dialogue_lines[-1].startswith("Dialogue: 0,0:01:08.52,0:01:09.72,Default,,0,0,0,,"),
+        )
+        self.assertIn("最後仲要達到高潮。", dialogue_lines[-1])
+        for line in dialogue_lines:
+            text = line.rsplit(",,", 1)[-1]
+            self.assertLessEqual(text.count(r"\N") + 1, 4)
+
+    def test_run_voxcpm_job_passes_selected_video_preset_to_black_video_builder(self):
+        """6 号面板完成渲染时，应按所选画幅把宽高传给黑底字幕视频构建器。"""
+
+        task_id = "20260519_000001_layout"
+        out_root = self.voxcpm_output_root / f"voxcpm_{task_id}"
+        out_root.mkdir(parents=True, exist_ok=True)
+        task = voxcpm_dub_api._create_task_payload(
+            task_id=task_id,
+            project_filename="subtitle_only",
+            input_media_path=None,
+            subtitle_mode="translated",
+            source_lang="English",
+            target_lang="Chinese",
+            source_count=0,
+            translated_count=1,
+            out_root=out_root,
+            voxcpm_api_url="http://127.0.0.1:7860",
+            subtitle_video_preset="1080x1920",
+            speaker_ids=["Speaker 1"],
+        )
+        voxcpm_dub_api._task_store.create(task_id, task)
+        selected_rows = [
+            {"start": 0.0, "end": 1.0, "text": "第一句", "speaker_id": "Speaker 1"},
+        ]
+        builder_calls = []
+
+        def fake_tts(**kwargs):
+            wav = io.BytesIO()
+            sf.write(wav, np.zeros(16000, dtype=np.float32), 16000, format="WAV")
+            return {"audio_base64": voxcpm_dub_api.base64.b64encode(wav.getvalue()).decode("utf-8")}
+
+        def fake_black_video_builder(**kwargs):
+            builder_calls.append(kwargs)
+            Path(kwargs["output_video_path"]).write_text("video", encoding="utf-8")
+            return kwargs["output_video_path"]
+
+        with (
+            patch.object(voxcpm_dub_api, "_ensure_voxcpm_backend_ready", return_value={"status": "ok", "device": "mps"}),
+            patch.object(voxcpm_dub_api, "_validate_preset_ref_voices_available"),
+            patch.object(
+                voxcpm_dub_api,
+                "_pick_preset_ref_voices_for_missing_speakers",
+                return_value={
+                    "Speaker 1": {
+                        "ref_audio": str((out_root / "preset_speaker1.wav").resolve()),
+                        "ref_text": "你好，这是我的声音音色，很高兴为你提供配音服务。",
+                        "reference_mode": "preset_pool",
+                    }
+                },
+            ),
+            patch.object(voxcpm_dub_api, "_call_voxcpm_tts", side_effect=fake_tts),
+            patch.object(voxcpm_dub_api, "build_black_video_with_ass_subtitles", side_effect=fake_black_video_builder),
+        ):
+            voxcpm_dub_api._run_voxcpm_job(
+                task_id=task_id,
+                input_media_path=None,
+                source_rows=[],
+                translated_rows=selected_rows,
+                subtitle_mode="translated",
+                source_lang="English",
+                target_lang="Chinese",
+                api_key="",
+                translate_base_url="",
+                translate_model="",
+                translate_system_prompt="",
+                ref_audio_path=None,
+                ref_text="",
+                voxcpm_api_url="http://127.0.0.1:7860",
+                cfg_value=2.0,
+                inference_timesteps=10,
+                subtitle_video_preset="1080x1920",
+            )
+
+        self.assertEqual(len(builder_calls), 1)
+        self.assertEqual(builder_calls[0]["width"], 1080)
+        self.assertEqual(builder_calls[0]["height"], 1920)
+        manifest = json.loads((out_root / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["subtitle_video_preset"], "1080x1920")
 
     def test_build_styled_ass_from_rows_uses_fixed_template_and_dialogue_format(self):
         """5号面板 styled ASS 应使用固定样式模板，并输出标准 Dialogue 行。"""
@@ -526,6 +3297,16 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(manifest["paths"]["dubbed_video_burned"], str(final_video_burned.resolve()))
         artifact_order = [item["key"] for item in manifest.get("artifacts") or []]
         self.assertLess(artifact_order.index("video_burned"), artifact_order.index("video"))
+        self.assertEqual(manifest["source_lang"], "English")
+        self.assertEqual(manifest["source_lang_runtime"], "English")
+        self.assertEqual(manifest["target_lang"], "Chinese")
+        self.assertEqual(manifest["target_lang_runtime"], "zh")
+
+        recreated = omnivoice_dub_api._create_task_from_manifest(manifest)
+        self.assertEqual(recreated["source_lang"], "English")
+        self.assertEqual(recreated["source_lang_runtime"], "English")
+        self.assertEqual(recreated["target_lang"], "Chinese")
+        self.assertEqual(recreated["target_lang_runtime"], "zh")
 
     def test_burn_ass_subtitles_into_video_uses_expected_ffmpeg_args(self):
         """ASS 烧录视频应使用 `ass=` filter、libx264 和固定画质参数。"""
@@ -563,6 +3344,41 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("-crf") + 1], "16")
         self.assertEqual(cmd[cmd.index("-preset") + 1], "slow")
         self.assertEqual(cmd[cmd.index("-c:a") + 1], "copy")
+
+    def test_build_black_video_with_ass_subtitles_uses_black_canvas_and_ass_filter(self):
+        """黑底字幕视频应使用 color 黑底输入，并把 ASS 烧到中间字幕画面上。"""
+
+        audio_path = self.tmpdir / "input.wav"
+        subtitle_ass = self.tmpdir / "subtitles.ass"
+        output_video = self.tmpdir / "black.mp4"
+        sf.write(audio_path, np.zeros(16000, dtype=np.float32), 16000)
+        subtitle_ass.write_text("ass", encoding="utf-8")
+
+        seen = {}
+
+        def _fake_run_cmd(cmd, cwd=None):
+            seen["cmd"] = list(cmd)
+            output_video.write_text("black-video", encoding="utf-8")
+            return 0, "", ""
+
+        with (
+            patch.object(media_compose, "run_cmd", side_effect=_fake_run_cmd),
+            patch.object(media_compose, "probe_ffprobe_duration", return_value=1.0),
+        ):
+            result = media_compose.build_black_video_with_ass_subtitles(
+                audio_path=audio_path,
+                ass_subtitle_path=subtitle_ass,
+                output_video_path=output_video,
+            )
+
+        self.assertEqual(result, output_video)
+        cmd = seen["cmd"]
+        self.assertIn("lavfi", cmd)
+        self.assertIn("color=c=black:s=1920x1080:r=24:d=1.000000", cmd)
+        self.assertIn("-vf", cmd)
+        self.assertIn("ass='", cmd[cmd.index("-vf") + 1])
+        self.assertEqual(cmd[cmd.index("-c:v") + 1], "libx264")
+        self.assertEqual(cmd[cmd.index("-c:a") + 1], "aac")
 
     def test_prepare_omnivoice_source_stems_falls_back_to_vocals_only_when_demucs_fails(self):
         """5号面板预分离双失败时，应退化为 vocals-only，而不是整任务报错。"""
@@ -950,6 +3766,7 @@ class DubbingCliApiTests(unittest.TestCase):
                 subtitles_mode="source",
                 source_rows=source_rows,
                 translated_rows=[],
+                source_lang="English",
                 target_lang="中文",
                 api_key="",
                 translate_base_url="https://api.deepseek.com",
@@ -990,6 +3807,7 @@ class DubbingCliApiTests(unittest.TestCase):
                 subtitles_mode="source",
                 source_rows=source_rows,
                 translated_rows=[],
+                source_lang="English",
                 target_lang="Chinese",
                 api_key="",
                 translate_base_url="https://api.deepseek.com",
@@ -1032,6 +3850,7 @@ class DubbingCliApiTests(unittest.TestCase):
                 subtitles_mode="source",
                 source_rows=source_rows,
                 translated_rows=[],
+                source_lang="English",
                 target_lang="Chinese",
                 api_key="",
                 translate_base_url="https://api.deepseek.com",
@@ -1044,6 +3863,39 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertIn("中文", rows[0]["text"])
         self.assertEqual(rows[1]["text"], "第二行")
+
+    def test_omnivoice_translate_subtitles_if_needed_skips_translation_for_english_source_to_english(self):
+        """5 号面板明确 English -> English 时，也应直接复用原文。"""
+
+        source_rows = [
+            {"start": 0.0, "end": 1.0, "text": "Hello one", "speaker_id": "Speaker 1"},
+            {"start": 1.0, "end": 2.0, "text": "Hello two", "speaker_id": "Speaker 1"},
+        ]
+
+        class _FailTranslator:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("English 到 English 不应调用翻译 API")
+
+        with patch.object(omnivoice_dub_api, "Translator", _FailTranslator), patch.object(
+            omnivoice_dub_api,
+            "resolve_translation_api_key",
+            return_value="dummy-key",
+        ):
+            rows, mode = omnivoice_dub_api._translate_subtitles_if_needed(
+                subtitles_mode="source",
+                source_rows=source_rows,
+                translated_rows=[],
+                source_lang="English",
+                target_lang="English",
+                api_key="",
+                translate_base_url="https://api.deepseek.com",
+                translate_model="deepseek-v4-flash",
+                translate_system_prompt="",
+                task_id="unit_test",
+            )
+
+        self.assertEqual(mode, "source")
+        self.assertEqual([row["text"] for row in rows], ["Hello one", "Hello two"])
 
     def test_omnivoice_preset_ref_voices_fill_missing_speakers(self):
         """5号链路部分上传参考音时，应从 ref-voices/<target_lang>/ 随机补齐缺失 speaker。"""
@@ -1089,6 +3941,170 @@ class DubbingCliApiTests(unittest.TestCase):
                     target_lang="Chinese",
                     out_root=out_root,
                 )
+
+    def test_omnivoice_preset_ref_voices_supports_cantonese_alias(self):
+        """粤语别名应能映射到同一组预置参考音目录。"""
+
+        ref_root = self.tmpdir / "ref-voices"
+        cantonese_dir = ref_root / "Cantonese"
+        cantonese_dir.mkdir(parents=True, exist_ok=True)
+        (cantonese_dir / "c1.wav").write_bytes(b"RIFF_fake_c1")
+
+        out_root = self.tmpdir / "out"
+        out_root.mkdir(parents=True, exist_ok=True)
+
+        with patch.object(omnivoice_dub_api, "REF_VOICES_ROOT", ref_root):
+            filled = omnivoice_dub_api._pick_preset_ref_voices_for_missing_speakers(
+                missing_speaker_ids=["Speaker 2"],
+                target_lang="yue",
+                out_root=out_root,
+            )
+
+        self.assertIn("Speaker 2", filled)
+        self.assertTrue(Path(filled["Speaker 2"]["ref_audio"]).exists())
+
+    def test_omnivoice_preset_ref_voices_supports_cantonese_mainland_alias(self):
+        """Cantonese-Mainland 应继续复用 ref-voices/Cantonese。"""
+
+        ref_root = self.tmpdir / "ref-voices"
+        cantonese_dir = ref_root / "Cantonese"
+        cantonese_dir.mkdir(parents=True, exist_ok=True)
+        (cantonese_dir / "c1.wav").write_bytes(b"RIFF_fake_c1")
+
+        out_root = self.tmpdir / "out"
+        out_root.mkdir(parents=True, exist_ok=True)
+
+        with patch.object(omnivoice_dub_api, "REF_VOICES_ROOT", ref_root):
+            filled = omnivoice_dub_api._pick_preset_ref_voices_for_missing_speakers(
+                missing_speaker_ids=["Speaker 2"],
+                target_lang="Cantonese-Mainland",
+                out_root=out_root,
+            )
+
+        self.assertIn("Speaker 2", filled)
+        self.assertTrue(Path(filled["Speaker 2"]["ref_audio"]).exists())
+
+    def test_speaker_ref_text_switches_by_target_lang(self):
+        """默认参考文本应随目标语切换。"""
+
+        self.assertEqual(
+            omnivoice_dub_api._speaker_ref_text_for_target_lang("Chinese"),
+            "你好，这是我的声音音色，很高兴为你提供配音服务。",
+        )
+        self.assertEqual(
+            omnivoice_dub_api._speaker_ref_text_for_target_lang("Cantonese"),
+            "你好，呢個系我嘅聲音音色，很高興為你提供配音服務。",
+        )
+        self.assertEqual(
+            omnivoice_dub_api._speaker_ref_text_for_target_lang("Cantonese-Mainland"),
+            "你好，呢個系我嘅聲音音色，很高興為你提供配音服務。",
+        )
+
+    def test_translator_build_prompt_distinguishes_two_cantonese_styles(self):
+        """翻译 prompt 应区分港式繁体与广东式繁体两档。"""
+
+        translator = object.__new__(translator_module.Translator)
+
+        hk_prompt = translator._build_prompt(["你好"], "Cantonese")
+        mainland_prompt = translator._build_prompt(["你好"], "Cantonese-Mainland")
+
+        self.assertIn("Hong Kong style", hk_prompt)
+        self.assertIn("Prefer Traditional Chinese characters", hk_prompt)
+        self.assertIn("Guangdong / Mainland style", mainland_prompt)
+        self.assertIn("Prefer Traditional Chinese characters", mainland_prompt)
+
+    def test_cantonese_prompt_enforces_authentic_vocabulary_and_particles(self):
+        """粤语 prompt 应强制地道词汇、禁书面语直译，并允许语气助词。"""
+
+        translator = object.__new__(translator_module.Translator)
+        hk_prompt = translator._build_prompt(["这个东西不是这样"], "Cantonese")
+        mainland_prompt = translator._build_prompt(["这个东西不是这样"], "Cantonese-Mainland")
+
+        for prompt in (hk_prompt, mainland_prompt):
+            self.assertIn("Must use authentic Cantonese vocabulary whenever possible", prompt)
+            self.assertIn("Absolutely avoid written Mandarin, literal translation", prompt)
+            self.assertIn("Tone must feel naturally spoken in Cantonese", prompt)
+            self.assertIn("㗎、啫、啦、呢、呀、咩", prompt)
+
+        self.assertIn("嘢、唔係、咩、搞掂、呢個、咁、返工、食飯", hk_prompt)
+        self.assertIn("嘢、唔係、咩、搞掂、呢個、咁、返工、食飯", mainland_prompt)
+
+    def test_pipeline_cantonese_constraints_distinguish_two_styles(self):
+        """改写链路的粤语约束也必须同步到两档风格。"""
+
+        hk_constraints = dubbing_pipeline._build_cantonese_prompt_constraints("Cantonese")
+        mainland_constraints = dubbing_pipeline._build_cantonese_prompt_constraints("Cantonese-Mainland")
+
+        self.assertIn("Hong Kong style", hk_constraints)
+        self.assertIn("Prefer Traditional Chinese characters", hk_constraints)
+        self.assertIn("嘢、唔係、咩、搞掂、呢個、咁、返工、食飯", hk_constraints)
+        self.assertIn("㗎、啫、啦、呢、呀、咩", hk_constraints)
+        self.assertIn("Absolutely avoid written Mandarin, literal translation", hk_constraints)
+
+        self.assertIn("Guangdong / Mainland style", mainland_constraints)
+        self.assertIn("Prefer Traditional Chinese characters", mainland_constraints)
+        self.assertIn("嘢、唔係、咩、搞掂、呢個、咁、返工、食飯", mainland_constraints)
+        self.assertIn("㗎、啫、啦、呢、呀、咩", mainland_constraints)
+        self.assertIn("Absolutely avoid written Mandarin, literal translation", mainland_constraints)
+
+    def test_cantonese_translation_normalizer_rewrites_common_mandarin_residue(self):
+        """粤语后处理应把常见普通话残留压成更自然的口语表达。"""
+
+        normalized_hk = translator_module.normalize_cantonese_translation_text(
+            "你 结婚了，遇到了 这样的 下场，给你带来 了 麻烦。 你把孩子送进学校，被年轻嘅领导边缘化，别不好以为自己只系在大脑里。",
+            "Cantonese",
+        )
+        normalized_mainland = translator_module.normalize_cantonese_translation_text(
+            "你 结婚了，遇到了 这样的 下场，给你带来 了 麻烦。 你把孩子送进学校，被年轻嘅领导边缘化，别不好以为自己只系在大脑里。",
+            "Cantonese-Mainland",
+        )
+
+        self.assertIn("结咗婚", normalized_hk)
+        self.assertIn("遇到咗", normalized_hk)
+        self.assertIn("咁嘅下场", normalized_hk)
+        self.assertIn("俾你带来咗", normalized_hk)
+        self.assertIn("将细路送入学校", normalized_hk)
+        self.assertIn("俾后生领导边缘化", normalized_hk)
+        self.assertIn("唔好以为", normalized_hk)
+        self.assertIn("大脑入面", normalized_hk)
+        self.assertIn("短句", translator_module.normalize_cantonese_translation_text("一句断语", "Cantonese"))
+        self.assertIn("经历", translator_module.normalize_cantonese_translation_text("阅历", "Cantonese"))
+        self.assertIn("冇", translator_module.normalize_cantonese_translation_text("都冇有", "Cantonese"))
+        self.assertIn("但系", translator_module.normalize_cantonese_translation_text("可系", "Cantonese"))
+        self.assertIn("好似", translator_module.normalize_cantonese_translation_text("就像一个导师", "Cantonese"))
+
+        self.assertIn("结咗婚", normalized_mainland)
+        self.assertIn("遇到咗", normalized_mainland)
+        self.assertIn("咁嘅下场", normalized_mainland)
+        self.assertIn("俾你带来咗", normalized_mainland)
+        self.assertIn("将细路送入学校", normalized_mainland)
+        self.assertIn("俾后生领导边缘化", normalized_mainland)
+        self.assertIn("唔好以为", normalized_mainland)
+        self.assertIn("大脑入面", normalized_mainland)
+
+    def test_cantonese_translation_normalizer_leaves_non_cantonese_unchanged(self):
+        """非粤语目标语不应被这层后处理改写。"""
+
+        text = "You met him there."
+        self.assertEqual(
+            translator_module.normalize_cantonese_translation_text(text, "Chinese"),
+            text,
+        )
+
+    def test_validate_preset_ref_voices_available_rejects_empty_cantonese_dir(self):
+        """粤语预置目录存在但为空时，应在启动前明确拒绝。"""
+
+        ref_root = self.tmpdir / "ref-voices"
+        (ref_root / "Cantonese").mkdir(parents=True, exist_ok=True)
+
+        with patch.object(omnivoice_dub_api, "REF_VOICES_ROOT", ref_root):
+            with self.assertRaises(Exception) as ctx:
+                omnivoice_dub_api._validate_preset_ref_voices_available(
+                    target_lang="Cantonese",
+                    missing_speaker_ids=["Speaker 2"],
+                )
+
+        self.assertIn("Preset reference voices dir is empty for Cantonese", str(ctx.exception))
 
     def test_omnivoice_preset_ref_voices_prefers_gender_hint_pool(self):
         """缺失 speaker 有男/女提示时，应优先命中对应的预存参考音池。"""
@@ -1304,6 +4320,58 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(len(reused_translated_rows), 1)
         self.assertEqual(reused_translated_rows[0]["speaker_id"], "Speaker 1")
 
+    def test_start_omnivoice_from_project_rejects_partial_cantonese_refs_when_preset_pool_empty(self):
+        """5号面板粤语只上传部分 speaker 时，若预置池为空，应在启动接口直接报错。"""
+
+        media_path = self.upload_root / "demo.mp4"
+        media_path.write_bytes(b"video-data")
+        ref_root = self.tmpdir / "ref-voices"
+        (ref_root / "Cantonese").mkdir(parents=True, exist_ok=True)
+
+        with patch.object(omnivoice_dub_api, "REF_VOICES_ROOT", ref_root), patch.object(
+            omnivoice_dub_api, "_ensure_omnivoice_backend_ready", return_value={"ready": True}
+        ), patch.object(
+            omnivoice_dub_api.sf,
+            "info",
+            return_value=type("Info", (), {"duration": 1.0})(),
+        ), patch.object(
+            omnivoice_dub_api.threading,
+            "Thread",
+            FakeThread,
+        ):
+            response = self.client.post(
+                "/omnivoice/auto/start-from-project",
+                files=[
+                    ("speaker_ref_files", ("speaker1.wav", b"RIFF_fake", "audio/wav")),
+                ],
+                data={
+                    "filename": "demo.mp4",
+                    "original_filename": "demo.mp4",
+                    "task_id": "legacy-task",
+                    "target_lang": "Cantonese",
+                    "subtitle_mode": "translated",
+                    "source_subtitles_json": json.dumps(
+                        [
+                            {"start": 0.0, "end": 1.0, "text": "hello", "speaker_id": "Speaker 1"},
+                            {"start": 1.0, "end": 2.0, "text": "world", "speaker_id": "Speaker 2"},
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    "translated_subtitles_json": json.dumps(
+                        [
+                            {"start": 0.0, "end": 1.0, "text": "你好", "speaker_id": "Speaker 1"},
+                            {"start": 1.0, "end": 2.0, "text": "世界", "speaker_id": "Speaker 2"},
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    "speaker_ref_speaker_ids_json": json.dumps(["Speaker 1"], ensure_ascii=False),
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Preset reference voices dir is empty for Cantonese", response.json()["detail"])
+        self.assertFalse(FakeThread.instances)
+
     def test_load_omnivoice_batch_marks_prepared_batch_resumable(self):
         """5号面板 load-batch 应把 prepared batch 标成可恢复。"""
 
@@ -1348,6 +4416,109 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(payload["processed_segments"], 0)
         self.assertEqual(payload["total_segments"], 1)
 
+    def test_load_omnivoice_batch_preserves_cantonese_mainland_display_lang(self):
+        """load-batch 应恢复 Cantonese-Mainland 展示值，同时 runtime 保持 yue。"""
+
+        batch_id = "20260517_010203"
+        out_root = self.omnivoice_output_root / f"omnivoice_{batch_id}"
+        out_root.mkdir(parents=True, exist_ok=True)
+        selected_srt = out_root / "selected_subtitles.srt"
+        selected_with_speaker = out_root / "selected_subtitles_with_speakers.srt"
+        selected_srt.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n", encoding="utf-8")
+        selected_with_speaker.write_text("1\n00:00:00,000 --> 00:00:01,000\n[Speaker 1] 你好\n", encoding="utf-8")
+        (out_root / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "task_id": batch_id,
+                    "batch_id": batch_id,
+                    "status": "completed",
+                    "stage": "prepared:selected_subtitles",
+                    "project_filename": "demo.mp4",
+                    "input_media_path": str((self.upload_root / "demo.mp4").resolve()),
+                    "subtitle_mode": "source",
+                    "source_lang": "English",
+                    "target_lang": "Cantonese-Mainland",
+                    "target_lang_runtime": "yue",
+                    "source_subtitles_count": 1,
+                    "translated_subtitles_count": 1,
+                    "speaker_ids": ["Speaker 1"],
+                    "segment_count": 1,
+                    "paths": {
+                        "selected_subtitles": str(selected_srt.resolve()),
+                        "selected_subtitles_with_speakers": str(selected_with_speaker.resolve()),
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        response = self.client.post("/omnivoice/auto/load-batch", data={"batch_id": batch_id})
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["target_lang"], "Cantonese-Mainland")
+        self.assertEqual(payload["target_lang_runtime"], "yue")
+
+    def test_list_omnivoice_batches_exposes_resume_state(self):
+        """5号面板 Restore 列表应提前暴露可断点继续状态。"""
+
+        batch_id = "20260516_225500"
+        out_root = self.omnivoice_output_root / f"omnivoice_{batch_id}"
+        segment_dir = out_root / "segment_jobs" / "segment_0001"
+        out_root.mkdir(parents=True, exist_ok=True)
+        segment_dir.mkdir(parents=True, exist_ok=True)
+        selected_srt = out_root / "selected_subtitles.srt"
+        selected_srt.write_text(
+            "1\n00:00:00,000 --> 00:00:01,000\n你好\n\n2\n00:00:01,000 --> 00:00:02,000\n世界\n",
+            encoding="utf-8",
+        )
+        (segment_dir / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "id": "seg_0001",
+                    "speaker_id": "Speaker 1",
+                    "start_sec": 0.0,
+                    "end_sec": 1.0,
+                    "text": "你好",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        (segment_dir / "seg_0001.wav").write_text("seg1", encoding="utf-8")
+        (out_root / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "task_id": batch_id,
+                    "batch_id": batch_id,
+                    "status": "failed",
+                    "stage": "failed",
+                    "project_filename": "demo.mp4",
+                    "input_media_path": str((self.upload_root / "demo.mp4").resolve()),
+                    "subtitle_mode": "translated",
+                    "source_lang": "English",
+                    "target_lang": "Chinese",
+                    "source_subtitles_count": 2,
+                    "translated_subtitles_count": 2,
+                    "segment_count": 2,
+                    "paths": {
+                        "selected_subtitles": str(selected_srt.resolve()),
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        response = self.client.get("/omnivoice/auto/batches")
+        self.assertEqual(response.status_code, 200)
+        items = response.json()["items"]
+        item = next(entry for entry in items if entry["batch_id"] == batch_id)
+        self.assertTrue(item["resumable"])
+        self.assertEqual(item["resume_stage"], "dubbing_partial")
+        self.assertEqual(item["processed_segments"], 1)
+        self.assertEqual(item["total_segments"], 2)
+
     def test_resume_omnivoice_task_requeues_batch_with_resume_context(self):
         """5号面板 resume 应重用 selected_subtitles 和已存在 segment checkpoint。"""
 
@@ -1391,7 +4562,7 @@ class DubbingCliApiTests(unittest.TestCase):
                     "speakers": {
                         "Speaker 1": {
                             "ref_audio": str(ref_audio.resolve()),
-                            "ref_text": "你好，这是我的声音音色，很高兴为你进行配音服务。",
+                            "ref_text": "你好，呢個系我嘅聲音音色，很高興為你提供配音服務。",
                             "duration": 1.0,
                         }
                     },
@@ -1467,6 +4638,220 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertTrue(kwargs["resume_context"]["reuse_selected_subtitles"])
         self.assertTrue(kwargs["resume_context"]["reuse_stems"])
         self.assertEqual(kwargs["resume_context"]["completed_segment_indices"], {1})
+
+    def test_run_omnivoice_job_normalizes_cantonese_to_yue_for_generation(self):
+        """5号面板粤语输出应在底座调用时使用 yue，而不是仅保留 UI 文本。"""
+
+        task_id = "20260517_000001"
+        out_root = self.omnivoice_output_root / f"omnivoice_{task_id}"
+        media_path = self.upload_root / "cantonese-demo.mp4"
+        media_path.write_bytes(b"video-data")
+        selected_rows = [{"start": 0.0, "end": 1.0, "text": "你好", "speaker_id": "Speaker 1"}]
+        task = omnivoice_dub_api._create_task_payload(
+            task_id=task_id,
+            project_filename="cantonese-demo.mp4",
+            input_media_path=media_path,
+            subtitle_mode="translated",
+            source_lang="粤语",
+            target_lang="Cantonese",
+            enable_source_separation=False,
+            source_count=0,
+            translated_count=1,
+            speaker_ids=["Speaker 1"],
+            out_root=out_root,
+        )
+        omnivoice_dub_api._task_store.create(task_id, task)
+
+        ref_audio = self.tmpdir / "ref.wav"
+        ref_audio.write_text("ref", encoding="utf-8")
+        speaker_ref_map = {"Speaker 1": {"ref_audio": str(ref_audio.resolve()), "ref_text": "固定参考文案"}}
+
+        def _fake_generate(**kwargs):
+            self.assertEqual(kwargs["language"], "yue")
+            return b"wav-bytes"
+
+        def _fake_normalize_generated_segment_audio(*, input_path, output_path, target_duration_sec):
+            del input_path, target_duration_sec
+            output_path.write_text("normalized", encoding="utf-8")
+
+        def _fake_compose_vocals_master(*, segments, output_path, source_audio_fallback=None):
+            del source_audio_fallback
+            output_path.write_text(json.dumps(segments, ensure_ascii=False), encoding="utf-8")
+
+        with patch.object(omnivoice_dub_api, "_ensure_omnivoice_backend_ready", return_value={"ready": True}), patch.object(
+            omnivoice_dub_api,
+            "_translate_subtitles_if_needed",
+            return_value=(selected_rows, "translated"),
+        ), patch.object(
+            omnivoice_dub_api,
+            "_prepare_omnivoice_source_stems",
+            return_value={"has_bgm_track": False},
+        ), patch.object(
+            omnivoice_dub_api,
+            "_build_speaker_reference_map",
+            return_value=speaker_ref_map,
+        ), patch.object(
+            omnivoice_dub_api,
+            "_call_remote_generate",
+            side_effect=_fake_generate,
+        ), patch.object(
+            omnivoice_dub_api,
+            "_normalize_generated_segment_audio",
+            side_effect=_fake_normalize_generated_segment_audio,
+        ), patch.object(
+            omnivoice_dub_api,
+            "compose_vocals_master",
+            side_effect=_fake_compose_vocals_master,
+        ), patch.object(
+            omnivoice_dub_api,
+            "mix_with_bgm",
+        ), patch.object(
+            omnivoice_dub_api,
+            "prepare_dubbed_audio_for_video",
+        ), patch.object(
+            omnivoice_dub_api,
+            "replace_video_audio_two_step",
+        ), patch.object(
+            omnivoice_dub_api,
+            "burn_ass_subtitles_into_video",
+        ), patch.object(
+            omnivoice_dub_api,
+            "has_video_stream",
+            return_value=False,
+        ), patch.object(
+            omnivoice_dub_api.sf,
+            "info",
+            return_value=type("Info", (), {"duration": 1.0})(),
+        ):
+            omnivoice_dub_api._run_omnivoice_job(
+                task_id=task_id,
+                input_media_path=media_path,
+                project_filename="cantonese-demo.mp4",
+                source_subtitles=selected_rows,
+                translated_subtitles=selected_rows,
+                subtitle_mode="translated",
+                source_lang="粤语",
+                target_lang="Cantonese",
+                api_key="",
+                translate_base_url="",
+                translate_model="",
+                translate_system_prompt="",
+                omnivoice_api_url="http://127.0.0.1:3900",
+                enable_source_separation=False,
+                uploaded_speaker_ref_map=None,
+            )
+
+        task_after = omnivoice_dub_api._task_store.get(task_id)
+        self.assertIsNotNone(task_after)
+        self.assertEqual(task_after["target_lang"], "Cantonese")
+        self.assertEqual(task_after["target_lang_runtime"], "yue")
+
+    def test_run_omnivoice_job_normalizes_cantonese_mainland_to_yue_for_generation(self):
+        """Cantonese-Mainland 应保持展示值，但底座调用仍使用 yue。"""
+
+        task_id = "20260517_000002"
+        out_root = self.omnivoice_output_root / f"omnivoice_{task_id}"
+        media_path = self.upload_root / "cantonese-mainland-demo.mp4"
+        media_path.write_bytes(b"video-data")
+        selected_rows = [{"start": 0.0, "end": 1.0, "text": "你好", "speaker_id": "Speaker 1"}]
+        task = omnivoice_dub_api._create_task_payload(
+            task_id=task_id,
+            project_filename="cantonese-mainland-demo.mp4",
+            input_media_path=media_path,
+            subtitle_mode="translated",
+            source_lang="粤语",
+            target_lang="Cantonese-Mainland",
+            enable_source_separation=False,
+            source_count=0,
+            translated_count=1,
+            speaker_ids=["Speaker 1"],
+            out_root=out_root,
+        )
+        omnivoice_dub_api._task_store.create(task_id, task)
+
+        ref_audio = self.tmpdir / "ref-mainland.wav"
+        ref_audio.write_text("ref", encoding="utf-8")
+        speaker_ref_map = {"Speaker 1": {"ref_audio": str(ref_audio.resolve()), "ref_text": "固定参考文案"}}
+
+        def _fake_generate(**kwargs):
+            self.assertEqual(kwargs["language"], "yue")
+            return b"wav-bytes"
+
+        def _fake_normalize_generated_segment_audio(*, input_path, output_path, target_duration_sec):
+            del input_path, target_duration_sec
+            output_path.write_text("normalized", encoding="utf-8")
+
+        def _fake_compose_vocals_master(*, segments, output_path, source_audio_fallback=None):
+            del source_audio_fallback
+            output_path.write_text(json.dumps(segments, ensure_ascii=False), encoding="utf-8")
+
+        with patch.object(omnivoice_dub_api, "_ensure_omnivoice_backend_ready", return_value={"ready": True}), patch.object(
+            omnivoice_dub_api,
+            "_translate_subtitles_if_needed",
+            return_value=(selected_rows, "translated"),
+        ), patch.object(
+            omnivoice_dub_api,
+            "_prepare_omnivoice_source_stems",
+            return_value={"has_bgm_track": False},
+        ), patch.object(
+            omnivoice_dub_api,
+            "_build_speaker_reference_map",
+            return_value=speaker_ref_map,
+        ), patch.object(
+            omnivoice_dub_api,
+            "_call_remote_generate",
+            side_effect=_fake_generate,
+        ), patch.object(
+            omnivoice_dub_api,
+            "_normalize_generated_segment_audio",
+            side_effect=_fake_normalize_generated_segment_audio,
+        ), patch.object(
+            omnivoice_dub_api,
+            "compose_vocals_master",
+            side_effect=_fake_compose_vocals_master,
+        ), patch.object(
+            omnivoice_dub_api,
+            "mix_with_bgm",
+        ), patch.object(
+            omnivoice_dub_api,
+            "prepare_dubbed_audio_for_video",
+        ), patch.object(
+            omnivoice_dub_api,
+            "replace_video_audio_two_step",
+        ), patch.object(
+            omnivoice_dub_api,
+            "burn_ass_subtitles_into_video",
+        ), patch.object(
+            omnivoice_dub_api,
+            "has_video_stream",
+            return_value=False,
+        ), patch.object(
+            omnivoice_dub_api.sf,
+            "info",
+            return_value=type("Info", (), {"duration": 1.0})(),
+        ):
+            omnivoice_dub_api._run_omnivoice_job(
+                task_id=task_id,
+                input_media_path=media_path,
+                project_filename="cantonese-mainland-demo.mp4",
+                source_subtitles=selected_rows,
+                translated_subtitles=selected_rows,
+                subtitle_mode="translated",
+                source_lang="粤语",
+                target_lang="Cantonese-Mainland",
+                api_key="",
+                translate_base_url="",
+                translate_model="",
+                translate_system_prompt="",
+                omnivoice_api_url="http://127.0.0.1:3900",
+                enable_source_separation=False,
+                uploaded_speaker_ref_map=None,
+            )
+
+        task_after = omnivoice_dub_api._task_store.get(task_id)
+        self.assertIsNotNone(task_after)
+        self.assertEqual(task_after["target_lang"], "Cantonese-Mainland")
+        self.assertEqual(task_after["target_lang_runtime"], "yue")
 
     def test_run_omnivoice_job_resume_skips_completed_segments(self):
         """resume 场景应复用已完成 segment，只补剩余条目。"""

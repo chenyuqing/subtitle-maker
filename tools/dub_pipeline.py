@@ -1995,8 +1995,11 @@ def sanitize_subtitles_for_tts(subtitles: List[Dict[str, Any]]) -> Tuple[List[Di
 
 def merge_text_lines(lines: List[str], *, cjk_mode: bool) -> str:
     if cjk_mode:
-        merged = "".join((line or "").strip() for line in lines)
-        merged = re.sub(r"\s+", "", merged)
+        merged = " ".join((line or "").strip() for line in lines if (line or "").strip())
+        merged = re.sub(r"\s+", " ", merged).strip()
+        # 中文之间不需要空格，但英文短语内部的空格要保留，例如 Claude Code。
+        merged = re.sub(r"([\u4e00-\u9fff])\s+([\u4e00-\u9fff])", r"\1\2", merged)
+        merged = re.sub(r"\s*([，。！？、；：])\s*", r"\1", merged)
         return merged
 
     merged = " ".join((line or "").strip() for line in lines)

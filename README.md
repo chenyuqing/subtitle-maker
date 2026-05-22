@@ -1,17 +1,19 @@
 # Subtitle Maker (Local AI)
 
-一个基于 Qwen3-ASR 和 DeepSeek API 的本地视频字幕生成与翻译工具。专为 Mac (Apple Silicon) 优化，支持实时预览、双语字幕导出和内存自动管理。
+一个基于 Qwen3-ASR 与 OpenAI-compatible 翻译接口的本地字幕、配音与成片工具。专为 Mac (Apple Silicon) 优化，支持实时预览、双语字幕导出、独立 OmniVoice / VoxCPM 配音链路和内存自动管理。
 
 ## ✨ 主要功能
 
 *   **本地转写**: 使用 `Qwen3-ASR` 模型进行高精度语音识别，无需上传音频，保护隐私。
 *   **Mac 优化**: 支持 MPS (Metal Performance Shaders) 加速，在 Mac 上运行高效。
 *   **长视频支持**: 采用分块处理机制，支持长视频转写，内存占用稳定。
-*   **AI 翻译**: 集成 DeepSeek API，支持将字幕翻译为多种语言。
+*   **AI 翻译**: 使用 OpenAI-compatible 接口，支持自定义 `API Key / Base URL / Model`。
 *   **Auto Dubbing 可选字幕输入**: 在 Step 5 可上传自定义 `.srt`，自动跳过 ASR，直接进入翻译与配音。
 *   **按时间区间配音**: Step 5 支持手动时间区间与自动语音区间，仅处理选中片段。
-*   **OmniVoice Final 成片输出**: 5 号面板最终结果会同时产出 `styled ASS` 字幕与烧录字幕的 `MP4` 成片，便于直接下载和回放。
+*   **OmniVoice 独立配音链路**: 5 号面板支持独立后端探活、逐 speaker 参考音、粤语目标语、`selected_subtitles.srt` 人工 review、分段恢复与最终成片导出。
+*   **OmniVoice Final 成片输出**: 5 号面板最终结果会同时产出 `styled ASS` 字幕、纯换音轨 `MP4` 和烧录 ASS 字幕的 `MP4` 成片，便于直接下载和回放。
 *   **OmniVoice 断点恢复**: 5 号面板支持从已生成的 `selected_subtitles.srt` 继续配音，也支持在配音中断后从已完成的 segment 断点续跑。
+*   **VoxCPM 独立配音链路**: 6 号面板支持参考音克隆、播客脚本解析、多 speaker 映射、字幕视频导出、历史 batch 恢复与重新生成多种字幕视频规格。
 *   **灵活导出**: 支持导出 SRT 字幕文件，可选原文、译文或双语对照格式。
 *   **实时预览**:
     *   转写过程中实时显示生成字幕。
@@ -121,7 +123,7 @@ subtitle-maker/
     *   点击视频控制栏的 **📂 图标**，可直接加载本地 SRT 文件进行预览。
     *   点击 **⛶ 图标** 进入**网页全屏模式**，可确保字幕在全屏下始终可见。
 4.  **翻译 (可选)**:
-    *   输入 DeepSeek API Key。
+    *   在左侧底部填写 OpenAI-compatible 翻译配置。
     *   选择目标语言，点击 Translate。
 5.  **导出**:
     *   选择需要的格式（如 Bilingual），点击 Export 下载 `.srt` 文件。
@@ -129,12 +131,15 @@ subtitle-maker/
 6.  **导入字幕 (可选)**:
     *   如果在左侧菜单选择 **Step 4: Import SRT**，可以直接上传 `.srt` 文件进行编辑或翻译，无需视频文件。
 
-7.  **Auto Dubbing 高级用法 (Step 5)**:
+7.  **Auto Dubbing 高级用法 (Step 5 / Step 6)**:
     *   可选上传字幕文件（`.srt`）：上传后会跳过 ASR，直接翻译与配音。
     *   可选设置配音时间区间：仅对指定区间执行翻译与配音，区间外保留原声。
     *   时长对齐策略：当配音超出当前字幕窗口时，会先尝试借用“下一句前的静音间隔”（保留约 100ms 安全边界），只有仍超出可用窗口时才进行变速压缩。
-    *   OmniVoice final 结果目录会同时包含 `dubbed_final_full.srt`、`dubbed_final_full-styled.ass`、`dubbed_video_full.mp4` 和 `dubbed_video_full_burned.mp4`。
-    *   OmniVoice Restore 区支持加载历史 batch；如果只完成了“生成译文”，会显示“跳过翻译继续配音”，如果配音中断在中途，会显示“从断点继续配音”。
+    *   5 号 OmniVoice final 结果目录会同时包含 `dubbed_final_full.srt`、`dubbed_final_full-styled.ass`、`dubbed_video_full.mp4` 和 `dubbed_video_full_burned.mp4`。
+    *   5 号 OmniVoice Restore 区支持加载历史 batch；如果只完成了“生成译文”，会显示“跳过翻译继续配音”，如果配音中断在中途，会显示“从断点继续配音”。
+    *   5 号 OmniVoice 支持 `Chinese / Cantonese / Cantonese-Mainland` 目标语；粤语链路会复用粤语参考音文案与 `yue` 语言码。
+    *   6 号 VoxCPM 支持只用“字幕 + 参考音频”启动，也支持上传播客脚本并自动解析为字幕。
+    *   6 号 VoxCPM 会输出最终音频、字幕文件、带 speaker 副本，以及黑底字幕视频；已完成 batch 还可以额外再渲染其他视频规格，不必重新跑配音。
 
 ## ⚠️ 注意事项
 

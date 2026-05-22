@@ -8,6 +8,7 @@ from subtitle_maker.dubbing_cli_api import router as dubbing_router
 from subtitle_maker.omnivoice_dub_api import router as omnivoice_dub_router
 from subtitle_maker.speaker_voice_api import router as speaker_voice_router
 from subtitle_maker.streaming_api import router as streaming_router
+from subtitle_maker.voxcpm_dub_api import router as voxcpm_dub_router
 
 from . import legacy_runtime
 from .routes.exports import router as exports_router
@@ -25,6 +26,7 @@ def create_app() -> FastAPI:
     app.include_router(streaming_router)
     app.include_router(dubbing_router)
     app.include_router(omnivoice_dub_router)
+    app.include_router(voxcpm_dub_router)
     app.include_router(speaker_voice_router)
     app.include_router(agent_router)
     app.include_router(projects_router)

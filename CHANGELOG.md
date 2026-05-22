@@ -1,5 +1,23 @@
 # Changelog
 
+## [Unreleased] - 2026-05-22
+
+### Added
+- **Auto Dub VoxCPM（Step 6）独立面板**: 新增 6 号面板，提供独立于 OmniVoice / index-tts 的参考音克隆配音链路。
+- **VoxCPM 播客脚本支持**: 6 号面板可单独上传播客脚本并自动解析为字幕，支持继续导出 `selected_subtitles.srt`、翻译副本和带 speaker 副本。
+- **VoxCPM 字幕视频规格扩展**: 6 号面板支持输出黑底字幕视频，并允许在配音完成后额外生成 `16:9 / 9:16 / 4:3 / 3:4` 等不同规格。
+- **一键重启脚本**: 新增 `restart.sh`，串联现有 `stop.sh` 和 `start.sh`，便于本地服务快速重启。
+
+### Changed
+- **翻译配置统一**: 左侧底部统一收口为 OpenAI-compatible 翻译配置，供翻译、Auto Dubbing 和 Agent 复用。
+- **OmniVoice 粤语目标语扩展**: 5 号面板现在区分 `Chinese / Cantonese / Cantonese-Mainland`，参考音提示文案和翻译风格会随目标语切换。
+
+### Fixed
+- **OmniVoice 本机代理误走**: 修复 5 号面板 `/health`、`/model/status` 与正式 `/generate` 请求读取系统代理，导致按钮置灰或请求被错误转发到 `127.0.0.1:1082` 的问题。
+- **OmniVoice 恢复链路稳定性**: 修复 prepared batch 缺少 `enable_source_separation` 参数导致的 500；恢复态现在可稳定区分“跳过翻译继续配音”和“从断点继续配音”。
+- **VoxCPM backend 探活与恢复**: 修复 6 号面板本机后端探活误走代理导致的 Start 按钮置灰；同时增强 resume 前旧产物清理，避免 segment 编号和当前字幕漂移。
+- **VoxCPM 长句与不稳定合成**: 修复 6 号面板长句 pre-TTS 拆分、Markdown 样式残留、以及 `Generation remained unstable ... Please shorten the text` 这类可恢复错误；现在会自动拆小重试并拼回单段结果。
+
 ## [Unreleased] - 2026-05-17
 
 ### Added

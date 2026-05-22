@@ -13,6 +13,7 @@ import soundfile as sf
 
 from subtitle_maker.backends import IndexTtsBackend, TtsSynthesisRequest
 from subtitle_maker.translator import build_translation_system_prompt
+from subtitle_maker.translator import normalize_cantonese_translation_text
 from subtitle_maker.domains.media import (
     DEFAULT_DUB_AUDIO_LEVELING_ACTIVITY_THRESHOLD_DB,
     DEFAULT_DUB_AUDIO_LEVELING_MAX_GAIN_DB,
@@ -606,19 +607,49 @@ def _is_cantonese_target_lang(target_lang: str) -> bool:
     """判断目标语种是否为粤语。"""
 
     lowered = (target_lang or "").strip().lower()
-    markers = ["cantonese", "粤语", "廣東話", "广东话", "yue"]
+    markers = ["cantonese", "cantonese-mainland", "mainland cantonese", "粤语", "廣東話", "广东话", "yue"]
     return any(marker in lowered for marker in markers)
 
 
-def _build_cantonese_prompt_constraints() -> str:
+def _is_mainland_cantonese_target_lang(target_lang: str) -> bool:
+    """判断目标语种是否为“广东式口语”这一档。"""
+
+    lowered = (target_lang or "").strip().lower()
+    markers = [
+        "cantonese-mainland",
+        "mainland cantonese",
+        "mainland-cantonese",
+        "广东式粤语",
+        "廣東式粵語",
+        "繁体粤语",
+        "繁體粵語",
+        "简体粤语",
+        "簡體粵語",
+    ]
+    return any(marker in lowered for marker in markers)
+
+
+def _build_cantonese_prompt_constraints(target_lang: str) -> str:
     """返回粤语重写约束，降低普通话书面表达渗透。"""
 
+    if _is_mainland_cantonese_target_lang(target_lang):
+        return (
+            "Cantonese constraints:\n"
+            "- Use natural spoken Cantonese (Guangdong / Mainland style), not written Mandarin.\n"
+            "- Prefer Traditional Chinese characters for output.\n"
+            "- Must use authentic Cantonese vocabulary whenever possible, for example: 嘢、唔係、咩、搞掂、呢個、咁、返工、食飯.\n"
+            "- Keep colloquial Cantonese function words natural in Traditional form (e.g. 佢/我哋/你哋/喺/咗/嘅/唔/咩/呀/喇/啦).\n"
+            "- Tone must feel naturally spoken in Cantonese; add suitable sentence-final particles when appropriate (e.g. 㗎、啫、啦、呢、呀、咩).\n"
+            "- Absolutely avoid written Mandarin, literal translation, or stiff book-style phrasing when a Cantonese alternative exists.\n"
+        )
     return (
         "Cantonese constraints:\n"
         "- Use natural spoken Cantonese (Hong Kong style), not written Mandarin.\n"
         "- Prefer Traditional Chinese characters for output.\n"
+        "- Must use authentic Cantonese vocabulary whenever possible, for example: 嘢、唔係、咩、搞掂、呢個、咁、返工、食飯.\n"
         "- Keep colloquial Cantonese function words natural (e.g. 佢/我哋/你哋/喺/咗/嘅/唔/咩/呀/喇/啦).\n"
-        "- Avoid stiff Mandarin book-style wording when a Cantonese alternative exists.\n"
+        "- Tone must feel naturally spoken in Cantonese; add suitable sentence-final particles when appropriate (e.g. 㗎、啫、啦、呢、呀、咩).\n"
+        "- Absolutely avoid written Mandarin, literal translation, or stiff book-style phrasing when a Cantonese alternative exists.\n"
     )
 
 
@@ -788,8 +819,11 @@ def _merge_text_lines(lines: List[str], *, cjk_mode: bool) -> str:
     """把多行文本按语种模式合并成一段待配音文本。"""
 
     if cjk_mode:
-        merged = "".join((line or "").strip() for line in lines)
-        merged = re.sub(r"\s+", "", merged)
+        merged = " ".join((line or "").strip() for line in lines if (line or "").strip())
+        merged = re.sub(r"\s+", " ", merged).strip()
+        # 中文之间不需要空格，但英文短语内部的空格要保留，例如 Claude Code。
+        merged = re.sub(r"([\u4e00-\u9fff])\s+([\u4e00-\u9fff])", r"\1\2", merged)
+        merged = re.sub(r"\s*([，。！？、；：])\s*", r"\1", merged)
         return merged
     merged = " ".join((line or "").strip() for line in lines)
     merged = re.sub(r"\s+", " ", merged).strip()
@@ -824,7 +858,7 @@ def _retranslate_single_line(
         prompt = (
             prompt
             + "\n\n"
-            + _build_cantonese_prompt_constraints()
+            + _build_cantonese_prompt_constraints(target_lang)
             + "Do not switch to Mandarin written style."
         )
     client = translator._ensure_client()
@@ -844,6 +878,8 @@ def _retranslate_single_line(
         stream=False,
     )
     text = (response.choices[0].message.content or "").strip()
+    if _is_cantonese_target_lang(target_lang):
+        text = normalize_cantonese_translation_text(text, target_lang)
     return text or current_translation
 
 

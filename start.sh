@@ -32,11 +32,11 @@ fi
 
 # 当前统一走懒汉式 TTS 运行时：
 # - `./start.sh` 只启动 Subtitle Maker Web
-# - index-tts 由后端在实际请求到来时按需拉起
-echo "TTS runtime mode: lazy on-demand (index-tts is not prewarmed by start.sh)"
+# - 配音后端由对应链路在实际请求到来时按需拉起
+echo "TTS runtime mode: lazy on-demand (backend is not prewarmed by start.sh)"
 PYANNOTE_LOCAL_MODEL_DIR="${PYANNOTE_LOCAL_MODEL_DIR:-$PROJECT_DIR/models/pyannote-speaker-diarization-community-1}"
 PYANNOTE_EXTERNAL_PYTHON_DEFAULT="$PROJECT_DIR/.venv-pyannote/bin/python"
-PYANNOTE_EXTERNAL_PYTHON_FALLBACK="/Users/tim/Documents/vibe-coding/MVP/index-tts-1108/.venv/bin/python"
+PYANNOTE_EXTERNAL_PYTHON_FALLBACK="/Users/tim/Documents/vibe-coding/MVP/OmniVoice/.venv/bin/python"
 
 # 优先使用本地 pyannote 社区模型，避免运行时再走网络下载
 if [[ -z "${PYANNOTE_MODEL_SOURCE:-}" ]]; then
@@ -57,7 +57,7 @@ if [[ -z "${PYANNOTE_PYTHON_BIN:-}" ]]; then
         echo "PYANNOTE_PYTHON_BIN set to: $PYANNOTE_PYTHON_BIN"
     elif [[ -x "$PYANNOTE_EXTERNAL_PYTHON_FALLBACK" ]]; then
         export PYANNOTE_PYTHON_BIN="$PYANNOTE_EXTERNAL_PYTHON_FALLBACK"
-        echo "Warning: using fallback pyannote python from index-tts env"
+        echo "Warning: using fallback pyannote python from external env"
         echo "PYANNOTE_PYTHON_BIN set to: $PYANNOTE_PYTHON_BIN"
     else
         echo "Warning: External pyannote python not found: $PYANNOTE_EXTERNAL_PYTHON_DEFAULT"
@@ -89,7 +89,7 @@ done
 
 echo "Server is ready! Opening browser..."
 open "http://localhost:8000"
-echo "Tip: index-tts will auto-start only when Auto Dubbing actually uses it."
+echo "Tip: dubbing backend will auto-start only when the corresponding panel actually uses it."
 echo "Tip: Auto Dubbing logs now include detailed runtime snapshot: TTS base, dubbing mode, grouping policy, timing mode, merge policy, range policy, and segment sizing."
 
 # Handle script exit to kill server

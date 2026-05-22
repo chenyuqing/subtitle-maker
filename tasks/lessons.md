@@ -1,5 +1,36 @@
 # Lessons
 
+- 2026-05-21：修 5 号面板本机 OmniVoice 代理问题时，不能只修 `/health` 和 `/model/status` 探活；正式配音的 `src/subtitle_maker/omnivoice_dub_api.py::_call_remote_generate()` 也会走 `requests.post(...)`。如果不同时对本机 `requests.Session()` 设 `trust_env=False` 并清空 `proxies`，按钮虽然恢复可点，但一到 `/generate` 仍会被转发去 `127.0.0.1:1082`。
+- 2026-05-21：5 号面板如果“生成译文 / 开始配音”同时变灰，先查 `src/subtitle_maker/static/js/omnivoiceDubbingPanel.js::syncStartButtonState()` 和 `/omnivoice/auto/backend-status`。这次根因不是前端状态锁死，而是 `src/subtitle_maker/omnivoice_dub_api.py::_check_omnivoice_health()` / `_fetch_omnivoice_model_status()` 直接用 `urllib.urlopen` 访问本机 `127.0.0.1:3900` 时误走系统代理。对本机 OmniVoice 探活必须显式 `ProxyHandler({})` 直连。
+- 2026-05-21：6 号面板如果直接吃播客脚本或翻译文本里的 Markdown 样式标记（如 `**加粗**`、孤立 `**`），VoxCPM 可能在很短句上也报 `Generation remained unstable`。进入 rebuild/TTS 前必须先剥掉样式符号，只保留正文，并过滤掉清洗后变空的标记行。
+- 2026-05-21：6 号面板排查“某条字幕明明很短却报 VoxCPM 500”时，必须同时核对 `manifest.selected_subtitles_tts_rows` 和 `segments/segment_XXXX/manifest.json`；这次根因不是第 101 条短句本身，而是同一个 batch 目录残留了旧 segment 结果，导致“当前行号”和“磁盘真实喂给模型的文本”漂移。非 resume 新任务必须先清旧 segment/final，resume 也只能保留与当前字幕完全匹配的旧段。
+- 2026-05-21：6 号面板遇到 VoxCPM 返回 `Generation remained unstable ... Please shorten the text or try again.` 时，不能把整批任务直接判失败；应仅对该句触发“完整句级自动拆小重试”，并在后端把子句音频拼回单段，保持主时间轴与用户可见字幕合同不变。
+- 2026-05-21：6 号面板 `Start VoxCPM Dubbing` 变灰时，先同时对比 `/voxcpm/auto/backend-status` 和 `http://127.0.0.1:7860/api/health`；这次根因不是 VoxCPM 服务没起，而是 Python `urllib` 探活把本机 `127.0.0.1:7860` 错误走进了本地代理 `127.0.0.1:1082`。对本机 TTS/health 接口，后端必须显式禁用代理直连。
+
+- 2026-05-20：6 号面板一旦把“源字幕真值”和“翻译/配音工作副本”解耦，就必须同时落盘一份可见的“翻译后字幕文件”给用户核对；否则用户无法证明问题发生在翻译层还是后续配音层。
+- 2026-05-20：6 号面板不能直接复用共享 `sanitize_translation_text(...)` 作为翻译落盘前的最终清洗；它会把正常长中文/粤语整段误裁成一句。正确做法是先保留整段正文，只在明显 `[Error] / 更正说明` 这类脏输出时才启用激进裁剪。
+- 2026-05-20：当播客原文被解析成少量超长 block 时，不能直接送翻译；应该先把源真值前移做 `rebuild` 短句化，形成 `selected_subtitles_rebuild.srt` 作为翻译工作副本，再逐句翻译回填。这样才能避免模型把整段当摘要任务。
+
+- 2026-05-20：6 号面板播客脚本行如果上游已经显式带了 `speaker_id`，后续 `normalize_subtitles_with_speakers(...)` 绝不能再从正文里二次猜 `speaker 前缀`；否则像“原话是：...”这种正常冒号会被误判成 `speaker:text` 结构，直接把正文前半段截掉。
+
+- 2026-05-20：6 号面板里 `selected_subtitles.srt` 是用户可见合同，必须始终保持“原始选中字字幕”语义；任何 pre-TTS 长句拆分、节奏重排或其他 TTS 内部处理都必须写到单独的工作副本（如 `selected_subtitles_tts.srt`），resume 也要跟着读工作副本，不能再污染用户看到的 selected 文件。
+- 2026-05-19：用户指出 `selected_subtitles.srt` 和原始播客脚本“不一致”时，必须先按文字内容逐句对比，不能把问题解释成格式、换行或时间戳差异；6 号面板应落盘 `selected_subtitles_pre_tts.srt` 作为拆分前真值，方便定位内容是在解析、翻译/直通、还是 pre-TTS 拆分阶段变化。
+- 2026-05-19：6 号面板处理“上传播客脚本单行字幕太长”时，pre-TTS 拆分的对象是播客脚本长字幕行，不是字幕视频显示换行；只能按完整句边界分段，并允许合并相邻短完整句以控制 VoxCPM API 调用次数，禁止再按逗号、连接词或字数在句子内部硬切。
+- 2026-05-19：做“跳过翻译计费”时，不能只给 `Chinese -> Chinese` 或 `Cantonese -> Cantonese` 单点打补丁；应先做统一语言归一，再按“明确同语种直通”处理 5/6 号面板，否则 `English -> English`、`Japanese -> Japanese` 这类场景会继续白白走翻译 API。
+- 2026-05-19：6 号面板的“跳过翻译计费”不能只覆盖 `Chinese -> Chinese`；用户直接上传粤语字幕并把 `Target Language` 选成 `Cantonese/Cantonese-Mainland` 时，也必须按同语种直通处理，否则会白白走一次翻译 API。
+- 2026-05-19：6 号面板导出 `dubbed_final_full_with_speakers.srt` 时，不能直接拿 segment manifest 加前缀；final 已经按真实生成音频时长重建过时间轴，带 speaker 的副本必须复用同一份 `final_rows`，否则会出现全 0 时间戳或回退到原始 segment 窗口。
+- 2026-05-19：共享翻译层遇到 provider 连接失败、超时或上游异常时，不能用 `[Error] 原文` 继续往下跑；这会把故障伪装成字幕内容。正确做法是直接抛出明确的翻译 provider 错误，让 5/6 号面板任务失败并展示真实原因。
+- 2026-05-19：6 号面板的 `selected_subtitles.srt` 不能只依赖共享翻译层清洗；只要目标语是 `Chinese / Cantonese / Cantonese-Mainland` 这类中文目标语，就必须在 VoxCPM 选中字字幕落盘前再识别一次“英文主导漏译行”，并做定向重译，否则 `[Error] ...` 或整句英文会直接流进后续配音。
+- 2026-05-16：对“纯人声、无背景音乐”这类素材，不要强制所有 5 号面板任务都先跑 Demucs；默认仍开启分离，但必须给用户一个明确的手动关闭开关，关闭后直接走 `source_audio -> source_vocals` 的 passthrough vocals-only 语义，并显式关闭 BGM 回混。
+- 2026-05-16：翻译批量漏行时，优先补缺失编号行并带少量邻近上下文，比直接整半批重翻更省 API 成本；只有缺失过多或局部补译仍不完整时，才应回退二分重试。
+- 2026-05-16：字幕翻译批量不能长期固定到过大的 `500`；当编号块解析出现漏行时，应该在 `translator.py` 里直接递归二分重试，把“少几行”前移修复，而不是等到 OmniVoice 层再用 source 原文回填。这样能显著减少最终字幕里的原文残留。
+- 2026-05-16：5 号面板长视频分段 separation 的切点主锚点必须是 `source_audio.wav` 的静音/低能量区，不能把 `speaker_id` 当主锚点；`speaker_id` 只适合在多个候选字幕边界都接近时做 tie-break。否则很容易仍然切在连续说话中间，影响分离和后续参考音质量。
+- 2026-05-16：5 号面板做长视频人声分离时，不要把 4 号面板的 `segment_minutes` 直接复用为 separation 参数；那是 TTS 批处理语义，不是 stem separation 语义。长视频分离要单独定义阈值和 chunk 时长，并保持后续链路继续消费统一整片 `full_source_vocals.wav` / `full_source_bgm.wav`。
+- 2026-05-16：5 号面板的 Demucs 预分离不能把“双模型都失败”当成致命错误直接终止；长视频上 `htdemucs` 可能失败，而 `mdx_extra_q` 还可能受 `diffq` 依赖影响。正确兜底是退化为 vocals-only，继续后续配音链路，并把降级状态明确写进 `separation_report.json`。
+- 2026-05-17：粤语质量不能只靠 prompt；只要目标语是粤语，就应在翻译落盘前再过一层确定性的口语规整，把 `了 / 把 / 被 / 这样 / 里 / 给 / 让 / 像 / 着` 这类普通话残留收掉，否则最终 `selected_subtitles.srt` 仍会出现“半普半粤”的表面形态。
+- 2026-05-17：继续扩展粤语白名单时，不能把 `也 / 与 / 这种` 这类高频字直接做全局字符替换；这类规则必须优先收敛到短语级，不然容易误伤正常粤语句子并把语义写歪。
+- 2026-05-18：`Cantonese-Mainland` 这档如果强制输出简体，容易把结果拉成“普通话式粤语”；更稳的做法是保留“广东式口语”风格分档，但统一繁体落盘。
+- 2026-05-19：6 号面板的简繁脚本开关只应该服务粤语目标语，默认繁体，只有手动切到简体才做繁转简；`Chinese` 不应该显示也不应该受这个控件影响。
 - 2026-05-15：验证 FFmpeg 烧录耗时时，不能把源视频总时长直接当成编码耗时预期；必须区分“素材时长”和“本机实测编码时长”，优先引用用户已经给出的实测口径（这次是 `libx264` 约 1 分半）。
 - 2026-05-15：当用户要求 5 号面板 final 视频烧录 ASS 字幕时，不能覆盖现有 `dubbed_video_full.mp4`；应保留“纯换音轨成片”并新增独立 burned 版本，否则会破坏既有结果回放与恢复合同。
 - 2026-05-15：当用户要求 5 号面板导出 styled ASS，并明确给出一个现成 `.ass` 样例作为真值时，不要自定义“差不多”的默认字幕样式；必须直接复用样例里的 `Script Info`、`Style` 和关键排版参数，把需求收敛成固定模板导出。
@@ -137,3 +168,6 @@
 - 2026-05-12：5 号面板译文质量问题不能只靠一层修复；“speaker 回填”与“文本清洗/碎片回并”是两条独立轴，必须分别修。文本后处理可以显著减少半句碎片和中英粘连，但无法单独消除所有 speaker 错配。
 - 2026-05-12：当 `selected_subtitles` 已经带了错误 speaker 标签时，仅“补齐空 speaker_id”不够；5 号面板必须支持按 source 时间窗强制校正 speaker（覆盖已有错误标签），否则 speaker 错配会残留。
 - 2026-05-12：4 号面板出现 `Pipeline failed: Error code: 401 - {'error': 'Internal server error'}` 时，不要先归因到参考音频；先看 `web_cli_stdout.log` 是否在 `translate:translation_started` 后出现 `chat/completions 401`。这是翻译 provider 鉴权/服务侧错误，需优先提示 API key/base_url/model。
+- 2026-05-18：评估外部 TTS 底座语种支持时，不能只看 README 的“primarily trained on Chinese and English”就下“仅中英支持”的结论；还要核对实际服务层语言别名、前端选项和项目自带使用说明。此次 `/Users/tim/Documents/vibe-coding/MVP/VoxCPM/app.py` 已明确接入 `粤语/廣東話/cantonese/yue` 别名，前端模板也已有粤语选项。
+- 2026-05-18：给独立配音面板做 `resume` 时，不能只把失败态批次标成 `resumable=true`；必须把 `selected_subtitles.srt`、参考音频、关键推理参数和每条 segment manifest 一起落盘，并由 `load-batch` 基于磁盘真实产物推断 `prepared / dubbing_partial / completed`，否则前端展示出来的恢复能力就是假功能。
+- 2026-05-19：6 号面板的简繁开关只能放在 final 渲染层，不能混进翻译阶段；最终输出必须统一从同一份 `final_rows_for_output` 派生，否则 SRT、ASS、黑底视频和恢复态会出现字形不一致。
