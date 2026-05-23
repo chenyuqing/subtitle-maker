@@ -748,6 +748,11 @@ function setupAutoDubbing(config, deps) {
             if (!parsed.length) {
                 throw new Error('empty or invalid srt');
             }
+            if (typeof window.applyAutoDubPreviewSubtitles === 'function') {
+                window.applyAutoDubPreviewSubtitles(parsed);
+                return;
+            }
+            // 兜底：老版本 app.js 未提供独立预览接口时，仍保持旧行为。
             applyAutoDubSubtitleItems(parsed);
         } catch (error) {
             console.warn('Auto load dubbing subtitles failed:', error);

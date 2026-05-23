@@ -65,7 +65,6 @@ from subtitle_maker.translator import (
     normalize_language_tag_for_passthrough,
     resolve_translation_api_key,
     normalize_cantonese_translation_text,
-    sanitize_translation_text,
 )
 
 router = APIRouter(prefix="/omnivoice/auto", tags=["omnivoice-auto"])
@@ -110,6 +109,15 @@ OMNIVOICE_SELECTED_MAX_SEG_SEC = 12.0
 OMNIVOICE_SELECTED_SPLIT_MAX_CHARS = 60
 OMNIVOICE_SELECTED_MAX_CPS = 10.0
 OMNIVOICE_SELECTED_MIN_SEG_SEC = 0.25
+_OMNIVOICE_TARGET_CPS: Dict[str, float] = {
+    "zh": 6.0, "yue": 6.0, "ja": 10.0, "ko": 10.0,
+    "en": 15.0, "de": 14.0, "fr": 15.0, "es": 15.5, "it": 15.0, "pt": 15.0,
+}
+_OMNIVOICE_TTS_SPEED_MIN = 0.8
+_OMNIVOICE_ULTRA_SHORT_CHARS = 4
+_OMNIVOICE_ULTRA_SHORT_SEC = 0.3
+_OMNIVOICE_SILENCE_SAMPLE_RATE = 24000
+_OMNIVOICE_TTS_SPEED_MAX = 1.4
 OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_THRESHOLD_SEC = 90.0 * 60.0
 # 长视频分段预分离默认切成 40 分钟一块，降低 Demucs 调度和音频拆分开销。
 OMNIVOICE_LONG_VIDEO_CHUNKED_SEPARATION_CHUNK_SEC = 40.0 * 60.0
@@ -762,11 +770,16 @@ def _sanitize_translated_rows_for_target(
     *,
     target_lang: str,
 ) -> List[Dict[str, Any]]:
-    """清洗已存在的译文字幕，去掉模型说明废话并保留时轴与 speaker。"""
+    """清洗已存在的译文字幕。
+
+    5 号面板这里不再调用共享 sanitize_translation_text(...)：
+    用户已确认正常粤语正文会被这层误裁，所以当前只做最小 trim，
+    再按目标语种执行可逆的口语化/字形规整。
+    """
 
     sanitized_rows: List[Dict[str, Any]] = []
     for row in list(rows or []):
-        sanitized_text = sanitize_translation_text(str(row.get("text") or ""), target_lang)
+        sanitized_text = str(row.get("text") or "").replace("\r\n", "\n").replace("\r", "\n").strip()
         if not sanitized_text:
             continue
         if _is_cantonese_language_variant(target_lang):
@@ -1046,11 +1059,93 @@ def _drop_empty_subtitle_rows(
     return filtered
 
 
-def _optimize_omnivoice_source_rows(source_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _should_keep_omnivoice_source_cue_boundaries(subtitle_mode: str) -> bool:
+    """判断 5 号面板当前是否应优先保留原始 cue 边界。"""
+
+    normalized_mode = str(subtitle_mode or "").strip().lower()
+    return normalized_mode in {"", "auto", "source"}
+
+
+def _normalize_omnivoice_passthrough_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """规整 5 号面板 source 直通字幕，只做清洗和超长单条切分，不跨 cue 合并。"""
+
+    normalized_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        start_sec = float(row.get("start", 0.0) or 0.0)
+        end_sec = float(row.get("end", 0.0) or 0.0)
+        if end_sec <= start_sec:
+            continue
+        text = _normalize_omnivoice_selected_text(str(row.get("text") or ""))
+        if not text:
+            continue
+        speaker_id = str(row.get("speaker_id") or "").strip()
+        duration_sec = end_sec - start_sec
+        if duration_sec <= OMNIVOICE_SELECTED_MAX_SEG_SEC:
+            normalized_rows.append(
+                {
+                    "start": start_sec,
+                    "end": end_sec,
+                    "text": text,
+                    "speaker_id": speaker_id,
+                }
+            )
+            continue
+
+        # 只在单条 cue 本身已经过长时，才在其内部做时间均分切分，避免再次跨条吞字。
+        segments = _wrap_final_srt_text_segments(
+            text,
+            max_chars=OMNIVOICE_SELECTED_SPLIT_MAX_CHARS,
+        )
+        if len(segments) <= 1:
+            normalized_rows.append(
+                {
+                    "start": start_sec,
+                    "end": end_sec,
+                    "text": text,
+                    "speaker_id": speaker_id,
+                }
+            )
+            continue
+
+        spans = _estimate_final_srt_time_spans(start_sec, end_sec, segments)
+        if len(spans) != len(segments):
+            normalized_rows.append(
+                {
+                    "start": start_sec,
+                    "end": end_sec,
+                    "text": text,
+                    "speaker_id": speaker_id,
+                }
+            )
+            continue
+
+        for (split_start, split_end), split_text in zip(spans, segments):
+            cleaned = str(split_text or "").strip()
+            if not cleaned or split_end <= split_start:
+                continue
+            normalized_rows.append(
+                {
+                    "start": float(split_start),
+                    "end": float(split_end),
+                    "text": cleaned,
+                    "speaker_id": speaker_id,
+                }
+            )
+    return normalized_rows
+
+
+def _optimize_omnivoice_source_rows(
+    source_rows: List[Dict[str, Any]],
+    *,
+    subtitle_mode: str = "auto",
+) -> List[Dict[str, Any]]:
     """仅在 5 号 OmniVoice source 字幕链路做导入优化，避免影响其他入口。"""
 
     if not source_rows:
         return []
+    if _should_keep_omnivoice_source_cue_boundaries(subtitle_mode):
+        passthrough_rows = _normalize_omnivoice_passthrough_rows(source_rows)
+        return _ensure_speaker_ids(passthrough_rows, fallback_rows=source_rows)
     optimized = optimize_srt_import_subtitles(
         source_rows,
         speaker_mode="auto",
@@ -1059,7 +1154,11 @@ def _optimize_omnivoice_source_rows(source_rows: List[Dict[str, Any]]) -> List[D
     return _ensure_speaker_ids(optimized, fallback_rows=source_rows)
 
 
-def _optimize_omnivoice_selected_rows(selected_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _optimize_omnivoice_selected_rows(
+    selected_rows: List[Dict[str, Any]],
+    *,
+    subtitle_mode: str = "translated",
+) -> List[Dict[str, Any]]:
     """仅在 5 号 OmniVoice 最终选中字链路做防长时窗优化，不影响其他面板。
 
     约束：
@@ -1069,6 +1168,13 @@ def _optimize_omnivoice_selected_rows(selected_rows: List[Dict[str, Any]]) -> Li
 
     if not selected_rows:
         return []
+    if _should_keep_omnivoice_source_cue_boundaries(subtitle_mode):
+        passthrough_rows = _normalize_omnivoice_passthrough_rows(selected_rows)
+        return _ensure_speaker_ids(
+            passthrough_rows,
+            fallback_rows=selected_rows,
+            force_align_by_time=True,
+        )
     normalized_input_rows: List[Dict[str, Any]] = []
     for row in selected_rows:
         normalized_input_rows.append(
@@ -1326,6 +1432,231 @@ def _rebalance_omnivoice_synthesis_rows(
         adjusted_pairs += 1
 
     return normalized, adjusted_pairs
+
+
+def _equalize_cps_across_neighbors(
+    rows: List[Dict[str, Any]],
+    *,
+    max_cps_ratio: float = 2.0,
+    min_seg_sec: float = 0.25,
+    max_iterations: int = 3,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """对同 speaker 相邻行按文本密度重分时间，降低 CPS 方差。"""
+
+    if len(rows) <= 1:
+        return [dict(item) for item in rows], 0
+
+    result = [dict(item) for item in rows]
+    total_adjusted = 0
+
+    for _ in range(max_iterations):
+        adjusted_this_round = 0
+        for index in range(len(result) - 1):
+            current = result[index]
+            nxt = result[index + 1]
+            if not current.get("text") or not nxt.get("text"):
+                continue
+            if str(current.get("speaker_id") or "").strip() != str(nxt.get("speaker_id") or "").strip():
+                continue
+            gap = float(nxt["start"]) - float(current["end"])
+            if gap > 0.8:
+                continue
+
+            c_dur = max(0.05, float(current["end"]) - float(current["start"]))
+            n_dur = max(0.05, float(nxt["end"]) - float(nxt["start"]))
+            cjk_mode = infer_cjk_mode_from_lines(
+                [str(current.get("text") or ""), str(nxt.get("text") or "")]
+            )
+            c_units = max(1, subtitle_text_units(str(current["text"]).strip(), cjk_mode=cjk_mode))
+            n_units = max(1, subtitle_text_units(str(nxt["text"]).strip(), cjk_mode=cjk_mode))
+            c_cps = c_units / c_dur
+            n_cps = n_units / n_dur
+            ratio = max(c_cps, n_cps) / max(0.01, min(c_cps, n_cps))
+            if ratio < max_cps_ratio:
+                continue
+
+            window_start = float(current["start"])
+            window_end = max(float(current["end"]), float(nxt["end"]))
+            total_dur = window_end - window_start
+            if total_dur < min_seg_sec * 2:
+                continue
+            target_c = total_dur * (c_units / float(c_units + n_units))
+            target_c = max(min_seg_sec, min(total_dur - min_seg_sec, target_c))
+            current["end"] = round(window_start + target_c, 3)
+            nxt["start"] = current["end"]
+            nxt["end"] = round(window_end, 3)
+            adjusted_this_round += 1
+
+        total_adjusted += adjusted_this_round
+        if adjusted_this_round == 0:
+            break
+
+    return result, total_adjusted
+
+
+_TRAD_TO_SIMP_FOR_DEDUP = str.maketrans({
+    "後": "后", "車": "车", "過": "过", "從": "从", "會": "会",
+    "個": "个", "對": "对", "電": "电", "動": "动", "話": "话",
+    "還": "还", "機": "机", "經": "经", "開": "开", "來": "来",
+    "門": "门", "們": "们", "認": "认", "時": "时", "書": "书",
+    "說": "说", "為": "为", "問": "问", "學": "学", "長": "长",
+    "這": "这", "讓": "让", "與": "与", "語": "语", "場": "场",
+    "號": "号", "資": "资", "際": "际", "關": "关", "練": "练",
+    "單": "单", "選": "选", "題": "题", "間": "间", "頭": "头",
+    "覺": "觉", "護": "护", "環": "环", "養": "养", "總": "总",
+    "導": "导", "寫": "写", "識": "识", "證": "证", "較": "较",
+    "項": "项", "實": "实", "團": "团", "圓": "圆", "壓": "压",
+    "願": "愿", "係": "是", "慶": "庆", "廣": "广", "適": "适",
+    "發": "发", "異": "异", "當": "当", "盡": "尽", "種": "种",
+    "積": "积", "稱": "称", "維": "维", "繼": "继", "聲": "声",
+    "興": "兴", "處": "处", "計": "计", "設": "设", "試": "试",
+    "調": "调", "論": "论", "買": "买", "轉": "转", "輕": "轻",
+    "進": "进", "運": "运", "達": "达", "遠": "远", "邊": "边",
+    "鍵": "键", "響": "响", "點": "点",
+})
+
+
+def _deduplicate_translated_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    similarity_threshold: float = 0.65,
+    lookback: int = 15,
+    min_chars: int = 10,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """移除 LLM 翻译产生的近似重复行（如繁简重复翻译）。绝不跨 speaker 去重。"""
+
+    if len(rows) <= 1:
+        return list(rows), 0
+
+    output: List[Dict[str, Any]] = [rows[0]]
+    removed = 0
+
+    for i in range(1, len(rows)):
+        row = rows[i]
+        text = str(row.get("text") or "").strip()
+        speaker = str(row.get("speaker_id") or "").strip()
+
+        if len(text) < min_chars:
+            output.append(row)
+            continue
+
+        chars_i = set(text.translate(_TRAD_TO_SIMP_FOR_DEDUP))
+        is_dup = False
+        start_j = max(0, len(output) - lookback)
+        for j in range(start_j, len(output)):
+            prev = output[j]
+            prev_text = str(prev.get("text") or "").strip()
+            prev_speaker = str(prev.get("speaker_id") or "").strip()
+            if speaker != prev_speaker:
+                continue
+            if len(prev_text) < min_chars:
+                continue
+            chars_j = set(prev_text.translate(_TRAD_TO_SIMP_FOR_DEDUP))
+            intersection = len(chars_i & chars_j)
+            union = len(chars_i | chars_j)
+            if union > 0 and intersection / union >= similarity_threshold:
+                is_dup = True
+                break
+
+        if is_dup:
+            removed += 1
+        else:
+            output.append(row)
+
+    return output, removed
+
+
+def _merge_ultra_short_segments(
+    rows: List[Dict[str, Any]],
+    *,
+    min_chars: int = _OMNIVOICE_ULTRA_SHORT_CHARS,
+    min_sec: float = _OMNIVOICE_ULTRA_SHORT_SEC,
+    max_gap_sec: float = 0.5,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """将超短段合并到同 speaker 相邻行，绝不跨 speaker 合并。"""
+
+    if not rows:
+        return [], 0
+
+    items = [dict(r) for r in rows]
+    merged_count = 0
+    absorbed: set = set()
+
+    for i, row in enumerate(items):
+        if i in absorbed:
+            continue
+        text = re.sub(r"\s+", "", str(row.get("text") or ""))
+        dur = max(0.0, float(row.get("end", 0) or 0) - float(row.get("start", 0) or 0))
+        if len(text) > min_chars and dur > min_sec:
+            continue
+        spk = str(row.get("speaker_id") or "").strip()
+        best_target: int | None = None
+        best_gap = float("inf")
+        for j in (i - 1, i + 1):
+            if j < 0 or j >= len(items) or j in absorbed:
+                continue
+            neighbor = items[j]
+            if str(neighbor.get("speaker_id") or "").strip() != spk:
+                continue
+            gap = abs(float(row["start"]) - float(neighbor["end"])) if j < i else abs(float(neighbor["start"]) - float(row["end"]))
+            if gap > max_gap_sec:
+                continue
+            if gap < best_gap:
+                best_gap = gap
+                best_target = j
+        if best_target is None:
+            continue
+        target = items[best_target]
+        target["start"] = min(float(target["start"]), float(row["start"]))
+        target["end"] = max(float(target["end"]), float(row["end"]))
+        t_text = str(target.get("text") or "").strip()
+        r_text = str(row.get("text") or "").strip()
+        if best_target < i:
+            target["text"] = t_text + r_text
+        else:
+            target["text"] = r_text + t_text
+        absorbed.add(i)
+        merged_count += 1
+
+    result = [items[i] for i in range(len(items)) if i not in absorbed]
+    return result, merged_count
+
+
+def _merge_short_lines_for_tts(
+    rows: List[Dict[str, Any]],
+    *,
+    target_chars: int = 25,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """将 <target_chars 的短行合并到同 speaker 相邻行，直到接近上限。绝不跨 speaker。"""
+
+    if not rows:
+        return [], 0
+
+    output: List[Dict[str, Any]] = []
+    merge_count = 0
+    current = dict(rows[0])
+
+    for i in range(1, len(rows)):
+        nxt = dict(rows[i])
+        cur_spk = str(current.get("speaker_id") or "").strip()
+        nxt_spk = str(nxt.get("speaker_id") or "").strip()
+        cjk_mode = infer_cjk_mode_from_lines([str(current.get("text") or "")])
+        cur_units = subtitle_text_units(str(current.get("text") or "").strip(), cjk_mode=cjk_mode)
+        if cur_spk != nxt_spk or cur_units >= target_chars:
+            output.append(current)
+            current = nxt
+            continue
+        nxt_cjk = infer_cjk_mode_from_lines([str(nxt.get("text") or "")])
+        nxt_units = subtitle_text_units(str(nxt.get("text") or "").strip(), cjk_mode=nxt_cjk)
+        if cur_units + nxt_units <= target_chars:
+            current = _merge_two_subtitle_rows(current, nxt)
+            merge_count += 1
+        else:
+            output.append(current)
+            current = nxt
+
+    output.append(current)
+    return output, merge_count
 
 
 def _normalize_final_srt_text(text: str) -> str:
@@ -1984,6 +2315,35 @@ def _encode_multipart_form_data(fields: Dict[str, str], files: Dict[str, Tuple[s
     return b"".join(parts), boundary
 
 
+def _is_ultra_short_for_tts(text: str, duration_sec: float) -> bool:
+    """判断文本是否太短以至于 TTS 可能产生无效音。"""
+    chars = len(re.sub(r"\s+", "", text or ""))
+    return chars <= _OMNIVOICE_ULTRA_SHORT_CHARS or duration_sec <= _OMNIVOICE_ULTRA_SHORT_SEC
+
+
+def _generate_silence_wav(output_path: Path, duration_sec: float) -> None:
+    """生成指定时长的静音 WAV 文件。"""
+    samples = int(max(0.01, duration_sec) * _OMNIVOICE_SILENCE_SAMPLE_RATE)
+    silence = np.zeros(samples, dtype=np.float32)
+    sf.write(str(output_path), silence, _OMNIVOICE_SILENCE_SAMPLE_RATE)
+
+
+def _compute_tts_speed_for_segment(
+    text: str,
+    duration_sec: float,
+    target_lang: str,
+) -> float:
+    """根据文本密度与时间窗计算 TTS speed 参数，让语速匹配时间槽。"""
+    lang_key = (target_lang or "zh").strip().lower().split("-")[0]
+    target_cps = _OMNIVOICE_TARGET_CPS.get(lang_key, 6.0)
+    cjk_mode = infer_cjk_mode_from_lines([text])
+    units = max(1, subtitle_text_units(text, cjk_mode=cjk_mode))
+    natural_duration = units / target_cps
+    slot = max(0.1, float(duration_sec))
+    speed = natural_duration / slot
+    return max(_OMNIVOICE_TTS_SPEED_MIN, min(_OMNIVOICE_TTS_SPEED_MAX, speed))
+
+
 def _call_remote_generate(
     *,
     api_url: str,
@@ -2127,7 +2487,9 @@ def _translate_subtitles_if_needed(
         texts,
         target_lang=target_lang,
         system_prompt=build_translation_system_prompt(translate_system_prompt),
+        sanitize_outputs=False,
     )
+    selected_mode = "translated"
     if _target_prefers_cjk_text(target_lang):
         retry_indices = [
             index
@@ -2141,6 +2503,7 @@ def _translate_subtitles_if_needed(
                     retry_inputs,
                     target_lang=target_lang,
                     system_prompt=build_translation_system_prompt(translate_system_prompt),
+                    sanitize_outputs=False,
                 )
                 if len(retry_outputs) != len(retry_inputs):
                     logger.warning(
@@ -2163,16 +2526,7 @@ def _translate_subtitles_if_needed(
                 logger.warning("OmniVoice translation retry failed: %s", exc)
     translated_rows = _normalize_translation_result(selected_rows, translated_texts)
     translated_rows = _ensure_speaker_ids(translated_rows, fallback_rows=source_rows)
-    translated_rows = _sanitize_translated_rows_for_target(translated_rows, target_lang=target_lang)
-    if _is_cantonese_language_variant(target_lang):
-        translated_rows = [
-            {
-                **row,
-                "text": normalize_cantonese_translation_text(str(row.get("text") or ""), target_lang),
-            }
-            for row in translated_rows
-        ]
-    # 5 号链路最小兜底：翻译空行不再删除，直接回退对应 source 文本，保证 1:1 行数不缩水。
+    # 空行回退必须在 sanitize 之前：sanitize 会丢弃空行，导致 1:1 索引失效。
     repaired_rows: List[Dict[str, Any]] = []
     fallback_count = 0
     for index, row in enumerate(translated_rows):
@@ -2194,8 +2548,7 @@ def _translate_subtitles_if_needed(
             "OmniVoice translation fallback restored %d empty rows using source text",
             fallback_count,
         )
-    # 5 号链路最小修复：空译文回退 source 后，仍可能残留英文主导文本。
-    # 这里仅对回退结果再做一次定向重译，避免英文原文直接写入 selected_subtitles.srt。
+    # 空译文回退 source 后，仍可能残留英文主导文本——定向重译。
     if _target_prefers_cjk_text(target_lang):
         repaired_retry_indices = [
             index
@@ -2214,6 +2567,7 @@ def _translate_subtitles_if_needed(
                     target_lang=target_lang,
                     system_prompt=strict_prompt,
                     system_prompt_is_final=True,
+                    sanitize_outputs=False,
                 )
                 if len(repaired_retry_outputs) != len(repaired_retry_inputs):
                     logger.warning(
@@ -2235,15 +2589,27 @@ def _translate_subtitles_if_needed(
                     )
             except Exception as exc:
                 logger.warning("OmniVoice repaired-row retry failed: %s", exc)
-    translated_rows = _drop_empty_subtitle_rows(repaired_rows, label="translated")
+    # 所有回退和重译完成后，统一做 sanitize + 粤语规整。
+    translated_rows = _sanitize_translated_rows_for_target(repaired_rows, target_lang=target_lang)
+    if _is_cantonese_language_variant(target_lang):
+        translated_rows = [
+            {
+                **row,
+                "text": normalize_cantonese_translation_text(str(row.get("text") or ""), target_lang),
+            }
+            for row in translated_rows
+        ]
+    translated_rows = _drop_empty_subtitle_rows(translated_rows, label="translated")
     if not translated_rows:
         raise HTTPException(status_code=400, detail="OmniVoice translation produced no usable subtitle rows")
     logger.info("OmniVoice task %s translated %d subtitles from source mode", task_id, len(translated_rows))
     return translated_rows, selected_mode
 
 
-def _normalize_generated_segment_audio(input_path: Path, output_path: Path, target_duration_sec: float) -> Path:
-    """对单句 OmniVoice 输出做轻量收尾处理，避免前导空白和轻微时长漂移。"""
+def _normalize_generated_segment_audio(
+    input_path: Path, output_path: Path, target_duration_sec: float,
+) -> Tuple[Path, str]:
+    """对单句 OmniVoice 输出做轻量收尾处理，返回 (输出路径, 操作类型)。"""
 
     work_dir = output_path.parent
     trim_path = work_dir / f"{output_path.stem}._trim.wav"
@@ -2257,7 +2623,7 @@ def _normalize_generated_segment_audio(input_path: Path, output_path: Path, targ
     )
     if trimmed_duration <= 0.0:
         shutil.copy2(input_path, output_path)
-        return output_path
+        return output_path, "passthrough"
 
     normalize_speech_audio_level(
         input_path=trim_path,
@@ -2271,14 +2637,14 @@ def _normalize_generated_segment_audio(input_path: Path, output_path: Path, targ
     target_duration_sec = max(0.05, float(target_duration_sec))
     if current_duration > target_duration_sec + 0.15:
         ratio = current_duration / target_duration_sec
-        if ratio <= 1.25:
+        if ratio <= 1.5:
             try:
                 fit_audio_to_duration(
                     input_path=norm_path,
                     output_path=output_path,
                     target_duration_sec=target_duration_sec,
                 )
-                return output_path
+                return output_path, "time_stretch"
             except Exception as exc:
                 logger.warning("OmniVoice fit timing fallback for %s: %s", output_path.name, exc)
         trim_audio_to_max_duration(
@@ -2286,10 +2652,122 @@ def _normalize_generated_segment_audio(input_path: Path, output_path: Path, targ
             output_path=output_path,
             max_duration_sec=target_duration_sec,
         )
-        return output_path
+        return output_path, "hard_trim"
+
+    if current_duration < target_duration_sec * 0.85 and target_duration_sec >= 0.5:
+        try:
+            fit_audio_to_duration(
+                input_path=norm_path,
+                output_path=output_path,
+                target_duration_sec=target_duration_sec,
+            )
+            return output_path, "slow_fit"
+        except Exception as exc:
+            logger.warning("OmniVoice slow-fit fallback for %s: %s", output_path.name, exc)
 
     shutil.copy2(norm_path, output_path)
-    return output_path
+    return output_path, "passthrough"
+
+
+def _generate_synthesis_diagnostic_report(
+    segment_results: List[Dict[str, Any]],
+    out_root: Path,
+    target_lang: str,
+) -> Path:
+    """合成完成后生成诊断报告，量化语速/时长匹配质量。"""
+
+    if not segment_results:
+        report_path = out_root / "synthesis_report.json"
+        report_path.write_text(json.dumps({"segments": 0}, ensure_ascii=False, indent=2), encoding="utf-8")
+        return report_path
+
+    sync_ratios: List[float] = []
+    speeds: List[float] = []
+    cps_values: List[float] = []
+    action_counts: Dict[str, int] = {}
+    problem_segments: List[Dict[str, Any]] = []
+
+    for seg in segment_results:
+        target_dur = max(0.01, float(seg.get("duration_sec", 0.0) or 0.0))
+        actual_dur = max(0.01, float(seg.get("normalized_duration_sec", 0.0) or 0.0))
+        sync = actual_dur / target_dur
+        sync_ratios.append(sync)
+
+        speed = float(seg.get("tts_speed", 1.0) or 1.0)
+        speeds.append(speed)
+
+        text = str(seg.get("text") or "")
+        chars = len(re.sub(r"\s+", "", text))
+        cps = chars / target_dur
+        cps_values.append(cps)
+
+        action = str(seg.get("fit_action") or "unknown")
+        action_counts[action] = action_counts.get(action, 0) + 1
+
+        reasons: List[str] = []
+        if sync > 1.3:
+            reasons.append(f"sync_ratio={sync:.2f}>1.3")
+        if sync < 0.7:
+            reasons.append(f"sync_ratio={sync:.2f}<0.7")
+        if action == "hard_trim":
+            reasons.append("hard_trim")
+        if cps > 12:
+            reasons.append(f"cps={cps:.1f}>12")
+        if reasons:
+            problem_segments.append({
+                "id": seg.get("id", ""),
+                "text": text[:80],
+                "duration_sec": round(target_dur, 3),
+                "sync_ratio": round(sync, 3),
+                "tts_speed": round(speed, 3),
+                "cps": round(cps, 1),
+                "fit_action": action,
+                "reasons": reasons,
+            })
+
+    def _percentile(vals: List[float], p: float) -> float:
+        s = sorted(vals)
+        idx = min(len(s) - 1, max(0, int(len(s) * p)))
+        return s[idx]
+
+    report = {
+        "segments": len(segment_results),
+        "sync_ratio": {
+            "min": round(min(sync_ratios), 3),
+            "max": round(max(sync_ratios), 3),
+            "median": round(_percentile(sync_ratios, 0.5), 3),
+            "p10": round(_percentile(sync_ratios, 0.1), 3),
+            "p90": round(_percentile(sync_ratios, 0.9), 3),
+        },
+        "tts_speed": {
+            "min": round(min(speeds), 3),
+            "max": round(max(speeds), 3),
+            "median": round(_percentile(speeds, 0.5), 3),
+            "extreme_slow_count": sum(1 for s in speeds if s < 0.85),
+            "extreme_fast_count": sum(1 for s in speeds if s > 1.3),
+        },
+        "cps": {
+            "median": round(_percentile(cps_values, 0.5), 1),
+            "p10": round(_percentile(cps_values, 0.1), 1),
+            "p90": round(_percentile(cps_values, 0.9), 1),
+            "above_12_count": sum(1 for c in cps_values if c > 12),
+        },
+        "fit_actions": action_counts,
+        "problem_segments": problem_segments,
+    }
+
+    report_path = out_root / "synthesis_report.json"
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    logger.info(
+        "OmniVoice synthesis report: %d segments, median sync=%.2f, %d hard_trim, %d slow_fit, %d problem",
+        len(segment_results),
+        _percentile(sync_ratios, 0.5),
+        action_counts.get("hard_trim", 0),
+        action_counts.get("slow_fit", 0),
+        len(problem_segments),
+    )
+    return report_path
 
 
 def _create_task_payload(
@@ -3719,7 +4197,10 @@ def _run_omnivoice_job(
     else:
         selected_subtitles, selected_mode = _translate_subtitles_if_needed(
             subtitles_mode=subtitle_mode,
-            source_rows=_optimize_omnivoice_source_rows(source_subtitles),
+            source_rows=_optimize_omnivoice_source_rows(
+                source_subtitles,
+                subtitle_mode=subtitle_mode,
+            ),
             translated_rows=translated_subtitles,
             source_lang=display_source_lang,
             target_lang=display_target_lang,
@@ -3729,19 +4210,50 @@ def _run_omnivoice_job(
             translate_system_prompt=translate_system_prompt,
             task_id=task_id,
         )
-        selected_subtitles = _optimize_omnivoice_selected_rows(selected_subtitles)
+        selected_subtitles = _optimize_omnivoice_selected_rows(
+            selected_subtitles,
+            subtitle_mode=selected_mode,
+        )
         selected_subtitles = _ensure_speaker_ids(
             selected_subtitles,
             fallback_rows=source_subtitles,
             force_align_by_time=True,
         )
         selected_subtitles = _drop_empty_subtitle_rows(selected_subtitles, label="selected")
+    selected_subtitles, dedup_count = _deduplicate_translated_rows(selected_subtitles)
+    if dedup_count > 0:
+        logger.warning(
+            "OmniVoice task %s removed %d near-duplicate translated rows",
+            task_id,
+            dedup_count,
+        )
     selected_subtitles, adjusted_pairs = _rebalance_omnivoice_synthesis_rows(selected_subtitles)
     if adjusted_pairs > 0:
         logger.warning(
             "OmniVoice task %s rebalanced %d extreme subtitle timing pairs before synthesis",
             task_id,
             adjusted_pairs,
+        )
+    selected_subtitles, equalized_pairs = _equalize_cps_across_neighbors(selected_subtitles)
+    if equalized_pairs > 0:
+        logger.info(
+            "OmniVoice task %s equalized CPS for %d neighbor pairs",
+            task_id,
+            equalized_pairs,
+        )
+    selected_subtitles, merged_short_lines = _merge_short_lines_for_tts(selected_subtitles)
+    if merged_short_lines > 0:
+        logger.info(
+            "OmniVoice task %s merged %d short lines toward ~25 chars",
+            task_id,
+            merged_short_lines,
+        )
+    selected_subtitles, merged_short = _merge_ultra_short_segments(selected_subtitles)
+    if merged_short > 0:
+        logger.info(
+            "OmniVoice task %s merged %d ultra-short segments into same-speaker neighbors",
+            task_id,
+            merged_short,
         )
     source_reference_subtitles = _ensure_speaker_ids(source_subtitles, fallback_rows=selected_subtitles)
     selected_subtitles_path = out_root / "selected_subtitles.srt"
@@ -3908,24 +4420,38 @@ def _run_omnivoice_job(
                 f"OmniVoice subtitle #{index:04d} has empty text after filtering; "
                 "cannot synthesize blank content"
             )
-        generated_bytes = _call_remote_generate(
-            api_url=omnivoice_api_url,
-            text=generation_text,
-            language=runtime_target_lang,
-            ref_audio_path=ref_audio_path,
-            ref_text=ref_text_for_generation,
-            instruct="",
-            duration=duration_sec,
-        )
-        output_segment_path.write_bytes(generated_bytes)
-        normalized_segment_path = segment_dir / f"seg_{index:04d}_normalized.wav"
-        _normalize_generated_segment_audio(
-            input_path=output_segment_path,
-            output_path=normalized_segment_path,
-            target_duration_sec=duration_sec,
-        )
-        final_segment_path = segment_dir / f"seg_{index:04d}.wav"
-        shutil.copy2(normalized_segment_path, final_segment_path)
+        if _is_ultra_short_for_tts(generation_text, duration_sec):
+            logger.warning(
+                "OmniVoice seg #%04d ultra-short (%d chars, %.2fs) — generating silence instead of TTS",
+                index, len(generation_text.replace(" ", "")), duration_sec,
+            )
+            final_segment_path = segment_dir / f"seg_{index:04d}.wav"
+            _generate_silence_wav(final_segment_path, duration_sec)
+            actual_duration = round(duration_sec, 3)
+            segment_speed = 1.0
+            fit_action = "silence_skip"
+        else:
+            segment_speed = _compute_tts_speed_for_segment(generation_text, duration_sec, runtime_target_lang)
+            generated_bytes = _call_remote_generate(
+                api_url=omnivoice_api_url,
+                text=generation_text,
+                language=runtime_target_lang,
+                ref_audio_path=ref_audio_path,
+                ref_text=ref_text_for_generation,
+                instruct="",
+                duration=duration_sec,
+                speed=segment_speed,
+            )
+            output_segment_path.write_bytes(generated_bytes)
+            normalized_segment_path = segment_dir / f"seg_{index:04d}_normalized.wav"
+            _, fit_action = _normalize_generated_segment_audio(
+                input_path=output_segment_path,
+                output_path=normalized_segment_path,
+                target_duration_sec=duration_sec,
+            )
+            final_segment_path = segment_dir / f"seg_{index:04d}.wav"
+            shutil.copy2(normalized_segment_path, final_segment_path)
+            actual_duration = round(float(sf.info(str(final_segment_path)).duration), 3)
         segment_manifest = {
             "id": f"seg_{index:04d}",
             "speaker_id": speaker_id,
@@ -3935,7 +4461,10 @@ def _run_omnivoice_job(
             "ref_audio_path": str(ref_audio_path.resolve()),
             "tts_audio_path": str(final_segment_path.resolve()),
             "duration_sec": round(duration_sec, 3),
-            "normalized_duration_sec": round(float(sf.info(str(final_segment_path)).duration), 3),
+            "normalized_duration_sec": actual_duration,
+            "tts_speed": round(segment_speed, 3),
+            "fit_action": fit_action,
+            "sync_ratio": round(actual_duration / max(0.01, duration_sec), 3),
         }
         (segment_dir / "manifest.json").write_text(json.dumps(segment_manifest, ensure_ascii=False, indent=2), encoding="utf-8")
         segment_results.append(segment_manifest)
@@ -4075,6 +4604,11 @@ def _run_omnivoice_job(
     task["out_root"] = str(out_root.resolve())
     task["result_audio"] = str(final_mix_path.resolve())
     task["result_srt"] = str(final_srt_path.resolve())
+    _generate_synthesis_diagnostic_report(
+        segment_results=segment_results,
+        out_root=out_root,
+        target_lang=display_target_lang,
+    )
     _set_task(task_id, status="completed", stage="completed", progress=100.0)
     _annotate_task_with_resume_state(task, manifest=manifest, out_root=out_root, from_disk=False)
 
@@ -4328,7 +4862,10 @@ async def prepare_omnivoice_subtitles_from_project(
 
     selected_subtitles, selected_mode = _translate_subtitles_if_needed(
         subtitles_mode=subtitle_mode,
-        source_rows=_optimize_omnivoice_source_rows(source_rows),
+        source_rows=_optimize_omnivoice_source_rows(
+            source_rows,
+            subtitle_mode=subtitle_mode,
+        ),
         translated_rows=translated_rows,
         source_lang=source_lang,
         target_lang=target_lang,
@@ -4338,13 +4875,21 @@ async def prepare_omnivoice_subtitles_from_project(
         translate_system_prompt=translate_system_prompt,
         task_id=resolved_task_id,
     )
-    selected_subtitles = _optimize_omnivoice_selected_rows(selected_subtitles)
+    selected_subtitles = _optimize_omnivoice_selected_rows(
+        selected_subtitles,
+        subtitle_mode=selected_mode,
+    )
     selected_subtitles = _ensure_speaker_ids(
         selected_subtitles,
         fallback_rows=source_rows,
         force_align_by_time=True,
     )
     selected_subtitles = _drop_empty_subtitle_rows(selected_subtitles, label="selected")
+    selected_subtitles, _dd = _deduplicate_translated_rows(selected_subtitles)
+    selected_subtitles, _adj = _rebalance_omnivoice_synthesis_rows(selected_subtitles)
+    selected_subtitles, _eq = _equalize_cps_across_neighbors(selected_subtitles)
+    selected_subtitles, _ml = _merge_short_lines_for_tts(selected_subtitles)
+    selected_subtitles, _ms = _merge_ultra_short_segments(selected_subtitles)
     if not selected_subtitles:
         raise HTTPException(status_code=400, detail="OmniVoice selected subtitles are empty")
 

@@ -1294,19 +1294,29 @@ if (videoPlayer) {
 }
 
 // 供 5 号 OmniVoice 面板兜底写入预览字幕：当独立预览注入器不可用时，回退到全局 translated 字幕。
-window.applyOmnivoicePreviewSubtitles = function applyOmnivoicePreviewSubtitles(items) {
+function applySubtitlePreviewItems(items, { displayMode = 'translated', renderTranslatedPanel = true } = {}) {
     const nextItems = Array.isArray(items) ? items : [];
     translatedSubtitlesData = nextItems;
-    if (translatedDisplay) {
+    if (renderTranslatedPanel && translatedDisplay) {
         renderSubtitles(translatedSubtitlesData, translatedDisplay);
     }
-    overlayMode = 'translated';
+    overlayMode = displayMode || 'translated';
     if (displayModeSelect) {
-        displayModeSelect.value = 'translated';
+        displayModeSelect.value = overlayMode;
     }
     if (videoPlayer) {
         videoPlayer.dispatchEvent(new Event('timeupdate'));
     }
+}
+
+// 供 5 号 OmniVoice 面板兜底写入预览字幕：当独立预览注入器不可用时，回退到全局 translated 字幕。
+window.applyOmnivoicePreviewSubtitles = function applyOmnivoicePreviewSubtitles(items) {
+    applySubtitlePreviewItems(items, { displayMode: 'translated', renderTranslatedPanel: true });
+};
+
+// 供 4 号面板加载已完成批次结果时使用；只改预览，不得回写 Current Project 真值。
+window.applyAutoDubPreviewSubtitles = function applyAutoDubPreviewSubtitles(items) {
+    applySubtitlePreviewItems(items, { displayMode: 'translated', renderTranslatedPanel: true });
 };
 
 // 1. Media Upload Logic (Panel 1)

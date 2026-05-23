@@ -965,7 +965,7 @@ def _translate_subtitles_if_needed(
         for row in source_rows
         if str(row.get("text") or "").strip()
     ]
-    return (source_truth_rows, _sanitize_voxcpm_selected_rows_for_target(translated_rows_for_output, target_lang=target_lang), "source")
+    return (source_truth_rows, _sanitize_voxcpm_selected_rows_for_target(translated_rows_for_output, target_lang=target_lang), "translated")
 
 
 def _http_json(

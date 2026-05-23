@@ -41,16 +41,16 @@ async def upload_srt(
     except UnicodeDecodeError:
         content_str = content_bytes.decode("latin-1")
 
-    subtitles = parse_srt(content_str)
-    subtitles, _ = normalize_subtitles_with_speakers(subtitles)
-    subtitles = optimize_srt_import_subtitles(subtitles)
-    if not subtitles:
-        raise HTTPException(status_code=400, detail="Could not parse subtitles or file is empty")
-
-    # 明确区分“原字幕上传”和“译文字幕上传”，供 Current Project 直接配音策略选择。
     normalized_subtitle_kind = str(subtitle_kind or "source").strip().lower()
     if normalized_subtitle_kind not in {"source", "translated"}:
         raise HTTPException(status_code=400, detail="Invalid subtitle_kind")
+
+    subtitles = parse_srt(content_str)
+    subtitles, _ = normalize_subtitles_with_speakers(subtitles)
+    if normalized_subtitle_kind == "translated":
+        subtitles = optimize_srt_import_subtitles(subtitles)
+    if not subtitles:
+        raise HTTPException(status_code=400, detail="Could not parse subtitles or file is empty")
 
     task_id = str(uuid.uuid4())
     legacy_runtime.tasks[task_id] = {

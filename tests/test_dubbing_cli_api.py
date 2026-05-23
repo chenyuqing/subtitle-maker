@@ -1060,7 +1060,7 @@ class DubbingCliApiTests(unittest.TestCase):
                 translate_system_prompt="",
             )
 
-        self.assertEqual(mode, "source")
+        self.assertEqual(mode, "translated")
         self.assertEqual([row["speaker_id"] for row in source_selected_rows], ["Speaker 1", "Speaker 2"])
         self.assertEqual([row["speaker_id"] for row in translated_selected_rows], ["Speaker 1", "Speaker 2"])
 
@@ -1130,7 +1130,7 @@ class DubbingCliApiTests(unittest.TestCase):
                 translate_system_prompt="",
             )
 
-        self.assertEqual(mode, "source")
+        self.assertEqual(mode, "translated")
         self.assertEqual(len(source_selected_rows), 1)
         self.assertEqual(len(translated_selected_rows), 1)
         self.assertNotIn("[Error]", translated_selected_rows[0]["text"])
@@ -1179,7 +1179,7 @@ class DubbingCliApiTests(unittest.TestCase):
                 translate_system_prompt="",
             )
 
-        self.assertEqual(mode, "source")
+        self.assertEqual(mode, "translated")
         self.assertEqual(source_selected_rows[0]["text"], "原始中文整段")
         self.assertIn("我今日想讲一个可能会令好多创业者唔舒服嘅事实。", translated_selected_rows[0]["text"])
         self.assertIn("而公司失败嘅头号原因", translated_selected_rows[0]["text"])
@@ -3089,6 +3089,52 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(speaker_seq[0], "Speaker 1")
         self.assertTrue(any(spk == "Speaker 2" for spk in speaker_seq[1:]))
 
+    def test_omnivoice_source_mode_keeps_original_cue_boundaries_for_continuation_lines(self):
+        """5号链路 source 直通时，不得把连续英文 cue 压成只剩半句的长窗。"""
+
+        rows = [
+            {"start": 734.0, "end": 735.36, "text": "Which is right for Google?", "speaker_id": "Speaker 1"},
+            {"start": 735.36, "end": 738.16, "text": "Is it uh you know is there is there some model that", "speaker_id": "Speaker 1"},
+            {"start": 738.16, "end": 741.6, "text": "is just too good and and you're gonna hold it back or", "speaker_id": "Speaker 1"},
+            {"start": 741.6, "end": 746.96, "text": "is the more iterative deployment strategy that OpenAI takes more aligned with", "speaker_id": "Speaker 1"},
+        ]
+
+        source_rows = omnivoice_dub_api._optimize_omnivoice_source_rows(rows, subtitle_mode="source")
+        selected_rows = omnivoice_dub_api._optimize_omnivoice_selected_rows(source_rows, subtitle_mode="source")
+
+        self.assertEqual(len(source_rows), 4)
+        self.assertEqual(len(selected_rows), 4)
+        self.assertEqual(source_rows[0]["text"], "Which is right for Google?")
+        self.assertEqual(source_rows[1]["text"], "Is it uh you know is there is there some model that")
+        self.assertEqual(source_rows[2]["text"], "is just too good and and you're gonna hold it back or")
+        self.assertIn("iterative deployment strategy", source_rows[3]["text"])
+        self.assertIn("takes more aligned with", source_rows[3]["text"])
+        self.assertEqual([row["text"] for row in selected_rows], [row["text"] for row in source_rows])
+
+    def test_omnivoice_source_mode_does_not_swallow_short_followup_rows(self):
+        """5号链路 source 直通时，短尾 cue 不能被错误压成残句或吞进后文。"""
+
+        rows = [
+            {"start": 16.4, "end": 19.28, "text": "I'm the CEO of Ford Future. And", "speaker_id": "Speaker 1"},
+            {"start": 21.52, "end": 22.16, "text": "today", "speaker_id": "Speaker 1"},
+            {
+                "start": 22.16,
+                "end": 27.2,
+                "text": "I am super excited to share a conversation with the man who has been leading Google for the last 10 years, please welcome",
+                "speaker_id": "Speaker 1",
+            },
+            {"start": 27.2, "end": 28.1, "text": "Sundar Pichai.", "speaker_id": "Speaker 1"},
+        ]
+
+        source_rows = omnivoice_dub_api._optimize_omnivoice_source_rows(rows, subtitle_mode="source")
+        selected_rows = omnivoice_dub_api._optimize_omnivoice_selected_rows(source_rows, subtitle_mode="source")
+
+        self.assertEqual(len(source_rows), 4)
+        self.assertEqual(source_rows[1]["text"], "today")
+        self.assertTrue(source_rows[2]["text"].startswith("I am super excited"))
+        self.assertEqual(source_rows[3]["text"], "Sundar Pichai.")
+        self.assertEqual([row["text"] for row in selected_rows], [row["text"] for row in source_rows])
+
     def test_ensure_speaker_ids_prefers_time_overlap_when_row_count_changes(self):
         """speaker 回填应优先按时间重叠，而不是固定索引，避免跨 speaker 错贴。"""
 
@@ -3775,7 +3821,7 @@ class DubbingCliApiTests(unittest.TestCase):
                 task_id="unit_test",
             )
 
-        self.assertEqual(mode, "source")
+        self.assertEqual(mode, "translated")
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["text"], "你好一")
         self.assertEqual(rows[1]["text"], "Hello two")
@@ -3816,7 +3862,7 @@ class DubbingCliApiTests(unittest.TestCase):
                 task_id="unit_test",
             )
 
-        self.assertEqual(mode, "source")
+        self.assertEqual(mode, "translated")
         self.assertEqual(len(rows), 2)
         self.assertIn("你好一", rows[0]["text"])
         self.assertEqual(rows[1]["text"], "你好二")
@@ -3859,7 +3905,7 @@ class DubbingCliApiTests(unittest.TestCase):
                 task_id="unit_test",
             )
 
-        self.assertEqual(mode, "source")
+        self.assertEqual(mode, "translated")
         self.assertEqual(len(rows), 2)
         self.assertIn("中文", rows[0]["text"])
         self.assertEqual(rows[1]["text"], "第二行")
@@ -4673,6 +4719,7 @@ class DubbingCliApiTests(unittest.TestCase):
         def _fake_normalize_generated_segment_audio(*, input_path, output_path, target_duration_sec):
             del input_path, target_duration_sec
             output_path.write_text("normalized", encoding="utf-8")
+            return output_path, "passthrough"
 
         def _fake_compose_vocals_master(*, segments, output_path, source_audio_fallback=None):
             del source_audio_fallback
@@ -4780,6 +4827,7 @@ class DubbingCliApiTests(unittest.TestCase):
         def _fake_normalize_generated_segment_audio(*, input_path, output_path, target_duration_sec):
             del input_path, target_duration_sec
             output_path.write_text("normalized", encoding="utf-8")
+            return output_path, "passthrough"
 
         def _fake_compose_vocals_master(*, segments, output_path, source_audio_fallback=None):
             del source_audio_fallback
@@ -4861,8 +4909,8 @@ class DubbingCliApiTests(unittest.TestCase):
         media_path = self.upload_root / "resume-demo.mp4"
         media_path.write_bytes(b"video-data")
         selected_rows = [
-            {"start": 0.0, "end": 1.0, "text": "你好", "speaker_id": "Speaker 1"},
-            {"start": 1.0, "end": 2.0, "text": "世界", "speaker_id": "Speaker 1"},
+            {"start": 0.0, "end": 1.0, "text": "你好世界欢迎光临这是第一段测试文本内容比较长的那种类型", "speaker_id": "Speaker 1"},
+            {"start": 1.0, "end": 2.0, "text": "今天天气真不错呀我们一起出去走走看看风景如何呢朋友们", "speaker_id": "Speaker 1"},
         ]
         task = omnivoice_dub_api._create_task_payload(
             task_id=task_id,
@@ -4884,7 +4932,7 @@ class DubbingCliApiTests(unittest.TestCase):
             "speaker_id": "Speaker 1",
             "start_sec": 0.0,
             "end_sec": 1.0,
-            "text": "你好",
+            "text": "你好世界欢迎光临这是第一段测试文本内容比较长的那种类型",
             "tts_audio_path": str((out_root / "segment_jobs" / "segment_0001" / "seg_0001.wav").resolve()),
             "duration_sec": 1.0,
             "normalized_duration_sec": 1.0,
@@ -4906,6 +4954,7 @@ class DubbingCliApiTests(unittest.TestCase):
         def _fake_normalize_generated_segment_audio(*, input_path, output_path, target_duration_sec):
             del input_path, target_duration_sec
             output_path.write_text("normalized", encoding="utf-8")
+            return output_path, "passthrough"
 
         def _fake_prepare_audio(**kwargs):
             kwargs["output_audio_path"].write_text("m4a", encoding="utf-8")
@@ -4998,7 +5047,7 @@ class DubbingCliApiTests(unittest.TestCase):
                 },
             )
 
-        self.assertEqual(generate_calls, ["世界"])
+        self.assertEqual(generate_calls, ["今天天气真不错呀我们一起出去走走看看风景如何呢朋友们"])
         task_after = omnivoice_dub_api._task_store.get(task_id)
         self.assertIsNotNone(task_after)
         self.assertEqual(task_after["status"], "completed")

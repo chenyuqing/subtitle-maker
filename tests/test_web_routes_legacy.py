@@ -106,7 +106,7 @@ class WebLegacyRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("subtitle_kind", response.json()["detail"])
 
-    def test_upload_srt_optimizes_same_speaker_short_turns(self):
+    def test_upload_srt_source_kind_keeps_original_cue_boundaries(self):
         response = self.client.post(
             "/upload_srt",
             files={
@@ -128,6 +128,28 @@ class WebLegacyRouteTests(unittest.TestCase):
         self.assertEqual(payload["subtitles"][1]["text"], "But most guys are doing things in order not to ejaculate quite so quickly.")
         self.assertEqual(payload["subtitles"][0]["speaker_id"], "Speaker 1")
         self.assertEqual(payload["subtitles"][1]["speaker_id"], "Speaker 1")
+
+    def test_upload_srt_translated_kind_still_uses_import_optimization(self):
+        response = self.client.post(
+            "/upload_srt",
+            files={
+                "file": (
+                    "demo.srt",
+                    (
+                        "1\n00:00:00,000 --> 00:00:02,000\nSpeaker 1: 我今日想講\n\n"
+                        "2\n00:00:02,000 --> 00:00:04,000\nSpeaker 1: 呢個故事。\n"
+                    ).encode("utf-8"),
+                    "application/x-subrip",
+                )
+            },
+            data={"video_filename": "demo.mp4", "subtitle_kind": "translated"},
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["subtitle_kind"], "translated")
+        self.assertEqual(len(payload["subtitles"]), 1)
+        self.assertEqual(payload["subtitles"][0]["text"], "我今日想講呢個故事。")
+        self.assertEqual(len(payload["translated_subtitles"]), 1)
 
     def test_upload_deepgram_json_and_status_keep_legacy_task_contract(self):
         deepgram_payload = {

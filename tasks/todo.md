@@ -1,5 +1,161 @@
 # TODO
 
+## 150. 2026-05-22 5 号面板 OmniVoice 配音语速不均修复（CPS timing rebalance）
+- 问题：`selected_subtitles.srt` 存在极端 CPS 方差（1.1～60.7，中位 5.6），导致配音交替极慢/极快
+- 根因：TTS 合成始终 `speed=1.0` 不随文本密度调整；后处理变速阈值过窄（≤1.25）超出则硬截断；时间再分配只覆盖极端相邻对
+- 参考 OmniVoice-Studio-main 三层方案（LLM 文本裁剪 + TTS speed + 后生成变速），跳过 LLM 层（太贵），用增强的前处理 + TTS speed + 后处理替代
+- [x] 修复 1：Per-segment TTS speed 参数
+  - [x] 在 [src/subtitle_maker/omnivoice_dub_api.py] 新增 `_OMNIVOICE_TARGET_CPS` 表（Chinese=6.0, English=15.0 等）和 `_compute_tts_speed_for_segment()` 函数
+  - [x] 合成循环根据 `text_units / target_cps / slot_duration` 计算 speed [0.8, 1.4]，传入 `_call_remote_generate(speed=...)`
+  - [x] segment manifest 新增 `tts_speed` 字段用于诊断
+- [x] 修复 2：扩大后处理变速范围
+  - [x] `_normalize_generated_segment_audio()` 变速阈值从 `ratio <= 1.25` 扩到 `ratio <= 1.5`，减少硬截断
+  - [x] 新增音频过短（< 85% 目标时长）时的减速拉长处理
+- [x] 修复 3：CPS 均衡化预处理
+  - [x] 新增 `_equalize_cps_across_neighbors()`：同 speaker 相邻行 CPS 比值 > 2.0 时按文本长度重分时间，最多迭代 3 轮
+  - [x] 接入主合成管线（`_rebalance` 之后）
+- [x] 修复 4：Speaker upload 路径补齐
+  - [x] `prepare_omnivoice_speaker_upload_dubbing` 漏调了 `_rebalance_omnivoice_synthesis_rows` 和 `_equalize_cps_across_neighbors`，已补上
+- [x] 验证
+  - [x] 316 测试通过，0 新增失败（3 个为预存问题）
+  - [x] `_compute_tts_speed_for_segment` 手动验证：密集中文 2s 窗 → speed=1.4，稀疏中文 5s 窗 → speed=0.8，正常文本 → speed 在合理范围
+  - [x] `_equalize_cps_across_neighbors` 手动验证：20 字 vs 2 字相邻行正确按文本比例重分时间
+
+## 149. 2026-05-22 4 号面板 Index-TTS 翻译链路检查——无需修改
+- [x] 检查结论
+  - [x] 4 号面板架构与 5/6 号面板不同：翻译由 web route `translation.py:translate()` / `subtitles.py` 处理，无 `_translate_subtitles_if_needed()`，无 `selected_mode` 概念
+  - [x] 翻译结果直接 `zip(subtitles, translated_texts)` 拼回，无后处理链路（无 sanitize→fallback→retry→optimize 复杂流程）
+  - [x] `translate_batch()` 保持默认 `sanitize_outputs=True`，对 4 号面板是正确的——翻译结果供用户预览/编辑，`sanitize_translation_text()` 清洗 LLM 废话是有用的
+  - [x] 不存在 mode 错标、sanitize 执行顺序、空行回退等 5/6 号面板的问题
+- [x] 结论：4 号面板无需修改
+
+## 148. 2026-05-22 6 号面板 VoxCPM 翻译链路 selected_mode 记账错误修复
+- [x] 根因分析
+  - [x] `voxcpm_dub_api.py::_translate_subtitles_if_needed()` L968 翻译完成后返回 `"source"` 而非 `"translated"`，与 5 号面板 #146 同类 bug
+  - [x] VoxCPM 的 `selected_mode` 只写入 task 元数据，不影响下游优化分支（与 5 号面板不同，无行为影响，仅记账错误）
+  - [x] `sanitize_outputs=False` 和清洗策略已正确：6 号面板默认保留整段正文，只在检测到脏输出时才回退激进清洗
+- [x] 修复
+  - [x] `voxcpm_dub_api.py` L968：翻译完成后返回 `"translated"` 而非 `"source"`
+  - [x] 更新 3 个测试断言：`preserves_speaker_ids`、`retries_latin_dominant`、`keeps_full_cantonese_paragraph`
+
+### Review
+- [x] 5 个 VoxCPM 翻译测试全部通过（含 2 个同语种直通测试确认仍返回 `"source"`）
+- [x] 全量 `tests.test_dubbing_cli_api` 151 个测试：0 新增 FAIL/ERROR
+
+## 146. 2026-05-22 5 号面板翻译链路 selected_mode 错误标记 + sanitize 执行顺序修复
+- [x] 根因分析
+  - [x] `_translate_subtitles_if_needed()` 在 `subtitles_mode="source"` + 翻译实际执行后，`selected_mode` 仍返回 `"source"` 而非 `"translated"`
+  - [x] 这导致 `_optimize_omnivoice_selected_rows(subtitle_mode="source")` 走直通分支（不合并相邻短 cue），674 条逐 cue 翻译的粤语碎片原样保留
+  - [x] manifest 记账 `selected_subtitle_mode=source` 但 `selected_subtitles.srt` 内容为粤语——记账与实际内容不一致
+- [x] 修复 1：翻译完成后 selected_mode 设为 "translated"
+  - [x] `omnivoice_dub_api.py` L2229：`translator.translate_batch()` 返回后立即设置 `selected_mode = "translated"`
+  - [x] 使 `_optimize_omnivoice_selected_rows()` 走完整优化路径（合并相邻短 cue + 超长段切分），不再保留 674 个碎片
+- [x] 修复 2：OmniVoice 翻译调用禁用内置 sanitize
+  - [x] 三处 `translator.translate_batch()` 调用均传 `sanitize_outputs=False`
+  - [x] 避免 `sanitize_translation_text()` 的候选片段评分逻辑在翻译器层面就裁断正常粤语正文
+  - [x] 由 `_sanitize_translated_rows_for_target()` 在后处理统一接管
+- [x] 修复 3：空行回退 vs sanitize 执行顺序
+  - [x] 原流程：sanitize（丢弃空行）→ 空行回退（永远不触发）→ 重译
+  - [x] 修复后：空行回退 → 重译 → sanitize → drop_empty
+  - [x] 确保空行回退能正确触发，重译结果也能被 sanitize 处理
+
+### Review
+- [x] 三个直接相关测试（restore_empty_rows / retries_latin_dominant / retries_latin_rows_after_empty_fallback）全部通过
+- [x] 全量 `tests.test_dubbing_cli_api` 151 个测试：0 新增 FAIL，剩余 1 FAIL + 3 ERROR 均为预先存在的问题（git stash 验证）
+- [x] 全量 `tests.test_web_routes_legacy` 11 个测试：全部通过
+- [x] 端到端验证 `omnivoice_20260522_135724/selected_subtitles.srt`：
+  - [x] manifest `selected_subtitle_mode` 正确显示 `"translated"`（旧值错误显示 `"source"`）
+  - [x] 674 条原始 source cue 翻译后合并为 344 条完整粤语句（旧版 674 条碎片不合并）
+  - [x] 粤语翻译完整可读："我叫 Matt Berman"、"我系 Ford Future 嘅 CEO" 等（旧版 "我叫"、"我系"、"同埋" 各占一条）
+
+## 147. 2026-05-22 翻译 batch size 过大导致 API 调用爆炸
+- [x] 根因分析
+  - [x] `DEFAULT_TRANSLATION_BATCH_SIZE=300`，LLM 对 300 行编号列表精度差，丢行率 ~15%
+  - [x] `MAX_TRANSLATION_MISSING_RETRY_COUNT=8` + `MAX_TRANSLATION_MISSING_RETRY_RATIO=0.05` 太严格，46 行缺失直接跳过局部补译，走 split retry
+  - [x] 实际观察：1 个 batch 本来 1 次 API 调用，因递归拆分变成 8 次（300→150+150→75+75+150，每层再补译）
+  - [x] 674 行翻译预计 20+ 次 API 调用，浪费 token 和时间
+- [x] 修复
+  - [x] `DEFAULT_TRANSLATION_BATCH_SIZE` 300→100：LLM 处理 100 行编号列表精度高很多，674 行变 7 批
+  - [x] `MAX_TRANSLATION_MISSING_RETRY_COUNT` 8→15：100 行里丢 10 行也能直接局部补译
+  - [x] `MAX_TRANSLATION_MISSING_RETRY_RATIO` 0.05→0.15：放宽门槛，优先走便宜的局部补译而非 split retry
+  - [x] `MIN_TRANSLATION_RETRY_CHUNK_SIZE` 60→30：万一还要拆，拆得更小更精准
+
+### Review
+- [x] `py_compile` 验证通过
+- [x] 预期效果：674 行翻译从 ~20 次 API 调用降到 7-9 次（7 批各 1 次 + 偶尔 1-2 次局部补译）
+
+## 145. 2026-05-22 1 号面板 source SRT 上传不应激进优化
+- [x] 现状分析
+  - [x] 核对 [src/subtitle_maker/app/routes/subtitles.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/app/routes/subtitles.py) `::upload_srt()`，确认 source/translated 两种上传都统一调用了 `optimize_srt_import_subtitles(...)`
+  - [x] 用原始文件 `~/Downloads/2026-05-22-125013-YTDown_YouTube_Beyond-the-keynote-with-Sundar-Pichai_Media_9C20esBUf-Q_001_1080p.srt` 取证，确认 1 号面板上传链路会把 `674` 行压成 `423` 行
+  - [x] 用 [outputs/dub_jobs/omnivoice_20260522_123518/manifest.json](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/omnivoice_20260522_123518/manifest.json:1) 取证，确认 `source_subtitles_count=423`，说明 5 号面板读取到的 source 已经是上传阶段被改写后的版本
+- [x] 功能点设计
+  - [x] 只修改 1 号面板 SRT 上传入口，不改 Deepgram JSON、不改 5/6 号面板后端翻译逻辑
+  - [x] `subtitle_kind=source` 时保留原始 cue 边界，只做 `normalize_subtitles_with_speakers(...)` 和必要的基础清洗
+  - [x] `subtitle_kind=translated` 保留现有导入优化，继续服务“直接上传译文稿”的收敛场景
+- [x] 风险与决策
+  - [x] 风险 1：上传后 source 行数回升，会影响依赖 Current Project 的 4/5/6 号面板，但这是期望行为，因为用户要的是原始 source 真值
+  - [x] 风险 2：如果 translated 上传仍走优化、source 上传不走，前端需继续清楚区分两种语义
+- [x] 待确认
+  - [x] 确认后按“source 上传保原始 cue”实现
+
+### Review
+- [x] [src/subtitle_maker/app/routes/subtitles.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/app/routes/subtitles.py) 的 `upload_srt()` 现已按 `subtitle_kind` 分流：`source` 只做 `normalize_subtitles_with_speakers(...)`，不再跑 `optimize_srt_import_subtitles(...)`
+- [x] `translated` 上传仍保留原有导入优化，因此不会影响“直接上传译文稿后对齐/收敛”的旧行为
+- [x] 已通过 `tests/test_web_routes_legacy.py` 四个定向用例与 `py_compile` 验证，锁住 source 上传保原始 cue、translated 上传仍可收敛两条语义
+
+## 144. 2026-05-22 1 号面板 source 状态被 4 号面板结果污染修复
+- [x] 现状分析
+  - [x] 核对 [src/subtitle_maker/static/app.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js) `::handleSrtUpload()` 与 `::applyImportedSubtitleResponse()`，确认 1 号面板上传 `subtitle_kind=source` 时会把英文 SRT 写入 `originalSubtitlesData`
+  - [x] 核对 [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js) `::autoLoadAutoDubSubtitles()`，确认 4 号面板加载结果后会调用 [src/subtitle_maker/static/app.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js) `::applyAutoDubSubtitleItems()`，把结果字幕回写到 `originalSubtitlesData`
+  - [x] 确认 [src/subtitle_maker/static/app.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js) `::saveState()` 会把被污染后的 `originalSubtitlesData` 持久化到 `sm_originalSubtitles`，导致刷新后 5 号面板仍读到错误 source
+- [x] 功能点设计
+  - [x] 只修改前端状态管理，不改 5 号面板后端翻译/配音逻辑
+  - [x] 4 号面板加载历史结果或自动加载配音结果时，只更新播放器字幕预览，不再改写 `Current Project` 的 `originalSubtitlesData / translatedSubtitlesData`
+  - [x] 保留 1 号面板上传 source/translated SRT 时对 `Current Project` 的真值写入语义
+- [x] 风险与决策
+  - [x] 风险 1：4 号面板结果预览仍要可见，不能因为去掉全局回写而失去播放器字幕显示
+  - [x] 风险 2：localStorage 中旧的污染值可能仍存在；至少要确保新一轮结果加载不再继续覆盖
+- [x] 待确认
+  - [x] 确认后按“结果预览状态”和“Current Project 真值状态”分离的方案落地
+
+### Review
+- [x] [src/subtitle_maker/static/app.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/app.js) 新增 `applySubtitlePreviewItems()` 与 `window.applyAutoDubPreviewSubtitles()`，把“字幕预览注入播放器”从“Current Project 真值写回”里拆开
+- [x] [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js) `::autoLoadAutoDubSubtitles()` 现优先走 `window.applyAutoDubPreviewSubtitles()`，因此 4 号面板加载历史结果时不再覆盖 1 号面板英文 source
+- [x] 当前验证已完成 diff 级自检；原计划的 `node --check` 在本机失败，根因是系统 `node` 缺少动态库 `libsimdjson.29.dylib`，不是本次 JS 改动本身的语法错误
+
+## 143. 2026-05-22 5 号面板 source 直通链路吞字修复
+- [x] 现状分析
+  - [x] 核对 [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) `::_run_omnivoice_job()` 与 [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) `::_optimize_omnivoice_source_rows()`，确认 5 号面板在 `subtitle_mode=source` 时会先把原始字幕送进 `optimize_srt_import_subtitles(...)`，再进入 selected 后处理
+  - [x] 核对 [src/subtitle_maker/domains/subtitles/srt_import.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/subtitles/srt_import.py) `::optimize_srt_import_subtitles()`，确认当前 source 导入优化会按 speaker block + 句末标点 + 碎片修补重组 cue，存在把 `And / today / I am super excited...` 这类原始相邻 cue 合并坏的风险
+  - [x] 用 [outputs/dub_jobs/omnivoice_20260522_112753/manifest.json](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/outputs/dub_jobs/omnivoice_20260522_112753/manifest.json) 取证，确认该批次 `subtitle_mode=source`、`selected_subtitle_mode=source`、`translated_subtitles_count=0`，因此 `selected_subtitles.srt` 的问题不是翻译层压缩导致，而是 source 直通链路本身吞字
+  - [x] 取证结论：原始 source 674 行经 `_optimize_omnivoice_source_rows(...)` 后压成 336 行，随后 `_optimize_omnivoice_selected_rows(...)` 又把已被压坏的块继续切碎；根因在 source 导入优化，而不是翻译 provider
+- [x] 功能点设计
+  - [x] 只修改 5 号面板 source 直通链路，不改翻译 provider、不改 6 号面板、不改 final rebuild
+  - [x] 给 `_optimize_omnivoice_source_rows()` 增加更保守的 source 模式分支：
+    - [x] 对原始英文 SRT，禁止把 `Speaker X:` 前缀残留和后续正文跨 cue 吞并成一条
+    - [x] 对明显短尾 cue（例如 `And`、`today`）不再做激进跨 cue 合并，优先保留原始时间窗与文字内容
+    - [x] 只保留清洗和“单条超长 cue 内部切分”的最小处理，不做大范围句块重构
+  - [x] 给 `_optimize_omnivoice_selected_rows()` 在 source 模式下增加更保守约束：
+    - [x] source 直通结果只做规整与必要的单条超长切分，不再按长窗做二次重切
+    - [x] 保证 `selected_subtitles.srt` 与原始 source 的文字内容尽量一一对应，优先保字义完整而不是压缩行数
+  - [x] 产出合同保持不变：
+    - [x] 仍输出 `selected_subtitles.srt`
+    - [x] 仍输出 `selected_subtitles_with_speakers.srt`
+    - [x] 不新增前端开关，不新增中间文件
+- [x] 风险与决策
+  - [x] 风险 1：source 直通结果行数可能回升，导致后续 TTS 句数变多；但这是接受的，因为当前优先级是“不吞字、不漏义”
+  - [x] 风险 2：如果过度放宽 source 合并，可能再次出现超长句；因此改成只允许单条超长 cue 内部切分，不再做激进跨 cue 合并
+  - [x] 风险 3：speaker_id 仍必须保留，后续恢复/重启不能丢 speaker 标签
+  - [x] 验证必须覆盖原始坏例子，至少对 `And / today / I am super excited... / has been leading Google...` 这类 source cue 进行回归
+- [x] 待确认
+  - [x] 你确认后，我再开始实现这条 Spec，只收口 5 号面板 source 直通链路
+
+### Review
+- [x] [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 已为 5 号面板新增 source 模式保守直通分支：`subtitle_mode/source` 与 `selected_mode/source` 不再走跨 cue 合并，只做文本规整和单条超长 cue 内部切分
+- [x] [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已补回归，锁住 `Which is right for Google? / Is it ... / is just too good ... / is the more iterative ...` 与 `And / today / I am super excited ... / Sundar Pichai.` 不会再被压坏
+- [x] 用原始 SRT `~/Downloads/2026-05-22-125013-YTDown_YouTube_Beyond-the-keynote-with-Sundar-Pichai_Media_9C20esBUf-Q_001_1080p.srt` 复现后，当前 source 直通结果已从历史的 `674 -> 336 -> 591` 收敛为 `674 -> 674 -> 674`，不再出现用户点名的半句长窗问题
+
 ## 132. 2026-05-22 5 号面板仅替换有字幕说话段，其余时间保留原音
 - [ ] 现状分析
   - [ ] 核对 5 号面板当前 final 音频/视频拼接逻辑，确认无字幕时段是否保留原音
