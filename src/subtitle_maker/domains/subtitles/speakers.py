@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 SPEAKER_PREFIX_RE = re.compile(
-    r"^\s*(?P<speaker>(?:Speaker\s+\S+)|(?:[^:：\n]{1,80}))\s*[:：]\s*(?P<text>.+?)\s*$",
+    r"^\s*(?P<speaker>(?:Speaker\s+\S+)|(?:[^:：\n]{1,80}))\s*[:：](?!\s*\d{2})\s*(?P<text>.+?)\s*$",
     re.IGNORECASE,
 )
 
