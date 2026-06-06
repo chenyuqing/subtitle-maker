@@ -114,7 +114,7 @@ class TaskStore:
     def list_active_ids(self, *, terminal_statuses: Optional[set[str]] = None) -> List[str]:
         """列出处于非终态的任务 ID。"""
 
-        terminal = terminal_statuses or {"completed", "failed", "cancelled"}
+        terminal = terminal_statuses or {"prepared", "completed", "failed", "cancelled"}
         with self._lock:
             return [
                 task_id

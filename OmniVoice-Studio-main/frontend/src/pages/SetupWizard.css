@@ -1,0 +1,361 @@
+.setup-wizard {
+  width: 100%;
+  max-width: none;
+  margin: 0;
+  padding: 0 32px;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;        /* let flex children shrink */
+  overflow: hidden;      /* NO page-level scroll — only embed scrolls */
+}
+
+/* ── Step pills — top bar ────────────────────────────────────────────── */
+.setup-wizard__steps {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  justify-content: center;
+  padding: 10px 12px 0;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+}
+.setup-wizard__step {
+  padding: 5px 14px;
+  border-radius: 999px;
+  font-size: 0.74rem;
+  letter-spacing: 0.02em;
+  line-height: 1.4;
+  color: var(--color-fg-muted);
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.setup-wizard__step--active {
+  background: rgba(243, 165, 182, 0.12);
+  border-color: rgba(243, 165, 182, 0.35);
+  color: #f3a5b6;
+}
+.setup-wizard__step--done {
+  color: #8ec07c;
+  border-color: rgba(142, 192, 124, 0.35);
+}
+
+/* ── Hero — horizontal single-line: logo | title · subtitle ──────────── */
+.setup-wizard__hero {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px 6px;
+  flex-shrink: 0;
+  max-width: 760px;
+  margin-left: auto;
+  margin-right: auto;
+}
+.setup-wizard__logo {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+}
+.setup-wizard__hero-text {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.setup-wizard__hero h1 {
+  margin: 0;
+  font-size: 1.15rem;
+  font-family: var(--font-display, var(--font-sans));
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.setup-wizard__sub {
+  margin: 0;
+  color: var(--color-fg-muted);
+  font-size: 0.78rem;
+  line-height: 1.4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Embed panel — the ONLY scrollable region ────────────────────────── */
+.setup-wizard__embed {
+  padding: 4px 0;
+  margin-top: 4px;
+  flex: 1 1 0;
+  min-height: 0;          /* critical for flex child scroll */
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* ── Nav bar — pinned to bottom, always visible above LogsFooter ─────── */
+.setup-wizard__nav {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  padding: 10px 0 6px;
+  background: var(--color-bg, #1d2021);
+  border-top: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.setup-wizard--centered {
+  max-width: 100%;
+  height: 100%;
+  justify-content: center;
+  align-items: center;
+  text-align: center;
+}
+
+/* ── Card / checklist rows ───────────────────────────────────────────── */
+.setup-wizard__card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.setup-wizard__card--error {
+  background: rgba(251, 73, 52, 0.06);
+  border-color: rgba(251, 73, 52, 0.3);
+  color: var(--color-danger);
+}
+.setup-wizard__card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.72rem;
+  color: var(--color-fg-muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.setup-wizard__row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.setup-wizard__row-body   { flex: 1; display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.setup-wizard__row-title  { font-weight: 600; font-size: 0.84rem; line-height: 1.4; }
+
+.setup-wizard__muted {
+  color: var(--color-fg-muted);
+  font-size: 0.74rem;
+  line-height: 1.5;
+}
+.setup-wizard__muted code { color: var(--color-fg-subtle); }
+
+.setup-wizard__warn { color: var(--color-warn, #fabd2f); font-weight: 600; }
+
+/* ── Welcome step cards ──────────────────────────────────────────────── */
+.setup-wizard__welcome {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.setup-wizard__welcome-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.setup-wizard__welcome-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.025);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+}
+.setup-wizard__welcome-card strong {
+  font-size: 0.84rem;
+  line-height: 1.3;
+  display: block;
+  margin-bottom: 2px;
+}
+.setup-wizard__welcome-card p {
+  margin: 0;
+  color: var(--color-fg-muted);
+  font-size: 0.78rem;
+  line-height: 1.5;
+}
+.setup-wizard__welcome-num {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  background: rgba(211, 134, 155, 0.12);
+  color: #d3869b;
+  font-size: 0.72rem;
+  font-weight: 700;
+  margin-top: 1px;
+}
+.setup-wizard__welcome-note {
+  margin: 0;
+  color: var(--color-fg-subtle);
+  font-size: 0.74rem;
+  line-height: 1.5;
+  text-align: center;
+}
+
+/* ── Model list ──────────────────────────────────────────────────────── */
+.setup-wizard__models {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.setup-wizard__models li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.78rem;
+}
+.setup-wizard__models code { font-size: 0.68rem; }
+
+.setup-wizard__aggregate {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.setup-wizard__files {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 280px;
+  overflow-y: auto;
+  padding: 4px 2px 2px;
+}
+.setup-wizard__file {
+  display: grid;
+  grid-template-columns: 1fr 120px 44px;
+  align-items: center;
+  gap: 10px;
+  font-size: 0.72rem;
+}
+.setup-wizard__file-name {
+  font-family: var(--font-mono);
+  color: var(--chrome-fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.setup-wizard__file-pct {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--color-fg-muted);
+}
+
+.setup-wizard__actions {
+  display: flex;
+  gap: 10px;
+  justify-content: center;
+  padding-top: 8px;
+}
+
+/* ── Inline HF token (compact, lives in models-toolbar) ──────────────── */
+.models-toolbar__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.models-toolbar__hf-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  font-size: 0.68rem;
+  color: #fe8019;
+  background: rgba(254, 128, 25, 0.08);
+  border: 1px solid rgba(254, 128, 25, 0.2);
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.models-toolbar__hf-btn:hover {
+  background: rgba(254, 128, 25, 0.15);
+  border-color: rgba(254, 128, 25, 0.35);
+}
+.models-toolbar__hf-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.models-toolbar__hf-input {
+  width: 150px;
+  padding: 3px 8px;
+  border-radius: 5px;
+  border: 1px solid rgba(254, 128, 25, 0.25);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--chrome-fg, #ebdbb2);
+  font-size: 0.7rem;
+  font-family: var(--font-mono);
+  outline: none;
+  transition: border-color 0.15s;
+}
+.models-toolbar__hf-input:focus {
+  border-color: rgba(254, 128, 25, 0.5);
+}
+.models-toolbar__hf-input::placeholder {
+  color: var(--chrome-fg-dim, #665c54);
+}
+.models-toolbar__hf-ok {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 0.66rem;
+  color: #8ec07c;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(142, 192, 124, 0.08);
+  border: 1px solid rgba(142, 192, 124, 0.2);
+}
+.models-toolbar__hf-link {
+  font-size: 0.68rem;
+  color: #83a598;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: color 0.15s;
+}
+.models-toolbar__hf-link:hover {
+  color: #b8bb26;
+  text-decoration: underline;
+}
+
+/* ── Footnote — pinned to bottom ─────────────────────────────────────── */
+.setup-wizard__footnote {
+  color: var(--color-fg-muted);
+  font-size: 0.68rem;
+  margin: 0;
+  padding: 6px 0 8px;
+  text-align: center;
+  line-height: 1.5;
+  flex-shrink: 0;
+}
+.setup-wizard__footnote code { font-size: 0.64rem; color: var(--chrome-fg-dim, #665c54); }
+
+/* ── Responsive ─────────────────────────────────────────────────────── */
+@media (max-width: 640px) {
+  .setup-wizard {
+    padding: 0 14px;
+  }
+  .setup-wizard__steps { gap: 4px; padding: 8px 8px 0; }
+  .setup-wizard__step { padding: 4px 10px; font-size: 0.7rem; }
+  .setup-wizard__hero { gap: 8px; padding: 6px 8px 4px; }
+  .setup-wizard__hero h1 { font-size: 1rem; }
+  .setup-wizard__sub { font-size: 0.72rem; }
+}

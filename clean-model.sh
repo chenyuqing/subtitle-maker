@@ -7,7 +7,8 @@ set -euo pipefail
 # helper endpoints that unload models and flush caches; this script simply
 # calls them and gives user-friendly logging.
 
-API_URL="${API_URL:-http://127.0.0.1:8000}"
+WEB_PORT="${SUBTITLE_MAKER_PORT:-17493}"
+API_URL="${API_URL:-http://127.0.0.1:${WEB_PORT}}"
 
 if ! command -v curl >/dev/null 2>&1; then
   echo "curl is required to call ${API_URL}; please install curl." >&2

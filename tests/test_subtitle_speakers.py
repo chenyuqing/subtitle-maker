@@ -29,6 +29,11 @@ class SubtitleSpeakerTests(unittest.TestCase):
         self.assertEqual(speaker_id, "Speaker 1")
         self.assertEqual(text, "Hello world")
 
+    def test_strip_speaker_prefix_does_not_treat_normal_english_colon_text_as_speaker(self) -> None:
+        speaker_id, text = strip_speaker_prefix("Ideas are everywhere: they're worthless.")
+        self.assertIsNone(speaker_id)
+        self.assertEqual(text, "Ideas are everywhere: they're worthless.")
+
     def test_normalize_subtitles_with_speakers_keeps_order_and_removes_prefix(self) -> None:
         subtitles = [
             {"start": 0.0, "end": 1.0, "text": "Speaker 1: Hello"},

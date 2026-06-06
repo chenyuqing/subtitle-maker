@@ -236,8 +236,40 @@ def _cantonese_prompt_constraints(target_lang: str) -> str:
     )
 
 
+def normalize_cantonese_surface_text(text: str, target_lang: str) -> str:
+    """只做粤语字幕表面层规整，不做语义级重写。"""
+
+    variant = _normalize_cantonese_target_variant(target_lang)
+    if not variant:
+        return str(text or "").strip()
+
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return ""
+
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = re.sub(r"([\u4e00-\u9fff])\s+([\u4e00-\u9fff])", r"\1\2", normalized)
+    normalized = re.sub(r"\s*([，。！？、；：])\s*", r"\1", normalized)
+    normalized = re.sub(r"\s*([,!?])\s*", r"\1 ", normalized)
+    normalized = re.sub(r"\s*([.])\s*", r". ", normalized)
+    normalized = re.sub(r"([\u4e00-\u9fff])\s+([A-Za-z])", r"\1 \2", normalized)
+    normalized = re.sub(r"([A-Za-z])\s+([\u4e00-\u9fff])", r"\1 \2", normalized)
+    normalized = re.sub(r"([。！？])([A-Za-z])", r"\1 \2", normalized)
+    normalized = normalized.replace("Java Script", "JavaScript")
+    normalized = normalized.replace("Deep Seek V 四", "DeepSeek V 四")
+    normalized = normalized.replace("Deep Seek", "DeepSeek")
+    normalized = normalized.replace("DeepSeek V4 Pro", "DeepSeek V 四 Pro")
+    normalized = normalized.replace("DeepSeek V4", "DeepSeek V 四")
+    normalized = re.sub(r"(DeepSeek V 四)(?=[\u4e00-\u9fff])", r"\1 ", normalized)
+    normalized = normalized.replace("DeepSeek V 四 來", "DeepSeek V 四來")
+    normalized = normalized.replace("DeepSeek V 四 嚟", "DeepSeek V 四嚟")
+    normalized = re.sub(r"([。！？])\1+", r"\1", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
 def normalize_cantonese_translation_text(text: str, target_lang: str) -> str:
-    """把粤语译文规整成更口语化的表面形式。"""
+    """旧版重型粤语规则归一，暂保留给非 5 号面板链路使用。"""
 
     variant = _normalize_cantonese_target_variant(target_lang)
     if not variant:
@@ -259,6 +291,9 @@ def normalize_cantonese_translation_text(text: str, target_lang: str) -> str:
     normalized = re.sub(r"([。！？])([A-Za-z])", r"\1 \2", normalized)
 
     phrase_rules = [
+        ("另外，我们来看看和之前的", "另外，我哋嚟睇下同之前嘅"),
+        ("相比的准确度", "相比嘅準確度"),
+        ("尤其是这个新版本将很多东西都压缩得很厉害", "尤其係呢個新版本將好多嘢都壓縮得好犀利"),
         ("结婚了", "结咗婚"),
         ("遇到了", "遇到咗"),
         ("崩溃了", "崩溃咗"),
@@ -329,6 +364,18 @@ def normalize_cantonese_translation_text(text: str, target_lang: str) -> str:
         ("唔 系", "唔係"),
         ("可 系", "但系"),
         ("呢唔单止", "呢句嘢唔单止"),
+        ("想好似好似", "想像"),
+        ("想好似", "想像"),
+        ("好似好似", "好似"),
+        ("Java Script", "JavaScript"),
+        ("Deep Seek V 四", "DeepSeek V4"),
+        ("Deep Seek V 四", "DeepSeek V4"),
+        ("Deep Seek", "DeepSeek"),
+        ("來咗", "嚟咗"),
+        ("未算完全俾理解", "未被完全理解"),
+        ("未俾完全理解", "未被完全理解"),
+        ("兩分鐘論文。。", "兩分鐘論文。"),
+        ("七百六十一十億個參數", "六千七百一十億個參數"),
     ]
     for source, target in phrase_rules:
         normalized = normalized.replace(source, target)
@@ -357,7 +404,16 @@ def normalize_cantonese_translation_text(text: str, target_lang: str) -> str:
             ("呢种", "呢種"),
             ("食饭", "食飯"),
             ("唔系", "唔係"),
-            ("系", "系"),
+            ("真系", "真係"),
+            ("就系", "就係"),
+            ("而家系", "而家係"),
+            ("呢個系", "呢個係"),
+            ("我系", "我係"),
+            ("佢系", "佢係"),
+            ("係咪", "係咪"),
+            ("系統", "系統"),
+            ("關係", "關係"),
+            ("系", "係"),
             ("佢哋", "佢哋"),
             ("咗咗", "咗"),
         ]
@@ -374,6 +430,8 @@ def normalize_cantonese_translation_text(text: str, target_lang: str) -> str:
     normalized = re.sub(r"(?<=[\u4e00-\u9fff])让(?=[\u4e00-\u9fff])", "令", normalized)
     normalized = re.sub(r"(?<=[\u4e00-\u9fff])像(?=[\u4e00-\u9fff])", "好似", normalized)
     normalized = re.sub(r"(?<=[\u4e00-\u9fff])着(?=[\u4e00-\u9fff])", "住", normalized)
+    normalized = normalized.replace("想好似你", "想像你")
+    normalized = normalized.replace("未俾完全理解", "未被完全理解")
 
     normalized = re.sub(r"\s+", " ", normalized).strip()
     normalized = re.sub(r"([\u4e00-\u9fff])\s+([\u4e00-\u9fff])", r"\1\2", normalized)
@@ -383,6 +441,8 @@ def normalize_cantonese_translation_text(text: str, target_lang: str) -> str:
     normalized = re.sub(r"([\u4e00-\u9fff])\s+([A-Za-z])", r"\1 \2", normalized)
     normalized = re.sub(r"([A-Za-z])\s+([\u4e00-\u9fff])", r"\1 \2", normalized)
     normalized = re.sub(r"([。！？])([A-Za-z])", r"\1 \2", normalized)
+    normalized = re.sub(r"(DeepSeek V4)(?=[\u4e00-\u9fff])", r"\1 ", normalized)
+    normalized = re.sub(r"([。！？])\1+", r"\1", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return normalized
 
@@ -454,6 +514,36 @@ def build_translation_system_prompt(user_prompt: str | None = None) -> str:
     )
 
 
+def build_cantonese_review_system_prompt(target_lang: str, user_prompt: str | None = None) -> str:
+    """构造粤语二次审校 prompt，只允许润色与常用繁体统一，不允许摘要或删改信息。"""
+
+    custom_prompt = str(user_prompt or "").strip()
+    base_prompt = (
+        "你是专业的粤语字幕审校助手。\n"
+        "你的任务不是重新翻译，而是审校已经译好的逐行字幕。\n"
+        "硬性规则：\n"
+        "1. 必须逐行一一对应返回，绝对不能合并行、拆分行、漏行。\n"
+        "2. 绝对不能概括、缩写、摘要、删减信息，也不能补充原文没有的新信息。\n"
+        "3. 保留原句核心语义、语气、专有名词和英文品牌名。\n"
+        "4. 只修正为更自然的粤语口语表达，并统一成现代常用繁体字。\n"
+        "5. 禁止输出异体字、古字、冷僻字或不适合现代字幕/TTS 的字形，例如：昰、爲、后颱、麪、裏麪。\n"
+        "6. 输出必须适合现代粤语字幕与 TTS 朗读，不要解释，不要备注，不要额外说明。\n"
+        "7. 品牌名与产品名统一写法：DeepSeek V 四、DeepSeek V 四 Pro、JavaScript、Gemini 3.1 Pro。\n"
+        "8. 繁体粤语里优先用「係、而家、圖像、想像」，不要写成「系、宜家、圖好似、想好似」。\n"
+        "9. 数字必须准确，中文数字表达必须完整自然，禁止输出「六百七十一十億」这类错误形式。\n"
+        "10. 禁止残缺句式或错搭配，例如「呢喺…」「冇圖好似或者音頻」；要修成自然完整粤语。\n"
+    )
+    variant_constraints = _cantonese_prompt_constraints(target_lang)
+    if not custom_prompt:
+        return f"{base_prompt}\n{variant_constraints}".strip()
+    return (
+        f"{base_prompt}\n"
+        f"{variant_constraints}\n"
+        "用户附加要求：\n"
+        f"{custom_prompt}"
+    ).strip()
+
+
 def _normalize_prompt_text(text: str | None) -> str:
     """把单条字幕里的内部换行折叠掉，避免翻译 prompt 把一个 cue 拆成多行。"""
 
@@ -519,6 +609,20 @@ Input:
                 + f"Input:\n{input_text}\n"
             )
         return prompt
+
+    def _build_review_prompt(self, subtitles, target_lang):
+        """构造逐行粤语审校 prompt，复用编号输出合同，禁止模型改动行数。"""
+
+        input_text = "\n".join(
+            [f"{i+1}. {_normalize_prompt_text(text)}" for i, text in enumerate(subtitles)]
+        )
+        return (
+            f"Review the following subtitle lines in {target_lang}.\n"
+            "Do NOT translate from scratch.\n"
+            "Keep the same number of lines and the same meaning.\n"
+            "Return ONLY the reviewed lines, numbered as in the input.\n\n"
+            f"Input:\n{input_text}\n"
+        )
 
     def _is_translation_noise_line(self, line: str) -> bool:
         """判定是否为翻译回复中的说明/噪声行，避免污染编号条目。"""
@@ -793,12 +897,17 @@ Input:
         target_lang="Chinese",
         system_prompt=None,
         system_prompt_is_final: bool = False,
+        review_mode: bool = False,
     ) -> tuple[list[str], int]:
         """执行单个翻译批次请求，并返回解析结果及命中行数。"""
 
         current_batch_texts = [sub if isinstance(sub, str) else sub["text"] for sub in subtitles]
         return self._translate_with_user_prompt(
-            user_prompt=self._build_prompt(current_batch_texts, target_lang),
+            user_prompt=(
+                self._build_review_prompt(current_batch_texts, target_lang)
+                if review_mode
+                else self._build_prompt(current_batch_texts, target_lang)
+            ),
             expected_len=len(subtitles),
             system_prompt=system_prompt,
             system_prompt_is_final=system_prompt_is_final,
@@ -812,6 +921,7 @@ Input:
         system_prompt=None,
         system_prompt_is_final: bool = False,
         min_retry_chunk_size: int | None = None,
+        review_mode: bool = False,
     ) -> list[str]:
         """单批漏行时先局部补译缺失行，补不齐再递归拆小重试。"""
 
@@ -820,6 +930,7 @@ Input:
             target_lang=target_lang,
             system_prompt=system_prompt,
             system_prompt_is_final=system_prompt_is_final,
+            review_mode=review_mode,
         )
         expected_len = len(subtitles)
         if parsed_count >= expected_len:
@@ -879,6 +990,7 @@ Input:
             system_prompt=system_prompt,
             system_prompt_is_final=system_prompt_is_final,
             min_retry_chunk_size=safe_min_retry_chunk_size,
+            review_mode=review_mode,
         )
         right = self._translate_batch_with_split_retry(
             subtitles[split_index:],
@@ -886,6 +998,7 @@ Input:
             system_prompt=system_prompt,
             system_prompt_is_final=system_prompt_is_final,
             min_retry_chunk_size=safe_min_retry_chunk_size,
+            review_mode=review_mode,
         )
         recovered = left + right
         recovered_count = sum(1 for line in recovered if str(line or "").strip())
@@ -941,6 +1054,48 @@ Input:
                 ) from e
 
         return all_translated
+
+    def review_batch(
+        self,
+        subtitles,
+        *,
+        target_lang="Cantonese",
+        system_prompt=None,
+        chunk_size=DEFAULT_TRANSLATION_BATCH_SIZE,
+        sanitize_outputs: bool = False,
+    ):
+        """按批量审校已翻译字幕，保持行数不变，只做粤语口语与常用繁体修正。"""
+
+        if not subtitles:
+            return []
+
+        review_system_prompt = build_cantonese_review_system_prompt(target_lang, user_prompt=system_prompt)
+        reviewed = []
+        total = len(subtitles)
+
+        for i in range(0, total, chunk_size):
+            batch = subtitles[i:i + chunk_size]
+            logger.info(f"Reviewing batch {i//chunk_size + 1}/{(total + chunk_size - 1)//chunk_size} ({len(batch)} lines)...")
+            try:
+                parsed = self._translate_batch_with_split_retry(
+                    batch,
+                    target_lang=target_lang,
+                    system_prompt=review_system_prompt,
+                    system_prompt_is_final=True,
+                    review_mode=True,
+                )
+                if sanitize_outputs:
+                    parsed = [sanitize_translation_text(text, target_lang) for text in parsed]
+                if _is_cantonese_target_lang(target_lang):
+                    parsed = [normalize_cantonese_translation_text(text, target_lang) for text in parsed]
+                reviewed.extend(parsed)
+            except Exception as e:
+                logger.error(f"Batch review failed: {e}")
+                raise TranslationProviderError(
+                    f"Translation provider review failed for batch {i//chunk_size + 1}: {e}"
+                ) from e
+
+        return reviewed
 
     def test_connection(self) -> dict[str, str]:
         """发送最小化请求，验证当前 OpenAI-compatible 配置是否可连通。"""

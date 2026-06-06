@@ -3354,6 +3354,34 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(recreated["target_lang"], "Chinese")
         self.assertEqual(recreated["target_lang_runtime"], "zh")
 
+    def test_build_omnivoice_final_paths_uses_uploaded_video_stem(self):
+        """5号面板 final 输出文件名应跟随上传视频文件名。"""
+
+        final_dir = self.tmpdir / "final"
+        final_dir.mkdir(parents=True, exist_ok=True)
+        paths = omnivoice_dub_api._build_omnivoice_final_paths(final_dir, "My Demo Video.mp4")
+
+        self.assertEqual(paths["srt"].name, "My_Demo_Video.srt")
+        self.assertEqual(paths["ass"].name, "My_Demo_Video-styled.ass")
+        self.assertEqual(paths["vocals"].name, "My_Demo_Video-vocals.wav")
+        self.assertEqual(paths["mix"].name, "My_Demo_Video-mix.wav")
+        self.assertEqual(paths["video"].name, "My_Demo_Video.mp4")
+        self.assertEqual(paths["video_burned"].name, "My_Demo_Video-burned.mp4")
+
+    def test_build_voxcpm_final_paths_uses_uploaded_video_stem(self):
+        """6号面板 final 输出文件名也应跟随上传视频文件名。"""
+
+        final_dir = self.tmpdir / "final"
+        final_dir.mkdir(parents=True, exist_ok=True)
+        paths = voxcpm_dub_api._build_voxcpm_final_paths(final_dir, "Podcast Demo.mp4")
+
+        self.assertEqual(paths["srt"].name, "Podcast_Demo.srt")
+        self.assertEqual(paths["srt_rebuild"].name, "Podcast_Demo-rebuild.srt")
+        self.assertEqual(paths["srt_with_speakers"].name, "Podcast_Demo_with_speakers.srt")
+        self.assertEqual(paths["mix"].name, "Podcast_Demo-mix.wav")
+        self.assertEqual(paths["ass"].name, "Podcast_Demo-styled.ass")
+        self.assertEqual(paths["video"].name, "Podcast_Demo.mp4")
+
     def test_burn_ass_subtitles_into_video_uses_expected_ffmpeg_args(self):
         """ASS 烧录视频应使用 `ass=` filter、libx264 和固定画质参数。"""
 
@@ -3910,6 +3938,124 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertIn("中文", rows[0]["text"])
         self.assertEqual(rows[1]["text"], "第二行")
 
+    def test_omnivoice_cantonese_review_replaces_abnormal_script_forms(self):
+        """5 号面板粤语审校应消除异常字形来源，不再产出昰/爲/后颱这类字符。"""
+
+        source_rows = [
+            {"start": 0.0, "end": 1.0, "text": "This is my voice timbre, happy to serve you.", "speaker_id": "Speaker 1"},
+        ]
+
+        class _FakeTranslator:
+            def __init__(self, *args, **kwargs):
+                self.calls = 0
+
+            def translate_batch(self, subtitles, *args, **kwargs):
+                self.calls += 1
+                return ["這昰我的聲音音色，很高興爲你提供配音服務，后颱亦都正常。"]
+
+            def review_batch(self, subtitles, *args, **kwargs):
+                return ["這是我的聲音音色，很高興為你提供配音服務，後台亦都正常。"]
+
+        with patch.object(omnivoice_dub_api, "Translator", _FakeTranslator), patch.object(
+            omnivoice_dub_api,
+            "resolve_translation_api_key",
+            return_value="dummy-key",
+        ):
+            rows, mode = omnivoice_dub_api._translate_subtitles_if_needed(
+                subtitles_mode="source",
+                source_rows=source_rows,
+                translated_rows=[],
+                source_lang="English",
+                target_lang="Cantonese",
+                api_key="",
+                translate_base_url="https://api.deepseek.com",
+                translate_model="deepseek-v4-flash",
+                translate_system_prompt="",
+                task_id="unit_test",
+            )
+
+        self.assertEqual(mode, "translated")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["text"], "這是我的聲音音色，很高興為你提供配音服務，後台亦都正常。")
+        self.assertNotIn("昰", rows[0]["text"])
+        self.assertNotIn("爲", rows[0]["text"])
+        self.assertNotIn("后颱", rows[0]["text"])
+
+    def test_omnivoice_cantonese_review_keeps_full_sentence_meaning(self):
+        """5 号面板粤语审校不能把完整句压成“我叫 / 我系”这种残句。"""
+
+        source_rows = [
+            {"start": 0.0, "end": 1.0, "text": "My name is Matt Berman.", "speaker_id": "Speaker 1"},
+            {"start": 1.0, "end": 2.0, "text": "I'm the CEO of Ford Future.", "speaker_id": "Speaker 1"},
+        ]
+
+        class _FakeTranslator:
+            def __init__(self, *args, **kwargs):
+                self.translate_calls = 0
+
+            def translate_batch(self, subtitles, *args, **kwargs):
+                self.translate_calls += 1
+                return ["我叫", "我系"]
+
+            def review_batch(self, subtitles, *args, **kwargs):
+                return ["我叫 Matt Berman。", "我係 Ford Future 嘅行政總裁。"]
+
+        with patch.object(omnivoice_dub_api, "Translator", _FakeTranslator), patch.object(
+            omnivoice_dub_api,
+            "resolve_translation_api_key",
+            return_value="dummy-key",
+        ):
+            rows, mode = omnivoice_dub_api._translate_subtitles_if_needed(
+                subtitles_mode="source",
+                source_rows=source_rows,
+                translated_rows=[],
+                source_lang="English",
+                target_lang="Cantonese",
+                api_key="",
+                translate_base_url="https://api.deepseek.com",
+                translate_model="deepseek-v4-flash",
+                translate_system_prompt="",
+                task_id="unit_test",
+            )
+
+        self.assertEqual(mode, "translated")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["text"], "我叫 Matt Berman。")
+        self.assertEqual(rows[1]["text"], "我係 Ford Future 嘅行政總裁。")
+
+    def test_normalize_cantonese_surface_text_only_keeps_safe_surface_fixes(self):
+        """5 号面板应只做表面层收尾，不再用规则函数承担语义级改写。"""
+
+        text = (
+            "另外，我们来看看和之前的 Deep Seek V 四相比的准确度，尤其是这个新版本将很多东西都压缩得很厉害。"
+            "想好似好似你喺度睇一本書。"
+            "親愛嘅各位學者，歡迎嚟到由 Karo Jonah Fahir 博士主持嘅兩分鐘論文。。"
+            "呢個系統未算完全俾理解。"
+            "叫佢生成 Java Script code 真系超易。"
+            "終於，Deep Seek V 四來咗。"
+            "七百六十一十億個參數。"
+        )
+        normalized = translator_module.normalize_cantonese_surface_text(text, "Cantonese")
+
+        self.assertNotIn("Deep Seek V 四", normalized)
+        self.assertIn("DeepSeek V 四", normalized)
+        self.assertIn("想好似好似你喺度睇一本書。", normalized)
+        self.assertIn("兩分鐘論文。", normalized)
+        self.assertNotIn("兩分鐘論文。。", normalized)
+        self.assertIn("JavaScript code 真系超易。", normalized)
+        self.assertIn("DeepSeek V 四來咗。", normalized)
+        self.assertIn("七百六十一十億個參數。", normalized)
+
+    def test_build_cantonese_review_system_prompt_includes_latest_guardrails(self):
+        """粤语 review prompt 必须显式约束品牌名、係/而家、数字与残缺句式。"""
+
+        prompt = translator_module.build_cantonese_review_system_prompt("Cantonese", user_prompt="")
+        self.assertIn("DeepSeek V 四、DeepSeek V 四 Pro、JavaScript、Gemini 3.1 Pro", prompt)
+        self.assertIn("係、而家、圖像、想像", prompt)
+        self.assertIn("六百七十一十億", prompt)
+        self.assertIn("呢喺…", prompt)
+        self.assertIn("冇圖好似或者音頻", prompt)
+
     def test_omnivoice_translate_subtitles_if_needed_skips_translation_for_english_source_to_english(self):
         """5 号面板明确 English -> English 时，也应直接复用原文。"""
 
@@ -4418,6 +4564,102 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertIn("Preset reference voices dir is empty for Cantonese", response.json()["detail"])
         self.assertFalse(FakeThread.instances)
 
+    def test_start_omnivoice_from_project_auto_binds_single_uploaded_ref_without_speaker_ids(self):
+        """5号面板单 speaker 且只上传 1 份参考音时，后端应自动绑定到唯一 speaker。"""
+
+        media_path = self.upload_root / "demo.mp4"
+        media_path.write_bytes(b"video-data")
+
+        with patch.object(omnivoice_dub_api, "_ensure_omnivoice_backend_ready", return_value={"ready": True}), patch.object(
+            omnivoice_dub_api.sf,
+            "info",
+            return_value=type("Info", (), {"duration": 1.0})(),
+        ), patch.object(
+            omnivoice_dub_api.threading,
+            "Thread",
+            FakeThread,
+        ):
+            response = self.client.post(
+                "/omnivoice/auto/start-from-project",
+                files=[
+                    ("speaker_ref_files", ("speaker1.wav", b"RIFF_fake", "audio/wav")),
+                ],
+                data={
+                    "filename": "demo.mp4",
+                    "original_filename": "demo.mp4",
+                    "task_id": "legacy-task",
+                    "target_lang": "Chinese",
+                    "subtitle_mode": "translated",
+                    "source_subtitles_json": json.dumps(
+                        [{"start": 0.0, "end": 1.0, "text": "hello"}],
+                        ensure_ascii=False,
+                    ),
+                    "translated_subtitles_json": json.dumps(
+                        [{"start": 0.0, "end": 1.0, "text": "你好"}],
+                        ensure_ascii=False,
+                    ),
+                    "speaker_ref_speaker_ids_json": "",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        task = omnivoice_dub_api._task_store.get(payload["task_id"])
+        self.assertIsNotNone(task)
+        self.assertEqual(task["speaker_ids"], ["Speaker 1"])
+        self.assertEqual(task["speaker_reference_mode"], "uploaded_strict")
+        self.assertTrue(FakeThread.instances)
+        kwargs = FakeThread.instances[-1].kwargs
+        self.assertEqual(sorted(kwargs["uploaded_speaker_ref_map"].keys()), ["Speaker 1"])
+        self.assertEqual(
+            kwargs["uploaded_speaker_ref_map"]["Speaker 1"]["ref_text"],
+            "你好，这是我的声音音色，很高兴为你提供配音服务。",
+        )
+
+    def test_start_omnivoice_from_project_rejects_uploaded_refs_without_bindable_speaker_ids(self):
+        """5号面板上传了参考音却无法唯一绑定 speaker 时，后端必须直接报错。"""
+
+        media_path = self.upload_root / "demo.mp4"
+        media_path.write_bytes(b"video-data")
+
+        with patch.object(omnivoice_dub_api, "_ensure_omnivoice_backend_ready", return_value={"ready": True}), patch.object(
+            omnivoice_dub_api.threading,
+            "Thread",
+            FakeThread,
+        ):
+            response = self.client.post(
+                "/omnivoice/auto/start-from-project",
+                files=[
+                    ("speaker_ref_files", ("speaker1.wav", b"RIFF_fake", "audio/wav")),
+                ],
+                data={
+                    "filename": "demo.mp4",
+                    "original_filename": "demo.mp4",
+                    "task_id": "legacy-task",
+                    "target_lang": "Chinese",
+                    "subtitle_mode": "translated",
+                    "source_subtitles_json": json.dumps(
+                        [
+                            {"start": 0.0, "end": 1.0, "text": "hello", "speaker_id": "Speaker 1"},
+                            {"start": 1.0, "end": 2.0, "text": "world", "speaker_id": "Speaker 2"},
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    "translated_subtitles_json": json.dumps(
+                        [
+                            {"start": 0.0, "end": 1.0, "text": "你好", "speaker_id": "Speaker 1"},
+                            {"start": 1.0, "end": 2.0, "text": "世界", "speaker_id": "Speaker 2"},
+                        ],
+                        ensure_ascii=False,
+                    ),
+                    "speaker_ref_speaker_ids_json": "",
+                },
+            )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("require explicit speaker ids", response.json()["detail"])
+        self.assertFalse(FakeThread.instances)
+
     def test_load_omnivoice_batch_marks_prepared_batch_resumable(self):
         """5号面板 load-batch 应把 prepared batch 标成可恢复。"""
 
@@ -4461,6 +4703,51 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(payload["resume_stage"], "prepared")
         self.assertEqual(payload["processed_segments"], 0)
         self.assertEqual(payload["total_segments"], 1)
+
+    def test_prepare_omnivoice_selected_subtitles_returns_prepared_status(self):
+        """5号面板仅 Prepare 字幕时，不应被标成 completed。"""
+
+        media_path = self.upload_root / "demo.mp4"
+        media_path.write_bytes(b"fake-video")
+
+        with patch("subtitle_maker.omnivoice_dub_api._ensure_omnivoice_backend_ready", return_value={"status": "ready"}), \
+             patch("subtitle_maker.omnivoice_dub_api._translate_subtitles_if_needed", return_value=(
+                 [{"start": 0.0, "end": 1.0, "text": "你好", "speaker_id": "Speaker 1"}],
+                 "translated",
+             )), \
+             patch("subtitle_maker.omnivoice_dub_api._optimize_omnivoice_selected_rows", side_effect=lambda rows, subtitle_mode=None: rows), \
+             patch("subtitle_maker.omnivoice_dub_api._drop_empty_subtitle_rows", side_effect=lambda rows, label=None: rows), \
+             patch("subtitle_maker.omnivoice_dub_api._deduplicate_translated_rows", return_value=([{"start": 0.0, "end": 1.0, "text": "你好", "speaker_id": "Speaker 1"}], 0)), \
+             patch("subtitle_maker.omnivoice_dub_api._rebalance_omnivoice_synthesis_rows", return_value=([{"start": 0.0, "end": 1.0, "text": "你好", "speaker_id": "Speaker 1"}], 0)), \
+             patch("subtitle_maker.omnivoice_dub_api._equalize_cps_across_neighbors", return_value=([{"start": 0.0, "end": 1.0, "text": "你好", "speaker_id": "Speaker 1"}], 0)), \
+             patch("subtitle_maker.omnivoice_dub_api._merge_short_lines_for_tts", return_value=([{"start": 0.0, "end": 1.0, "text": "你好", "speaker_id": "Speaker 1"}], 0)), \
+             patch("subtitle_maker.omnivoice_dub_api._merge_ultra_short_segments", return_value=([{"start": 0.0, "end": 1.0, "text": "你好", "speaker_id": "Speaker 1"}], 0)):
+            response = self.client.post(
+                "/omnivoice/auto/prepare-subtitles-from-project",
+                data={
+                    "filename": "demo.mp4",
+                    "original_filename": "demo.mp4",
+                    "task_id": "demo",
+                    "source_subtitles_json": json.dumps(
+                        [{"start": 0.0, "end": 1.0, "text": "hello", "speaker_id": "Speaker 1"}],
+                        ensure_ascii=False,
+                    ),
+                    "translated_subtitles_json": json.dumps([], ensure_ascii=False),
+                    "subtitle_mode": "source",
+                    "source_lang": "English",
+                    "target_lang": "Chinese",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "prepared")
+        self.assertEqual(payload["stage"], "prepared:selected_subtitles")
+
+        manifest_path = self.omnivoice_output_root / f"omnivoice_{payload['task_id']}" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["status"], "prepared")
+        self.assertEqual(manifest["stage"], "prepared:selected_subtitles")
 
     def test_load_omnivoice_batch_preserves_cantonese_mainland_display_lang(self):
         """load-batch 应恢复 Cantonese-Mainland 展示值，同时 runtime 保持 yue。"""

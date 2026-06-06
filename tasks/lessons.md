@@ -1,5 +1,8 @@
 # Lessons
 
+- 2026-05-31：讨论 4 号面板 speaker 能力时，不能把它直接类比成 5/6 号面板的“上传 speaker 参考音”合同。4 号面板当前用户要的是继续使用原视频里一一对应裁出的原音频做 Index-TTS 参考音，只是必须先按 `speaker_id` 把前段分组与参考音选择拆开，避免不同 speaker 的原音混入同一组，导致一个人的音色说两个人的话。
+- 2026-05-26：调整任务状态语义时，必须同步检查 `TaskStore.list_active_ids()` 这类并发门禁。此次把 5 号面板 `Prepare selected_subtitles.srt` 从 `completed` 改成 `prepared` 后，如果不把 `prepared` 加入终态，`src/subtitle_maker/jobs/store.py::list_active_ids()` 会把“已准备好译文但未开始配音”的 batch 错当成活任务，直接拦成 `Another OmniVoice job is already running`。
+- 2026-05-26：5 号面板排查 speaker 上传映射问题时，不能在没先验证 `sourceSubtitles` 里的 `speaker_id` 真值是否可靠之前，就把前端 fallback 从“只读显式 speaker_id”改成“按 source 时间轴补 speaker”。这次回归暴露出更底层的 `src/subtitle_maker/domains/subtitles/speakers.py::strip_speaker_prefix()` 正则过宽，会把普通英文冒号句子误识别成 speaker，结果前端直接显示出 `layers using a 1` 这类垃圾 speaker。先收窄 speaker 前缀识别，再谈前后端对齐。
 - 2026-05-21：修 5 号面板本机 OmniVoice 代理问题时，不能只修 `/health` 和 `/model/status` 探活；正式配音的 `src/subtitle_maker/omnivoice_dub_api.py::_call_remote_generate()` 也会走 `requests.post(...)`。如果不同时对本机 `requests.Session()` 设 `trust_env=False` 并清空 `proxies`，按钮虽然恢复可点，但一到 `/generate` 仍会被转发去 `127.0.0.1:1082`。
 - 2026-05-21：5 号面板如果“生成译文 / 开始配音”同时变灰，先查 `src/subtitle_maker/static/js/omnivoiceDubbingPanel.js::syncStartButtonState()` 和 `/omnivoice/auto/backend-status`。这次根因不是前端状态锁死，而是 `src/subtitle_maker/omnivoice_dub_api.py::_check_omnivoice_health()` / `_fetch_omnivoice_model_status()` 直接用 `urllib.urlopen` 访问本机 `127.0.0.1:3900` 时误走系统代理。对本机 OmniVoice 探活必须显式 `ProxyHandler({})` 直连。
 - 2026-05-21：6 号面板如果直接吃播客脚本或翻译文本里的 Markdown 样式标记（如 `**加粗**`、孤立 `**`），VoxCPM 可能在很短句上也报 `Generation remained unstable`。进入 rebuild/TTS 前必须先剥掉样式符号，只保留正文，并过滤掉清洗后变空的标记行。

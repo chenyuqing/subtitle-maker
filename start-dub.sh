@@ -2,6 +2,8 @@
 echo "Starting Dubbing Service (Subtitle Maker)..."
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WEB_PORT="${SUBTITLE_MAKER_PORT:-17493}"
+WEB_URL="http://localhost:${WEB_PORT}"
 PYANNOTE_LOCAL_MODEL_DIR="${PYANNOTE_LOCAL_MODEL_DIR:-$PROJECT_DIR/models/pyannote-speaker-diarization-community-1}"
 PYANNOTE_EXTERNAL_PYTHON_DEFAULT="$PROJECT_DIR/.venv-pyannote/bin/python"
 PYANNOTE_EXTERNAL_PYTHON_FALLBACK="/Users/tim/Documents/vibe-coding/MVP/index-tts-1108/.venv/bin/python"
@@ -39,7 +41,7 @@ uv sync
 
 # Run the Uvicorn server in the background
 # We usage --reload for development
-uv run python -m uvicorn subtitle_maker.web:app --host 0.0.0.0 --port 8000 --reload &
+uv run python -m uvicorn subtitle_maker.web:app --host 0.0.0.0 --port "$WEB_PORT" --reload &
 
 PID=$!
 echo $PID > dubbing.pid
@@ -47,4 +49,4 @@ echo $PID > dubbing.pid
 echo "Service started successfully!"
 echo "PID: $PID"
 echo "Logs: Output to terminal"
-echo "Access at: http://localhost:8000"
+echo "Access at: $WEB_URL"

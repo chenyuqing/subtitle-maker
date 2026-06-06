@@ -65,6 +65,7 @@ from subtitle_maker.translator import (
     normalize_language_tag_for_passthrough,
     resolve_translation_api_key,
     normalize_cantonese_translation_text,
+    normalize_cantonese_surface_text,
 )
 
 router = APIRouter(prefix="/omnivoice/auto", tags=["omnivoice-auto"])
@@ -783,7 +784,7 @@ def _sanitize_translated_rows_for_target(
         if not sanitized_text:
             continue
         if _is_cantonese_language_variant(target_lang):
-            sanitized_text = normalize_cantonese_translation_text(sanitized_text, target_lang)
+            sanitized_text = normalize_cantonese_surface_text(sanitized_text, target_lang)
         sanitized_rows.append(
             {
                 **row,
@@ -828,6 +829,46 @@ def _normalize_omnivoice_selected_text(text: str) -> str:
     normalized = re.sub(r"\s+([，。！？、；：,.!?;:])", r"\1", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return normalized
+
+
+def _review_cantonese_rows_with_llm(
+    *,
+    translator: Translator,
+    rows: List[Dict[str, Any]],
+    target_lang: str,
+    translate_system_prompt: str,
+) -> List[Dict[str, Any]]:
+    """用 LLM 二次审校粤语译文，统一常用繁体与口语化，但不得改动行数或摘要。"""
+
+    if not rows or not _is_cantonese_language_variant(target_lang):
+        return list(rows or [])
+
+    input_texts = [str(row.get("text") or "").strip() for row in rows]
+    reviewed_texts = translator.review_batch(
+        input_texts,
+        target_lang=target_lang,
+        system_prompt=translate_system_prompt,
+        sanitize_outputs=False,
+    )
+    if len(reviewed_texts) != len(rows):
+        logger.warning(
+            "OmniVoice cantonese review count mismatch: expected=%d returned=%d",
+            len(rows),
+            len(reviewed_texts),
+        )
+        return list(rows)
+    reviewed_rows: List[Dict[str, Any]] = []
+    for row, reviewed_text in zip(rows, reviewed_texts):
+        normalized_text = normalize_cantonese_surface_text(str(reviewed_text or "").strip(), target_lang)
+        if not normalized_text:
+            normalized_text = str(row.get("text") or "").strip()
+        reviewed_rows.append(
+            {
+                **row,
+                "text": normalized_text,
+            }
+        )
+    return reviewed_rows
 
 
 def _merge_two_subtitle_rows(left: Dict[str, Any], right: Dict[str, Any]) -> Dict[str, Any]:
@@ -2589,16 +2630,15 @@ def _translate_subtitles_if_needed(
                     )
             except Exception as exc:
                 logger.warning("OmniVoice repaired-row retry failed: %s", exc)
-    # 所有回退和重译完成后，统一做 sanitize + 粤语规整。
-    translated_rows = _sanitize_translated_rows_for_target(repaired_rows, target_lang=target_lang)
     if _is_cantonese_language_variant(target_lang):
-        translated_rows = [
-            {
-                **row,
-                "text": normalize_cantonese_translation_text(str(row.get("text") or ""), target_lang),
-            }
-            for row in translated_rows
-        ]
+        repaired_rows = _review_cantonese_rows_with_llm(
+            translator=translator,
+            rows=repaired_rows,
+            target_lang=target_lang,
+            translate_system_prompt=translate_system_prompt,
+        )
+    # 所有回退、重译与粤语审校完成后，统一做最小 sanitize + 粤语规整。
+    translated_rows = _sanitize_translated_rows_for_target(repaired_rows, target_lang=target_lang)
     translated_rows = _drop_empty_subtitle_rows(translated_rows, label="translated")
     if not translated_rows:
         raise HTTPException(status_code=400, detail="OmniVoice translation produced no usable subtitle rows")
@@ -3229,21 +3269,57 @@ def _artifact_path_from_task(task: Dict[str, Any], artifact: str) -> Optional[Pa
     """根据 artifact key 解析输出路径。"""
 
     manifest_path = Path(str(task.get("batch_manifest_path") or "")).expanduser()
-    out_root = manifest_path.parent if manifest_path.exists() else _resolve_output_dir(str(task.get("batch_id") or task.get("id") or ""))
-    paths = {
-        "srt": out_root / "final" / "dubbed_final_full.srt",
-        "ass": out_root / "final" / "dubbed_final_full-styled.ass",
-        "selected_srt": out_root / "selected_subtitles.srt",
-        "selected_srt_with_speaker": out_root / "selected_subtitles_with_speakers.srt",
-        "vocals": out_root / "final" / "dubbed_vocals_full.wav",
-        "mix": out_root / "final" / "dubbed_mix_full.wav",
-        "video": out_root / "final" / "dubbed_video_full.mp4",
-        "video_burned": out_root / "final" / "dubbed_video_full_burned.mp4",
-        "video_audio": out_root / "final" / "dubbed_audio_for_video.m4a",
-        "manifest": out_root / "manifest.json",
-        "separation_report": out_root / "separation_report.json",
+    manifest: Dict[str, Any] = {}
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            manifest = {}
+    paths = dict(manifest.get("paths") or {})
+    mapping = {
+        "srt": paths.get("dubbed_final_srt"),
+        "ass": paths.get("dubbed_final_ass"),
+        "selected_srt": paths.get("selected_subtitles"),
+        "selected_srt_with_speaker": paths.get("selected_subtitles_with_speakers"),
+        "vocals": paths.get("dubbed_vocals"),
+        "mix": paths.get("dubbed_mix"),
+        "video": paths.get("dubbed_video_full"),
+        "video_burned": paths.get("dubbed_video_burned"),
+        "video_audio": paths.get("dubbed_audio_for_video"),
+        "manifest": str(manifest_path) if manifest_path.exists() else None,
+        "separation_report": paths.get("separation_report"),
     }
-    return paths.get(artifact)
+    resolved = mapping.get(artifact)
+    if not resolved:
+        return None
+    return Path(str(resolved)).expanduser()
+
+
+def _build_final_output_stem(project_filename: str, fallback: str = "dubbed_final_full") -> str:
+    """基于上传视频文件名生成稳定的 final 输出 stem。"""
+
+    raw_name = str(project_filename or "").strip()
+    if not raw_name:
+        return fallback
+    stem = Path(raw_name).stem.strip()
+    sanitized = _sanitize_filename(stem)
+    sanitized = re.sub(r"\s+", "_", str(sanitized or "").strip()).strip("._")
+    return sanitized or fallback
+
+
+def _build_omnivoice_final_paths(final_dir: Path, project_filename: str) -> Dict[str, Path]:
+    """为 5 号面板 final 产物生成统一路径，文件名跟随上传视频名。"""
+
+    stem = _build_final_output_stem(project_filename)
+    return {
+        "srt": final_dir / f"{stem}.srt",
+        "ass": final_dir / f"{stem}-styled.ass",
+        "vocals": final_dir / f"{stem}-vocals.wav",
+        "mix": final_dir / f"{stem}-mix.wav",
+        "video": final_dir / f"{stem}.mp4",
+        "video_burned": final_dir / f"{stem}-burned.mp4",
+        "video_audio": final_dir / f"{stem}-audio-for-video.m4a",
+    }
 
 
 def _resolve_omnivoice_separator_device() -> str:
@@ -4130,6 +4206,7 @@ def _run_omnivoice_job(
     out_root.mkdir(parents=True, exist_ok=True)
     final_dir = out_root / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
+    final_paths = _build_omnivoice_final_paths(final_dir, project_filename)
     segment_root = out_root / "segment_jobs"
     segment_root.mkdir(parents=True, exist_ok=True)
     stems_root = out_root / "stems"
@@ -4275,17 +4352,17 @@ def _run_omnivoice_job(
         source_vocals_path=source_vocals_path,
         source_bgm_path=source_bgm_path,
         speaker_ref_map_path=speaker_ref_map_path,
-        final_srt_path=final_dir / "dubbed_final_full.srt",
-        final_vocals_path=final_dir / "dubbed_vocals_full.wav",
-        final_mix_path=final_dir / "dubbed_mix_full.wav",
-        final_video_path=final_dir / "dubbed_video_full.mp4",
-        separated_video_audio_path=final_dir / "dubbed_audio_for_video.m4a",
+        final_srt_path=final_paths["srt"],
+        final_vocals_path=final_paths["vocals"],
+        final_mix_path=final_paths["mix"],
+        final_video_path=final_paths["video"],
+        separated_video_audio_path=final_paths["video_audio"],
         separation_report_path=separation_report_path,
         speaker_reference_dir=speaker_root,
         subtitles_path=selected_subtitles_path,
         subtitles_with_speaker_path=selected_subtitles_with_speaker_path,
-        final_ass_path=final_dir / "dubbed_final_full-styled.ass",
-        burned_video_path=final_dir / "dubbed_video_full_burned.mp4",
+        final_ass_path=final_paths["ass"],
+        burned_video_path=final_paths["video_burned"],
     )
 
     detected_speaker_ids = sorted(
@@ -4339,12 +4416,39 @@ def _run_omnivoice_job(
         else:
             reference_mode = "uploaded_strict"
     else:
-        speaker_ref_map = _build_speaker_reference_map(
-            vocals_path=source_vocals_path,
-            subtitles=selected_subtitles,
-            transcript_subtitles=source_reference_subtitles if source_reference_subtitles else selected_subtitles,
-            out_dir=speaker_root,
-        )
+        # 没有上传任何参考音时，优先用预设声音库（按性别选音）；
+        # 预设库不存在才退回到从原视频人声轨提取聚合参考音。
+        preset_voices_dir = _resolve_ref_voices_dir(display_target_lang)
+        if preset_voices_dir is not None:
+            speaker_gender_hints = _infer_missing_speaker_gender_hints(
+                vocals_path=source_vocals_path,
+                subtitles=selected_subtitles,
+                missing_speaker_ids=list(detected_speaker_ids),
+                out_root=out_root,
+            )
+            try:
+                speaker_ref_map = _pick_preset_ref_voices_for_missing_speakers(
+                    missing_speaker_ids=list(detected_speaker_ids),
+                    target_lang=display_target_lang,
+                    out_root=out_root,
+                    speaker_gender_hints=speaker_gender_hints,
+                )
+                reference_mode = "preset_gender"
+            except Exception as exc:
+                logger.warning("OmniVoice preset voice selection failed, falling back to source extraction: %s", exc)
+                speaker_ref_map = _build_speaker_reference_map(
+                    vocals_path=source_vocals_path,
+                    subtitles=selected_subtitles,
+                    transcript_subtitles=source_reference_subtitles if source_reference_subtitles else selected_subtitles,
+                    out_dir=speaker_root,
+                )
+        else:
+            speaker_ref_map = _build_speaker_reference_map(
+                vocals_path=source_vocals_path,
+                subtitles=selected_subtitles,
+                transcript_subtitles=source_reference_subtitles if source_reference_subtitles else selected_subtitles,
+                out_dir=speaker_root,
+            )
     speaker_ref_map_path.write_text(
         json.dumps(
             {
@@ -4368,17 +4472,17 @@ def _run_omnivoice_job(
         source_vocals_path=source_vocals_path,
         source_bgm_path=source_bgm_path,
         speaker_ref_map_path=speaker_ref_map_path,
-        final_srt_path=final_dir / "dubbed_final_full.srt",
-        final_vocals_path=final_dir / "dubbed_vocals_full.wav",
-        final_mix_path=final_dir / "dubbed_mix_full.wav",
-        final_video_path=final_dir / "dubbed_video_full.mp4",
-        separated_video_audio_path=final_dir / "dubbed_audio_for_video.m4a",
+        final_srt_path=final_paths["srt"],
+        final_vocals_path=final_paths["vocals"],
+        final_mix_path=final_paths["mix"],
+        final_video_path=final_paths["video"],
+        separated_video_audio_path=final_paths["video_audio"],
         separation_report_path=separation_report_path,
         speaker_reference_dir=speaker_root,
         subtitles_path=selected_subtitles_path,
         subtitles_with_speaker_path=selected_subtitles_with_speaker_path,
-        final_ass_path=final_dir / "dubbed_final_full-styled.ass",
-        burned_video_path=final_dir / "dubbed_video_full_burned.mp4",
+        final_ass_path=final_paths["ass"],
+        burned_video_path=final_paths["video_burned"],
     )
 
     completed_segment_indices = set(int(item) for item in list(resume_context.get("completed_segment_indices") or []))
@@ -4482,17 +4586,17 @@ def _run_omnivoice_job(
             source_vocals_path=source_vocals_path,
             source_bgm_path=source_bgm_path,
             speaker_ref_map_path=speaker_ref_map_path,
-            final_srt_path=final_dir / "dubbed_final_full.srt",
-            final_vocals_path=final_dir / "dubbed_vocals_full.wav",
-            final_mix_path=final_dir / "dubbed_mix_full.wav",
-            final_video_path=final_dir / "dubbed_video_full.mp4",
-            separated_video_audio_path=final_dir / "dubbed_audio_for_video.m4a",
+            final_srt_path=final_paths["srt"],
+            final_vocals_path=final_paths["vocals"],
+            final_mix_path=final_paths["mix"],
+            final_video_path=final_paths["video"],
+            separated_video_audio_path=final_paths["video_audio"],
             separation_report_path=separation_report_path,
             speaker_reference_dir=speaker_root,
             subtitles_path=selected_subtitles_path,
             subtitles_with_speaker_path=selected_subtitles_with_speaker_path,
-            final_ass_path=final_dir / "dubbed_final_full-styled.ass",
-            burned_video_path=final_dir / "dubbed_video_full_burned.mp4",
+            final_ass_path=final_paths["ass"],
+            burned_video_path=final_paths["video_burned"],
         )
 
     segment_results.sort(key=lambda item: float(item.get("start_sec", 0.0) or 0.0))
@@ -4508,14 +4612,14 @@ def _run_omnivoice_job(
         }
         for item in segment_results
     ]
-    final_vocals_path = final_dir / "dubbed_vocals_full.wav"
+    final_vocals_path = final_paths["vocals"]
     compose_vocals_master(
         segments=compose_inputs,
         output_path=final_vocals_path,
         source_audio_fallback=source_vocals_path,
     )
 
-    final_mix_path = final_dir / "dubbed_mix_full.wav"
+    final_mix_path = final_paths["mix"]
     if has_bgm_track:
         mix_with_bgm(
             vocals_path=final_vocals_path,
@@ -4526,10 +4630,10 @@ def _run_omnivoice_job(
     else:
         shutil.copy2(final_vocals_path, final_mix_path)
 
-    final_srt_path = final_dir / "dubbed_final_full.srt"
+    final_srt_path = final_paths["srt"]
     final_srt_rows = _rebalance_omnivoice_final_srt_rows(selected_subtitles)
     final_srt_path.write_text(format_srt(final_srt_rows), encoding="utf-8")
-    final_ass_path = final_dir / "dubbed_final_full-styled.ass"
+    final_ass_path = final_paths["ass"]
     final_ass_path.write_text(
         _build_styled_ass_from_rows(final_srt_rows, source_name=final_srt_path.name),
         encoding="utf-8",
@@ -4540,8 +4644,8 @@ def _run_omnivoice_job(
     prepared_audio_path: Optional[Path] = None
     if has_video_stream(input_media_path):
         _set_task(task_id, stage="dubbing:muxing", progress=91.0)
-        final_video_path = final_dir / "dubbed_video_full.mp4"
-        prepared_audio_path = final_dir / "dubbed_audio_for_video.m4a"
+        final_video_path = final_paths["video"]
+        prepared_audio_path = final_paths["video_audio"]
         prepare_dubbed_audio_for_video(
             preferred_audio_path=final_mix_path,
             output_audio_path=prepared_audio_path,
@@ -4554,7 +4658,7 @@ def _run_omnivoice_job(
             target_duration_sec=max(0.05, float(ffprobe_duration(input_media_path))),
         )
         _set_task(task_id, stage="dubbing:burning_subtitles", progress=96.0)
-        burned_video_path = final_dir / "dubbed_video_full_burned.mp4"
+        burned_video_path = final_paths["video_burned"]
         burn_ass_subtitles_into_video(
             input_video_path=final_video_path,
             ass_subtitle_path=final_ass_path,
@@ -4657,6 +4761,15 @@ def _task_to_public(task: Dict[str, Any]) -> Dict[str, Any]:
     return public
 
 
+def _has_uploaded_file_selection(files: List[UploadFile]) -> bool:
+    """判断请求里是否真的带了用户上传的参考音文件。"""
+
+    for ref_file in files or []:
+        if str(getattr(ref_file, "filename", "") or "").strip():
+            return True
+    return False
+
+
 @router.post("/start-from-project")
 async def start_omnivoice_from_project(
     filename: str = Form(""),
@@ -4731,6 +4844,8 @@ async def start_omnivoice_from_project(
         }
     )
     uploaded_speaker_ref_map: Dict[str, Dict[str, Any]] = {}
+    has_uploaded_speaker_ref_files = _has_uploaded_file_selection(speaker_ref_files)
+    speaker_ids_payload: List[Any] = []
     if speaker_ref_speaker_ids_json.strip():
         try:
             speaker_ids_payload = json.loads(speaker_ref_speaker_ids_json)
@@ -4738,6 +4853,19 @@ async def start_omnivoice_from_project(
             raise HTTPException(status_code=400, detail=f"Invalid speaker_ref_speaker_ids_json: {exc}") from exc
         if not isinstance(speaker_ids_payload, list):
             raise HTTPException(status_code=400, detail="speaker_ref_speaker_ids_json must be a list")
+    elif has_uploaded_speaker_ref_files:
+        # 5 号面板的单人无 speaker 场景允许省略 speaker ids，后端自动绑定到唯一 speaker。
+        if len(speaker_ids) == 1 and len(speaker_ref_files) == 1:
+            speaker_ids_payload = [speaker_ids[0]]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "uploaded OmniVoice speaker refs require explicit speaker ids unless exactly "
+                    "one speaker and one reference file are provided"
+                ),
+            )
+    if speaker_ids_payload:
         if len(speaker_ids_payload) != len(speaker_ref_files):
             raise HTTPException(status_code=400, detail="speaker_ref_speaker_ids_json count must match speaker_ref_files")
         uploaded_ref_dir = out_root / "uploaded_speaker_refs"
@@ -4763,6 +4891,11 @@ async def start_omnivoice_from_project(
                 "reference_mode": "uploaded_partial",
                 "upload_filename": Path(str(ref_file.filename or "")).name,
             }
+    if has_uploaded_speaker_ref_files and not uploaded_speaker_ref_map:
+        raise HTTPException(
+            status_code=400,
+            detail="uploaded OmniVoice speaker refs were provided but none could be bound to detected speaker ids",
+        )
 
     if uploaded_speaker_ref_map:
         missing_speaker_ids = [
@@ -4917,7 +5050,7 @@ async def prepare_omnivoice_subtitles_from_project(
     )
     task.update(
         {
-            "status": "completed",
+            "status": "prepared",
             "stage": "prepared:selected_subtitles",
             "progress": 100.0,
             "selected_subtitle_mode": selected_mode,
@@ -4963,7 +5096,7 @@ async def prepare_omnivoice_subtitles_from_project(
     return {
         "task_id": resolved_task_id,
         "short_id": resolved_task_id.split("_")[0],
-        "status": "completed",
+        "status": "prepared",
         "stage": "prepared:selected_subtitles",
         "project_filename": display_name,
         "selected_subtitle_mode": selected_mode,

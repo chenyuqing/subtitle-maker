@@ -6,6 +6,7 @@ set -euo pipefail
 # 统一切到项目目录，避免相对路径解析错误。
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
+WEB_PORT="${SUBTITLE_MAKER_PORT:-17493}"
 
 INDEX_TTS_PROJECT_DIR="${INDEX_TTS_PROJECT_DIR:-/Users/tim/Documents/vibe-coding/MVP/index-tts-1108}"
 INDEX_TTS_STOP_SCRIPT="${INDEX_TTS_STOP_SCRIPT:-$INDEX_TTS_PROJECT_DIR/stop-api.sh}"
@@ -109,7 +110,7 @@ kill_pattern "python[0-9.]* .*OmniVoice-Studio-main/backend/main.py" "omnivoice 
 kill_pattern "llama-server" "local sakura model"
 
 # 4) 最后按端口兜底清理监听者，确保下次 start 不会被端口占用阻塞。
-kill_port 8000 "subtitle-maker web"
+kill_port "$WEB_PORT" "subtitle-maker web"
 kill_port 8010 "index-tts api"
 kill_port 3900 "omnivoice api"
 kill_port 8081 "sakura llama-server"

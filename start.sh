@@ -6,6 +6,8 @@ set -euo pipefail
 # Ensure we are in the project directory
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
+WEB_PORT="${SUBTITLE_MAKER_PORT:-17493}"
+WEB_URL="http://localhost:${WEB_PORT}"
 
 echo "Starting Subtitle Maker..."
 
@@ -16,9 +18,9 @@ if ! command -v uv &> /dev/null; then
     exit 1
 fi
 
-# Check if port 8000 is already in use
-if lsof -Pi :8000 -sTCP:LISTEN -t >/dev/null ; then
-    echo "Warning: Port 8000 is already in use."
+# Check if port is already in use
+if lsof -Pi :"$WEB_PORT" -sTCP:LISTEN -t >/dev/null ; then
+    echo "Warning: Port $WEB_PORT is already in use."
     read -p "Do you want to stop the existing process? (y/n) " -n 1 -r
     echo
     if [[ $REPLY =~ ^[Yy]$ ]]; then
@@ -76,7 +78,7 @@ echo "Waiting for server to initialize..."
 MAX_RETRIES=30
 COUNT=0
 
-while ! curl -s http://localhost:8000 > /dev/null; do
+while ! curl -s "$WEB_URL" > /dev/null; do
     sleep 1
     COUNT=$((COUNT+1))
     if [ $COUNT -ge $MAX_RETRIES ]; then
@@ -88,7 +90,7 @@ while ! curl -s http://localhost:8000 > /dev/null; do
 done
 
 echo "Server is ready! Opening browser..."
-open "http://localhost:8000"
+open "$WEB_URL"
 echo "Tip: dubbing backend will auto-start only when the corresponding panel actually uses it."
 echo "Tip: Auto Dubbing logs now include detailed runtime snapshot: TTS base, dubbing mode, grouping policy, timing mode, merge policy, range policy, and segment sizing."
 

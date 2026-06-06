@@ -1,6 +1,6 @@
 #!/bin/bash
 
-PORT=8000
+PORT="${SUBTITLE_MAKER_PORT:-17493}"
 
 echo "Stopping Dubbing Service..."
 

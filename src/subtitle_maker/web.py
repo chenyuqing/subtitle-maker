@@ -31,6 +31,8 @@ from subtitle_maker.index_tts_service import (
     stop_index_tts_service,
 )
 
+DEFAULT_WEB_PORT = int(os.environ.get("SUBTITLE_MAKER_PORT", "17493"))
+
 
 class _SuppressPollingAccessLogFilter(logging.Filter):
     """过滤高频轮询接口的 access log，避免控制台被重复 200 刷屏。"""
@@ -57,4 +59,4 @@ def start():
     # 在启动前先压掉高频轮询 access log，保留其余请求日志。
     _configure_access_log_filters()
     reload_enabled = os.environ.get("SUBTITLE_MAKER_RELOAD", "0").lower() in {"1", "true", "yes", "on"}
-    uvicorn.run("subtitle_maker.web:app", host="0.0.0.0", port=8000, reload=reload_enabled, workers=1)
+    uvicorn.run("subtitle_maker.web:app", host="0.0.0.0", port=DEFAULT_WEB_PORT, reload=reload_enabled, workers=1)

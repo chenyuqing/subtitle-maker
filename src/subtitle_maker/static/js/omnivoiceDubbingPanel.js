@@ -204,34 +204,24 @@ export function setupOmnivoiceDubbingPanel(deps) {
     }
 
     /**
-     * 5 号面板的缺失 speaker 采用“上一行优先、最后 Speaker 1”的补齐顺序。
-     * 这里只服务于前端上传槽位/提示统计，确保和后端实际路由策略一致。
-     */
-    function normalizeSpeakerIdsForPanelRows(rows) {
-        const normalized = [];
-        let previousSpeakerId = '';
-        (Array.isArray(rows) ? rows : []).forEach((row) => {
-            const explicitSpeakerId = String(row?.speaker_id || '').trim();
-            const speakerId = explicitSpeakerId || previousSpeakerId || 'Speaker 1';
-            normalized.push(speakerId);
-            previousSpeakerId = speakerId;
-        });
-        return normalized;
-    }
-
-    /**
-     * 提取稳定 speaker 列表，和 4 号面板一样完全以字幕 speaker_id 为准。
+     * 提取稳定 speaker 列表。
+     * 5 号面板前端只信任字幕里已经显式存在的 `speaker_id`，绝不在 UI 层凭空补 `Speaker 1`。
      */
     function getDetectedSpeakerIds(projectContext = readProjectContext()) {
         const rows = getEffectiveSubtitleRows(projectContext);
         const ordered = [];
         const seen = new Set();
-        normalizeSpeakerIdsForPanelRows(rows).forEach((speakerId) => {
-            if (!seen.has(speakerId)) {
-                seen.add(speakerId);
-                ordered.push(speakerId);
+        (Array.isArray(rows) ? rows : []).forEach((row) => {
+            const speakerId = String(row?.speaker_id || '').trim();
+            if (!speakerId || seen.has(speakerId)) {
+                return;
             }
+            seen.add(speakerId);
+            ordered.push(speakerId);
         });
+        if (ordered.length === 0 && Array.isArray(rows) && rows.length > 0) {
+            return ['Speaker 1'];
+        }
         return ordered;
     }
 
@@ -246,9 +236,13 @@ export function setupOmnivoiceDubbingPanel(deps) {
         const nextMap = new Map();
         speakerRefListEl.innerHTML = '';
 
+        const hasSubtitleRows = Array.isArray(getEffectiveSubtitleRows(projectContext)) && getEffectiveSubtitleRows(projectContext).length > 0;
         if (speakerIds.length === 0) {
-            speakerRefHintEl.textContent = '当前项目字幕里还没有 speaker 信息；请上传带 Speaker 前缀或 speaker_id 的字幕。';
+            speakerRefHintEl.textContent = '当前项目字幕里还没有字幕，暂时无法建立 speaker 参考音映射。';
             return;
+        }
+        if (speakerIds.length === 1 && speakerIds[0] === 'Speaker 1' && hasSubtitleRows) {
+            speakerRefHintEl.textContent = '当前项目未检测到显式 speaker，先按单个 Speaker 1 处理；请上传这位 speaker 的参考音。';
         }
 
         speakerIds.forEach((speakerId) => {
@@ -314,8 +308,16 @@ export function setupOmnivoiceDubbingPanel(deps) {
         const cantoneseSuffix = cantoneseTarget
             ? ` 当前目标语为粤语（${cantoneseStyle}）；若未上传完整参考音，后端需存在 ref-voices/Cantonese 预置目录才能自动补齐缺失 speaker。`
             : '';
+        const hasSubtitleRows = Array.isArray(getEffectiveSubtitleRows()) && getEffectiveSubtitleRows().length > 0;
         if (speakerIds.length === 0) {
-            speakerRefHintEl.textContent = `当前项目字幕里还没有 speaker 信息；请上传带 Speaker 前缀或 speaker_id 的字幕。${cantoneseSuffix}`.trim();
+            speakerRefHintEl.textContent = `当前项目字幕里还没有字幕，暂时无法建立 speaker 参考音映射。${cantoneseSuffix}`.trim();
+            return;
+        }
+        if (speakerIds.length === 1 && speakerIds[0] === 'Speaker 1' && hasSubtitleRows) {
+            const hasUpload = !!speakerRefFiles.get('Speaker 1');
+            speakerRefHintEl.textContent = hasUpload
+                ? `当前项目未检测到显式 speaker，现按单个 Speaker 1 处理，参考音已上传。${cantoneseSuffix}`.trim()
+                : `当前项目未检测到显式 speaker，现按单个 Speaker 1 处理；请上传这位 speaker 的参考音。${cantoneseSuffix}`.trim();
             return;
         }
         const missing = speakerIds.filter((speakerId) => !speakerRefFiles.get(speakerId));

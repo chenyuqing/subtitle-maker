@@ -1,0 +1,564 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Subtitle Maker - 系统架构图</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0d1117; color: #c9d1d9; margin: 0; padding: 20px; }
+  h1 { text-align: center; color: #58a6ff; margin-bottom: 30px; }
+  .mermaid { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 20px; margin-bottom: 30px; overflow-x: auto; }
+  h2 { color: #f0883e; border-bottom: 1px solid #30363d; padding-bottom: 8px; margin-top: 40px; }
+</style>
+</head>
+<body>
+
+<h1>Subtitle Maker — 系统架构图</h1>
+
+<h2>1. 整体分层架构</h2>
+<div class="mermaid">
+graph TB
+    subgraph Entry["🚪 入口层"]
+        CLI["cli.py<br/>命令行工具"]
+        Web["web.py<br/>Uvicorn 启动"]
+    end
+
+    subgraph Frontend["🖥️ 前端 SPA — Jinja2 + Vanilla JS + CSS"]
+        direction TB
+        IDX["index.html<br/>单页应用"]
+        AppJS["app.js<br/>主控脚本"]
+        DubJS["dubbingPanel.js<br/>配音面板"]
+        AgentJS["agentDrawer.js<br/>AI 助手抽屉"]
+
+        subgraph Panels["5 个功能面板"]
+            P1["1. 上传<br/>视频/音频拖放"]
+            P2["2. 转写<br/>语言/时间范围配置"]
+            P3["3. 编辑导出<br/>字幕编辑/翻译/导出"]
+            P4["4. 配音 V1<br/>完整配音工作流"]
+            P5["5. 配音 V2<br/>支持改写翻译"]
+        end
+
+        VideoPlayer["VideoPlayer<br/>字幕叠加 + 音轨切换"]
+        LS["localStorage<br/>API Key / 主题 / 后端选择"]
+    end
+
+    subgraph API["🌐 API 层 — FastAPI (app/main.py)"]
+        direction TB
+
+        subgraph CoreRoutes["核心路由"]
+            PROJ["routes/projects.py<br/>POST /upload · /stream · /reset"]
+            SUB["routes/subtitles.py<br/>POST /transcribe · /transcribe/sync"]
+            TRANS["routes/translation.py<br/>POST /translate"]
+            EXPORT["routes/exports.py<br/>POST /export · /segment · /download"]
+            JOBS["routes/jobs.py<br/>GET /status · POST /cancel · 模型管理"]
+        end
+
+        subgraph ExtRoutes["扩展路由"]
+            DUB_API["dubbing_cli_api.py (~1500行)<br/>POST /dubbing/auto/*"]
+            STREAM_API["streaming_api.py<br/>POST /api/streaming/*"]
+            AGENT_API["agent_api.py<br/>POST /api/agent/chat"]
+        end
+    end
+
+    subgraph Core["⚙️ 核心服务层"]
+        ASR_ENGINE["SubtitleGenerator<br/>transcriber.py<br/>Qwen3-ASR 封装"]
+        TRANS_ENGINE["Translator<br/>translator.py<br/>DeepSeek 批量翻译"]
+        DUB_PIPELINE["Dubbing Pipeline<br/>domains/dubbing/pipeline.py<br/>逐段合成编排"]
+        STREAM_MGR["StreamingSessionManager<br/>streaming_asr.py<br/>实时 ASR 会话"]
+        AGENT_LLM["OpenAICompatibleChatClient<br/>core/llm_client.py<br/>LLM 客户端"]
+    end
+
+    subgraph Domain["📦 领域层 — 纯逻辑,无 IO"]
+        direction TB
+
+        subgraph DD["domains/dubbing/"]
+            DUB_PIPE["pipeline.py<br/>TTS 合成 + 对齐 + 重试"]
+            DUB_ALIGN["alignment.py<br/>变速 · 裁剪 · 时长适配"]
+            DUB_REF["references.py<br/>人声参考音频提取"]
+            DUB_REVIEW["review.py<br/>重配运行时参数"]
+        end
+
+        subgraph SD["domains/subtitles/"]
+            SRT_UTIL["srt.py<br/>文本合并 · 断句检测"]
+            TIMELINE["timeline.py<br/>时间按权重分配"]
+            SENT_SPLIT["sentence_split.py<br/>标点边界断句"]
+            SHORT_MRG["short_merge.py<br/>短句智能合并"]
+        end
+
+        subgraph MD["domains/media/"]
+            PROBE["probe.py<br/>音频时长/加载/重采样"]
+            SEGMENT["segment.py<br/>静音检测 · 片段切割"]
+            COMPOSE["compose.py<br/>混音 · 视频合成 · 响度归一"]
+        end
+    end
+
+    subgraph Backend["🔌 后端服务层"]
+        direction TB
+
+        subgraph TTS["TTS 后端 (策略模式)"]
+            TTS_BASE["backends/base.py<br/>TtsBackend (ABC)"]
+            INDEX_TTS["backends/index_tts.py<br/>IndexTtsBackend<br/>API:8010 / 本地模型"]
+            OMNI_VOICE["backends/omni_voice.py<br/>OmniVoiceBackend<br/>API:8020 / CLI"]
+        end
+
+        subgraph JobSystem["任务系统"]
+            JOB_MODEL["jobs/models.py<br/>JobRecord · TaskStatus"]
+            JOB_STORE["jobs/store.py<br/>TaskStore (RLock 线程安全)"]
+            JOB_CMD["jobs/command_builder.py<br/>子进程 CLI 构建"]
+            JOB_RECOVER["jobs/recovery.py<br/>从 manifest 恢复任务"]
+        end
+
+        subgraph Manifest["清单持久化"]
+            MAN_SCHEMA["manifests/schema.py<br/>BatchManifest · SegmentManifest"]
+            MAN_RW["manifests/readwrite.py<br/>JSON 读写 · 路径解析"]
+        end
+
+        CORE_FFMPEG["core/ffmpeg.py<br/>FFmpeg 子进程封装"]
+    end
+
+    subgraph External["🌍 外部服务 & 本地模型"]
+        DEEPSEEK["DeepSeek API<br/>deepseek-v4-flash"]
+        INDEXTTS_SVC["Index-TTS Server<br/>localhost:8010"]
+        OMNIVOICE_SVC["OmniVoice Server<br/>localhost:8020"]
+        QWEN_ASR_M["Qwen3-ASR-0.6B<br/>models/Qwen3-ASR-0.6B/"]
+        QWEN_FA_M["Qwen3-ForcedAligner<br/>字级时间对齐"]
+        QWEN_TTS_M["Qwen3-TTS<br/>qwen_tts/ 内嵌推理"]
+    end
+
+    subgraph FS["💾 文件系统"]
+        UPLOADS["uploads/"]
+        OUTPUTS["outputs/"]
+        MODELS_DIR["models/"]
+        DUB_JOBS["outputs/dub_jobs/{batch_id}/"]
+    end
+
+    %% 依赖连线
+    Frontend -->|HTTP 轮询| API
+    API --> Core
+    Core --> Domain
+    Core --> External
+
+    DUB_PIPELINE --> DD
+    DUB_PIPELINE --> MD
+    DUB_PIPELINE --> TTS
+    DUB_PIPELINE --> Manifest
+    DUB_PIPELINE -->|subprocess| FS
+
+    ASR_ENGINE --> QWEN_ASR_M
+    ASR_ENGINE --> QWEN_FA_M
+    TRANS_ENGINE --> DEEPSEEK
+    AGENT_LLM --> DEEPSEEK
+
+    TTS_BASE --> INDEX_TTS
+    TTS_BASE --> OMNI_VOICE
+    INDEX_TTS --> INDEXTTS_SVC
+    OMNI_VOICE --> OMNIVOICE_SVC
+
+    DUB_API --> JobSystem
+    DUB_API --> Manifest
+
+    style Frontend fill:#1a2332,stroke:#58a6ff,color:#c9d1d9
+    style API fill:#1a2332,stroke:#3fb950,color:#c9d1d9
+    style Core fill:#1a2332,stroke:#d2a8ff,color:#c9d1d9
+    style Domain fill:#1a2332,stroke:#f0883e,color:#c9d1d9
+    style Backend fill:#1a2332,stroke:#f778ba,color:#c9d1d9
+    style External fill:#1a2332,stroke:#e5534b,color:#c9d1d9
+    style FS fill:#1a2332,stroke:#8b949e,color:#c9d1d9
+</div>
+
+<h2>2. 核心业务流程序列图</h2>
+<div class="mermaid">
+sequenceDiagram
+    actor U as 👤 用户
+    participant FE as 🖥️ 前端 SPA
+    participant API as 🌐 FastAPI
+    participant ASR as 🧠 Qwen3-ASR
+    participant TR as 🤖 DeepSeek
+    participant TTS as 🔊 TTS 后端
+    participant FS as 💾 文件系统
+
+    rect rgb(30,40,60)
+    Note over U,FS: 流程 A — 字幕生成与翻译
+    U->>FE: 拖放上传视频/音频
+    FE->>API: POST /upload (multipart)
+    API->>FS: 保存 uploads/{uuid}.ext
+    API-->>FE: { file_id, filename }
+
+    U->>FE: 配置语言 / 时间范围 → 开始转写
+    FE->>API: POST /transcribe
+    API->>API: BackgroundTasks 入队
+    API-->>FE: { task_id }
+
+    API->>ASR: 加载模型, 逐 30s 块转写
+    loop 逐块处理
+        API->>FS: ffmpeg 提取音频块
+        ASR-->>API: 逐块返回字幕片段
+    end
+    API->>FS: 写入 outputs/*.srt
+    API->>API: status → "completed"
+
+    loop 前端轮询
+        FE->>API: GET /status/{task_id}
+        API-->>FE: { status, progress, subtitles }
+    end
+
+    U->>FE: 选择目标语言 → 翻译
+    FE->>API: POST /translate { task_id, target_lang, api_key }
+    API->>TR: translate_batch(subtitles, target_lang)
+    TR-->>API: 翻译后字幕
+    API-->>FE: 双语字幕 JSON
+
+    U->>FE: 导出
+    FE->>API: POST /export { format, task_id }
+    API-->>FE: SRT 文件下载
+    end
+
+    rect rgb(40,35,30)
+    Note over U,FS: 流程 B — 自动配音 (V1/V2)
+    U->>FE: 配置配音参数 (语言/策略/时间范围)
+    FE->>API: POST /dubbing/auto/start { ...params }
+    API->>FS: 创建 outputs/dub_jobs/{batch_id}/
+    API->>FS: 写入 batch_manifest.json
+    API->>API: 启动子进程 tools/dub_long_video.py
+    API-->>FE: { task_id, batch_id }
+
+    Note over API,TTS: 子进程异步执行
+
+    API->>ASR: 转写 (若无源 SRT)
+    API->>TR: 翻译 (若无译文 SRT)
+    API->>FS: 音频分段 (静音检测切割)
+
+    loop 逐段合成
+        API->>FS: 提取参考人声
+        API->>TTS: synthesize(text, ref_audio, lang)
+        TTS-->>API: 合成 WAV 音频段
+        API->>API: 时长对齐 (atempo/trim)
+        API->>API: 响度归一
+    end
+
+    API->>FS: 拼接全部片段 → 混音 BGM
+    API->>FS: 合成最终配音视频
+    API->>API: status → "completed"
+
+    loop 前端轮询
+        FE->>API: GET /dubbing/auto/task/{task_id}
+        API-->>FE: { status, progress, steps, eta }
+    end
+
+    FE->>API: GET /dubbing/auto/download/{path}
+    API-->>FE: 配音视频文件
+    end
+</div>
+
+<h2>3. TTS 后端可插拔架构</h2>
+<div class="mermaid">
+graph TB
+    subgraph AppLayer["业务层"]
+        PIPELINE["Dubbing Pipeline<br/>pipeline.py"]
+        CLI_API["dubbing_cli_api.py<br/>REST API 桥接"]
+    end
+
+    subgraph Abstract["抽象接口"]
+        TTS_BASE["TtsBackend (ABC)<br/>backends/base.py<br/><br/>+ synthesize()<br/>+ health_check()"]
+        TTS_REQ["TtsSynthesisRequest<br/>frozen dataclass<br/><br/>text · ref_audio · output_path<br/>ref_text · language · emo_audio<br/>top_p · temperature · target_duration"]
+    end
+
+    subgraph Backends["后端实现"]
+        direction TB
+
+        subgraph IndexTTS["Index-TTS 后端"]
+            IT_API["via_api 模式<br/>HTTP → localhost:8010<br/>/v1/tts/generate"]
+            IT_LOCAL["local_model 模式<br/>直接加载模型推理"]
+            IT_EXTRA["额外能力<br/>CJK/拉丁文本分句<br/>健康检查 + 自动恢复<br/>时长匹配重试"]
+        end
+
+        subgraph OmniVoice["OmniVoice 后端"]
+            OV_API["via_api 模式<br/>HTTP → localhost:8020<br/>/api/v1/synthesize"]
+            OV_CLI["via_cli 模式<br/>子进程 python -m omnivoice.cli.infer"]
+            OV_EXTRA["额外能力<br/>语言规范化<br/>本地服务自动恢复<br/>保守重试策略"]
+        end
+    end
+
+    subgraph Lifecycle["服务生命周期"]
+        IDX_SVC["index_tts_service.py<br/>get_status / start / stop / release"]
+        START_SH["start_index_tts_api.sh<br/>start_omnivoice_api.sh"]
+        STOP_SH["stop_index_tts_api.sh<br/>stop_omnivoice_api.sh"]
+    end
+
+    subgraph External2["外部进程"]
+        IT_SERVER["Index-TTS FastAPI<br/>tools/index_tts_fastapi_server.py<br/>:8010"]
+        OV_SERVER["OmniVoice FastAPI<br/>tools/omnivoice_fastapi_server.py<br/>:8020"]
+    end
+
+    PIPELINE --> TTS_BASE
+    CLI_API --> TTS_BASE
+
+    TTS_BASE --> TTS_REQ
+    TTS_BASE --> IT_API
+    TTS_BASE --> OV_API
+
+    IT_API --> IT_LOCAL
+    IT_API --> IT_EXTRA
+    OV_API --> OV_CLI
+    OV_API --> OV_EXTRA
+
+    IT_API -->|HTTP| IT_SERVER
+    OV_API -->|HTTP| OV_SERVER
+
+    IDX_SVC --> START_SH
+    IDX_SVC --> STOP_SH
+    START_SH --> IT_SERVER
+    START_SH --> OV_SERVER
+
+    style Abstract fill:#1a2332,stroke:#f0883e,color:#c9d1d9
+    style Backends fill:#1a2332,stroke:#3fb950,color:#c9d1d9
+    style Lifecycle fill:#1a2332,stroke:#58a6ff,color:#c9d1d9
+    style External2 fill:#1a2332,stroke:#d2a8ff,color:#c9d1d9
+</div>
+
+<h2>4. 前端组件树</h2>
+<div class="mermaid">
+graph TB
+    Main["index.html<br/>单页应用入口"]
+
+    Sidebar["侧边栏导航"]
+    ThemeToggle["主题切换<br/>亮色/暗色"]
+    APIConfig["全局配置<br/>DeepSeek Key<br/>TTS 后端选择"]
+
+    subgraph Panels["5 个主面板"]
+        direction LR
+        Panel1["Panel 1: 上传<br/>拖放视频/音频<br/>SRT 文件上传<br/>视频播放器预览"]
+        Panel2["Panel 2: 转写<br/>语言选择<br/>最大行宽<br/>时间范围<br/>进度条"]
+        Panel3["Panel 3: 编辑导出<br/>字幕编辑器<br/>翻译配置/执行<br/>导出格式选择<br/>音频片段导出"]
+        Panel4["Panel 4: 配音 V1<br/>项目/独立模式<br/>语言/分组策略<br/>短句合并配置<br/>时间范围<br/>恢复历史批次"]
+        Panel5["Panel 5: 配音 V2<br/>V1 全部功能<br/>+ 改写翻译开关"]
+    end
+
+    subgraph Overlay["浮层组件"]
+        VideoOverlay["视频字幕叠加<br/>显示模式切换<br/>字幕位置切换<br/>音轨切换<br/>逐段跳转"]
+        AgentDrawer["AI 助手抽屉<br/>agentDrawer.js<br/>DeepSeek 对话<br/>操作建议按钮"]
+        ProgressBar["进度轮询<br/>status 定时查询<br/>步骤指示器"]
+    end
+
+    subgraph State["状态管理"]
+        LS2["localStorage<br/>apiKey · theme<br/>ttsBackend · sidebarState"]
+        SS["sessionStorage<br/>agentChatHistory"]
+        InMem["内存状态<br/>currentFileId<br/>currentSubtitles<br/>translatedSubtitles"]
+    end
+
+    Main --> Sidebar
+    Main --> Panels
+    Sidebar --> APIConfig
+    Sidebar --> ThemeToggle
+    Panels --> Overlay
+    Overlay --> VideoOverlay
+    Overlay --> AgentDrawer
+    Overlay --> ProgressBar
+    Panels --> State
+
+    style Panels fill:#1a2332,stroke:#58a6ff,color:#c9d1d9
+    style Overlay fill:#1a2332,stroke:#3fb950,color:#c9d1d9
+    style State fill:#1a2332,stroke:#f0883e,color:#c9d1d9
+</div>
+
+<h2>5. 领域层架构 — 配音流程详解</h2>
+<div class="mermaid">
+graph TB
+    subgraph Input2["输入"]
+        MEDIA["媒体文件<br/>视频/音频"]
+        SRT_SRC["源语言 SRT<br/>(可选)"]
+        SRT_TRANS["翻译后 SRT<br/>(可选)"]
+    end
+
+    subgraph Prep["准备阶段"]
+        EXTRACT["domains/media/probe.py<br/>提取音频 + 元数据"]
+        TRANSCRIBE["transcriber.py<br/>Qwen3-ASR 转写<br/>(若无 SRT)"]
+        TRANSLATE["translator.py<br/>DeepSeek 翻译<br/>(若无译文)"]
+        SEGMENT_AUDIO["domains/media/segment.py<br/>静音检测 → 音频分段"]
+    end
+
+    subgraph SRTProc["字幕预处理"]
+        SENT_SP["sentence_split.py<br/>标点边界断句"]
+        SHORT_M["short_merge.py<br/>短句智能合并"]
+        TIMELINE_A["timeline.py<br/>时间按权重分配"]
+        SRT_BUILD["srt.py<br/>重平衡字幕构建"]
+    end
+
+    subgraph PerSegment["逐段合成循环"]
+        direction TB
+        REF_EXTRACT["references.py<br/>从原人声提取参考音频"]
+        TTS_SYNTH["TTS 后端<br/>synthesize(text, ref_audio, lang)"]
+        ALIGN["alignment.py<br/>apply_atempo 变速<br/>trim_silence_edges 裁剪<br/>fit_audio_to_duration"]
+        NORMALIZE["compose.py<br/>normalize_speech_audio_level<br/>响度归一化"]
+        QUALITY["质量门<br/>时长匹配检查<br/>重试逻辑"]
+    end
+
+    subgraph Compose2["合成阶段"]
+        CONCAT["concat_generated_wavs()<br/>拼接全部片段"]
+        MIX_BGM["mix_with_bgm()<br/>混入背景音乐"]
+        BUILD_VIDEO["build_dubbed_video_two_step()<br/>替换视频音轨"]
+        MERGE_SRT["merge_bilingual_srt_files()<br/>合并双语字幕"]
+    end
+
+    subgraph Output3["输出"]
+        DUB_AUDIO["dubbed_audio.wav"]
+        DUB_VIDEO["dubbed_video.mp4"]
+        FINAL_SRT["双语字幕 .srt"]
+        MANIFEST_JSON["batch_manifest.json"]
+    end
+
+    Input2 --> Prep
+    Prep --> SRTProc
+    SRTProc --> PerSegment
+    PerSegment --> Compose2
+    Compose2 --> Output3
+
+    MEDIA --> EXTRACT
+    EXTRACT --> TRANSCRIBE
+    TRANSCRIBE --> TRANSLATE
+    TRANSLATE --> SEGMENT_AUDIO
+    SEGMENT_AUDIO --> SENT_SP
+
+    SENT_SP --> SHORT_M
+    SHORT_M --> TIMELINE_A
+    TIMELINE_A --> SRT_BUILD
+
+    SRT_BUILD --> REF_EXTRACT
+    REF_EXTRACT --> TTS_SYNTH
+    TTS_SYNTH --> ALIGN
+    ALIGN --> NORMALIZE
+    NORMALIZE --> QUALITY
+    QUALITY -.->|重试| TTS_SYNTH
+
+    QUALITY --> CONCAT
+    CONCAT --> MIX_BGM
+    MIX_BGM --> BUILD_VIDEO
+    BUILD_VIDEO --> MERGE_SRT
+
+    style Prep fill:#1a2332,stroke:#58a6ff,color:#c9d1d9
+    style SRTProc fill:#1a2332,stroke:#f0883e,color:#c9d1d9
+    style PerSegment fill:#1a2332,stroke:#d2a8ff,color:#c9d1d9
+    style Compose2 fill:#1a2332,stroke:#3fb950,color:#c9d1d9
+    style Output3 fill:#1a2332,stroke:#f778ba,color:#c9d1d9
+</div>
+
+<h2>6. 任务系统与清单持久化</h2>
+<div class="mermaid">
+graph TB
+    subgraph API_Layer["API 层"]
+        START["POST /dubbing/auto/start"]
+        STATUS["GET /dubbing/auto/task/{id}"]
+        CANCEL["POST /dubbing/auto/cancel/{id}"]
+        RESUME["POST /dubbing/auto/resume"]
+        REVIEW_LOAD["POST /dubbing/auto/review/load"]
+        REVIEW_SAVE["POST /dubbing/auto/review/save"]
+        REDUB["POST /dubbing/auto/redub/failed"]
+    end
+
+    subgraph JobCore["任务核心"]
+        STORE["TaskStore<br/>jobs/store.py<br/><br/>RLock 线程安全<br/>create / get / update<br/>delete / list<br/>cancel_all_running"]
+        MODELS2["JobRecord · PublicJobRecord<br/>jobs/models.py<br/><br/>task_id · status · progress<br/>stdout_lines · artifacts<br/>error · created_at"]
+        CMD["command_builder.py<br/>构建子进程命令<br/><br/>build_auto_dubbing_command()<br/>build_segment_redub_command()"]
+    end
+
+    subgraph Manifest2["清单系统"]
+        SCHEMA2["manifests/schema.py<br/><br/>BatchManifestView<br/>SegmentManifestView<br/>BatchReplayOptions"]
+        RW["manifests/readwrite.py<br/><br/>load_batch_manifest()<br/>load_segment_manifest()<br/>write_manifest_json()<br/>resolve_output_path()"]
+    end
+
+    subgraph Recovery["恢复系统"]
+        REPAIR["jobs/recovery.py<br/><br/>try_auto_repair()<br/>find_batch_dir_by_name()<br/>find_batch_manifest_by_name()<br/>list_available_batches()"]
+    end
+
+    subgraph FS2["文件系统"]
+        BATCH_DIR["outputs/dub_jobs/{batch_id}/<br/><br/>batch_manifest.json<br/>segments/{i}/segment_manifest.json<br/>output/{seg_i}.wav<br/>final/"]
+    end
+
+    START --> STORE
+    STATUS --> STORE
+    CANCEL --> STORE
+    RESUME --> STORE
+    REVIEW_LOAD --> STORE
+    REVIEW_SAVE --> STORE
+    REDUB --> STORE
+
+    STORE --> MODELS2
+    STORE --> CMD
+    CMD -->|subprocess.Popen| FS2
+
+    STORE --> RW
+    RW --> SCHEMA2
+    RW --> FS2
+
+    STORE --> REPAIR
+    REPAIR --> RW
+    REPAIR --> FS2
+
+    RESUME --> REPAIR
+    REVIEW_LOAD --> RW
+
+    style JobCore fill:#1a2332,stroke:#d2a8ff,color:#c9d1d9
+    style Manifest2 fill:#1a2332,stroke:#f0883e,color:#c9d1d9
+    style Recovery fill:#1a2332,stroke:#58a6ff,color:#c9d1d9
+    style FS2 fill:#1a2332,stroke:#8b949e,color:#c9d1d9
+</div>
+
+<h2>7. 目录职责速览</h2>
+<div class="mermaid">
+graph LR
+    subgraph SRC["src/subtitle_maker/"]
+        direction TB
+
+        subgraph Layer1["app/ — HTTP 层"]
+            A1["main.py 应用工厂"]
+            A2["routes/ 8个路由模块"]
+            A3["legacy_runtime.py"]
+        end
+
+        subgraph Layer2["根模块 — 核心服务"]
+            B1["web.py 启动入口"]
+            B2["cli.py 命令行"]
+            B3["transcriber.py ASR"]
+            B4["translator.py 翻译"]
+            B5["dubbing_cli_api.py 配音API"]
+            B6["streaming_asr.py 流式ASR"]
+            B7["streaming_api.py 流式路由"]
+            B8["agent_api.py AI助手"]
+        end
+
+        subgraph Layer3["domains/ — 领域逻辑"]
+            C1["dubbing/ 配音域"]
+            C2["subtitles/ 字幕域"]
+            C3["media/ 媒体域"]
+        end
+
+        subgraph Layer4["backends/ — TTS 后端"]
+            D1["base.py 抽象基类"]
+            D2["index_tts.py"]
+            D3["omni_voice.py"]
+        end
+
+        subgraph Layer5["基础层"]
+            E1["jobs/ 任务系统"]
+            E2["manifests/ 清单系统"]
+            E3["core/ ffmpeg+LLM"]
+            E4["qwen_tts/ 内嵌TTS"]
+        end
+
+        Layer1 --> Layer2
+        Layer2 --> Layer3
+        Layer3 --> Layer4
+        Layer2 --> Layer5
+    end
+
+    style Layer1 fill:#1a2332,stroke:#3fb950,color:#c9d1d9
+    style Layer2 fill:#1a2332,stroke:#58a6ff,color:#c9d1d9
+    style Layer3 fill:#1a2332,stroke:#f0883e,color:#c9d1d9
+    style Layer4 fill:#1a2332,stroke:#d2a8ff,color:#c9d1d9
+    style Layer5 fill:#1a2332,stroke:#f778ba,color:#c9d1d9
+</div>
+
+<script>mermaid.initialize({ startOnLoad: true, theme: 'dark', securityLevel: 'loose' });</script>
+</body>
+</html>

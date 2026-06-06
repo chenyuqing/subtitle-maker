@@ -1,5 +1,251 @@
 # TODO
 
+## 163. 2026-06-06 5 号面板无参考音时优先使用预设声音库（性别识别）
+- [x] 现状分析
+  - [x] 完全没上传参考音时，`_run_omnivoice_job` 直接走 `_build_speaker_reference_map()`，从原视频人声轨提取聚合参考音，未经过性别识别和预设声音库
+  - [x] 性别识别（`_infer_missing_speaker_gender_hints`）和预设库选音（`_pick_preset_ref_voices_for_missing_speakers`）仅在"上传了部分 speaker 参考音但有缺失"时才触发
+- [x] 功能点设计
+  - [x] 完全未上传参考音时，先检查 `ref-voices/<target_lang>/` 预设声音库是否存在
+  - [x] 预设库存在 → 对所有 detected speakers 做性别识别 → 按性别从预设库选参考音（`reference_mode = "preset_gender"`）
+  - [x] 预设库不存在，或选音抛出异常 → fallback 回 `_build_speaker_reference_map()`（`reference_mode = "auto_aggregate"`）
+  - [x] 只修改 5 号面板（`omnivoice_dub_api.py`），不触碰其他面板
+- [x] 验证
+  - [x] 语法检查通过（`uv run python -c "import ast; ast.parse(...)"` ✅）
+
+### Review
+- [x] [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) `_run_omnivoice_job()` 的 `else` 分支（无上传）已改为：先调 `_resolve_ref_voices_dir()` 检查预设库 → 有则性别识别 + 预设库选音，无则人声提取
+
+## 162. 2026-05-31 4 号面板 Index-TTS 按 speaker_id 拆分原音参考链路
+- [x] 现状分析
+  - [x] [src/subtitle_maker/static/js/dubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/dubbingPanel.js) `buildCurrentProjectRequest()` 当前会把 `subtitles_json` 直接送去 `/dubbing/auto/start-from-project`，没有单独声明“按 speaker 切原音参考”的前端合同
+  - [x] [src/subtitle_maker/dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/dubbing_cli_api.py) Current Project 启动链路已经会落 `_input_project.speakers.json`，说明 4 号面板并不是没有 speaker 数据，而是后续是否正确利用它要继续核对
+  - [x] [tools/dub_pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tools/dub_pipeline.py) 当前单人模式 `dubbing_mode == "single"` 会直接 `extract_reference_audio_from_first_subtitle(...)`，多人模式若没有上传的 `speaker_ref_map_json`，则退回 `build_subtitle_reference_map(...)` 自动抽原音参考
+  - [x] [src/subtitle_maker/domains/dubbing/pipeline.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/dubbing/pipeline.py) `build_speaker_aware_synthesis_groups()` 已具备“先按同一 speaker 连续 run 分组”的底层能力
+- [ ] 功能点设计
+  - [ ] 4 号面板不引入 5/6 号那种“上传 speaker 参考音”工作流
+  - [ ] 4 号面板继续沿用“从原视频人声音轨自动裁原音参考”的模式，但要在前段严格按 `speaker_id` 做分组与参考音选择
+  - [ ] 目标是避免不同 speaker 的原音落进同一组，导致一个人的音色说两个人的话
+- [ ] 风险与决策
+  - [ ] 必须先确认问题发生在 `dubbing_mode` 推导、`grouped_synthesis` 分组、还是 `build_subtitle_reference_map(...)` 的参考音选择层，不能直接打补丁
+  - [ ] 若 4 号面板当前被误推成 `single`，即使字幕里有 `speaker_id`，后续也会走共享参考音路径
+
+## 161. 2026-05-26 Web 默认端口从 8000 切到不常用端口
+- [x] 现状分析
+  - [x] [src/subtitle_maker/web.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/web.py) `start()` 当前默认 `port=8000`
+  - [x] [start.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/start.sh) 当前用 `http://localhost:8000` 做启动探活并自动打开浏览器
+  - [x] [start-dub.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/start-dub.sh)、[stop.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/stop.sh)、[stop-dub.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/stop-dub.sh)、[clean-model.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/clean-model.sh) 也都把 `8000` 写死成当前 Web 端口
+- [x] 功能点设计
+  - [x] 统一把项目 Web 默认端口改成一个不常用端口
+  - [x] 启动、停止、清理脚本与 Python 默认启动入口都改为同一端口
+  - [x] 脚本侧统一支持 `SUBTITLE_MAKER_PORT` 环境变量覆盖，避免以后再次分裂
+- [x] 验证
+  - [x] `bash -n` 验证相关 shell 脚本语法
+  - [x] `./.venv/bin/python -m py_compile src/subtitle_maker/web.py`
+
+### Review
+- [x] [src/subtitle_maker/web.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/web.py) 已把默认 Web 端口改为 `17493`，并允许通过 `SUBTITLE_MAKER_PORT` 覆盖
+- [x] [start.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/start.sh)、[start-dub.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/start-dub.sh)、[stop.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/stop.sh)、[stop-dub.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/stop-dub.sh)、[clean-model.sh](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/clean-model.sh) 已统一切到同一端口变量，不再写死 `8000`
+- [x] 已通过 `bash -n start.sh start-dub.sh stop.sh stop-dub.sh clean-model.sh restart.sh`
+- [x] 已通过 `./.venv/bin/python -m py_compile src/subtitle_maker/web.py`
+
+## 160. 2026-05-26 5 号面板上传了参考音却静默退回 auto_aggregate
+- [x] 现状分析
+  - [x] 当前运行批次 `outputs/dub_jobs/omnivoice_20260526_022415/manifest.json` 明确显示 `speaker_reference_mode = auto_aggregate`
+  - [x] 同批次不存在 `uploaded_speaker_refs/`，而 `speaker_ref_map.json` 里 `Speaker 1.ref_text` 竟然是 `>> [音乐] [音乐] ...`，说明这轮根本没使用用户上传参考音，而是静默退回自动聚合参考音
+  - [x] 当前后端 `src/subtitle_maker/omnivoice_dub_api.py::start_omnivoice_from_project()` 里，如果 `uploaded_speaker_ref_map` 为空，会直接进入 `auto_aggregate`，没有区分“用户没上传”还是“用户上传了但绑定失败”
+- [x] 功能点设计
+  - [x] 只改 5 号面板后端上传参考音绑定逻辑
+  - [x] 若请求里带了 `speaker_ref_files`，但 `speaker_ref_speaker_ids_json` 为空，且当前只检测到 1 个 speaker，则自动把该文件绑定到唯一 speaker
+  - [x] 若请求里带了 `speaker_ref_files`，但最终一个都没绑定成功，直接报错，禁止静默回退到 `auto_aggregate`
+- [x] 验证
+  - [x] 增加回归测试，覆盖单 speaker 上传文件但未显式传 speaker ids 时，后端仍能绑定成功
+  - [x] 增加回归测试，覆盖“上传了文件却未绑定”时会直接失败而不是静默 auto_aggregate
+
+### Review
+- [x] [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 已新增 `_has_uploaded_file_selection()`，并在 `start_omnivoice_from_project()` 里把“有上传文件但 ids 为空”的单 speaker 场景自动绑定到唯一 `Speaker 1`
+- [x] 同一入口现在会在“上传了文件但无法唯一推断 speaker”时直接返回 `400`，不再静默回退 `auto_aggregate`
+- [x] [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 已新增 2 个回归测试，覆盖自动绑定成功与无法绑定时报错
+- [x] 已通过 `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_omnivoice_from_project_auto_binds_single_uploaded_ref_without_speaker_ids tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_omnivoice_from_project_rejects_uploaded_refs_without_bindable_speaker_ids tests.test_dubbing_cli_api.DubbingCliApiTests.test_start_omnivoice_from_project_rejects_partial_cantonese_refs_when_preset_pool_empty`
+- [x] 已通过 `./.venv/bin/python -m py_compile src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py`
+
+## 159. 2026-05-26 5 号面板 prepared 状态被并发门禁误判为活任务
+- [x] 现状分析
+  - [x] 5 号面板 `Prepare selected_subtitles.srt` 现在会把 batch 写成 `status=prepared`
+  - [x] `src/subtitle_maker/jobs/store.py::TaskStore.list_active_ids()` 当前只把 `completed/failed/cancelled` 视为终态
+  - [x] 因此 `prepared` 会被当成“仍在运行中的活任务”，导致 5 号面板再次点击开始配音或 resume 时被拦成 `Another OmniVoice job is already running`
+- [x] 功能点设计
+  - [x] 只修改 `TaskStore.list_active_ids()` 的默认终态集合
+  - [x] 把 `prepared` 视为非活跃终态，允许其后续进入真正的 `start/resume`
+  - [x] 不改 queued/running 的并发保护
+- [x] 验证
+  - [x] 回归测试覆盖 `prepared` 不应出现在 `list_active_ids()` 结果中
+  - [x] 静态验证 `prepared` 终态已纳入并发门禁的终态集合
+
+### Review
+- [x] [src/subtitle_maker/jobs/store.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/jobs/store.py) 已把 `prepared` 纳入 `TaskStore.list_active_ids()` 的默认终态集合，不再把“已准备好字幕但未开始配音”的 batch 误当成活任务
+- [x] [tests/test_task_store.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_task_store.py) 已新增 `test_prepared_status_is_not_treated_as_active`
+- [x] 已通过 `./.venv/bin/python -m py_compile src/subtitle_maker/jobs/store.py tests/test_task_store.py`
+- [x] 已通过 2 个定向测试：
+  - [x] `tests.test_task_store.TaskStoreTests.test_update_and_active_listing_respect_terminal_status`
+  - [x] `tests.test_task_store.TaskStoreTests.test_prepared_status_is_not_treated_as_active`
+
+## 158. 2026-05-26 梳理并固化 speaker ID 识别逻辑文档
+- [x] 现状分析
+  - [x] 已收集 speaker ID 识别链路的核心出处：`src/subtitle_maker/domains/subtitles/speakers.py`、`src/subtitle_maker/static/app.js`、`src/subtitle_maker/static/js/omnivoiceDubbingPanel.js`、`src/subtitle_maker/static/js/voxcpmDubbingPanel.js`、`src/subtitle_maker/omnivoice_dub_api.py`、`src/subtitle_maker/voxcpm_dub_api.py`
+  - [x] 已确认当前系统至少存在 4 层 speaker 语义：字幕导入标准化、前端项目上下文消费、面板级上传参考音 UI、后端启动/恢复时的 speaker 补齐
+  - [x] 已确认 5 号面板与 6 号面板当前合同并不一致：5 号面板前端近期被收紧为只信任显式 `speaker_id`，6 号面板仍会在前端把无 speaker 场景展示为默认单 speaker
+- [x] 功能点设计
+  - [x] 产出一份单独逻辑文档，明确“当前实现”与“推荐合同”分开写
+  - [x] 文档必须为每个结论标注具体文件路径 + 函数名，避免后续再靠印象改
+  - [x] 文档必须明确回答：何时识别 `Speaker N:`、何时保留 sidecar `speaker_id`、何时默认单 speaker、何时写入 `selected_subtitles_with_speakers.srt`、恢复时从哪份文件还原
+- [ ] 验证
+  - [ ] 文档已写入仓库，后续可作为 speaker 相关改动的单一依据
+
+## 157. 2026-05-26 5 号面板无 speaker 时默认单 speaker 上传参考音
+- [x] 现状分析
+  - [x] 当前 `src/subtitle_maker/static/js/omnivoiceDubbingPanel.js::getDetectedSpeakerIds()` 已收敛为只信任显式 `speaker_id`
+  - [x] 这虽然避免了垃圾 speaker，但在“全文没有任何 speaker 标注”的正常单人场景下，会让 5 号面板错误显示为“没有 speaker 信息”，无法上传单 speaker 参考音
+  - [x] 后端 `src/subtitle_maker/omnivoice_dub_api.py::start_omnivoice_from_project()` 本来就会把无 speaker 的字幕补成 `Speaker 1`，所以前端合同应与后端保持一致
+- [x] 功能点设计
+  - [x] 只改 5 号面板前端 speaker 列表推导
+  - [x] 若存在显式 `speaker_id`，继续按显式 speaker 列表渲染
+  - [x] 若整份有效字幕非空但没有任何显式 `speaker_id`，前端默认返回 `["Speaker 1"]`，允许上传单人参考音
+  - [x] 若字幕为空，仍显示“没有 speaker 信息”
+- [x] 验证
+  - [x] 静态验证 5 号面板 JS 语法正常
+  - [x] 自检无 speaker 字幕场景会生成 `Speaker 1` 上传槽位
+
+### Review
+- [x] [src/subtitle_maker/static/js/omnivoiceDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/omnivoiceDubbingPanel.js) 已把 5 号面板前端合同补齐：当有效字幕非空但没有任何显式 `speaker_id` 时，`getDetectedSpeakerIds()` 默认返回 `["Speaker 1"]`
+- [x] `renderSpeakerReferenceInputs()` 与 `renderSpeakerRefHint()` 已同步改为单 speaker 文案，不再把这种场景错误提示成“没有 speaker 信息”
+- [x] 已通过 `node --check src/subtitle_maker/static/js/omnivoiceDubbingPanel.js`
+
+## 156. 2026-05-26 5 号面板 speaker 被误识别成英文正文片段
+- [x] 现状分析
+  - [x] `src/subtitle_maker/domains/subtitles/speakers.py::SPEAKER_PREFIX_RE` 当前允许 `(?:[^:：\n]{1,80})` 作为 speaker 名，因此任何“冒号前一段普通文本”都有机会被误识别成 `speaker_id`
+  - [x] 这会让普通英文句子、标题或说明文本中的冒号前半句被写进 `speaker_id`，出现用户看到的 `layers using a 1` 这类垃圾 speaker
+  - [x] 我上一版把 5 号面板前端 speaker fallback 改成读取 `sourceSubtitles` 时间轴后，等于把这个底层脏 speaker 更直接地暴露到了 UI
+- [x] 功能点设计
+  - [x] 只收窄底层 speaker 前缀识别：默认只接受明确的 `Speaker ...:` 这一类前缀，不再把普通冒号句子当 speaker
+  - [x] 回退 5 号面板前端那套“按 source 时间轴补 speaker”的改动，恢复为只基于显式 `speaker_id`
+  - [x] 不改 6 号面板，不改真正的配音路由后端
+- [x] 验证
+  - [x] 增加回归测试，覆盖普通英文冒号句子不会再被识别成 speaker
+  - [x] 静态验证 5 号面板前端 speaker 列表不再从 source 文本里捏造 speaker
+
+### Review
+- [x] [src/subtitle_maker/domains/subtitles/speakers.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/domains/subtitles/speakers.py) 已把 `SPEAKER_PREFIX_RE` 收窄为只接受明确的 `Speaker ...:` 前缀，不再把普通英文冒号句子误识别成 `speaker_id`
+- [x] [src/subtitle_maker/static/js/omnivoiceDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/omnivoiceDubbingPanel.js) 已回退前一版“按 source 时间轴补 speaker”的前端逻辑，恢复为只基于显式 `speaker_id` 渲染 speaker 上传槽位，避免把脏 source 数据直接扩散到 UI
+- [x] [tests/test_subtitle_speakers.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_subtitle_speakers.py) 已新增回归：`Ideas are everywhere: they're worthless.` 不会再被识别成 speaker
+- [x] 已通过 `./.venv/bin/python -m unittest tests.test_subtitle_speakers.SubtitleSpeakerTests.test_strip_speaker_prefix_extracts_speaker_and_text tests.test_subtitle_speakers.SubtitleSpeakerTests.test_strip_speaker_prefix_does_not_treat_normal_english_colon_text_as_speaker`
+- [x] 已通过 `./.venv/bin/python -m py_compile src/subtitle_maker/domains/subtitles/speakers.py tests/test_subtitle_speakers.py`
+- [x] 已通过 `node --check src/subtitle_maker/static/js/omnivoiceDubbingPanel.js`
+
+## 155. 2026-05-26 5 号面板 prepared batch 被误显示为“已完成配音”
+- [x] 现状分析
+  - [x] `src/subtitle_maker/omnivoice_dub_api.py::prepare_omnivoice_selected_subtitles_from_project()` 当前在“只生成 selected_subtitles.srt”后，把任务和 manifest 直接写成 `status=completed`
+  - [x] `src/subtitle_maker/static/js/omnivoiceDubbingPanel.js::renderResumeAction()` 只要看到 `resume_stage === completed` 就显示“该批次已完成”
+  - [x] 用户场景里虽然实际上只是 prepared，但因为后端 manifest 状态语义写错，Restore/Resume UI 被误导成“完成配音”
+- [x] 功能点设计
+  - [x] 只修改 5 号面板 prepared batch 的状态语义，不改真正 final 完成批次
+  - [x] Prepare 产出的 batch 应明确标记为 `status=prepared`，`stage=prepared:selected_subtitles`
+  - [x] 继续沿用 `_infer_resume_state()` 的 `resume_stage=prepared` 判定，让 Resume 按钮显示“跳过翻译继续配音”
+- [x] 验证
+  - [x] 回归测试覆盖 prepared batch 加载后仍为 `resumable=true`、`resume_stage=prepared`
+  - [x] 回归测试覆盖 prepare 接口返回和 manifest 落盘都使用 `status=prepared`
+
+### Review
+- [x] [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 已把 `prepare_omnivoice_selected_subtitles_from_project()` 的状态语义从 `completed` 改为 `prepared`，stage 仍保持 `prepared:selected_subtitles`
+- [x] 这意味着 5 号面板 Restore/Resume 读取 prepared batch 时，将继续由 `_infer_resume_state()` 正确推导成 `resume_stage=prepared`，不再被 UI 误显示为“该批次已完成”
+- [x] 已通过 `./.venv/bin/python -m py_compile src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py`
+- [x] 已通过 2 个定向测试：
+  - [x] `tests.test_dubbing_cli_api.DubbingCliApiTests.test_load_omnivoice_batch_marks_prepared_batch_resumable`
+  - [x] `tests.test_dubbing_cli_api.DubbingCliApiTests.test_prepare_omnivoice_selected_subtitles_returns_prepared_status`
+
+## 154. 2026-05-26 5 号面板上传参考音时报 unknown speaker_id
+- [x] 现状分析
+  - [x] 前端 `src/subtitle_maker/static/js/omnivoiceDubbingPanel.js::getDetectedSpeakerIds()` 当前基于 `getEffectiveSubtitleRows()` 直接做“上一行优先、最后 Speaker 1”的本地补齐
+  - [x] 后端 `src/subtitle_maker/omnivoice_dub_api.py::start_omnivoice_from_project()` 会对 `translated_rows/source_rows` 再执行 `_ensure_speaker_ids(..., fallback_rows=source_rows, force_align_by_time=True)`，按源字幕时间轴重对齐真实 speaker
+  - [x] 当前前后端 speaker 推导规则不一致，会导致前端上传 `Speaker 1`，但后端本轮真实 speaker 集合里并没有这个 id，进而在 `start_omnivoice_from_project()` 触发 `unknown speaker_id in uploaded OmniVoice references`
+- [x] 功能点设计
+  - [x] 只修改 5 号面板前端 speaker 探测逻辑，不改 6 号面板，不改 OmniVoice 合成逻辑
+  - [x] 前端按和后端一致的规则，为当前 `subtitle_mode` 的有效字幕补齐 speaker：优先按 source 时间窗重对齐，无命中时再回退上一行/`Speaker 1`
+  - [x] 上传参考音槽位、提示文案、`speaker_ref_speaker_ids_json` 都统一使用这套对齐后的 speaker 列表
+- [x] 验证
+  - [x] 自检前端 `speaker_ref_speaker_ids_json` 生成路径已改为使用时间轴对齐后的 speaker 列表
+  - [x] 运行静态验证，确认不会再把仅存在于前端默认补位的 `Speaker 1` 传给后端
+
+### Review
+- [x] [src/subtitle_maker/static/js/omnivoiceDubbingPanel.js](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/static/js/omnivoiceDubbingPanel.js) 已新增前端版时间轴 speaker 对齐逻辑：`buildSpeakerFallbackCandidates()`、`pickSpeakerIdByTime()`、`normalizeSpeakerIdsForPanelRows(rows, fallbackRows)`，现在与后端 `src/subtitle_maker/omnivoice_dub_api.py::_ensure_speaker_ids(..., force_align_by_time=True)` 的匹配顺序一致
+- [x] `getDetectedSpeakerIds()` 已改为用 `sourceSubtitles` 作为 fallback 时间轴，因此上传参考音槽位、提示文案、`speaker_ref_speaker_ids_json` 不会再因为译文缺失 speaker 而被前端错误补成统一的 `Speaker 1`
+- [x] 已通过 `node --check src/subtitle_maker/static/js/omnivoiceDubbingPanel.js`
+- [x] 已通过 `./.venv/bin/python -m py_compile src/subtitle_maker/translator.py src/subtitle_maker/omnivoice_dub_api.py src/subtitle_maker/voxcpm_dub_api.py tests/test_dubbing_cli_api.py`
+
+## 153. 2026-05-25 final 输出文件名跟随上传视频文件名
+- [x] 现状分析
+  - [x] 5 号面板 final 输出文件名当前在 `src/subtitle_maker/omnivoice_dub_api.py` 多处写死为 `dubbed_final_full.srt`、`dubbed_mix_full.wav`、`dubbed_video_full.mp4` 等
+  - [x] 6 号面板 final 输出文件名当前在 `src/subtitle_maker/voxcpm_dub_api.py` 也写死为 `dubbed_final_full.srt`、`dubbed_video_full.mp4` 等
+  - [x] 当前任务上下文里已经有上传视频原始文件名可用：`project_filename` / `original_filename`
+- [ ] 功能点设计
+  - [ ] final 目录下输出文件改为基于上传视频文件名的 stem 命名
+  - [ ] 只替换最终产物命名，不改中间产物目录结构，不改 artifact key
+  - [ ] 对无视频或仅字幕场景，回退到现有默认命名，避免空文件名
+- [ ] 风险与决策
+  - [ ] 风险 1：manifest / artifact / restore / download 依赖当前固定路径，必须统一从实际生成路径回填，不能只改文件名常量
+  - [ ] 风险 2：同一 batch 内可能同时存在不同规格视频、副产物 ASS/SRT/WAV，命名规则要稳定且可预测
+- [ ] 验证
+  - [ ] 增加定向测试，覆盖上传 `demo.mp4` 后 final 产物名带 `demo`
+  - [ ] 验证旧 artifact key 仍可下载到新文件路径
+
+## 152. 2026-05-25 5 号面板去掉简繁字符表后处理，改为 LLM 二次审校粤语译文
+- [x] 现状分析
+  - [x] `src/subtitle_maker/omnivoice_dub_api.py::_translate_subtitles_if_needed()` 在 5 号面板 source->粤语时，主翻译、缺失行补译、latin-dominant repair 完成后，会进入 `_sanitize_translated_rows_for_target(...)`
+  - [x] `src/subtitle_maker/omnivoice_dub_api.py::_sanitize_translated_rows_for_target()` 与同文件后续粤语分支，当前都会调用 `convert_chinese_script_text(..., "traditional")`
+  - [x] `src/subtitle_maker/domains/subtitles/zh_script.py::convert_chinese_script_text()` 当前环境下 `zhconv` 未加载成功，会退回 `GPT-SoVITS/.../char_convert.py` 的字符映射表
+  - [x] 已实测该 fallback 会产出不适合字幕/TTS 的异体字或冷僻字，例如：`这是 -> 這昰`、`为 -> 爲`、`后台 -> 后颱`
+- [ ] 功能点设计
+  - [x] 5 号面板粤语链路不再做字符级“简转繁”后处理；已移除 `convert_chinese_script_text(..., "traditional")` 在 OmniVoice 粤语路径上的调用
+  - [x] 新增一个基于现有 Translation API 的 LLM 审校步骤，只在 `target_lang in {Cantonese, Cantonese-Mainland}` 时启用
+  - [x] 审校输入为已翻译的逐行字幕文本，要求模型只做：
+    - [x] 保留原意，不摘要、不删句、不扩写
+    - [x] 修正为自然粤语
+    - [x] 统一输出现代常用繁体字
+    - [x] 每行一一对应返回，保留行数
+  - [x] 审校放在 5 号面板翻译完成、空行回退与 latin-dominant repair 之后，`selected_subtitles.srt` 落盘之前，避免影响上游对齐与补译
+- [ ] 风险与决策
+  - [ ] 风险 1：二次 LLM 审校会增加一次 API 成本与耗时，但能替代错误的字符表转换
+  - [ ] 风险 2：如果整批审校仍发生漏行，必须复用 `Translator.translate_batch()` 现有的 split/missing retry 机制，不能自己写一套脆弱 parser
+  - [ ] 风险 3：需要把审校 prompt 和“普通翻译 prompt”职责分开，避免再触发摘要化或截断
+- [ ] 验证
+  - [x] 增加回归测试，覆盖“简体粤语译文 -> 审校后变成常用繁体，且不出现 `這昰/爲/后颱` 这类异常字形”
+  - [x] 增加回归测试，覆盖审校步骤不会把 `My name is Matt Berman.` 这类译文再裁成 `我叫`
+
+### Review
+- [x] [src/subtitle_maker/translator.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/translator.py) 已新增 `build_cantonese_review_system_prompt()` 与 `Translator.review_batch()`，复用原有编号解析、missing-line retry、split retry 机制执行粤语二次审校
+- [x] [src/subtitle_maker/omnivoice_dub_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/src/subtitle_maker/omnivoice_dub_api.py) 已删除 5 号面板粤语链路里的 `convert_chinese_script_text(..., "traditional")`，改为 `_review_cantonese_rows_with_llm()` 在翻译后、落盘前做 LLM 审校
+- [x] 已通过 `./.venv/bin/python -m py_compile src/subtitle_maker/translator.py src/subtitle_maker/omnivoice_dub_api.py tests/test_dubbing_cli_api.py`
+- [x] 已通过 4 个定向测试：
+  - [x] `test_translate_subtitles_if_needed_restores_empty_rows_from_source_for_omnivoice`
+  - [x] `test_translate_subtitles_if_needed_retries_latin_rows_after_empty_fallback`
+  - [x] `test_omnivoice_cantonese_review_replaces_abnormal_script_forms`
+  - [x] `test_omnivoice_cantonese_review_keeps_full_sentence_meaning`
+
+## 151. 2026-05-24 5 号面板 OmniVoice 粤语翻译强制全量繁体落盘
+- [x] 现状分析
+  - [x] 用户要求：5 号面板只要目标语是 `Cantonese` / `Cantonese-Mainland`，落盘到 `selected_subtitles.srt` 的粤语结果必须全部转成繁体字，不能混入简体，否则 OmniVoice 可能按普通话习惯配音
+  - [x] 代码现状已存在繁体转换接入点：`src/subtitle_maker/omnivoice_dub_api.py::_sanitize_translated_rows_for_target()` 与 `src/subtitle_maker/omnivoice_dub_api.py::_translate_subtitles_if_needed()` 的粤语后处理分支
+  - [x] 共享翻译层仍需继续核对：`src/subtitle_maker/translator.py::translate_batch()` 默认仍会做通用清洗，必须确认不会在 5 号面板粤语链路里把正文裁断或改坏
+- [ ] 功能点设计
+  - [ ] 锁定 5 号面板合同：`Cantonese` / `Cantonese-Mainland` 的译文，无论来源是主翻译批次、缺失行补译、latin-dominant repair，最终写入 `selected_subtitles.srt` / `selected_subtitles_with_speakers.srt` 时都必须是繁体
+  - [ ] 增加回归测试，覆盖“简体粤语输入 -> 5 号面板最终 selected 输出为全量繁体”的合同
+  - [ ] 把“繁体转换”和“正文不被截断/摘要化”拆开验证，避免把两类问题混在一起判断
+- [ ] 风险与决策
+  - [ ] 风险 1：如果繁体转换放在过早阶段，可能影响缺失行补译与正文比对；优先在 5 号面板最终后处理/落盘前收口
+  - [ ] 风险 2：当前 5 号面板历史上还出现过 `我叫 / 我系 / 同埋` 这类残句，必须单独证明这是翻译/清洗问题还是后续 selected 优化问题，不能再靠猜
+- [ ] 验证
+  - [ ] 用 5 号面板英文 source -> 粤语目标语跑一次，核对 `selected_subtitles.srt` 是否为全量繁体
+  - [ ] 核对问题样本中是否还存在“繁体正确但正文被截断”的情况，分开记账
+
 ## 150. 2026-05-22 5 号面板 OmniVoice 配音语速不均修复（CPS timing rebalance）
 - 问题：`selected_subtitles.srt` 存在极端 CPS 方差（1.1～60.7，中位 5.6），导致配音交替极慢/极快
 - 根因：TTS 合成始终 `speed=1.0` 不随文本密度调整；后处理变速阈值过窄（≤1.25）超出则硬截断；时间再分配只覆盖极端相邻对

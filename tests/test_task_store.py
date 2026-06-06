@@ -26,6 +26,13 @@ class TaskStoreTests(unittest.TestCase):
         store.update("running_task", status="failed")
         self.assertEqual(store.list_active_ids(), [])
 
+    def test_prepared_status_is_not_treated_as_active(self) -> None:
+        store = TaskStore()
+        store.create("prepared_task", {"status": "prepared"})
+        store.create("running_task", {"status": "running"})
+
+        self.assertEqual(store.list_active_ids(), ["running_task"])
+
     def test_items_snapshot_returns_task_copies(self) -> None:
         store = TaskStore()
         store.create("task_001", {"status": "queued", "progress": 0.0})

@@ -1756,15 +1756,43 @@ def _build_voxcpm_ass_variant_artifact_key(preset: str) -> str:
     return f"ass_{normalized}"
 
 
-def _build_voxcpm_variant_paths(out_root: Path, preset: str) -> Dict[str, Path]:
+def _build_final_output_stem(project_filename: str, fallback: str = "dubbed_final_full") -> str:
+    """基于上传视频文件名生成稳定的 final 输出 stem。"""
+
+    raw_name = str(project_filename or "").strip()
+    if not raw_name:
+        return fallback
+    stem = Path(raw_name).stem.strip()
+    sanitized = _sanitize_filename(stem)
+    sanitized = re.sub(r"\s+", "_", str(sanitized or "").strip()).strip("._")
+    return sanitized or fallback
+
+
+def _build_voxcpm_final_paths(final_dir: Path, project_filename: str) -> Dict[str, Path]:
+    """为 6 号面板 final 主产物生成统一路径，文件名跟随上传视频名。"""
+
+    stem = _build_final_output_stem(project_filename)
+    return {
+        "srt": final_dir / f"{stem}.srt",
+        "srt_rebuild": final_dir / f"{stem}-rebuild.srt",
+        "srt_with_speakers": final_dir / f"{stem}_with_speakers.srt",
+        "mix": final_dir / f"{stem}-mix.wav",
+        "ass": final_dir / f"{stem}-styled.ass",
+        "video": final_dir / f"{stem}.mp4",
+        "video_audio": final_dir / f"{stem}-audio-for-video.m4a",
+    }
+
+
+def _build_voxcpm_variant_paths(out_root: Path, preset: str, project_filename: str) -> Dict[str, Path]:
     """根据规格返回独立命名的 ASS / 视频路径，避免覆盖默认主产物。"""
 
     normalized = _normalize_voxcpm_subtitle_video_preset(preset)
     final_dir = out_root / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
+    stem = _build_final_output_stem(project_filename)
     return {
-        "ass": final_dir / f"dubbed_final_full-styled-{normalized}.ass",
-        "video": final_dir / f"dubbed_video_full-{normalized}.mp4",
+        "ass": final_dir / f"{stem}-styled-{normalized}.ass",
+        "video": final_dir / f"{stem}-{normalized}.mp4",
     }
 
 
@@ -1787,6 +1815,7 @@ def _collect_voxcpm_video_variants(
     *,
     task_id: str,
     out_root: Path,
+    project_filename: str,
     default_preset: str,
     default_ass_path: Optional[Path],
     default_video_path: Optional[Path],
@@ -1812,7 +1841,7 @@ def _collect_voxcpm_video_variants(
         normalized = _normalize_voxcpm_subtitle_video_preset(preset)
         if normalized in seen:
             continue
-        variant_paths = _build_voxcpm_variant_paths(out_root, normalized)
+        variant_paths = _build_voxcpm_variant_paths(out_root, normalized, project_filename)
         if variant_paths["ass"].exists() and variant_paths["video"].exists():
             variants.append(
                 _build_voxcpm_video_variant_entry(
@@ -1949,6 +1978,7 @@ def _build_manifest(
     video_variants = _collect_voxcpm_video_variants(
         task_id=task["id"],
         out_root=out_root,
+        project_filename=str(task.get("project_filename") or ""),
         default_preset=normalized_video_preset,
         default_ass_path=final_ass_path,
         default_video_path=final_video_path,
@@ -2457,6 +2487,7 @@ def _create_task_payload(
 def _run_voxcpm_job(
     *,
     task_id: str,
+    project_filename: str,
     input_media_path: Optional[Path],
     source_rows: List[Dict[str, Any]],
     translated_rows: List[Dict[str, Any]],
@@ -2495,17 +2526,18 @@ def _run_voxcpm_job(
         _reset_voxcpm_output_for_fresh_run(out_root=out_root)
     final_dir = out_root / "final"
     final_dir.mkdir(parents=True, exist_ok=True)
+    final_paths = _build_voxcpm_final_paths(final_dir, project_filename)
     segments_dir = out_root / "segments"
     segments_dir.mkdir(parents=True, exist_ok=True)
     source_audio_path = out_root / "source_audio.wav"
     selected_subtitles_path = out_root / "selected_subtitles.srt"
     selected_subtitles_rebuild_path = out_root / "selected_subtitles_rebuild.srt"
     selected_subtitles_with_speakers_path = out_root / "selected_subtitles_with_speakers.srt"
-    final_srt_path = final_dir / "dubbed_final_full.srt"
-    final_rebuild_srt_path = final_dir / "dubbed_final_full-rebuild.srt"
-    final_srt_with_speakers_path = final_dir / "dubbed_final_full_with_speakers.srt"
-    final_mix_path = final_dir / "dubbed_mix_full.wav"
-    final_ass_path = final_dir / "dubbed_final_full-styled.ass"
+    final_srt_path = final_paths["srt"]
+    final_rebuild_srt_path = final_paths["srt_rebuild"]
+    final_srt_with_speakers_path = final_paths["srt_with_speakers"]
+    final_mix_path = final_paths["mix"]
+    final_ass_path = final_paths["ass"]
     selected_subtitles_translated_path = out_root / "selected_subtitles_translated.srt"
     normalized_script_variant = _normalize_voxcpm_subtitle_script_variant(
         str(resume_context.get("subtitle_script_variant") or subtitle_script_variant or DEFAULT_VOXCPM_SUBTITLE_SCRIPT_VARIANT)
@@ -2807,7 +2839,7 @@ def _run_voxcpm_job(
     final_video_path: Optional[Path] = None
     prepared_audio_path: Optional[Path] = None
     _set_task(task_id, stage="dubbing:building_black_video", progress=92.0)
-    final_video_path = final_dir / "dubbed_video_full.mp4"
+    final_video_path = final_paths["video"]
     layout = _get_voxcpm_subtitle_video_layout(normalized_subtitle_video_preset)
     build_black_video_with_ass_subtitles(
         audio_path=final_mix_path,
@@ -2881,6 +2913,7 @@ def _background_runner(task_id: str, **kwargs: Any) -> None:
         task = _task_store.get(task_id)
         if task is not None:
             out_root = Path(str(task.get("out_root") or _resolve_output_dir(task_id))).expanduser()
+            project_filename = str(task.get("project_filename") or out_root.name)
             manifest = _load_manifest(task_id)
             _set_task(task_id, status="failed", stage="failed", progress=100.0, error=str(exc))
             if manifest is not None:
@@ -3012,6 +3045,7 @@ async def start_voxcpm_from_project(
         target=_background_runner,
         kwargs=dict(
             task_id=resolved_task_id,
+            project_filename=display_name,
             input_media_path=input_media_path,
             source_rows=source_rows,
             translated_rows=translated_rows,
