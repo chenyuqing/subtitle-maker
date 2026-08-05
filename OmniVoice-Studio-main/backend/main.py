@@ -46,11 +46,16 @@ if sys.platform != "darwin":  # macOS has no CUDA
         except Exception:
             pass
 
-_local_omnivoice_checkpoint = Path("/Users/tim/Documents/vibe-coding/MVP/OmniVoice/omnivoice/checkpoints")
+_local_omnivoice_checkpoint = Path("/Volumes/JD5-1TB/tim/Documents/vibe-coding/MVP/OmniVoice/omnivoice/checkpoints")
 if _local_omnivoice_checkpoint.is_dir():
     current_model = os.environ.get("OMNIVOICE_MODEL", "").strip()
     if not current_model or not Path(current_model).expanduser().is_dir():
         os.environ["OMNIVOICE_MODEL"] = str(_local_omnivoice_checkpoint)
+
+# Add external OmniVoice source to Python path so backend can import omnivoice module
+_external_omnivoice_root = Path("/Volumes/JD5-1TB/tim/Documents/vibe-coding/MVP/OmniVoice")
+if _external_omnivoice_root.is_dir() and str(_external_omnivoice_root) not in sys.path:
+    sys.path.insert(0, str(_external_omnivoice_root))
 
 
 # Prevent torchaudio from lazy-importing torchcodec (broken on some installs).

@@ -23,7 +23,7 @@ from .compose import (
     prepare_dubbed_audio_for_video,
     replace_video_audio_two_step,
 )
-from .probe import audio_duration, ffprobe_duration, load_mono_audio, resample_mono_audio
+from .probe import audio_duration, ffprobe_duration, ffprobe_video_resolution, load_mono_audio, resample_mono_audio
 from .segment import (
     choose_boundaries,
     cut_audio_segment,
@@ -37,6 +37,7 @@ from .segment import (
 __all__ = [
     "audio_duration",
     "ffprobe_duration",
+    "ffprobe_video_resolution",
     "load_mono_audio",
     "resample_mono_audio",
     "choose_boundaries",

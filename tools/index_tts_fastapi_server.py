@@ -17,7 +17,7 @@ import soundfile as sf
 import torch
 
 
-DEFAULT_INDEX_TTS_ROOT = Path("/Users/tim/Documents/vibe-coding/MVP/index-tts-1108").resolve()
+DEFAULT_INDEX_TTS_ROOT = Path("/Volumes/JD5-1TB/tim/Documents/vibe-coding/MVP/index-tts-1108").resolve()
 DEFAULT_CFG_PATH = (DEFAULT_INDEX_TTS_ROOT / "checkpoints" / "config.yaml").resolve()
 DEFAULT_MODEL_DIR = (DEFAULT_INDEX_TTS_ROOT / "checkpoints").resolve()
 DEFAULT_AUTO_RESTART_REQUESTS = 50

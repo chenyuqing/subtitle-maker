@@ -120,7 +120,8 @@ def build_asr_gap_clusters(
     for raw_item in subtitles[1:]:
         item = dict(raw_item)
         gap = float(item["start"]) - float(current[-1]["end"])
-        if gap <= max_gap_sec:
+        # gap == 0 表示 SRT 中 \n\n 分隔的相邻块，不应合并
+        if gap <= max_gap_sec and gap != 0.0:
             current.append(item)
             continue
         clusters.append(current)

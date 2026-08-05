@@ -26,6 +26,7 @@ def _load_sibling_char_converter() -> object | None:
 
     candidate_paths = [
         Path(__file__).resolve().parents[5] / "GPT-SoVITS" / "GPT_SoVITS" / "text" / "zh_normalization" / "char_convert.py",
+        Path(__file__).resolve().parents[5] / "GPT-SoVITS-CPUFast" / "GPT_SoVITS" / "text" / "zh_normalization" / "char_convert.py",
         Path(__file__).resolve().parents[5] / "GPT-SoVITS" / "external" / "GPT-SoVITS-CPUFast" / "GPT_SoVITS" / "text" / "zh_normalization" / "char_convert.py",
     ]
     for candidate in candidate_paths:

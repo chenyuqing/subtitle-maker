@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
+
 from subtitle_maker.domains.subtitles import (
     build_segment_speaker_metadata_from_subtitles,
     deepgram_json_to_subtitles,
@@ -17,6 +19,7 @@ from subtitle_maker.domains.subtitles import (
 )
 
 
+@pytest.mark.unit
 class SubtitleSpeakerTests(unittest.TestCase):
     """覆盖多人字幕 speaker 前缀解析与参考音映射解析。"""
 
@@ -323,12 +326,14 @@ class SubtitleSpeakerTests(unittest.TestCase):
             {"start": 9.72, "end": 10.0, "text": "对吧？", "speaker_id": "Speaker 2"},
         ]
 
+        # gap==0 的相邻块不再自动合并，每个块保持独立
         optimized = optimize_srt_import_subtitles(subtitles, speaker_mode="single")
-        self.assertEqual(len(optimized), 3)
-        self.assertEqual([item["speaker_id"] for item in optimized], ["Speaker 1", "Speaker 1", "Speaker 1"])
-        self.assertEqual(optimized[0]["text"], "但失败模式六呢？")
-        self.assertIn("跟不上了。", optimized[1]["text"])
-        self.assertEqual(optimized[2]["text"], "对吧？")
+        self.assertEqual(len(optimized), 5)
+        self.assertEqual(optimized[0]["text"], "但")
+        self.assertEqual(optimized[1]["text"], "失败模式六呢？")
+        self.assertIn("跟不上", optimized[2]["text"])
+        self.assertEqual(optimized[3]["text"], "了。")
+        self.assertEqual(optimized[4]["text"], "对吧？")
 
     def test_optimize_srt_import_subtitles_keeps_complete_sentences_together(self) -> None:
         subtitles = [
@@ -345,10 +350,12 @@ class SubtitleSpeakerTests(unittest.TestCase):
         ]
 
         optimized = optimize_srt_import_subtitles(subtitles)
-        self.assertEqual(len(optimized), 3)
-        self.assertEqual(optimized[0]["text"], "但失败模式六呢？")
-        self.assertIn("跟不上了。", optimized[1]["text"])
-        self.assertEqual(optimized[2]["text"], "对吧？")
+        self.assertEqual(len(optimized), 5)
+        self.assertEqual(optimized[0]["text"], "但")
+        self.assertEqual(optimized[1]["text"], "失败模式六呢？")
+        self.assertIn("跟不上", optimized[2]["text"])
+        self.assertEqual(optimized[3]["text"], "了。")
+        self.assertEqual(optimized[4]["text"], "对吧？")
 
     def test_optimize_srt_import_subtitles_splits_overlong_runs_without_sentence_punctuation(self) -> None:
         subtitles = [

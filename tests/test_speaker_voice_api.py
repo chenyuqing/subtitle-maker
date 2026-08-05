@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 API_TEST_SKIP_REASON = ""
@@ -36,6 +37,7 @@ class FakeThread:
 
 
 @unittest.skipIf(bool(API_TEST_SKIP_REASON), API_TEST_SKIP_REASON or "")
+@pytest.mark.integration
 class SpeakerVoiceApiTests(unittest.TestCase):
     """覆盖 Get Speaker Voice 独立接口主合同。"""
 

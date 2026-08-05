@@ -12,6 +12,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DUB_LONG_VIDEO_PATH = REPO_ROOT / "tools" / "dub_long_video.py"
@@ -43,6 +45,7 @@ sys.modules.setdefault("soundfile", SimpleNamespace())
 MODULE_SPEC.loader.exec_module(dub_long_video)
 
 
+@pytest.mark.unit
 class DubLongVideoTests(unittest.TestCase):
     """覆盖当前 long-video 主编排合同。"""
 

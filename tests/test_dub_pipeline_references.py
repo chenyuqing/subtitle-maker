@@ -9,6 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DUB_PIPELINE_PATH = REPO_ROOT / "tools" / "dub_pipeline.py"
@@ -70,6 +72,7 @@ for name, module in original_subtitle_modules.items():
     sys.modules[name] = module
 
 
+@pytest.mark.unit
 class DubPipelineReferenceTests(unittest.TestCase):
     def test_extract_reference_audio_from_first_subtitle_impl_is_used_for_single_default(self) -> None:
         """单人模式默认参考音应从首条字幕起点开始截取，不再直接从整段音频首个能量峰取。"""

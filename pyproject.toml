@@ -35,3 +35,36 @@ build-backend = "hatchling.build"
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# 排除 vendor 和外部工程
+norecursedirs = [
+    ".*",
+    "build",
+    "dist",
+    "*.egg",
+    "venv",
+    ".venv",
+    "OmniVoice-Studio-main",
+    "VoxCPM",
+    "index-tts-1108",
+]
+markers = [
+    "unit: 快速合同测试，不启动模型或外部服务",
+    "integration: API 回归测试，可 mock 后端",
+    "requires_model: 需要真实模型加载",
+    "requires_mic: 需要麦克风硬件",
+]

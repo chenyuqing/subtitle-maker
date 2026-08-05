@@ -7,9 +7,10 @@ import tempfile
 import unittest
 from http.client import IncompleteRead
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import numpy as np
+import pytest
 import soundfile as sf
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -51,6 +52,7 @@ class FakeThread:
         self.started = True
 
 @unittest.skipIf(bool(API_TEST_SKIP_REASON), API_TEST_SKIP_REASON or "")
+@pytest.mark.integration
 class DubbingCliApiTests(unittest.TestCase):
     """覆盖当前 auto dubbing API 主合同。"""
 
@@ -732,8 +734,8 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(payload["preferred_video_artifact_key"], "video_1080x1920")
         variant_presets = {item["preset"] for item in payload["subtitle_video_variants"]}
         self.assertEqual(variant_presets, {"1920x1080", "1080x1920"})
-        self.assertTrue((final_dir / "dubbed_video_full-1080x1920.mp4").exists())
-        self.assertTrue((final_dir / "dubbed_final_full-styled-1080x1920.ass").exists())
+        self.assertTrue((final_dir / "demo-1080x1920.mp4").exists())
+        self.assertTrue((final_dir / "demo-styled-1080x1920.ass").exists())
 
     def test_render_voxcpm_video_variant_skips_existing_preset(self):
         """已生成过的规格再次请求时，应直接返回，不重复渲染。"""
@@ -1360,7 +1362,7 @@ class DubbingCliApiTests(unittest.TestCase):
                 raise AssertionError("English 到 English 不应调用翻译 API")
 
         with patch.object(voxcpm_dub_api, "Translator", _FailTranslator):
-            rows, mode = voxcpm_dub_api._translate_subtitles_if_needed(
+            source_rows_result, rows, mode = voxcpm_dub_api._translate_subtitles_if_needed(
                 subtitle_mode="source",
                 source_rows=source_rows,
                 translated_rows=[],
@@ -1373,8 +1375,8 @@ class DubbingCliApiTests(unittest.TestCase):
             )
 
         self.assertEqual(mode, "source")
-        self.assertEqual([row["text"] for row in rows], [row["text"] for row in source_rows])
-        self.assertEqual([row["speaker_id"] for row in rows], ["Speaker 1", "Speaker 2"])
+        self.assertEqual([row["text"] for row in source_rows_result], [row["text"] for row in source_rows])
+        self.assertEqual(rows, [])
 
     def test_voxcpm_http_json_retries_incomplete_read(self):
         """VoxCPM HTTP 响应被截断时，应自动重试一次，而不是整批任务直接失败。"""
@@ -1402,7 +1404,9 @@ class DubbingCliApiTests(unittest.TestCase):
                 raise IncompleteRead(b'{"audio_base64":"abc"', 10)
             return _FakeResponse(b'{"audio_base64":"ok"}')
 
-        with patch.object(voxcpm_dub_api.urllib.request, "urlopen", side_effect=fake_urlopen):
+        fake_opener = Mock()
+        fake_opener.open.side_effect = fake_urlopen
+        with patch.object(voxcpm_dub_api.urllib.request, "build_opener", return_value=fake_opener):
             payload = voxcpm_dub_api._http_json(
                 method="POST",
                 url="http://127.0.0.1:7860/api/tts",
@@ -2113,7 +2117,7 @@ class DubbingCliApiTests(unittest.TestCase):
         final_srt_with_speakers = out_root / "final" / "dubbed_final_full_with_speakers.srt"
         selected_srt_with_speakers = out_root / "selected_subtitles_with_speakers.srt"
         final_ass = out_root / "final" / "dubbed_final_full-styled.ass"
-        final_video = out_root / "final" / "dubbed_video_full.mp4"
+        final_video = out_root / "final" / "dubbed_final_full.mp4"
         self.assertTrue(final_srt.exists())
         self.assertTrue(final_rebuild_srt.exists())
         self.assertTrue(final_srt_with_speakers.exists())
@@ -2659,6 +2663,7 @@ class DubbingCliApiTests(unittest.TestCase):
         text = (
             "Ideas are everywhere. They're worthless. 你可能觉得自己有一个关于 X、Y、Z 的超棒想法。"
             "但在它被绑定到一个具体的人、一个具体的痛点之前，它什么都不是。"
+            "真正的产品还要经过真实用户验证，才能知道这个想法有没有价值。"
         )
 
         segments = voxcpm_dub_api._split_voxcpm_long_text_before_tts(text)
@@ -2673,8 +2678,8 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertEqual(
             segments,
             [
-                "Ideas are everywhere. They're worthless.",
-                " 你可能觉得自己有一个关于 X、Y、Z 的超棒想法。但在它被绑定到一个具体的人、一个具体的痛点之前，它什么都不是。",
+                "Ideas are everywhere. They're worthless. 你可能觉得自己有一个关于 X、Y、Z 的超棒想法。但在它被绑定到一个具体的人、一个具体的痛点之前，它什么都不是。",
+                "真正的产品还要经过真实用户验证，才能知道这个想法有没有价值。",
             ],
         )
 
@@ -3046,6 +3051,23 @@ class DubbingCliApiTests(unittest.TestCase):
         )
         self.assertIn(
             "Dialogue: 0,0:00:01.36,0:00:03.57,Default,,0,0,0,,你可能见过一些机器学习模型，",
+            ass_text,
+        )
+
+    def test_build_styled_ass_from_rows_scales_style_for_720p(self):
+        """5号面板 720p 输出应按画布比例缩小字号和边距，避免字幕出界。"""
+
+        ass_text = omnivoice_dub_api._build_styled_ass_from_rows(
+            [{"start": 0.0, "end": 1.0, "text": "720p 字幕"}],
+            source_name="720p.srt",
+            video_width=1280,
+            video_height=720,
+        )
+
+        self.assertIn("PlayResX: 1280", ass_text)
+        self.assertIn("PlayResY: 720", ass_text)
+        self.assertIn(
+            "Style: Default,PingFang SC,53,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,4,0,0,2,53,53,53,1",
             ass_text,
         )
 
@@ -3476,6 +3498,10 @@ class DubbingCliApiTests(unittest.TestCase):
             omnivoice_dub_api,
             "_resolve_omnivoice_separator_device",
             return_value="auto",
+        ), patch.object(
+            omnivoice_dub_api,
+            "ffprobe_duration",
+            return_value=1.0,
         ), patch.object(
             omnivoice_dub_api,
             "extract_source_audio",
@@ -4262,7 +4288,7 @@ class DubbingCliApiTests(unittest.TestCase):
         self.assertIn("短句", translator_module.normalize_cantonese_translation_text("一句断语", "Cantonese"))
         self.assertIn("经历", translator_module.normalize_cantonese_translation_text("阅历", "Cantonese"))
         self.assertIn("冇", translator_module.normalize_cantonese_translation_text("都冇有", "Cantonese"))
-        self.assertIn("但系", translator_module.normalize_cantonese_translation_text("可系", "Cantonese"))
+        self.assertIn("但係", translator_module.normalize_cantonese_translation_text("可系", "Cantonese"))
         self.assertIn("好似", translator_module.normalize_cantonese_translation_text("就像一个导师", "Cantonese"))
 
         self.assertIn("结咗婚", normalized_mainland)
@@ -6138,6 +6164,7 @@ class DubbingCliApiTests(unittest.TestCase):
 
 
 @unittest.skipIf(bool(API_TEST_SKIP_REASON), API_TEST_SKIP_REASON or "")
+@pytest.mark.integration
 class DubbingCliApiFailureParsingTests(unittest.TestCase):
     """覆盖 CLI 失败摘要提取规则。"""
 

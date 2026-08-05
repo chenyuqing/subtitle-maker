@@ -7371,3 +7371,59 @@
   - [x] 同文件对仍偏长的句子继续优先按软标点细分，减少落到字符级硬切的概率
   - [x] 在 [tests/test_dubbing_cli_api.py](/Users/tim/Documents/vibe-coding/MVP/subtitle-maker/tests/test_dubbing_cli_api.py) 增加回归测试，锁住 `Ideas are everywhere.` / `They're worthless.` 必须先断开，以及 `因为交税无可避免，` 这种优先沿标点切分
   - [x] 验证 `./.venv/bin/python -m unittest tests.test_dubbing_cli_api.DubbingCliApiTests.test_split_voxcpm_long_text_before_tts_keeps_spaces_inside_english_phrases tests.test_dubbing_cli_api.DubbingCliApiTests.test_split_voxcpm_long_text_before_tts_prefers_punctuation_boundaries tests.test_dubbing_cli_api.DubbingCliApiTests.test_split_voxcpm_mixed_text_breaks_on_english_period_before_chinese`
+
+## 2026-08-05 项目探索与理解（纯调研）
+- [x] 确认项目规则、`tasks/lessons.md` 与当前 Git 工作区状态
+- [x] 梳理技术栈、启动入口、依赖与目录职责
+- [x] 梳理后端 API、核心领域模块与任务状态流
+- [x] 梳理前端页面/面板及其与后端的交互关系
+- [x] 梳理测试结构、外部服务、数据产物与主要风险
+- [x] 运行非侵入式验证并形成带代码出处的项目理解
+
+### Review
+- [x] 已梳理 FastAPI 主应用、六个前端面板、Index-TTS / OmniVoice / VoxCPM 三条配音链路及 manifest 恢复机制
+- [x] FastAPI 应用导入成功，已枚举主路由；`tests/` 范围成功收集 331 个测试
+- [x] 核心定向测试结果为 37 passed、1 failed；失败来自当前工作树中 gap=0 新语义与旧 Web 路由测试合同不一致
+- [x] 仓库根目录 pytest 收集会误入 vendor 和麦克风脚本，结果为 4 个收集错误；基础测试应显式指定 `tests/`
+- [x] 主要 Shell 脚本均通过 `bash -n`；检查时 17493 / 8010 / 3900 / 7860 / 8081 / 8100 均未监听
+- [x] 本次仅更新调研任务记录，未修改业务代码、未启动模型或服务、未清理用户现有未提交改动
+
+## 2026-08-05 项目优先治理计划（规划阶段）
+- [x] 第一段：基于当前代码与验证结果，确认治理现状和优先级判断
+- [x] 第二段：确认治理目标、范围和阶段性交付物
+- [x] 第三段：确认风险、关键决策与明确不做事项
+- [ ] 用户确认完整 Spec（HARD-GATE）
+- [ ] 将确认后的计划细化到文件路径、函数签名和验证命令
+
+### Review
+- [x] 已完成三段渐进式 Spec：现状/优先级 → 阶段目标/范围 → 风险/决策/不做事项
+- [x] 五个关键决策已确定：gap=0 不合并、PID+命令行校验、默认安全停止、环境变量优先、保持独立并发
+- [x] 治理拆为五个独立里程碑：A 测试基线（P0）→ B 配置与进程（P1）→ C 任务与 manifest（P1）→ D 编排拆分（P2）→ E 输出管理（P2）
+- [x] 明确暂不纳入：前端重写、数据库、Docker 化、云部署、模型替换、UI 重设计、批量重写历史 manifest
+- [x] 当前只建议实施里程碑 A，后续阶段需独立确认
+
+## 2026-08-05 里程碑 A 执行记录（可信测试基线）
+- [x] A1：pytest 范围、vendor 排除规则和 unit/integration marker 已写入 `pyproject.toml`
+- [x] A2：gap=0 字幕导入合同与 Web legacy 回归已同步到测试
+- [x] A3：16 个测试文件完成 unit/integration 分类；manifest 测试补齐 `pytest` 导入
+- [x] A4：审计 `skipIf/skipUnless/skipTest`，确认仅用于缺失可选依赖时的整类保护，原因格式为 `missing dependency <name>`
+- [x] 修正 ASR 布局测试夹具：连续 ASR 片段使用极小正间隔，新增 gap=0 聚类边界回归
+- [x] 修正本轮验证中暴露的简繁转换回退路径、VoxCPM 视频变体路径和旧内部调用兼容合同
+
+### Review
+- `uv run pytest -m unit -v`：88 passed，244 deselected
+- `uv run pytest -m integration -q --tb=short`：244 passed，88 deselected
+- `uv run pytest tests/ -v -ra`：332 passed，0 failed，0 skipped
+- `tests/` 收集从 331 增至 332，新增项为 gap=0 聚类边界回归
+- 未启动模型、麦克风或真实外部服务；未清理、stash 或提交用户既有改动
+
+## 2026-08-05 5 号面板 720p 字幕字号修复
+- [x] 定位最终 ASS 生成链路：`omnivoice_dub_api.py::_build_styled_ass_from_rows(...)`
+- [x] 修复字号与边距固定为 1080p 数值的问题，按实际视频相对 `1920x1080` 的缩放比例计算
+- [x] 保持 1080p 默认行为不变：`Fontsize=80`、`MarginL/R/V=80`
+- [x] 新增 `1280x720` 回归测试，锁住 `Fontsize=53`、`MarginL/R/V=53`
+
+### Review
+- `uv run pytest tests/test_dubbing_cli_api.py -q --tb=short -k 'build_styled_ass_from_rows'`：2 passed
+- `uv run pytest tests/ -q`：333 passed
+- 未修改视频烧录命令，仅修正 ASS 样式的画布比例参数

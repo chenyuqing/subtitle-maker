@@ -3,7 +3,7 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INDEX_TTS_ROOT="${INDEX_TTS_ROOT:-/Users/tim/Documents/vibe-coding/MVP/index-tts-1108}"
+INDEX_TTS_ROOT="${INDEX_TTS_ROOT:-/Volumes/JD5-1TB/tim/Documents/vibe-coding/MVP/index-tts-1108}"
 INDEX_TTS_PYTHON="${INDEX_TTS_PYTHON:-$INDEX_TTS_ROOT/.venv/bin/python}"
 INDEX_TTS_CFG_PATH="${INDEX_TTS_CFG_PATH:-$INDEX_TTS_ROOT/checkpoints/config.yaml}"
 INDEX_TTS_MODEL_DIR="${INDEX_TTS_MODEL_DIR:-$INDEX_TTS_ROOT/checkpoints}"

@@ -7,6 +7,8 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = REPO_ROOT / "tools" / "repair_bad_segments.py"
@@ -18,6 +20,7 @@ sys.modules.setdefault("soundfile", SimpleNamespace())
 MODULE_SPEC.loader.exec_module(repair_bad_segments)
 
 
+@pytest.mark.unit
 class RepairBadSegmentsTests(unittest.TestCase):
     def test_resolve_segment_reference_audio_prefers_manifest_speaker_ref_map(self) -> None:
         """修复脚本应优先使用 manifest 里的 speaker_ref_map，而不是 refs/ 旧路径。"""

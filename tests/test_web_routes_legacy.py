@@ -8,12 +8,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from subtitle_maker import web
 from subtitle_maker.app import legacy_runtime
 
 
+@pytest.mark.integration
 class WebLegacyRouteTests(unittest.TestCase):
     """冻结 Phase 9 拆分后的 legacy web routes 兼容行为。"""
 
@@ -130,6 +132,8 @@ class WebLegacyRouteTests(unittest.TestCase):
         self.assertEqual(payload["subtitles"][1]["speaker_id"], "Speaker 1")
 
     def test_upload_srt_translated_kind_still_uses_import_optimization(self):
+        # gap=0 场景：第一条 end=2.0，第二条 start=2.0
+        # 当前语义：gap=0 不自动合并，保留两条独立字幕
         response = self.client.post(
             "/upload_srt",
             files={
@@ -147,9 +151,11 @@ class WebLegacyRouteTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         payload = response.json()
         self.assertEqual(payload["subtitle_kind"], "translated")
-        self.assertEqual(len(payload["subtitles"]), 1)
-        self.assertEqual(payload["subtitles"][0]["text"], "我今日想講呢個故事。")
-        self.assertEqual(len(payload["translated_subtitles"]), 1)
+        # gap=0 不合并，保留 2 条字幕
+        self.assertEqual(len(payload["subtitles"]), 2)
+        self.assertEqual(payload["subtitles"][0]["text"], "我今日想講")
+        self.assertEqual(payload["subtitles"][1]["text"], "呢個故事。")
+        self.assertEqual(len(payload["translated_subtitles"]), 2)
 
     def test_upload_deepgram_json_and_status_keep_legacy_task_contract(self):
         deepgram_payload = {

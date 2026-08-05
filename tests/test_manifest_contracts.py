@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 from typing import Any, Dict
 
+import pytest
+
 from subtitle_maker.manifests import BatchReplayOptions, build_batch_manifest, load_batch_manifest, load_segment_manifest
 
 
@@ -29,6 +31,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover - 仅在缺三方依赖�
 
 
 @unittest.skipIf(bool(MANIFEST_TEST_SKIP_REASON), MANIFEST_TEST_SKIP_REASON or "")
+@pytest.mark.integration
 class ManifestContractsTests(unittest.TestCase):
     """冻结当前 manifest 主合同，避免 replay 关键字段丢失。"""
 

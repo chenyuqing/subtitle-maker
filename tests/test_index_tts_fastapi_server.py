@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SERVER_PATH = REPO_ROOT / "tools" / "index_tts_fastapi_server.py"
@@ -17,6 +19,7 @@ sys.modules[MODULE_SPEC.name] = index_tts_fastapi_server
 MODULE_SPEC.loader.exec_module(index_tts_fastapi_server)
 
 
+@pytest.mark.unit
 class IndexTTSFastApiServerTests(unittest.TestCase):
     """覆盖 Index-TTS 服务启动时的设备兜底逻辑。"""
 

@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from unittest.mock import patch
 
 import numpy as np
+import pytest
 import soundfile as sf
 
 
@@ -96,12 +97,24 @@ class FakeTranslator:
         return lines[:expected_len]
 
 
+@pytest.mark.unit
 class DubPipelineAsrLayoutTests(unittest.TestCase):
     """验证 ASR 字幕会优先向句级布局收敛，而不是保留碎片 cue。"""
 
+    def with_positive_asr_gaps(self, subtitles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """用极小正间隔模拟连续 ASR 片段，避免触发 gap=0 的显式边界合同。"""
+
+        normalized = [dict(item) for item in subtitles]
+        for index in range(1, len(normalized)):
+            previous_end = float(normalized[index - 1]["end"])
+            current_start = float(normalized[index]["start"])
+            if current_start == previous_end:
+                normalized[index]["start"] = current_start + 0.000001
+        return normalized
+
     def build_fragmented_sample(self) -> List[Dict[str, Any]]:
         """复用同一份英文碎片样例，便于比较 rule 与 hybrid。"""
-        return [
+        return self.with_positive_asr_gaps([
             {"start": 0.080, "end": 1.360, "text": "I think it's extremely"},
             {"start": 1.360, "end": 2.160, "text": "clear"},
             {"start": 2.160, "end": 3.439, "text": "that we are going to have"},
@@ -121,7 +134,7 @@ class DubPipelineAsrLayoutTests(unittest.TestCase):
             {"start": 27.120, "end": 27.839, "text": "I was like,"},
             {"start": 27.839, "end": 29.839, "text": "no, that we we are the"},
             {"start": 29.839, "end": 29.960, "text": "underdog."},
-        ]
+        ])
 
     def test_resolve_grouped_synthesis_policy_keeps_grouping_for_source_short_merge(self) -> None:
         """source short merge 只做字幕重构，不应强制关闭 grouped synthesis。"""
@@ -307,12 +320,12 @@ class DubPipelineAsrLayoutTests(unittest.TestCase):
 
     def test_rebalance_source_subtitles_does_not_cross_large_gap_clusters(self) -> None:
         """明显停顿后的新句子不应被并入前一簇。"""
-        subtitles = [
+        subtitles = self.with_positive_asr_gaps([
             {"start": 0.000, "end": 0.600, "text": "This is"},
             {"start": 0.600, "end": 1.100, "text": "still one sentence"},
             {"start": 1.900, "end": 2.300, "text": "Another"},
             {"start": 2.300, "end": 3.000, "text": "sentence."},
-        ]
+        ])
 
         result = dub_pipeline.rebalance_source_subtitles(
             subtitles=subtitles,
@@ -582,12 +595,12 @@ class DubPipelineAsrLayoutTests(unittest.TestCase):
     def test_merge_short_source_subtitles_sentence_aware_prefers_complete_sentences(self) -> None:
         """句级重构应避免把一句话拆成多行。"""
 
-        subtitles = [
+        subtitles = self.with_positive_asr_gaps([
             {"start": 0.0, "end": 2.0, "text": "First clause,"},
             {"start": 2.0, "end": 4.0, "text": "still same sentence."},
             {"start": 4.0, "end": 6.0, "text": "Second sentence starts,"},
             {"start": 6.0, "end": 8.0, "text": "and ends here."},
-        ]
+        ])
 
         merged, merged_pairs, sentence_blocks = dub_pipeline.merge_short_source_subtitles_sentence_aware(
             subtitles=subtitles,
@@ -608,11 +621,11 @@ class DubPipelineAsrLayoutTests(unittest.TestCase):
     def test_merge_short_source_subtitles_sentence_aware_splits_oversized_sentence(self) -> None:
         """单句超过目标时长时应拆分，避免产生超长字幕块。"""
 
-        subtitles = [
+        subtitles = self.with_positive_asr_gaps([
             {"start": 0.0, "end": 4.0, "text": "One long thought,"},
             {"start": 4.0, "end": 8.0, "text": "with another clause,"},
             {"start": 8.0, "end": 12.0, "text": "and it keeps extending."},
-        ]
+        ])
 
         merged, merged_pairs, sentence_blocks = dub_pipeline.merge_short_source_subtitles_sentence_aware(
             subtitles=subtitles,
@@ -630,6 +643,19 @@ class DubPipelineAsrLayoutTests(unittest.TestCase):
         self.assertAlmostEqual(merged[0]["start"], 0.0, places=3)
         self.assertAlmostEqual(merged[0]["end"], 12.0, places=3)
         self.assertGreater(merged[0]["end"] - merged[0]["start"], 10.0)
+
+    def test_build_asr_gap_clusters_preserves_zero_gap_boundaries(self) -> None:
+        """gap=0 表示显式相邻字幕块，聚类时必须保持独立。"""
+
+        subtitles = [
+            {"start": 0.0, "end": 2.0, "text": "First block."},
+            {"start": 2.0, "end": 4.0, "text": "Second block."},
+        ]
+
+        clusters = dub_pipeline.build_asr_gap_clusters(subtitles, max_gap_sec=1.5)
+
+        self.assertEqual(len(clusters), 2)
+        self.assertEqual([cluster[0]["text"] for cluster in clusters], ["First block.", "Second block."])
 
     def test_merge_short_source_subtitles_speaker_aware_does_not_cross_different_speakers(self) -> None:
         """source short merge 遇到不同 speaker 时，绝不能跨 speaker 合并。"""

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -9,7 +10,13 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 import numpy as np
+import pytest
 from types import SimpleNamespace
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 RUNTIME_TEST_SKIP_REASON = ""
 try:
     import soundfile as sf
@@ -42,6 +49,7 @@ if not RUNTIME_TEST_SKIP_REASON:
 
 
 @unittest.skipIf(bool(RUNTIME_TEST_SKIP_REASON), RUNTIME_TEST_SKIP_REASON or "")
+@pytest.mark.integration
 class DubbingAlignmentTests(unittest.TestCase):
     def test_build_atempo_filter_chain_splits_large_ratio(self):
         self.assertEqual(build_atempo_filter_chain(6.0), "atempo=2.000000,atempo=2.000000,atempo=1.500000")
@@ -351,6 +359,7 @@ class DubbingAlignmentTests(unittest.TestCase):
 
 
 @unittest.skipIf(bool(RUNTIME_TEST_SKIP_REASON), RUNTIME_TEST_SKIP_REASON or "")
+@pytest.mark.integration
 class DubbingPipelineTests(unittest.TestCase):
     @dataclass(frozen=True)
     class _TestVoiceReference:
@@ -1759,6 +1768,7 @@ class DubbingPipelineTests(unittest.TestCase):
 
 
 @unittest.skipIf(bool(RUNTIME_TEST_SKIP_REASON), RUNTIME_TEST_SKIP_REASON or "")
+@pytest.mark.integration
 class DubbingBackendTests(unittest.TestCase):
     def test_split_text_for_index_tts_splits_cjk_on_punctuation(self):
         chunks = split_text_for_index_tts(
@@ -1775,6 +1785,7 @@ class DubbingBackendTests(unittest.TestCase):
 
 
 @unittest.skipIf(bool(RUNTIME_TEST_SKIP_REASON), RUNTIME_TEST_SKIP_REASON or "")
+@pytest.mark.integration
 class DubbingReviewTests(unittest.TestCase):
     def test_resolve_segment_redub_runtime_options_prefers_manifest_values(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1808,6 +1819,7 @@ class DubbingReviewTests(unittest.TestCase):
 
 
 @unittest.skipIf(bool(RUNTIME_TEST_SKIP_REASON), RUNTIME_TEST_SKIP_REASON or "")
+@pytest.mark.integration
 class IndexTtsBackendRecoveryTests(unittest.TestCase):
     def _build_request(self, tmpdir: str) -> TtsSynthesisRequest:
         """构造最小化请求对象，供 Index-TTS API 重试逻辑测试复用。"""
@@ -1877,6 +1889,7 @@ class IndexTtsBackendRecoveryTests(unittest.TestCase):
 
 
 @unittest.skipIf(bool(RUNTIME_TEST_SKIP_REASON), RUNTIME_TEST_SKIP_REASON or "")
+@pytest.mark.integration
 class IndexTtsBackendQualityTests(unittest.TestCase):
     def _build_request(
         self,

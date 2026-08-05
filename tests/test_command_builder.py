@@ -4,6 +4,8 @@ import json
 import unittest
 from pathlib import Path
 
+import pytest
+
 from subtitle_maker.jobs import (
     AutoDubbingCommandConfig,
     SegmentRedubCommandConfig,
@@ -12,6 +14,7 @@ from subtitle_maker.jobs import (
 )
 
 
+@pytest.mark.unit
 class CommandBuilderTests(unittest.TestCase):
     def test_build_auto_dubbing_command_keeps_optional_replay_flags(self):
         cmd = build_auto_dubbing_command(

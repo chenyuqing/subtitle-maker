@@ -3711,7 +3711,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tts-device", default="mps")
     parser.add_argument("--tts-dtype", default="float16", choices=["float16", "bfloat16", "float32"])
 
-    parser.add_argument("--index-tts-root", default="/Users/tim/Documents/vibe-coding/MVP/index-tts-1108")
+    parser.add_argument("--index-tts-root", default="/Volumes/JD5-1TB/tim/Documents/vibe-coding/MVP/index-tts-1108")
     parser.add_argument("--index-tts-cfg-path", default=None)
     parser.add_argument("--index-tts-model-dir", default=None)
     parser.add_argument("--index-tts-via-api", default="true")

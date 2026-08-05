@@ -6,7 +6,7 @@ WEB_PORT="${SUBTITLE_MAKER_PORT:-17493}"
 WEB_URL="http://localhost:${WEB_PORT}"
 PYANNOTE_LOCAL_MODEL_DIR="${PYANNOTE_LOCAL_MODEL_DIR:-$PROJECT_DIR/models/pyannote-speaker-diarization-community-1}"
 PYANNOTE_EXTERNAL_PYTHON_DEFAULT="$PROJECT_DIR/.venv-pyannote/bin/python"
-PYANNOTE_EXTERNAL_PYTHON_FALLBACK="/Users/tim/Documents/vibe-coding/MVP/index-tts-1108/.venv/bin/python"
+PYANNOTE_EXTERNAL_PYTHON_FALLBACK="/Volumes/JD5-1TB/tim/Documents/vibe-coding/MVP/index-tts-1108/.venv/bin/python"
 
 # 优先使用本地 pyannote 社区模型，避免运行时再走网络下载
 if [ -z "${PYANNOTE_MODEL_SOURCE:-}" ]; then

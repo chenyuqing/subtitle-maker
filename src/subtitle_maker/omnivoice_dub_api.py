@@ -36,6 +36,7 @@ from subtitle_maker.domains.media import (
     compose_vocals_master,
     extract_source_audio,
     ffprobe_duration,
+    ffprobe_video_resolution,
     has_video_stream,
     load_mono_audio,
     mix_with_bgm,
@@ -93,7 +94,7 @@ OMNIVOICE_BACKEND_MAIN = OMNIVOICE_STUDIO_DIR / "backend" / "main.py"
 OMNIVOICE_BACKEND_PYTHON = OMNIVOICE_STUDIO_DIR / ".venv" / "bin" / "python"
 OMNIVOICE_BACKEND_PID_FILE = REPO_ROOT / "outputs" / "omnivoice_backend.pid"
 OMNIVOICE_BACKEND_LOG_PATH = REPO_ROOT / "outputs" / "omnivoice_backend.log"
-OMNIVOICE_LOCAL_CHECKPOINT_DIR = Path("/Users/tim/Documents/vibe-coding/MVP/OmniVoice/omnivoice/checkpoints")
+OMNIVOICE_LOCAL_CHECKPOINT_DIR = Path("/Volumes/JD5-1TB/tim/Documents/vibe-coding/MVP/OmniVoice/omnivoice/checkpoints")
 REF_VOICES_ROOT = REPO_ROOT / "ref-voices"
 LOCAL_VOICE_GENDER_MODEL_DIR = REPO_ROOT / "norwood-maleVSfemale"
 _omnivoice_backend_start_lock = threading.Lock()
@@ -1729,8 +1730,22 @@ def _escape_ass_text(text: str) -> str:
     return r"\N".join(line for line in lines if line)
 
 
-def _build_styled_ass_from_rows(rows: List[Dict[str, Any]], *, source_name: str) -> str:
-    """按固定样式模板把最终字幕行导出为 styled ASS。"""
+def _build_styled_ass_from_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    source_name: str,
+    video_width: int = 1920,
+    video_height: int = 1080,
+) -> str:
+    """按视频分辨率缩放样式模板，把最终字幕行导出为 styled ASS。"""
+
+    safe_video_width = max(16, int(video_width or 1920))
+    safe_video_height = max(16, int(video_height or 1080))
+    # 以 1920x1080 为基准缩放，避免 720p 继续使用 1080p 的绝对字号和边距。
+    reference_scale = min(safe_video_width / 1920.0, safe_video_height / 1080.0)
+    style_scale = max(0.25, reference_scale)
+    font_size = max(12, int(round(80 * style_scale)))
+    margin = max(12, int(round(80 * style_scale)))
 
     header_lines = [
         "[Script Info]",
@@ -1740,12 +1755,12 @@ def _build_styled_ass_from_rows(rows: List[Dict[str, Any]], *, source_name: str)
         "WrapStyle: 2",
         "ScaledBorderAndShadow: yes",
         "YCbCr Matrix: TV.709",
-        "PlayResX: 1920",
-        "PlayResY: 1080",
+        f"PlayResX: {safe_video_width}",
+        f"PlayResY: {safe_video_height}",
         "",
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
-        "Style: Default,PingFang SC,80,&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,4,0,0,2,80,80,80,1",
+        f"Style: Default,PingFang SC,{font_size},&H00FFFFFF,&H000000FF,&H00000000,&H99000000,-1,0,0,0,100,100,0,0,4,0,0,2,{margin},{margin},{margin},1",
         "",
         "[Events]",
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
@@ -4633,9 +4648,20 @@ def _run_omnivoice_job(
     final_srt_path = final_paths["srt"]
     final_srt_rows = _rebalance_omnivoice_final_srt_rows(selected_subtitles)
     final_srt_path.write_text(format_srt(final_srt_rows), encoding="utf-8")
+
+    # 获取原视频分辨率用于 ASS 字幕适配
+    video_width, video_height = 1920, 1080
+    if has_video_stream(input_media_path):
+        video_width, video_height = ffprobe_video_resolution(input_media_path)
+
     final_ass_path = final_paths["ass"]
     final_ass_path.write_text(
-        _build_styled_ass_from_rows(final_srt_rows, source_name=final_srt_path.name),
+        _build_styled_ass_from_rows(
+            final_srt_rows,
+            source_name=final_srt_path.name,
+            video_width=video_width,
+            video_height=video_height,
+        ),
         encoding="utf-8",
     )
 

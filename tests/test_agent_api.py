@@ -4,6 +4,7 @@ import os
 import unittest
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from subtitle_maker import agent_api, web
@@ -28,6 +29,7 @@ class FakeAgentClient:
         )
 
 
+@pytest.mark.integration
 class AgentApiTests(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(web.app)

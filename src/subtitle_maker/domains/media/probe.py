@@ -36,6 +36,36 @@ def ffprobe_duration(path: Path) -> float:
         raise RuntimeError(f"invalid duration from ffprobe: {out!r}") from exc
 
 
+def ffprobe_video_resolution(path: Path) -> Tuple[int, int]:
+    """通过 ffprobe 获取视频分辨率 (width, height)，失败时返回默认 1920x1080。"""
+    code, out, err = run_cmd(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0",
+            str(path),
+        ]
+    )
+    if code != 0:
+        return 1920, 1080
+    try:
+        parts = out.strip().split(",")
+        if len(parts) == 2:
+            width = int(parts[0])
+            height = int(parts[1])
+            if width > 0 and height > 0:
+                return width, height
+    except (ValueError, IndexError):
+        pass
+    return 1920, 1080
+
+
 def load_mono_audio(path: Path) -> Tuple[np.ndarray, int]:
     """读取音频并统一为单声道 float32，便于后续时间轴处理。"""
     wav, sample_rate = sf.read(str(path))

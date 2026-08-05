@@ -6,6 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
+
 from subtitle_maker.jobs.recovery import (
     build_batch_task_updates,
     build_loaded_batch_task,
@@ -14,6 +16,7 @@ from subtitle_maker.jobs.recovery import (
 )
 
 
+@pytest.mark.unit
 class JobRecoveryTests(unittest.TestCase):
     """冻结 Job Store 恢复层的当前主合同。"""
 

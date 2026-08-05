@@ -38,7 +38,7 @@ logger = logging.getLogger("omnivoice.model")
 _gpu_pool = ThreadPoolExecutor(max_workers=1)
 _cpu_pool = ThreadPoolExecutor(max_workers=CPU_POOL_WORKERS)
 
-_LOCAL_OMNIVOICE_CHECKPOINT = Path("/Users/tim/Documents/vibe-coding/MVP/OmniVoice/omnivoice/checkpoints")
+_LOCAL_OMNIVOICE_CHECKPOINT = Path("/Volumes/JD5-1TB/tim/Documents/vibe-coding/MVP/OmniVoice/omnivoice/checkpoints")
 
 model = None  # type: ignore
 _model_lock = asyncio.Lock()

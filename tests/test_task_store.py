@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import unittest
 
+import pytest
+
 from subtitle_maker.jobs import TaskStore
 
 
+@pytest.mark.unit
 class TaskStoreTests(unittest.TestCase):
     def test_create_get_and_copy_keep_behavior_consistent(self) -> None:
         store = TaskStore()

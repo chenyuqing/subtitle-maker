@@ -137,7 +137,7 @@ VOXCPM_SUBTITLE_VIDEO_LAYOUTS: Dict[str, Dict[str, int]] = {
         "max_lines_per_page": 5,
     },
 }
-VOXCPM_STUDIO_DIR = Path("/Users/tim/Documents/vibe-coding/MVP/VoxCPM")
+VOXCPM_STUDIO_DIR = Path("/Volumes/JD5-1TB/tim/Documents/vibe-coding/MVP/VoxCPM")
 VOXCPM_BACKEND_MAIN = VOXCPM_STUDIO_DIR / "run_py311.py"
 VOXCPM_BACKEND_PYTHON = VOXCPM_STUDIO_DIR / ".venv" / "bin" / "python"
 VOXCPM_BACKEND_PID_FILE = REPO_ROOT / "outputs" / "voxcpm_backend.pid"
@@ -1911,6 +1911,7 @@ def _build_voxcpm_artifacts(
 def _render_voxcpm_video_variant(
     *,
     task_id: str,
+    project_filename: str,
     out_root: Path,
     rows: List[Dict[str, Any]],
     final_mix_path: Path,
@@ -1920,7 +1921,7 @@ def _render_voxcpm_video_variant(
     """按指定规格重新生成 ASS 与黑底字幕视频，不重跑配音。"""
 
     normalized = _normalize_voxcpm_subtitle_video_preset(preset)
-    variant_paths = _build_voxcpm_variant_paths(out_root, normalized)
+    variant_paths = _build_voxcpm_variant_paths(out_root, normalized, project_filename)
     variant_paths["ass"].write_text(
         _build_voxcpm_centered_ass_from_rows(
             rows,
@@ -2487,7 +2488,7 @@ def _create_task_payload(
 def _run_voxcpm_job(
     *,
     task_id: str,
-    project_filename: str,
+    project_filename: str = "",
     input_media_path: Optional[Path],
     source_rows: List[Dict[str, Any]],
     translated_rows: List[Dict[str, Any]],
@@ -3313,6 +3314,7 @@ async def render_voxcpm_video_variant(
 
     variant_entry = _render_voxcpm_video_variant(
         task_id=resolved_task_id,
+        project_filename=str(manifest.get("project_filename") or out_root.name),
         out_root=out_root,
         rows=final_rows,
         final_mix_path=final_mix_path,

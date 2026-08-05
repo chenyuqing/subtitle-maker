@@ -6,12 +6,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from subtitle_maker import simple_web
 from subtitle_maker.app import legacy_simple_app
 
 
+@pytest.mark.integration
 class SimpleWebLegacyTests(unittest.TestCase):
     """冻结 legacy simple web wrapper 的最小兼容行为。"""
 

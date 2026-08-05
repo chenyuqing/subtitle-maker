@@ -8,7 +8,7 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_DIR"
 WEB_PORT="${SUBTITLE_MAKER_PORT:-17493}"
 
-INDEX_TTS_PROJECT_DIR="${INDEX_TTS_PROJECT_DIR:-/Users/tim/Documents/vibe-coding/MVP/index-tts-1108}"
+INDEX_TTS_PROJECT_DIR="${INDEX_TTS_PROJECT_DIR:-/Volumes/JD5-1TB/tim/Documents/vibe-coding/MVP/index-tts-1108}"
 INDEX_TTS_STOP_SCRIPT="${INDEX_TTS_STOP_SCRIPT:-$INDEX_TTS_PROJECT_DIR/stop-api.sh}"
 LOCAL_INDEX_TTS_STOP_SCRIPT="$PROJECT_DIR/stop_index_tts_api.sh"
 

@@ -40,3 +40,7 @@ docs/*
 !docs/
 !docs/refactor/
 !docs/refactor/*.md
+
+# 本地性别分类模型（体积超过 GitHub 100MB 限制）
+norwood-maleVSfemale/*.safetensors
+norwood-maleVSfemale/*.bin
